@@ -116,7 +116,8 @@ class Othello:
                     self.sequences = self.sequences[:20000000]
                     print(f"Using 20 million for training, {len(self.val)} for validation")
         else:
-            for fn in os.listdir(data_root):
+            # next line modified (Teo Maayan, 2026-01-23)
+            for fn in sorted(os.listdir(data_root)):
                 if criteria(fn):
                     with open(os.path.join(data_root, fn), "r") as f:
                         pgn_text = f.read()
