@@ -1,0 +1,24 @@
+name: othello
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.8
+  - pytorch
+  - torchvision
+  - torchaudio
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - scipy
+  - scikit-learn
+  - jupyter
+  - jupyterlab
+  - ipykernel
+  - notebook
+  - tqdm
+  - pip
+  - pip:
+    - pgnparser==1.0
