@@ -10,7 +10,10 @@ import torch.nn as nn
 from torch.nn import functional as F
 from functools import partial
 
-from neel_plotly import imshow
+try:
+    from neel_plotly import imshow
+except ImportError:
+    imshow = None  # Optional dependency for interactive plotly visualizations
 
 torch.set_grad_enabled(True)
 # %%
