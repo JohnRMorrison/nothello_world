@@ -141,3 +141,6 @@ cython_debug/
 data/othello_synthetic
 data/othello_championship
 ckpts/*
+
+experiments/mathematical_transformation_experiments/ckpts/*
+experiments/mathematical_transformation_experiments/generated_labels/*
