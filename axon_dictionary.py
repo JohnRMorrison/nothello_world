@@ -22,11 +22,17 @@ For reference:
     
 """
 
+import sys, os
+
+# base directory where ckpts/, data/, mingpt/ live
+BASE_DIR = "/engram/nklab/jrm2182/nothello_world"
+sys.path.insert(0, BASE_DIR)
+
 import torch
 import torch.nn.functional as F
 from mingpt.model import GPT, GPTConfig
 from data.othello import OthelloBoardState, permit
-import glob, re, pickle, time, os
+import glob, re, pickle, time
 
 #token index and board position mappings (from mech_interp_othello_utils.py)
 itos = {
@@ -137,13 +143,13 @@ if __name__ == "__main__":
     #load model
     mconf = GPTConfig(vocab_size=61, block_size=59, n_layer=8, n_head=8, n_embd=512)
     model = GPT(mconf)
-    model.load_state_dict(torch.load("./ckpts/gpt_championship.ckpt", map_location=device))
+    model.load_state_dict(torch.load(f"{BASE_DIR}/ckpts/gpt_championship.ckpt", map_location=device))
     model.to(device)
     model.eval()
     print("Model loaded")
 
     #load games
-    all_games = load_all_games("./data")
+    all_games = load_all_games(f"{BASE_DIR}/data")
 
     # split into chunks
     chunk_size = len(all_games) // total_chunks
@@ -171,7 +177,7 @@ if __name__ == "__main__":
         'num_games': len(games),
     }
 
-    out_file = f'axon_data_chunk{chunk_id}.pkl'
+    out_file = f'{BASE_DIR}/axon_data_chunk{chunk_id}.pkl'
     with open(out_file, 'wb') as f:
         pickle.dump(output, f)
 
