@@ -119,6 +119,18 @@ def collect_data(model, games, device):
 
 
 if __name__ == "__main__":
+    import sys
+
+    # usage: python axon_dictionary.py <chunk_id> <total_chunks>
+    # example: axon_dictionary.py 0 5   (runs first 1/5 of games)
+    # or just: python axon_dictionary.py       (runs all games)
+    if len(sys.argv) == 3:
+        chunk_id = int(sys.argv[1])
+        total_chunks = int(sys.argv[2])
+    else:
+        chunk_id = 0
+        total_chunks = 1
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
 
@@ -131,21 +143,35 @@ if __name__ == "__main__":
     print("Model loaded")
 
     #load games
-    games = load_all_games("./data")
+    all_games = load_all_games("./data")
+
+    # split into chunks
+    chunk_size = len(all_games) // total_chunks
+    start = chunk_id * chunk_size
+    end = len(all_games) if chunk_id == total_chunks - 1 else start + chunk_size
+    games = all_games[start:end]
+    print(f"Chunk {chunk_id}/{total_chunks}: games {start} to {end} ({len(games)} games)")
 
     #run and collect everything
     game_data, game_moves = collect_data(model, games, device)
 
+    # remap keys back to original game indices
+    remapped_data = {}
+    remapped_moves = {}
+    for gi, orig_idx in enumerate(range(start, start + len(games))):
+        remapped_data[orig_idx] = game_data[gi]
+        remapped_moves[orig_idx] = game_moves[gi]
+
     #save
     output = {
-        'game_data': game_data,
-        'game_moves': game_moves,
+        'game_data': remapped_data,
+        'game_moves': remapped_moves,
         'itos': itos,
         'stoi': stoi,
         'num_games': len(games),
     }
 
-    out_file = 'axon_full_data.pkl'
+    out_file = f'axon_data_chunk{chunk_id}.pkl'
     with open(out_file, 'wb') as f:
         pickle.dump(output, f)
 
