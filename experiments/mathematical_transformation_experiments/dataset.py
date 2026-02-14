@@ -37,8 +37,11 @@ PAD_IDX = 0  # index for padding token
 VOCAB_SIZE = len(STOI)  # 61
 
 
-def _load_games_and_labels(transform_name, seed, labels_dir, max_files):
-    """Shared loading logic: returns (games list, labels np.ndarray, config dict)."""
+def _load_games_and_labels(transform_name, seed, labels_dir, max_files, n_transforms=1):
+    """Shared loading logic: returns (games list, labels np.ndarray, config dict).
+
+    Labels are always returned as 2D array of shape (N, n_transforms).
+    """
     games = []
     label_chunks = []
 
@@ -47,7 +50,9 @@ def _load_games_and_labels(transform_name, seed, labels_dir, max_files):
         files = files[:max_files]
 
     for fname in files:
-        lbl_path = os.path.join(labels_dir, labels_filename(fname, transform_name, seed))
+        lbl_path = os.path.join(
+            labels_dir, labels_filename(fname, transform_name, seed, n_transforms)
+        )
         if not os.path.exists(lbl_path):
             raise FileNotFoundError(
                 f"Labels not found: {lbl_path}\n"
@@ -67,8 +72,11 @@ def _load_games_and_labels(transform_name, seed, labels_dir, max_files):
         label_chunks.append(labels)
 
     labels = np.concatenate(label_chunks)
+    # Ensure labels are always 2D: (N, n_transforms)
+    if labels.ndim == 1:
+        labels = labels[:, np.newaxis]
 
-    cfg_path = os.path.join(labels_dir, config_filename(transform_name, seed))
+    cfg_path = os.path.join(labels_dir, config_filename(transform_name, seed, n_transforms))
     with open(cfg_path, "rb") as f:
         config = pickle.load(f)
 
@@ -76,13 +84,16 @@ def _load_games_and_labels(transform_name, seed, labels_dir, max_files):
 
 
 class BooleanLabelDataset(Dataset):
-    """Returns (x, y) where x is a float32 vector (normalized [0,1]) and y is 0/1."""
+    """Returns (x, y) where x is a float32 vector (normalized [0,1])
+    and y is a float32 tensor of shape (n_transforms,)."""
 
     def __init__(self, transform_name: str = "dot_product", seed: int = 42,
-                 labels_dir: str = OUTPUT_DIR, max_files: int = None):
+                 labels_dir: str = OUTPUT_DIR, max_files: int = None,
+                 n_transforms: int = 1):
         self.games, self.labels, self.config = _load_games_and_labels(
-            transform_name, seed, labels_dir, max_files
+            transform_name, seed, labels_dir, max_files, n_transforms
         )
+        self.n_transforms = self.labels.shape[1]
 
     def __len__(self):
         return len(self.games)
@@ -95,7 +106,7 @@ class BooleanLabelDataset(Dataset):
         padded /= NORMALIZE_MAX
 
         x = torch.tensor(padded, dtype=torch.float32)
-        y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        y = torch.tensor(self.labels[idx], dtype=torch.float32)  # (n_transforms,)
         return x, y
 
     def split(self, train_frac: float = 0.8, seed: int = 42):
@@ -107,15 +118,18 @@ class BooleanLabelDataset(Dataset):
 
 
 class BooleanLabelTokenDataset(Dataset):
-    """Returns (x, y) where x uses the same vocab mapping as CharDataset (61 tokens, pad=0)."""
+    """Returns (x, y) where x uses the same vocab mapping as CharDataset (61 tokens, pad=0)
+    and y is a float32 tensor of shape (n_transforms,)."""
 
     def __init__(self, transform_name: str = "dot_product", seed: int = 42,
-                 labels_dir: str = OUTPUT_DIR, max_files: int = None):
+                 labels_dir: str = OUTPUT_DIR, max_files: int = None,
+                 n_transforms: int = 1):
         self.games, self.labels, self.config = _load_games_and_labels(
-            transform_name, seed, labels_dir, max_files
+            transform_name, seed, labels_dir, max_files, n_transforms
         )
         self.stoi = STOI
         self.itos = ITOS
+        self.n_transforms = self.labels.shape[1]
 
     def __len__(self):
         return len(self.games)
@@ -128,7 +142,7 @@ class BooleanLabelTokenDataset(Dataset):
             tokens[i] = STOI[game[i]]
 
         x = torch.tensor(tokens, dtype=torch.long)
-        y = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        y = torch.tensor(self.labels[idx], dtype=torch.float32)  # (n_transforms,)
         return x, y
 
     def split(self, train_frac: float = 0.8, seed: int = 42):

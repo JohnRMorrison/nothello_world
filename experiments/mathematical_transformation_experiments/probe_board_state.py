@@ -379,6 +379,8 @@ def parse_args():
     p.add_argument("--layers", type=int, default=8, help="Number of transformer layers in the model")
     p.add_argument("--n-embd", type=int, default=512, help="Embedding dimension of the model")
     p.add_argument("--n-head", type=int, default=8, help="Number of attention heads in the model")
+    p.add_argument("--n-transforms", type=int, default=1,
+                   help="Number of model outputs (auto-detected from args.json if available)")
     # Probe
     p.add_argument("--layer", type=int, required=True,
                    help="Which layer to probe (e.g. 2 for after 2nd block)")
@@ -419,6 +421,7 @@ def main():
     # ---- Auto-detect model config from args.json if available ----
     ckpt_dir = os.path.dirname(args.ckpt_path)
     args_json_path = os.path.join(ckpt_dir, "args.json")
+    n_transforms = args.n_transforms
     if os.path.exists(args_json_path):
         with open(args_json_path) as f:
             train_args = json.load(f)
@@ -426,15 +429,16 @@ def main():
         args.layers = train_args.get("layers", args.layers)
         args.n_embd = train_args.get("n_embd", args.n_embd)
         args.n_head = train_args.get("n_head", args.n_head)
+        n_transforms = train_args.get("n_transforms", n_transforms)
         print(f"Auto-detected model config from {args_json_path}")
 
     # ---- Load model ----
-    print(f"Loading model: {args.layers}L/{args.n_embd}d/{args.n_head}h")
+    print(f"Loading model: {args.layers}L/{args.n_embd}d/{args.n_head}h/{n_transforms} outputs")
     config = GPTConfig(
         VOCAB_SIZE, GAME_LEN,
         n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
     )
-    model = GPTClassifier(config)
+    model = GPTClassifier(config, n_outputs=n_transforms)
 
     ckpt = torch.load(args.ckpt_path, map_location=device, weights_only=False)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -487,6 +491,7 @@ def main():
         "layer": args.layer,
         "model_layers": args.layers,
         "n_embd": args.n_embd,
+        "n_transforms": n_transforms,
         "ckpt_path": args.ckpt_path,
         "num_games": len(games),
         "best_acc": acc,

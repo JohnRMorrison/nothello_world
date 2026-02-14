@@ -7,12 +7,13 @@ Supports CUDA, MPS (Apple Silicon), and CPU. Run from the project root:
     python experiments/mathematical_transformation_experiments/train_boolean_classifier.py [OPTIONS]
 
 Options:
-    --layers 4              Number of transformer layers (default: 4)
-    --n-embd 256            Embedding dimension (default: 256)
+    --layers 8              Number of transformer layers (default: 8)
+    --n-embd 512            Embedding dimension (default: 512)
     --n-head 8              Number of attention heads (default: 8)
+    --n-transforms 1        Number of independent boolean outputs (default: 1)
     --epochs 20             Training epochs (default: 20)
     --batch-size 256        Batch size (default: 256)
-    --lr 3e-4               Learning rate (default: 3e-4)
+    --lr 5e-4               Learning rate (default: 5e-4)
     --max-files 5           Number of data pickle files to load (default: 5, None=all)
     --transform dot_product Transform name (default: dot_product)
     --seed 42               Random seed (default: 42)
@@ -49,17 +50,22 @@ from mingpt.model import GPT, GPTConfig  # noqa: F401 — GPTConfig used in main
 # ============================= Model ==========================================
 
 class GPTClassifier(GPT):
-    """Same architecture as OthelloGPT (causal transformer), with a binary
+    """Same architecture as OthelloGPT (causal transformer), with a
     classification head instead of next-token prediction.
 
     Uses the last non-padding position's hidden state for classification
     (in causal attention, this position has attended to all prior real tokens).
+
+    Args:
+        config: GPTConfig
+        n_outputs: number of independent binary classification outputs
+                   (1 = single boolean, 256 = 256 independent booleans)
     """
 
-    def __init__(self, config):
+    def __init__(self, config, n_outputs=1):
         super().__init__(config)
-        # Replace the next-token prediction head with binary classification
-        self.head = nn.Linear(config.n_embd, 2, bias=False)
+        self.n_outputs = n_outputs
+        self.head = nn.Linear(config.n_embd, n_outputs, bias=False)
         self.head.weight.data.normal_(mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
@@ -78,7 +84,7 @@ class GPTClassifier(GPT):
         last_idx = (lengths - 1).clamp(min=0)  # (B,)
         last_hidden = x[torch.arange(b, device=x.device), last_idx]  # (B, n_embd)
 
-        logits = self.head(last_hidden)  # (B, 2)
+        logits = self.head(last_hidden)  # (B, n_outputs)
         return logits
 
 
@@ -98,23 +104,23 @@ def train_one_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0.0
     total_correct = 0
-    total_samples = 0
+    total_elements = 0
 
     for x, y in tqdm(loader, desc="  train", leave=False):
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = nn.functional.cross_entropy(logits, y)
+        logits = model(x)  # (B, n_outputs)
+        loss = nn.functional.binary_cross_entropy_with_logits(logits, y)
 
         optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        total_loss += loss.item() * x.size(0)
-        total_correct += (logits.argmax(dim=1) == y).sum().item()
-        total_samples += x.size(0)
+        total_loss += loss.item() * y.numel()
+        total_correct += ((logits > 0).float() == y).sum().item()
+        total_elements += y.numel()
 
-    return total_loss / total_samples, total_correct / total_samples
+    return total_loss / total_elements, total_correct / total_elements
 
 
 @torch.no_grad()
@@ -122,18 +128,18 @@ def evaluate(model, loader, device):
     model.eval()
     total_loss = 0.0
     total_correct = 0
-    total_samples = 0
+    total_elements = 0
 
     for x, y in tqdm(loader, desc="  eval", leave=False):
         x, y = x.to(device), y.to(device)
-        logits = model(x)
-        loss = nn.functional.cross_entropy(logits, y)
+        logits = model(x)  # (B, n_outputs)
+        loss = nn.functional.binary_cross_entropy_with_logits(logits, y)
 
-        total_loss += loss.item() * x.size(0)
-        total_correct += (logits.argmax(dim=1) == y).sum().item()
-        total_samples += x.size(0)
+        total_loss += loss.item() * y.numel()
+        total_correct += ((logits > 0).float() == y).sum().item()
+        total_elements += y.numel()
 
-    return total_loss / total_samples, total_correct / total_samples
+    return total_loss / total_elements, total_correct / total_elements
 
 
 # ============================= Main ===========================================
@@ -143,6 +149,8 @@ def parse_args():
     p.add_argument("--layers", type=int, default=8, help="Number of transformer layers")
     p.add_argument("--n-embd", type=int, default=512, help="Embedding dimension")
     p.add_argument("--n-head", type=int, default=8, help="Number of attention heads")
+    p.add_argument("--n-transforms", type=int, default=1,
+                   help="Number of independent boolean outputs (default: 1)")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--lr", type=float, default=5e-4)
@@ -168,10 +176,10 @@ def main():
 
     # ---- Checkpoint dir ----
     if args.ckpt_dir is None:
-        args.ckpt_dir = os.path.join(
-            SCRIPT_DIR, "ckpts",
-            f"{args.transform}_seed{args.label_seed}_{args.layers}L_{args.n_embd}d"
-        )
+        name = f"{args.transform}_seed{args.label_seed}_{args.layers}L_{args.n_embd}d"
+        if args.n_transforms > 1:
+            name += f"_n{args.n_transforms}"
+        args.ckpt_dir = os.path.join(SCRIPT_DIR, "ckpts", name)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     # ---- Save random init and exit if requested ----
@@ -180,7 +188,7 @@ def main():
             VOCAB_SIZE, GAME_LEN,
             n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
         )
-        model = GPTClassifier(config)
+        model = GPTClassifier(config, n_outputs=args.n_transforms)
         init_path = os.path.join(args.ckpt_dir, "random_init.pt")
         torch.save(model.state_dict(), init_path)
         args_path = os.path.join(args.ckpt_dir, "args.json")
@@ -188,18 +196,20 @@ def main():
             json.dump(vars(args), f, indent=2)
         print(f"Saved randomly initialized model to {init_path}")
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h — {n_params:,} params")
+        print(f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h / "
+              f"{args.n_transforms} outputs — {n_params:,} params")
         return
 
     # ---- Data ----
     print("Loading dataset...")
     t0 = time.time()
     dataset = BooleanLabelTokenDataset(
-        transform_name=args.transform, seed=args.label_seed, max_files=args.max_files
+        transform_name=args.transform, seed=args.label_seed, max_files=args.max_files,
+        n_transforms=args.n_transforms,
     )
     train_ds, test_ds = dataset.split(train_frac=args.train_frac, seed=args.seed)
     print(f"Loaded {len(dataset)} games in {time.time() - t0:.1f}s "
-          f"(train={len(train_ds)}, test={len(test_ds)})")
+          f"(train={len(train_ds)}, test={len(test_ds)}, n_transforms={dataset.n_transforms})")
 
     train_loader = DataLoader(
         train_ds, shuffle=True, batch_size=args.batch_size,
@@ -215,10 +225,11 @@ def main():
         VOCAB_SIZE, GAME_LEN,
         n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
     )
-    model = GPTClassifier(config).to(device)
+    model = GPTClassifier(config, n_outputs=args.n_transforms).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h — {n_params:,} params")
+    print(f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h / "
+          f"{args.n_transforms} outputs — {n_params:,} params")
 
     class OptimConfig:
         learning_rate = args.lr
