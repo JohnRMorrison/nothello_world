@@ -1,6 +1,8 @@
 """
 Heatmap Analysis - Uses the pickle file containing the dictionary and builds
 an 8x8 heatmap containing squares where the model predicts illegally most often.
+
+Captures all illegal probability at every position. (previously only counted positions where illegal prob >5%)
 """
 
 import pickle
@@ -18,8 +20,8 @@ print(f"Loaded {total_games} games")
 # analyze illegal predictions
 square_counts = np.zeros(64)   # count each time a square is predicted illegally (>1% prob)
 square_probs = np.zeros(64)    # total probability assigned illegally to each square
-total_failures = 0             # total number of failure positions (>5% illegal)
-total_positions = 0            # total number of positions analyzed (for failure rate)
+total_positions = 0
+all_illegal_probs = []         # illegal prob for every position (removed previous 5% threshold)
 
 for gi, game_idx in enumerate(game_data):
     for move_idx in game_data[game_idx]:
@@ -39,19 +41,47 @@ for gi, game_idx in enumerate(game_data):
                         square_counts[board_pos] += 1
                         square_probs[board_pos] += entry['prob']
 
-        if position_illegal > 0.05:
-            total_failures += 1
+        all_illegal_probs.append(position_illegal)
 
     if (gi + 1) % 10000 == 0:
         print(f"  {gi+1}/{total_games} games...")
 
+all_illegal_probs = np.array(all_illegal_probs)
+
+# === SUMMARY ===
 print(f"\n{'='*60}")
 print(f"SUMMARY")
 print(f"{'='*60}")
 print(f"Total games: {total_games}")
 print(f"Total positions: {total_positions:,}")
-print(f"Total failure positions (>5% illegal): {total_failures}")
-print(f"Failure rate: {total_failures/total_positions*100:.2f}%")
+print(f"Total illegal probability across all positions: {all_illegal_probs.sum():.2f}")
+print(f"Average illegal prob per position: {all_illegal_probs.mean()*100:.4f}%")
+print(f"Median illegal prob per position: {np.median(all_illegal_probs)*100:.4f}%")
+print(f"Max illegal prob at any position: {all_illegal_probs.max()*100:.2f}%")
+print(f"Std dev: {all_illegal_probs.std()*100:.4f}%")
+
+# distribution breakdown - how many positions fall into each bucket
+print(f"\n{'='*60}")
+print("ILLEGAL PROBABILITY DISTRIBUTION")
+print("How many positions fall into each illegal probability range")
+print("="*60)
+buckets = [0, 0.001, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1.01]
+labels = ["0% (perfect)", "0-0.1%", "0.1-1%", "1-2%", "2-5%", "5-10%", "10-20%", "20-50%", "50%+"]
+for i in range(len(buckets) - 1):
+    count = np.sum((all_illegal_probs >= buckets[i]) & (all_illegal_probs < buckets[i+1]))
+    pct = count / total_positions * 100
+    print(f"  {labels[i]:>12s}: {count:>10,} positions ({pct:6.2f}%)")
+# exact zero
+exact_zero = np.sum(all_illegal_probs == 0)
+print(f"  {'Exact zero':>12s}: {exact_zero:>10,} positions ({exact_zero/total_positions*100:6.2f}%)")
+
+# percentiles
+print(f"\n{'='*60}")
+print("PERCENTILES")
+print("="*60)
+for p in [50, 75, 90, 95, 99, 99.5, 99.9]:
+    val = np.percentile(all_illegal_probs, p)
+    print(f"  {p:5.1f}th percentile: {val*100:.4f}%")
 
 # reshaping into 8x8 board
 count_board = square_counts.reshape(8, 8)
