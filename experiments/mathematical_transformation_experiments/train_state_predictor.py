@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 """
-Train a causal transformer to predict per-position state vectors derived from
-a mathematical transformation of Othello move sequences.
+Train a causal transformer to predict the SUM of the per-position state vector
+derived from a mathematical transformation of Othello move sequences.
 
 The model architecture matches Othello-GPT (causal transformer), but the
-training target is a 60-dimensional binary state vector at each position,
-computed via a deterministic flip rule using a fixed random lookup table
-(V_table). The V_table has no spatial or strategic relationship to Othello.
+training target is a single scalar at each position: the sum of a
+60-dimensional binary state vector (i.e. count of 1s, ranging from 0 to 60).
+The state is computed via a deterministic flip rule using a fixed random lookup
+table (V_table). The V_table has no spatial or strategic relationship to Othello.
 
 State update rule (1-indexed steps):
   - Initialize s = [+1, +1, ..., +1] (length 60)
@@ -14,7 +15,11 @@ State update rule (1-indexed steps):
   - t=2: for each cell c, if V_table[m_2][c] == 1, flip s[c]
   - t>=3: for each cell c, if at least 2 of {V_table[m_t][c],
            V_table[m_{t-1}][c], V_table[m_{t-2}][c]} are 1, flip s[c]
-  - Target at each step: s_t mapped to {0,1} (+1 -> 1, -1 -> 0)
+  - State at each step: s_t mapped to {0,1} (+1 -> 1, -1 -> 0)
+  - Target at each step: sum(s_t), an integer in [0, 60]
+
+The hypothesis is that predicting this scalar sum (via MSE regression) provides
+cleaner gradients than predicting the full 60-dim binary state vector.
 
 Run from the project root:
 
@@ -154,11 +159,11 @@ def tokenize_game(game_raw):
 
 
 class StateDataset(Dataset):
-    """Othello token sequences paired with per-position state targets."""
+    """Othello token sequences paired with per-position state-sum targets."""
 
     def __init__(self, vtable, max_files=None):
         all_tokens = []
-        all_states = []
+        all_sums = []
 
         files = list_synthetic_files()
         if max_files is not None:
@@ -169,17 +174,19 @@ class StateDataset(Dataset):
             tokens = np.array(
                 [tokenize_game(g) for g in games_raw], dtype=np.int64
             )
-            states = compute_states(tokens, vtable)
+            states = compute_states(tokens, vtable)  # (N, T, STATE_DIM)
+            state_sums = states.sum(axis=-1).astype(np.float32)  # (N, T)
 
             all_tokens.append(tokens)
-            all_states.append(states)
+            all_sums.append(state_sums)
 
         self.tokens = np.concatenate(all_tokens, axis=0)  # (N, GAME_LEN)
-        self.states = np.concatenate(all_states, axis=0)  # (N, GAME_LEN, STATE_DIM)
+        self.state_sums = np.concatenate(all_sums, axis=0)  # (N, GAME_LEN)
 
         print(
             f"Dataset: {len(self)} games, "
-            f"tokens {self.tokens.shape}, states {self.states.shape}"
+            f"tokens {self.tokens.shape}, state_sums {self.state_sums.shape}, "
+            f"sum range [{self.state_sums.min():.0f}, {self.state_sums.max():.0f}]"
         )
 
     def __len__(self):
@@ -187,8 +194,8 @@ class StateDataset(Dataset):
 
     def __getitem__(self, idx):
         x = torch.from_numpy(self.tokens[idx].copy())
-        y = torch.from_numpy(self.states[idx].astype(np.float32))
-        return x, y  # (GAME_LEN,) long, (GAME_LEN, STATE_DIM) float32
+        y = torch.from_numpy(self.state_sums[idx].copy())
+        return x, y  # (GAME_LEN,) long, (GAME_LEN,) float32
 
     def split(self, train_frac=0.8, seed=42):
         rng = np.random.default_rng(seed)
@@ -202,18 +209,19 @@ class StateDataset(Dataset):
 
 # ============================= Model ==========================================
 
-class GPTStatePredictor(GPT):
-    """Causal transformer predicting a STATE_DIM-dim binary state at each position.
+class GPTStateSumPredictor(GPT):
+    """Causal transformer predicting the sum of the state vector at each position.
 
-    Same architecture as Othello-GPT, but the output head produces STATE_DIM
-    logits per position instead of vocab_size logits for next-token prediction.
+    Same architecture as Othello-GPT, but the output head produces a single
+    scalar per position (the predicted sum, in [0, 60]) instead of vocab_size
+    logits for next-token prediction. Trained with MSE loss.
     """
 
-    def __init__(self, config, state_dim=STATE_DIM):
+    def __init__(self, config):
         super().__init__(config)
-        self.state_dim = state_dim
-        self.head = nn.Linear(config.n_embd, state_dim, bias=False)
+        self.head = nn.Linear(config.n_embd, 1, bias=True)
         self.head.weight.data.normal_(mean=0.0, std=0.02)
+        nn.init.constant_(self.head.bias, STATE_DIM / 2.0)  # init near mean
 
     def forward(self, idx, targets=None):
         b, t = idx.size()
@@ -225,8 +233,8 @@ class GPTStatePredictor(GPT):
         x = self.blocks(x)
         x = self.ln_f(x)  # (B, T, n_embd)
 
-        logits = self.head(x)  # (B, T, state_dim)
-        return logits
+        pred = self.head(x).squeeze(-1)  # (B, T)
+        return pred
 
 
 # ============================= Device =========================================
@@ -244,18 +252,16 @@ def get_device():
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0.0
-    total_correct = 0
+    total_mae = 0.0
     total_elements = 0
 
     for x, y in tqdm(loader, desc="  train", leave=False):
-        x, y = x.to(device), y.to(device)  # x: (B, T), y: (B, T, STATE_DIM)
-        logits = model(x)  # (B, T, STATE_DIM)
+        x, y = x.to(device), y.to(device)  # x: (B, T), y: (B, T)
+        pred = model(x)  # (B, T)
 
-        non_pad = (x != PAD_IDX).unsqueeze(-1).expand_as(logits)  # (B, T, STATE_DIM)
+        non_pad = (x != PAD_IDX)  # (B, T)
 
-        loss = nn.functional.binary_cross_entropy_with_logits(
-            logits[non_pad], y[non_pad]
-        )
+        loss = nn.functional.mse_loss(pred[non_pad], y[non_pad])
 
         optimizer.zero_grad()
         loss.backward()
@@ -264,35 +270,33 @@ def train_one_epoch(model, loader, optimizer, device):
 
         n = non_pad.sum().item()
         total_loss += loss.item() * n
-        total_correct += ((logits[non_pad] > 0).float() == y[non_pad]).sum().item()
+        total_mae += (pred[non_pad] - y[non_pad]).abs().sum().item()
         total_elements += n
 
-    return total_loss / total_elements, total_correct / total_elements
+    return total_loss / total_elements, total_mae / total_elements
 
 
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
     total_loss = 0.0
-    total_correct = 0
+    total_mae = 0.0
     total_elements = 0
 
     for x, y in tqdm(loader, desc="  eval", leave=False):
         x, y = x.to(device), y.to(device)
-        logits = model(x)
+        pred = model(x)
 
-        non_pad = (x != PAD_IDX).unsqueeze(-1).expand_as(logits)
+        non_pad = (x != PAD_IDX)
 
-        loss = nn.functional.binary_cross_entropy_with_logits(
-            logits[non_pad], y[non_pad]
-        )
+        loss = nn.functional.mse_loss(pred[non_pad], y[non_pad])
 
         n = non_pad.sum().item()
         total_loss += loss.item() * n
-        total_correct += ((logits[non_pad] > 0).float() == y[non_pad]).sum().item()
+        total_mae += (pred[non_pad] - y[non_pad]).abs().sum().item()
         total_elements += n
 
-    return total_loss / total_elements, total_correct / total_elements
+    return total_loss / total_elements, total_mae / total_elements
 
 
 # ============================= Main ===========================================
@@ -340,7 +344,7 @@ def main():
 
     # ---- Checkpoint dir ----
     if args.ckpt_dir is None:
-        name = f"state_pred_vseed{args.vtable_seed}_{args.layers}L_{args.n_embd}d"
+        name = f"state_sum_vseed{args.vtable_seed}_{args.layers}L_{args.n_embd}d"
         args.ckpt_dir = os.path.join(SCRIPT_DIR, "ckpts", name)
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
@@ -350,7 +354,7 @@ def main():
             VOCAB_SIZE, GAME_LEN,
             n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
         )
-        model = GPTStatePredictor(config, state_dim=STATE_DIM)
+        model = GPTStateSumPredictor(config)
         init_path = os.path.join(args.ckpt_dir, "random_init.pt")
         torch.save(model.state_dict(), init_path)
         with open(os.path.join(args.ckpt_dir, "args.json"), "w") as f:
@@ -386,7 +390,7 @@ def main():
         VOCAB_SIZE, GAME_LEN,
         n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
     )
-    model = GPTStatePredictor(config, state_dim=STATE_DIM).to(device)
+    model = GPTStateSumPredictor(config).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(
@@ -409,22 +413,22 @@ def main():
 
     # ---- Train ----
     history = []
-    best_test_acc = 0.0
+    best_test_mae = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs} (lr={scheduler.get_last_lr()[0]:.2e})")
 
-        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, device)
-        test_loss, test_acc = evaluate(model, test_loader, device)
+        train_loss, train_mae = train_one_epoch(model, train_loader, optimizer, device)
+        test_loss, test_mae = evaluate(model, test_loader, device)
         scheduler.step()
 
-        print(f"  train loss={train_loss:.4f}  acc={train_acc:.4f}")
-        print(f"  test  loss={test_loss:.4f}  acc={test_acc:.4f}")
+        print(f"  train mse={train_loss:.4f}  mae={train_mae:.4f}")
+        print(f"  test  mse={test_loss:.4f}  mae={test_mae:.4f}")
 
         record = {
             "epoch": epoch,
-            "train_loss": train_loss, "train_acc": train_acc,
-            "test_loss": test_loss, "test_acc": test_acc,
+            "train_loss": train_loss, "train_mae": train_mae,
+            "test_loss": test_loss, "test_mae": test_mae,
         }
         history.append(record)
 
@@ -434,21 +438,21 @@ def main():
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "test_loss": test_loss,
-            "test_acc": test_acc,
+            "test_mae": test_mae,
         }, ckpt_path)
 
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
+        if test_mae < best_test_mae:
+            best_test_mae = test_mae
             best_path = os.path.join(args.ckpt_dir, "best.pt")
             torch.save(model.state_dict(), best_path)
-            print(f"  ** new best test acc: {best_test_acc:.4f} — saved to {best_path}")
+            print(f"  ** new best test MAE: {best_test_mae:.4f} — saved to {best_path}")
 
     # ---- Save history ----
     hist_path = os.path.join(args.ckpt_dir, "history.json")
     with open(hist_path, "w") as f:
         json.dump(history, f, indent=2)
 
-    print(f"\nDone. Best test accuracy: {best_test_acc:.4f}")
+    print(f"\nDone. Best test MAE: {best_test_mae:.4f}")
     print(f"Checkpoints: {args.ckpt_dir}")
 
 
