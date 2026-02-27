@@ -159,10 +159,15 @@ def tokenize_game(game_raw):
 
 
 class StateDataset(Dataset):
-    """Othello token sequences paired with per-position state-sum targets."""
+    """Othello token sequences paired with per-position state targets.
+
+    Stores both full states (N, T, STATE_DIM) and their sums (N, T) so that
+    evaluation can compute metrics for both training modes.
+    """
 
     def __init__(self, vtable, max_files=None):
         all_tokens = []
+        all_states = []
         all_sums = []
 
         files = list_synthetic_files()
@@ -178,14 +183,16 @@ class StateDataset(Dataset):
             state_sums = states.sum(axis=-1).astype(np.float32)  # (N, T)
 
             all_tokens.append(tokens)
+            all_states.append(states)
             all_sums.append(state_sums)
 
-        self.tokens = np.concatenate(all_tokens, axis=0)  # (N, GAME_LEN)
-        self.state_sums = np.concatenate(all_sums, axis=0)  # (N, GAME_LEN)
+        self.tokens = np.concatenate(all_tokens, axis=0)    # (N, GAME_LEN)
+        self.states = np.concatenate(all_states, axis=0)     # (N, GAME_LEN, STATE_DIM)
+        self.state_sums = np.concatenate(all_sums, axis=0)   # (N, GAME_LEN)
 
         print(
             f"Dataset: {len(self)} games, "
-            f"tokens {self.tokens.shape}, state_sums {self.state_sums.shape}, "
+            f"tokens {self.tokens.shape}, states {self.states.shape}, "
             f"sum range [{self.state_sums.min():.0f}, {self.state_sums.max():.0f}]"
         )
 
@@ -194,8 +201,9 @@ class StateDataset(Dataset):
 
     def __getitem__(self, idx):
         x = torch.from_numpy(self.tokens[idx].copy())
-        y = torch.from_numpy(self.state_sums[idx].copy())
-        return x, y  # (GAME_LEN,) long, (GAME_LEN,) float32
+        y_sum = torch.from_numpy(self.state_sums[idx].copy())
+        y_states = torch.from_numpy(self.states[idx].astype(np.float32))
+        return x, y_sum, y_states
 
     def split(self, train_frac=0.8, seed=42):
         rng = np.random.default_rng(seed)
@@ -208,6 +216,33 @@ class StateDataset(Dataset):
 
 
 # ============================= Model ==========================================
+
+class GPTStatePredictor(GPT):
+    """Causal transformer predicting a STATE_DIM-dim binary state at each position.
+
+    Original training mode: output head produces STATE_DIM logits per position,
+    trained with binary cross-entropy.
+    """
+
+    def __init__(self, config, state_dim=STATE_DIM):
+        super().__init__(config)
+        self.state_dim = state_dim
+        self.head = nn.Linear(config.n_embd, state_dim, bias=False)
+        self.head.weight.data.normal_(mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        b, t = idx.size()
+        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+
+        token_embeddings = self.tok_emb(idx)
+        position_embeddings = self.pos_emb[:, :t, :]
+        x = self.drop(token_embeddings + position_embeddings)
+        x = self.blocks(x)
+        x = self.ln_f(x)  # (B, T, n_embd)
+
+        logits = self.head(x)  # (B, T, state_dim)
+        return logits
+
 
 class GPTStateSumPredictor(GPT):
     """Causal transformer predicting the sum of the state vector at each position.
@@ -255,7 +290,7 @@ def train_one_epoch(model, loader, optimizer, device):
     total_mae = 0.0
     total_elements = 0
 
-    for x, y in tqdm(loader, desc="  train", leave=False):
+    for x, y, _ in tqdm(loader, desc="  train", leave=False):
         x, y = x.to(device), y.to(device)  # x: (B, T), y: (B, T)
         pred = model(x)  # (B, T)
 
@@ -283,7 +318,7 @@ def evaluate(model, loader, device):
     total_mae = 0.0
     total_elements = 0
 
-    for x, y in tqdm(loader, desc="  eval", leave=False):
+    for x, y, _ in tqdm(loader, desc="  eval", leave=False):
         x, y = x.to(device), y.to(device)
         pred = model(x)
 
@@ -297,6 +332,82 @@ def evaluate(model, loader, device):
         total_elements += n
 
     return total_loss / total_elements, total_mae / total_elements
+
+
+# ============================= Eval-only ======================================
+
+def find_checkpoint(ckpt_dir):
+    """Find best.pt or the most recently modified .pt file in ckpt_dir."""
+    best = os.path.join(ckpt_dir, "best.pt")
+    if os.path.exists(best):
+        return best
+    pt_files = [
+        os.path.join(ckpt_dir, f)
+        for f in os.listdir(ckpt_dir)
+        if f.endswith(".pt")
+    ]
+    if not pt_files:
+        return None
+    return max(pt_files, key=os.path.getmtime)
+
+
+def detect_model_mode(state_dict):
+    """Detect whether a checkpoint is from the orig (60-dim) or sum (1-dim) model."""
+    head_shape = state_dict["head.weight"].shape[0]
+    if head_shape == STATE_DIM:
+        return "orig"
+    elif head_shape == 1:
+        return "sum"
+    else:
+        raise ValueError(f"Unexpected head.weight shape[0]={head_shape}")
+
+
+@torch.no_grad()
+def evaluate_checkpoint(model, loader, device, mode):
+    """Comprehensive evaluation for --eval-only.
+
+    For "orig" (60-dim output): reports per-cell binary accuracy.
+    For "sum" (scalar output): reports MSE, MAE, and integer accuracy.
+    """
+    model.eval()
+
+    if mode == "orig":
+        total_correct = 0
+        total_elements = 0
+
+        for x, _y_sum, y_states in tqdm(loader, desc="  eval (orig)", leave=False):
+            x, y_states = x.to(device), y_states.to(device)
+            logits = model(x)  # (B, T, STATE_DIM)
+
+            non_pad = (x != PAD_IDX).unsqueeze(-1).expand_as(logits)
+            total_correct += ((logits[non_pad] > 0).float() == y_states[non_pad]).sum().item()
+            total_elements += non_pad.sum().item()
+
+        acc = total_correct / total_elements
+        return {"accuracy": acc}
+
+    else:  # sum mode
+        total_mse = 0.0
+        total_mae = 0.0
+        total_correct = 0
+        total_elements = 0
+
+        for x, y_sum, _y_states in tqdm(loader, desc="  eval (sum)", leave=False):
+            x, y_sum = x.to(device), y_sum.to(device)
+            pred = model(x)  # (B, T)
+
+            non_pad = (x != PAD_IDX)
+            n = non_pad.sum().item()
+            total_mse += nn.functional.mse_loss(pred[non_pad], y_sum[non_pad]).item() * n
+            total_mae += (pred[non_pad] - y_sum[non_pad]).abs().sum().item()
+            total_correct += (pred[non_pad].round() == y_sum[non_pad]).sum().item()
+            total_elements += n
+
+        return {
+            "mse": total_mse / total_elements,
+            "mae": total_mae / total_elements,
+            "accuracy": total_correct / total_elements,
+        }
 
 
 # ============================= Main ===========================================
@@ -326,6 +437,11 @@ def parse_args():
     p.add_argument(
         "--save-random-init", action="store_true",
         help="Save a randomly initialized (untrained) model checkpoint and exit",
+    )
+    p.add_argument(
+        "--eval-only", action="store_true",
+        help="Load a checkpoint and run evaluation only (no training). "
+             "Uses best.pt if available, otherwise the most recently modified .pt file.",
     )
     return p.parse_args()
 
@@ -364,6 +480,59 @@ def main():
         print(
             f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h — {n_params:,} params"
         )
+        return
+
+    # ---- Eval-only mode ----
+    if args.eval_only:
+        ckpt_path = find_checkpoint(args.ckpt_dir)
+        if ckpt_path is None:
+            print(f"ERROR: No .pt checkpoint found in {args.ckpt_dir}")
+            sys.exit(1)
+
+        print(f"Loading checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+        # Handle both formats: raw state_dict or dict with 'model_state_dict'
+        state_dict = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+
+        mode = detect_model_mode(state_dict)
+        print(f"Detected model mode: {mode}")
+
+        config = GPTConfig(
+            VOCAB_SIZE, GAME_LEN,
+            n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
+        )
+        if mode == "orig":
+            model = GPTStatePredictor(config).to(device)
+        else:
+            model = GPTStateSumPredictor(config).to(device)
+        model.load_state_dict(state_dict)
+
+        n_params = sum(p.numel() for p in model.parameters())
+        print(
+            f"Model: {args.layers}L / {args.n_embd}d / {args.n_head}h — {n_params:,} params"
+        )
+
+        print("Loading dataset...")
+        t0 = time.time()
+        dataset = StateDataset(vtable=vtable, max_files=args.max_files)
+        _, test_ds = dataset.split(train_frac=args.train_frac, seed=args.seed)
+        print(
+            f"Loaded {len(dataset)} games in {time.time() - t0:.1f}s "
+            f"(test={len(test_ds)})"
+        )
+
+        test_loader = DataLoader(
+            test_ds, shuffle=False, batch_size=args.batch_size,
+            num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
+        )
+
+        results = evaluate_checkpoint(model, test_loader, device, mode)
+        print(f"\n{'='*50}")
+        print(f"Eval-only results ({mode} mode):")
+        print(f"  Checkpoint: {ckpt_path}")
+        for k, v in results.items():
+            print(f"  {k}: {v:.4f}")
+        print(f"{'='*50}")
         return
 
     # ---- Data ----
