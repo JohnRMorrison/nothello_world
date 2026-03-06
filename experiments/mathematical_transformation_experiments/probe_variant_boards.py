@@ -355,7 +355,7 @@ def train_board_probe(model, games, device, layer, simulator,
                 eval_total += targets.numel()
 
         acc = eval_correct / eval_total
-        print(f"  Epoch {epoch}: eval acc={acc:.4%}")
+        print(f"  Epoch {epoch}: eval acc={acc:.4%}", flush=True)
 
     return acc
 
@@ -427,7 +427,7 @@ def train_vtable_probe(model, games, device, layer, simulator,
 
         acc = eval_correct / eval_total
         best_acc = max(best_acc, acc)
-        print(f"  Epoch {epoch}: eval acc={acc:.4%}")
+        print(f"  Epoch {epoch}: eval acc={acc:.4%}", flush=True)
 
     return best_acc
 
