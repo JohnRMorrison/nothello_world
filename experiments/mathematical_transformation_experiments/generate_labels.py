@@ -1,5 +1,4 @@
 """
-Generate boolean labels for existing othello_synthetic datasets.
 
 Usage:
     python experiments/mathematical_transformation_experiments/generate_labels.py \
@@ -13,6 +12,7 @@ This will:
    - config (vector, median, metadata) to output_dir/config_<transform>_seed<seed>.pkl
    - per-file labels to output_dir/labels_<original_filename>.pkl
 """
+from __future__ import annotations
 
 import argparse
 import os
