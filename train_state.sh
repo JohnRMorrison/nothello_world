@@ -21,7 +21,7 @@
 module load cuda/11.8.0
 
 # Activate conda environment
-source ~/.conda/etc/profile.d/conda.sh
+source /share/apps/anaconda3-2019.03/etc/profile.d/conda.sh
 conda activate othello
 
 # Environment setup
