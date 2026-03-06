@@ -262,7 +262,9 @@ def main():
     print(f"Device: {device}")
 
     # Find checkpoint
-    ckpt_path = os.path.join(args.ckpt_dir, "best_model.pt")
+    ckpt_path = os.path.join(args.ckpt_dir, "best.pt")
+    if not os.path.exists(ckpt_path):
+        ckpt_path = os.path.join(args.ckpt_dir, "best_model.pt")
     if not os.path.exists(ckpt_path):
         ckpt_path = os.path.join(args.ckpt_dir, "final_model.pt")
     if not os.path.exists(ckpt_path):
