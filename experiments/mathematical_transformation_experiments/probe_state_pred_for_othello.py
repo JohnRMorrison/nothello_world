@@ -218,7 +218,12 @@ def train_board_probe(model, games, device, layer, block_size,
 
                 probe_out = torch.einsum("bpd,mdrco->mbprco", acts, linear_probe)
                 preds = probe_out[2].argmax(dim=-1)
-                targets = state_stack.to(device).long() + 1
+                # Match training one-hot: 0=empty, 1=white, 2=black
+                t_state = state_stack.to(device)
+                targets = torch.zeros_like(t_state, dtype=torch.long)
+                targets[t_state == 0] = 0
+                targets[t_state == -1] = 1
+                targets[t_state == 1] = 2
                 eval_correct += (preds == targets).sum().item()
                 eval_total += targets.numel()
 

@@ -223,7 +223,12 @@ def train_nanda_probe(model, games, device, args):
                 # Use mode 2 (all positions) for accuracy
                 preds = probe_out[2].argmax(dim=-1)  # (B, T, 8, 8)
                 # Map -1/0/1 to 0/1/2 for comparison
-                targets = state_stack.to(device).long() + 1  # 0=white, 1=empty, 2=black
+                # Match training one-hot: 0=empty, 1=white, 2=black
+                t_state = state_stack.to(device)
+                targets = torch.zeros_like(t_state, dtype=torch.long)
+                targets[t_state == 0] = 0
+                targets[t_state == -1] = 1
+                targets[t_state == 1] = 2
                 eval_correct += (preds == targets).sum().item()
                 eval_total += targets.numel()
 
