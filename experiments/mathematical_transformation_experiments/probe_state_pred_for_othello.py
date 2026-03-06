@@ -224,7 +224,7 @@ def train_board_probe(model, games, device, layer, block_size,
 
         acc = eval_correct / eval_total
         best_acc = max(best_acc, acc)
-        print(f"  Epoch {epoch}: eval acc={acc:.4%}")
+        print(f"  Epoch {epoch}: eval acc={acc:.4%}", flush=True)
 
     return best_acc
 
@@ -247,8 +247,6 @@ def parse_args():
     p.add_argument("--pos-start", type=int, default=5)
     p.add_argument("--pos-end-offset", type=int, default=5)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--probe-all-layers", action="store_true",
-                    help="Probe every layer instead of just --layer")
     p.add_argument("--output-dir", type=str, default=None)
     return p.parse_args()
 
@@ -287,48 +285,35 @@ def main():
     games = load_games(max_files=args.max_files)
     if args.max_games and len(games) > args.max_games:
         games = games[:args.max_games]
-    print(f"Using {len(games)} games")
+    print(f"Using {len(games)} games, probing layer {args.layer}", flush=True)
 
-    # Determine which layers to probe
-    if args.probe_all_layers:
-        layers_to_probe = list(range(args.layers + 1))  # 0 through n_layers
-    else:
-        layers_to_probe = [args.layer]
+    print(f"\n{'='*60}", flush=True)
+    print(f"Probing layer {args.layer} for Othello board state", flush=True)
+    print(f"{'='*60}", flush=True)
+    acc = train_board_probe(
+        model, games, device, args.layer, block_size,
+        pos_start=args.pos_start, pos_end_offset=args.pos_end_offset,
+        batch_size=args.probe_batch_size, lr=args.probe_lr,
+        epochs=args.probe_epochs,
+    )
 
-    results = {}
-    for layer in layers_to_probe:
-        print(f"\n{'='*60}")
-        print(f"Probing layer {layer} for Othello board state")
-        print(f"{'='*60}")
-        acc = train_board_probe(
-            model, games, device, layer, block_size,
-            pos_start=args.pos_start, pos_end_offset=args.pos_end_offset,
-            batch_size=args.probe_batch_size, lr=args.probe_lr,
-            epochs=args.probe_epochs,
-        )
-        results[f"layer_{layer}"] = {"accuracy": acc, "chance": 1/3}
-
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"RESULTS SUMMARY — Probing state predictor for Othello board state")
-    print(f"{'='*60}")
-    for name, r in results.items():
-        above = r["accuracy"] - r["chance"]
-        print(f"  {name:15s}  acc={r['accuracy']:.4%}  "
-              f"(chance={r['chance']:.1%}, +{above:.4%})")
+    above = acc - 1/3
+    print(f"\nLayer {args.layer}: acc={acc:.4%} (chance=33.3%, +{above:.4%})", flush=True)
 
     # Save
     if args.output_dir is None:
         args.output_dir = os.path.join(SCRIPT_DIR, "state_pred_probe_results")
     os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, "results.json")
+    out_path = os.path.join(args.output_dir, f"results_layer{args.layer}.json")
     with open(out_path, "w") as f:
         json.dump({
             "ckpt_dir": args.ckpt_dir,
+            "layer": args.layer,
             "num_games": len(games),
-            "results": results,
+            "accuracy": acc,
+            "chance": 1/3,
         }, f, indent=2)
-    print(f"\nSaved to {out_path}")
+    print(f"Saved to {out_path}", flush=True)
 
 
 if __name__ == "__main__":
