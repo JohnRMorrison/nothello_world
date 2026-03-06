@@ -3,16 +3,19 @@ Extract human-readable IF-THEN rules from pre-trained decision trees for Othello
 
 Usage:
     python extract_rules.py                          # all layers, top 20 neurons per layer
-    python extract_rules.py --layer 5                # single layer
-    python extract_rules.py --layer 5 --neuron 100   # single neuron
+    python extract_rules.py --layers 5               # single layer
+    python extract_rules.py --layers 3-6             # layers 3 through 6
+    python extract_rules.py --layers 2,4,7           # specific layers
+    python extract_rules.py --layers 2,4-7           # mix: 2,4,5,6,7
+    python extract_rules.py --layers 5 --neuron 100  # single neuron
     python extract_rules.py --top_n 50               # top 50 neurons per layer
     python extract_rules.py --min_score 0.99          # all neurons with F1 > 0.99
     python extract_rules.py --tree_type regression    # use regression trees instead
     python extract_rules.py --save rules.json        # save to JSON
 
     # Influence-based ranking (pick neurons that matter most to the model):
-    python extract_rules.py --min_score 0.95 --top_n_influential 5 --layer 5
-    python extract_rules.py --min_score 0.95 --top_n_influential 5 --precise_influence --layer 5
+    python extract_rules.py --min_score 0.95 --top_n_influential 5 --layers 5
+    python extract_rules.py --min_score 0.95 --top_n_influential 5 --precise_influence --layers 5
 """
 
 import argparse
@@ -346,8 +349,8 @@ def extract_all_rules(layers, tree_type="classification", top_n=20, neuron_idx=N
             total_samples = int(tree_obj.tree_.n_node_samples[0])
             min_samples = total_samples / 59 * 0.05  # ~5% of per-position samples
 
-            # Filter small leaves and sort by samples desc, then strength desc
-            rules = [r for r in rules if r["samples"] >= min_samples]
+            # Filter small leaves and vacuous rules (no conditions = always fires)
+            rules = [r for r in rules if r["samples"] >= min_samples and r["rule"].strip()]
             sort_key = "precision" if tree_type == "classification" else "predicted_value"
             rules.sort(key=lambda r: (-r["samples"], -r[sort_key]))
 
@@ -403,9 +406,23 @@ def print_results(results, tree_type):
                       f"({rule['samples']/info['total_training_samples']*100:.1f}% of data)")
 
 
+def _parse_layers(spec):
+    """Parse a layer specification like '4', '3-6', '2,4,7', or '2,4-7'."""
+    layers = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            layers.update(range(int(lo), int(hi) + 1))
+        else:
+            layers.add(int(part))
+    return sorted(layers)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Extract IF-THEN rules from Othello-GPT neuron decision trees")
-    parser.add_argument("--layer", type=int, default=None, help="Single layer to extract (0-7). Default: all layers.")
+    parser.add_argument("--layers", type=str, default=None,
+                        help="Layers to extract. Examples: '4', '3-6', '2,4,7', '2,4-7'. Default: all layers.")
     parser.add_argument("--neuron", type=int, default=None, help="Single neuron index (0-2047). Requires --layer.")
     parser.add_argument("--top_n", type=int, default=None, help="Top N neurons per layer by quality score")
     parser.add_argument("--min_score", type=float, default=None,
@@ -427,10 +444,13 @@ def main():
         parser.error("--top_n and --top_n_influential are mutually exclusive")
     if args.top_n_influential is not None and args.min_score is None:
         parser.error("--top_n_influential requires --min_score")
-    if args.neuron is not None and args.layer is None:
-        parser.error("--neuron requires --layer")
+    if args.neuron is not None and args.layers is None:
+        parser.error("--neuron requires --layers")
 
-    layers = [args.layer] if args.layer is not None else list(range(N_LAYERS))
+    if args.layers is not None:
+        layers = _parse_layers(args.layers)
+    else:
+        layers = list(range(N_LAYERS))
     if args.tree_type == "continuous":
         layers = [l for l in layers if l >= 1]  # continuous trees start at layer 1
 
