@@ -45,7 +45,6 @@ CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experim
     --ckpt-dir experiments/mathematical_transformation_experiments/ckpts/bracket_pred_gseed42_8L_512d \
     --layer $LAYER \
     --max-games 100000 \
-    --probe-epochs 15 \
     --output-dir experiments/mathematical_transformation_experiments/bracket_probe_results
 
 echo "Completed at: $(date)"
