@@ -249,11 +249,16 @@ def tokenize_games(games, seq_len=None):
 
 @torch.no_grad()
 def extract_activations(model, x, layer):
+    """Extract residual stream activations after the given layer (0-indexed).
+
+    layer=6 means run blocks 0..6 (7 blocks), matching TransformerLens
+    ``resid_post, 6``.
+    """
     b, t = x.size()
     tok = model.tok_emb(x)
     pos = model.pos_emb[:, :t, :]
     h = model.drop(tok + pos)
-    for block in model.blocks[:layer]:
+    for block in model.blocks[:layer + 1]:
         h = block(h)
     return h
 
@@ -271,97 +276,128 @@ def load_games(max_files=None):
     return games
 
 
-# ============================= Board Probe (Li et al.) ========================
+# ============================= Board Probe (Nanda 3-mode) =====================
 
-def _collect_board_activations_and_labels(model, games, device, layer, simulator, block_size):
-    """Extract per-position activations and board-state labels."""
-    acts = []
-    labels = []
-    game_batch = 64
-    for start in tqdm(range(0, len(games), game_batch), desc="  extracting", leave=False):
-        batch_games = games[start:start + game_batch]
-        tokens = tokenize_games(batch_games, seq_len=block_size).to(device)
-        with torch.no_grad():
-            h = extract_activations(model, tokens, layer)
-        for gi, game in enumerate(batch_games):
-            states = simulator(game)  # (T, 8, 8)
-            for t in range(min(len(game), block_size)):
-                acts.append(h[gi, t].cpu())
-                # Li encoding: state + 1 → white=0, empty=1, black=2
-                labels.append(torch.tensor(states[t].flatten() + 1, dtype=torch.long))
-    return acts, labels
+MODES = 3  # even, odd, all
+POS_START = 5
+POS_END = 54
+
+
+def _state_stack_to_one_hot(state_stack, device):
+    """Convert (B, T, 8, 8) board states to (modes, B, T, 8, 8, 3) one-hot."""
+    one_hot = torch.zeros(
+        MODES, state_stack.shape[0], state_stack.shape[1],
+        ROWS, COLS, OPTIONS, device=device, dtype=torch.int,
+    )
+    one_hot[:, ..., 0] = state_stack == 0    # empty
+    one_hot[:, ..., 1] = state_stack == -1   # white
+    one_hot[:, ..., 2] = state_stack == 1    # black
+    return one_hot
+
+
+def _get_state_stack(games, simulator, pos_start, pos_end):
+    """Compute board state stack for a batch of games.
+
+    Returns tensor of shape (B, length, 8, 8) with values -1/0/1.
+    """
+    state_stacks = []
+    for game in games:
+        states = simulator(game)  # (T, 8, 8)
+        state_stacks.append(states)
+    state_stack = np.stack(state_stacks, axis=0)  # (B, T, 8, 8)
+    return torch.tensor(state_stack[:, pos_start:pos_end, :, :])
 
 
 def train_board_probe(model, games, device, layer, simulator,
-                      lr=1e-3, epochs=16, batch_size=1024, block_size=59):
-    """Train Li et al. linear probe for an 8x8 board state variant."""
+                      lr=1e-4, epochs=2, batch_size=100, block_size=59):
+    """Train Nanda-style 3-mode linear probe for an 8x8 board state variant."""
     d_model = model.pos_emb.shape[-1]
+    pos_start = POS_START
+    pos_end = min(POS_END, block_size)
 
     num_games = len(games)
-    n_eval = max(int(num_games * 0.2), 100)
+    n_eval = max(int(num_games * 0.1), 100)
     n_train = num_games - n_eval
     train_games = games[:n_train]
     eval_games = games[n_train:]
+    print(f"  Train: {n_train} games, Eval: {n_eval} games", flush=True)
 
-    print(f"  Collecting activations for {n_train} train games...", flush=True)
-    train_acts, train_labels = _collect_board_activations_and_labels(
-        model, train_games, device, layer, simulator, block_size)
-    print(f"  Collecting activations for {n_eval} eval games...", flush=True)
-    eval_acts, eval_labels = _collect_board_activations_and_labels(
-        model, eval_games, device, layer, simulator, block_size)
-
-    print(f"  Train samples: {len(train_acts)}, Eval samples: {len(eval_acts)}", flush=True)
-
-    train_X = torch.stack(train_acts)
-    train_Y = torch.stack(train_labels)
-    eval_X = torch.stack(eval_acts)
-    eval_Y = torch.stack(eval_labels)
-
-    probe = nn.Linear(d_model, NUM_SQUARES * OPTIONS, bias=True).to(device)
-    nn.init.normal_(probe.weight, mean=0.0, std=0.02)
-    nn.init.zeros_(probe.bias)
-
-    optimizer = torch.optim.Adam(probe.parameters(), lr=lr, betas=(0.9, 0.999))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.75, patience=0)
+    # 3-mode probe: (modes, d_model, rows, cols, options)
+    linear_probe = torch.randn(
+        MODES, d_model, ROWS, COLS, OPTIONS,
+        requires_grad=False, device=device,
+    ) / np.sqrt(d_model)
+    linear_probe.requires_grad = True
+    optimizer = torch.optim.AdamW(
+        [linear_probe], lr=lr, betas=(0.9, 0.99), weight_decay=0.01)
 
     best_acc = 0.0
     for epoch in range(1, epochs + 1):
-        probe.train()
-        perm = torch.randperm(len(train_X))
-        for i in range(0, len(train_X), batch_size):
+        perm = torch.randperm(n_train)
+        for i in tqdm(range(0, n_train, batch_size),
+                      desc=f"  Epoch {epoch}", leave=False):
             idx = perm[i:i + batch_size]
-            x = train_X[idx].to(device)
-            y = train_Y[idx].to(device)
-            logits = probe(x).reshape(-1, NUM_SQUARES, OPTIONS)
-            loss = nn.functional.cross_entropy(
-                logits.reshape(-1, OPTIONS), y.reshape(-1))
-            optimizer.zero_grad()
+            batch_games = [train_games[j] for j in idx]
+            tokens = tokenize_games(batch_games, seq_len=block_size).to(device)
+
+            state_stack = _get_state_stack(
+                batch_games, simulator, pos_start, pos_end)
+            state_stack_one_hot = _state_stack_to_one_hot(
+                state_stack, device)
+
+            with torch.inference_mode():
+                resid_post = extract_activations(
+                    model, tokens, layer)[:, pos_start:pos_end]
+
+            probe_out = torch.einsum(
+                "bpd,mdrco->mbprco", resid_post, linear_probe)
+            probe_log_probs = probe_out.log_softmax(-1)
+            probe_correct_log_probs = (
+                (probe_log_probs * state_stack_one_hot)
+                .mean(dim=(1, -1))
+            ) * OPTIONS
+            loss_even = -probe_correct_log_probs[0, 0::2].mean(0).sum()
+            loss_odd = -probe_correct_log_probs[1, 1::2].mean(0).sum()
+            loss_all = -probe_correct_log_probs[2, :].mean(0).sum()
+            loss = loss_even + loss_odd + loss_all
             loss.backward()
             optimizer.step()
+            optimizer.zero_grad()
 
-        probe.eval()
+        # Eval
         eval_correct = 0
         eval_total = 0
-        eval_losses = []
         with torch.no_grad():
-            for i in range(0, len(eval_X), batch_size):
-                x = eval_X[i:i + batch_size].to(device)
-                y = eval_Y[i:i + batch_size].to(device)
-                logits = probe(x).reshape(-1, NUM_SQUARES, OPTIONS)
-                eval_loss = nn.functional.cross_entropy(
-                    logits.reshape(-1, OPTIONS), y.reshape(-1))
-                eval_losses.append(eval_loss.item())
-                preds = logits.argmax(dim=-1)
-                eval_correct += (preds == y).sum().item()
-                eval_total += y.numel()
+            for i in range(0, n_eval, batch_size):
+                batch_games = eval_games[i:i + batch_size]
+                tokens = tokenize_games(
+                    batch_games, seq_len=block_size).to(device)
+                resid_post = extract_activations(
+                    model, tokens, layer)[:, pos_start:pos_end]
+
+                state_stack = _get_state_stack(
+                    batch_games, simulator, pos_start, pos_end)
+                gt = state_stack.numpy()
+                gt_labels = np.zeros_like(gt, dtype=np.int64)
+                gt_labels[gt == -1] = 1   # white
+                gt_labels[gt == 0] = 0    # empty
+                gt_labels[gt == 1] = 2    # black
+                gt_tensor = torch.tensor(
+                    gt_labels, device=device, dtype=torch.long)
+
+                probe_out = torch.einsum(
+                    "bpd,mdrco->mbprco", resid_post, linear_probe)
+                B, L = resid_post.shape[0], resid_post.shape[1]
+                preds = torch.zeros(
+                    B, L, 8, 8, device=device, dtype=torch.long)
+                preds[:, 0::2] = probe_out[0, :, 0::2].argmax(-1)
+                preds[:, 1::2] = probe_out[1, :, 1::2].argmax(-1)
+                eval_correct += (preds == gt_tensor).sum().item()
+                eval_total += gt_tensor.numel()
 
         acc = eval_correct / eval_total
         best_acc = max(best_acc, acc)
-        scheduler.step(np.mean(eval_losses))
-        cur_lr = optimizer.param_groups[0]['lr']
-        print(f"  Epoch {epoch}: eval acc={acc:.4%}  loss={np.mean(eval_losses):.5f}  lr={cur_lr:.2e}",
-              flush=True)
+        print(f"  Epoch {epoch}: eval acc={acc:.4%}", flush=True)
 
     return best_acc
 
@@ -468,9 +504,9 @@ def parse_args():
     p.add_argument("--layer", type=int, default=6, help="Layer to probe")
     p.add_argument("--max-files", type=int, default=None)
     p.add_argument("--max-games", type=int, default=100000)
-    p.add_argument("--probe-epochs", type=int, default=16)
-    p.add_argument("--probe-batch-size", type=int, default=1024)
-    p.add_argument("--probe-lr", type=float, default=1e-3)
+    p.add_argument("--probe-epochs", type=int, default=2)
+    p.add_argument("--probe-batch-size", type=int, default=100)
+    p.add_argument("--probe-lr", type=float, default=1e-4)
     p.add_argument("--time-offset", type=int, default=7,
                     help="Time offset for shuffled variant")
     p.add_argument("--vtable-seed", type=int, default=42)
