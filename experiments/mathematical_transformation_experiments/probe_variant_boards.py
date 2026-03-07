@@ -345,7 +345,7 @@ def train_board_probe(model, games, device, layer, simulator,
             state_stack_one_hot = _state_stack_to_one_hot(
                 state_stack, device)
 
-            with torch.inference_mode():
+            with torch.no_grad():
                 resid_post = extract_activations(
                     model, tokens, layer)[:, pos_start:pos_end]
 
