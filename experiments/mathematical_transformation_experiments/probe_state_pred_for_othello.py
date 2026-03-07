@@ -259,8 +259,10 @@ def train_board_probe(model, games, device, layer, block_size,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Probe state predictor for Othello board state")
-    p.add_argument("--ckpt-dir", type=str, required=True,
-                    help="Path to state predictor checkpoint directory")
+    p.add_argument("--ckpt-dir", type=str, default=None,
+                    help="Path to checkpoint directory")
+    p.add_argument("--ckpt-path", type=str, default=None,
+                    help="Path to checkpoint file (alternative to --ckpt-dir)")
     p.add_argument("--layers", type=int, default=8)
     p.add_argument("--n-embd", type=int, default=512)
     p.add_argument("--n-head", type=int, default=8)
@@ -286,14 +288,19 @@ def main():
     print(f"Device: {device}")
 
     # Find checkpoint
-    ckpt_path = None
-    for name in ["best.pt", "best_model.pt", "final_model.pt", "random_init.pt"]:
-        p = os.path.join(args.ckpt_dir, name)
-        if os.path.exists(p):
-            ckpt_path = p
-            break
-    if ckpt_path is None:
-        raise FileNotFoundError(f"No checkpoint found in {args.ckpt_dir}")
+    if args.ckpt_path and os.path.exists(args.ckpt_path):
+        ckpt_path = args.ckpt_path
+    elif args.ckpt_dir:
+        ckpt_path = None
+        for name in ["best.pt", "best_model.pt", "final_model.pt", "random_init.pt"]:
+            p = os.path.join(args.ckpt_dir, name)
+            if os.path.exists(p):
+                ckpt_path = p
+                break
+        if ckpt_path is None:
+            raise FileNotFoundError(f"No checkpoint found in {args.ckpt_dir}")
+    else:
+        raise ValueError("Must specify --ckpt-dir or --ckpt-path")
 
     state_dict = torch.load(ckpt_path, map_location=device)
     block_size = state_dict["pos_emb"].shape[1]
@@ -303,7 +310,10 @@ def main():
     )
     # Auto-detect model type from head weight shape
     head_out_dim = state_dict["head.weight"].shape[0]
-    if head_out_dim == STATE_DIM:
+    if head_out_dim == VOCAB_SIZE:
+        model = GPT(config)
+        model_type = "othello_gpt"
+    elif head_out_dim == STATE_DIM:
         model = GPTStatePredictor(config)
         model_type = "state_pred"
     elif head_out_dim == STATE_DIM * 3:
