@@ -64,7 +64,7 @@ SYNTHETIC_DIR = os.path.join(PROJECT_ROOT, "data", "othello_synthetic")
 # ============================= Model ==========================================
 
 class GPTStatePredictor(GPT):
-    """Must match the class used during training."""
+    """State predictor with 60-dim binary output (BCE loss)."""
 
     def __init__(self, config, state_dim=STATE_DIM):
         super().__init__(config)
@@ -81,6 +81,27 @@ class GPTStatePredictor(GPT):
         x = self.ln_f(x)
         logits = self.head(x)
         return logits
+
+
+class GPTBracketPredictor(GPT):
+    """Bracket predictor with 180-dim output (3-class CE loss)."""
+
+    def __init__(self, config, state_dim=STATE_DIM, n_classes=3):
+        super().__init__(config)
+        self.state_dim = state_dim
+        self.n_classes = n_classes
+        self.head = nn.Linear(config.n_embd, state_dim * n_classes, bias=False)
+
+    def forward(self, idx, targets=None):
+        b, t = idx.size()
+        assert t <= self.block_size
+        token_embeddings = self.tok_emb(idx)
+        position_embeddings = self.pos_emb[:, :t, :]
+        x = self.drop(token_embeddings + position_embeddings)
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits.view(b, t, self.state_dim, self.n_classes)
 
 
 # ============================= Helpers ========================================
@@ -279,11 +300,20 @@ def main():
         VOCAB_SIZE, block_size,
         n_layer=args.layers, n_head=args.n_head, n_embd=args.n_embd,
     )
-    model = GPTStatePredictor(config)
+    # Auto-detect model type from head weight shape
+    head_out_dim = state_dict["head.weight"].shape[0]
+    if head_out_dim == STATE_DIM:
+        model = GPTStatePredictor(config)
+        model_type = "state_pred"
+    elif head_out_dim == STATE_DIM * 3:
+        model = GPTBracketPredictor(config)
+        model_type = "bracket_pred"
+    else:
+        raise ValueError(f"Unknown head output dim: {head_out_dim}")
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
-    print(f"Loaded state predictor from {ckpt_path} (block_size={block_size})")
+    print(f"Loaded {model_type} from {ckpt_path} (block_size={block_size})")
 
     # Load games
     print(f"Loading games...")
