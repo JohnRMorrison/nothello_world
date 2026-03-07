@@ -44,7 +44,6 @@ echo "============================================"
 CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.probe_state_pred_for_othello \
     --ckpt-dir experiments/mathematical_transformation_experiments/ckpts/state_pred_vseed42_8L_512d \
     --layer $LAYER \
-    --max-games 100000 \
-    --probe-epochs 15
+    --max-games 100000
 
 echo "Completed at: $(date)"
