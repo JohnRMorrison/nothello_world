@@ -286,12 +286,13 @@ def main():
     print(f"Device: {device}")
 
     # Find checkpoint
-    ckpt_path = os.path.join(args.ckpt_dir, "best.pt")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(args.ckpt_dir, "best_model.pt")
-    if not os.path.exists(ckpt_path):
-        ckpt_path = os.path.join(args.ckpt_dir, "final_model.pt")
-    if not os.path.exists(ckpt_path):
+    ckpt_path = None
+    for name in ["best.pt", "best_model.pt", "final_model.pt", "random_init.pt"]:
+        p = os.path.join(args.ckpt_dir, name)
+        if os.path.exists(p):
+            ckpt_path = p
+            break
+    if ckpt_path is None:
         raise FileNotFoundError(f"No checkpoint found in {args.ckpt_dir}")
 
     state_dict = torch.load(ckpt_path, map_location=device)
