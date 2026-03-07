@@ -493,7 +493,7 @@ def main():
 
     # Load Othello-GPT
     # Othello-GPT uses block_size=59 (next-token prediction: 59 inputs -> 59 outputs)
-    state_dict = torch.load(args.ckpt_path, map_location=device, weights_only=True)
+    state_dict = torch.load(args.ckpt_path, map_location=device)
     # Auto-detect block_size from checkpoint
     block_size = state_dict["pos_emb"].shape[1]
     config = GPTConfig(
