@@ -1,0 +1,373 @@
+Probing Results Summary
+=======================
+Date: 2026-03-07
+Probe: Nanda-style 3-mode linear probe (even/odd/all)
+  Shape: (3, d_model, 8, 8, 3), AdamW lr=1e-4, 2 epochs, batch_size=100
+  Positions: 5-54 (skip early/late moves)
+  ~100K games, 80/20 train/eval split
+
+================================================================================
+PART 1: Probing non-Othello models for OTHELLO board state
+================================================================================
+
+Models trained on non-Othello tasks, probed for real Othello board state.
+If decodability is high, it may reflect input artifacts rather than learned
+world models.
+
+Layer | Othello-GPT | V-table State Pred | Bracket Flipper | Chain Bracket | Random Init
+------|-------------|--------------------|-----------------|--------------|-----------
+  0   |    87.08%   |       76.74%       |     59.96%      |    59.91%    |   73.38%
+  1   |    93.85%   |       76.81%       |     59.96%      |    59.91%    |   73.91%
+  2   |    97.06%   |       76.75%       |     59.89%      |    59.81%    |   73.68%
+  3   |    98.39%   |       76.69%       |     59.74%      |    59.63%    |   73.56%
+  4   |    99.08%   |       76.62%       |     59.48%      |    59.38%    |   73.35%
+  5   |    99.20%   |       76.56%       |     59.23%      |    59.15%    |   73.29%
+  6   |    98.55%   |       76.48%       |     58.97%      |    58.83%    |   73.19%
+  7   |    97.97%   |       76.30%       |     58.50%      |    58.30%    |   73.12%
+  8   |    97.97%   |       76.30%       |     58.50%      |    58.30%    |   73.09%
+
+Chance level: 33.3% (3-class: empty/white/black)
+
+Model descriptions:
+  Othello-GPT:         GPT trained to predict next moves in Othello games.
+                       This is the standard model from Li et al. / Nanda et al.
+  V-table State Pred:  GPT trained to predict an arbitrary 60-dim binary state
+                       defined by a random "V-table" that maps each token to a
+                       bitmask of dimensions to flip. Not related to Othello rules.
+  Bracket Flipper:     GPT trained to predict states in a bracket-flipping game
+                       where tokens flip the colors of earlier tokens that share
+                       the same group (defined by a random group table).
+  Chain Bracket:       Same as Bracket Flipper but with cascading flips — each
+                       flipped token can trigger further bracket flips, up to 5
+                       rounds of cascading.
+  Random Init:         Untrained GPT with random weights. Serves as a baseline
+                       for what is decodable purely from input embeddings
+                       (token identity + positional encoding).
+
+Model checkpoints:
+  Othello-GPT:         ckpts/gpt_synthetic.ckpt
+  V-table State Pred:  experiments/.../ckpts/state_pred_vseed42_8L_512d
+  Bracket Flipper:     experiments/.../ckpts/bracket_pred_gseed42_8L_512d
+  Chain Bracket:       experiments/.../ckpts/chain_bracket_pred_gseed42_8L_512d
+  Random Init:         experiments/.../ckpts/random_init_8L_512d
+
+Key observations:
+  - Othello-GPT: Progressive buildup 87% -> 99%, peaks at L5. Clear world model.
+  - V-table State Pred: Flat ~76.3-76.8%. Only ~3% above random init baseline.
+  - Bracket / Chain Bracket: Flat ~58-60%. BELOW random init — learned
+    representations actively interfere with Othello decoding.
+  - Random Init: Flat ~73%. Sets the "input embedding only" baseline.
+  - All non-Othello models: flat or decreasing across layers (no progressive buildup).
+
+================================================================================
+PART 2: Probing Othello-GPT for VARIANT board states
+================================================================================
+
+Othello-GPT probed for board states under different game rules.
+Tests whether variant board states are also decodable from Othello-GPT
+activations (which would suggest decodability alone is not evidence of
+a world model for that specific game).
+
+Layer | Normal   | No Flip  | Row-Only | Gravity  | Shuffled | V_table
+------|----------|----------|----------|----------|----------|--------
+  0   |  87.08%  |  86.79%  |  77.63%  |  76.80%  |  68.49%  | 71.46%
+  1   |  93.86%  |  88.47%  |  80.05%  |  77.94%  |  70.66%  | 71.42%
+  2   |  97.05%  |  88.89%  |  80.45%  |  78.43%  |  71.73%  | 71.31%
+  3   |  98.39%  |  89.08%  |  80.67%  |  78.92%  |  72.23%  | 71.32%
+  4   |  99.08%  |  89.03%  |  80.53%  |  79.11%  |  72.37%  | 71.38%
+  5   |  99.20%  |  88.74%  |  80.01%  |  78.71%  |  71.91%  | 71.12%
+  6   |  98.54%  |  87.65%  |  78.26%  |  77.04%  |  70.54%  | 70.20%
+  7   |  97.97%  |  87.01%  |  77.43%  |  76.38%  |  69.68%  | 70.09%
+  8   |  97.95%  |  87.01%  |  77.42%  |  76.38%  |  69.68%  | 70.09%
+
+Chance levels: 33.3% for board variants, 50.0% for V_table (60-dim binary)
+
+Variant descriptions:
+  Normal:    Standard Othello (baseline/control)
+  No Flip:   Othello but pieces never flip after placement
+  Row-Only:  Othello but flips only along rows (not cols/diags)
+  Gravity:   Pieces fall to bottom of their column (Connect Four style)
+  Shuffled:  Real Othello board state shifted in time by offset=7
+  V_table:   Arbitrary flip game (60-dim binary state, not 8x8 board)
+
+Key observations:
+  - Normal: +12% progressive buildup (87 -> 99%), peaks at L5.
+  - No Flip: High at L0 (87%) then plateaus ~89%. Most decodability is from
+    input, only ~2% added by the network.
+  - Row-Only, Gravity: Similar pattern — modest L0->L3 increase, then decline.
+    Late layers return to ~L0 levels.
+  - Shuffled: Small increase L0->L4, then decline. Partial time correlation.
+  - V_table: Completely flat ~70-71%. No layer dependence whatsoever.
+  - All variants peak at L3-L4 and decline in later layers, suggesting the
+    model's later layers specialize for real Othello and reshape representations
+    away from variant states.
+  - Only real Othello board state shows the characteristic progressive buildup
+    through network depth that would indicate a genuine world model.
+
+================================================================================
+PART 3: Standard Probe (No Even/Odd Split)
+================================================================================
+
+Nanda's 3-mode probe uses separate weight matrices for even-turn and odd-turn
+positions, effectively giving the probe access to turn parity. This experiment
+tests a standard linear probe nn.Linear(512, 64*3) without that split.
+
+Layer | Othello-GPT | Random Init
+------|-------------|------------
+  0   |    75.85%   |   74.50%
+  1   |    75.92%   |   74.60%
+  2   |    75.96%   |   74.51%
+  3   |    75.89%   |   74.47%
+  4   |    75.75%   |   74.46%
+  5   |    75.73%   |   74.40%
+  6   |    75.35%   |   74.25%
+  7   |    75.37%   |   74.25%
+  8   |    75.27%   |   74.22%
+
+Key observations:
+  - Without even/odd split, Othello-GPT only reaches ~76% — vs 99% with Nanda's
+    probe. The even/odd split accounts for ~23% of accuracy.
+  - Othello-GPT is only ~1.2% above random init. Both are flat across layers.
+  - This suggests Nanda's high accuracy relies heavily on the probe's built-in
+    knowledge of turn parity, not just on the model's representations.
+
+================================================================================
+PART 4: Raw Embeddings (resid_pre) vs First Block (resid_post Layer 0)
+================================================================================
+
+Tests what can be decoded from token + position embeddings alone (before any
+attention or MLP), vs after the first transformer block.
+
+                  | Standard Probe Accuracy
+------------------|------------------------
+  resid_pre       |       61.37%
+  resid_post L0   |       75.82%
+  Difference      |      +14.45%
+
+Key observations:
+  - resid_pre sees only its own token identity and position. No cross-position
+    information (no attention has occurred).
+  - The first attention layer adds +14.5% by gathering information from other
+    positions in the sequence.
+  - 61% from embeddings alone is well above chance (33%), showing that token
+    identity and position encoding already carry significant board information.
+
+================================================================================
+PART 5: Alternative Board States from Othello-GPT Layer 0
+================================================================================
+
+Standard probe on Othello-GPT layer 0 activations, decoding 7 different board
+state definitions. Tests whether layer 0 generically supports decoding many
+board-state functions (which would undermine the claim that decodability implies
+a world model).
+
+Board State        | Standard Probe Accuracy
+-------------------|------------------------
+  Real Othello     |       75.81%
+  No Flip          |       89.17%
+  Column-shifted   |       75.88%
+  Row-shifted      |       75.85%
+  Transposed       |       75.82%
+  Color-inverted   |       75.83%
+  Cell-permuted    |       75.84%
+
+Variant descriptions:
+  Real Othello:    Standard Othello rules (control)
+  No Flip:         Pieces placed but never flip — just record where each player
+                   moved. ~80.6% agreement with real Othello board state.
+  Column-shifted:  Real Othello board with columns shifted by +1 (mod 8)
+  Row-shifted:     Real Othello board with rows shifted by +1 (mod 8)
+  Transposed:      Real Othello board with rows and columns swapped
+  Color-inverted:  Real Othello board with black/white swapped
+  Cell-permuted:   Real Othello board with a fixed random permutation of cells
+
+Key observations:
+  - All geometric transforms decode at ~75.8% — identical to real Othello.
+    A standard probe at layer 0 cannot distinguish the real board from shifted,
+    transposed, or permuted versions.
+  - No Flip is much easier (89.2%) because it requires no flip computation —
+    it only needs to track where each player moved.
+  - This confirms that layer 0 representations are not specialized for any
+    particular board geometry.
+
+================================================================================
+PART 6: Probe Accuracy by Move Number (Standard Probe, Layer 6)
+================================================================================
+
+Per-position accuracy for Normal and No Flip board states using a standard
+linear probe on Othello-GPT layer 6. Shows how accuracy degrades as the game
+progresses and board state diverges from what move history alone can predict.
+
+Move | Normal  | No Flip | Difference
+-----|---------|---------|----------
+   5 |  90.7%  |  90.8%  |   +0.1%
+  10 |  84.6%  |  85.2%  |   +0.6%
+  15 |  78.9%  |  79.9%  |   +1.0%
+  20 |  72.2%  |  73.9%  |   +1.8%
+  25 |  67.4%  |  68.5%  |   +1.2%
+  30 |  62.9%  |  64.8%  |   +1.9%
+  35 |  59.9%  |  62.2%  |   +2.3%
+  40 |  58.0%  |  61.0%  |   +3.1%
+  45 |  55.8%  |  59.8%  |   +4.1%
+  50 |  52.3%  |  58.4%  |   +6.1%
+  53 |  49.9%  |  57.1%  |   +7.2%
+
+Key observations:
+  - Both start at ~91% and decline steadily.
+  - Normal drops to ~50% (near chance) by move 53. No Flip stays at ~57%.
+  - The gap grows from 0% to +7.2% because No Flip never requires tracking
+    flips, so a probe based on move history degrades more gracefully.
+  - Early moves are easy for both: few pieces on the board, and normal/no-flip
+    board states haven't diverged much yet.
+
+================================================================================
+PART 7: Heuristic Features → Board State
+================================================================================
+
+Tests whether decision-tree rules (from Teo's interpretability work) can decode
+board state using only move-sequence information, with no access to model
+activations at all.
+
+Rules come from `rules_060_2000_2-6.json` (8139 rules total, layers 2-6).
+Original features reference board state (e.g., A5_mine, B3_theirs, F6_empty,
+D3_flipped). We convert them to move-only approximations.
+
+Two filtering strategies:
+  Convert: Drop rules with `_flipped` features. Convert `_mine` to "played on
+           same-parity turn" and `_theirs` to "played on opposite-parity turn".
+           Keeps `_empty` and `_just_played` directly. 4766 surviving rules.
+  Strict:  Drop rules with `_flipped`, `_mine`, or `_theirs` features. Only
+           uses `_empty` and `_just_played` — directly computable from moves.
+           405 surviving rules.
+
+Standard probe (no even/odd split):
+
+                         | Convert (4766 rules) | Strict (405 rules)
+-------------------------|----------------------|--------------------
+  Heuristic only         |       76.0%          |      72.7%
+  Heuristic + Random L0  |       76.2%          |      73.9%
+  Random L0 only         |       73.7%          |      73.6%
+  Othello-GPT L0 only    |       75.0%          |      75.0%
+  Heuristic + Othello L0 |       76.2%          |      74.9%
+
+Nanda even/odd probe:
+
+                              | Convert (4766 rules) | Strict (405 rules)
+------------------------------|----------------------|--------------------
+  Nanda heuristic only        |       86.4%          |      75.8%
+  Nanda heuristic + Othello L0|       89.7%          |      90.7%
+
+For reference, Nanda's probe on Othello-GPT achieves 87% at L0 and 99% at L5.
+
+Key observations:
+  - Standard probe: Heuristic features (no activations) match Othello-GPT
+    activations (~76% vs ~76%). Adding Othello-GPT L0 provides negligible gain.
+  - Nanda even/odd probe on convert heuristics: 86.4% — a large jump from
+    76% standard, showing the even/odd split unlocks parity-encoded features.
+    But still well below Othello-GPT's 99%.
+  - Nanda even/odd + Othello-GPT L0: ~90%. The model adds ~3-4% beyond
+    heuristics alone, and ~15% beyond its own standard probe (75% -> 90%).
+  - Strict mode is revealing: heuristics alone with Nanda probe = only 75.8%
+    (empty/just_played don't benefit from even/odd). But adding Othello-GPT L0
+    jumps to 90.7% — the model's representations contain information that
+    simple heuristics don't capture, but only accessible with the right probe.
+  - The 99% vs 90% gap: Othello-GPT's deeper layers (L3-L5) build
+    representations that go well beyond what's available at L0 + heuristics.
+    This ~9% gap represents genuine board-state computation by the network.
+
+================================================================================
+PART 8: Feature Search — How much board state is recoverable from move history?
+================================================================================
+
+Tests whether board state (including flips) can be decoded from move-sequence
+features alone, using increasingly powerful probes. No model activations used.
+
+Move-history features (180-d base):
+  played[i] (60): 1 if position i has been played by this step
+  when[i]   (60): normalized step when position i was played (0 if not played)
+  even[i]   (60): 1 if position i was played on an even-numbered turn
+
+Pairwise features (3780-d): base 180-d + played[i]*played[j] for i<j (1770) +
+  played[i]*even[i] (60) + even[i]*even[j] for i<j (1770)
+
+--- A. Linear Probes on Move-History Features (80K games) ---
+
+                              | Nanda (even/odd) | Standard
+------------------------------|------------------|----------
+  Base 180-d                  |     87.3%        |  87.3%
+  Pairwise 3780-d             |     87.8%        |    —
+
+Previous results (2K games):
+  Base 180-d: 83.4% (Nanda), 83.3% (standard)
+  Pairwise 3780-d: 85.5% (Nanda), 85.3% (standard)
+
+Key: scaling from 2K to 80K games improved linear probes by ~4%. Pairwise
+features add only ~0.5% at scale (vs 2.1% at 2K games).
+
+--- B. MLP on Move-History Features ---
+
+2-layer MLP: Linear(input_dim, H) -> ReLU -> Linear(H, 64*3)
+with Nanda's even/odd split (separate MLPs for even and odd positions).
+
+180-d base features:
+
+  Hidden dim  |  2K games  |  80K games  | 250K games
+  ------------|------------|-------------|------------
+  Linear      |   83.4%    |   87.3%     |     —
+  H = 256     |   86.3%    |   90.4%     |     —
+  H = 512     |   86.4%    |   91.9%     |     —
+  H = 1024    |   86.6%    |   92.5%     |   93.1%
+  H = 2048    |     —      |     —       |   93.3%
+
+3780-d pairwise features (80K games):
+
+  Hidden dim  |  Accuracy
+  ------------|----------
+  H = 256     |   89.5%
+  H = 512     |   89.9%
+  H = 1024    |   90.0%
+
+Key observations:
+  - MLP on 180-d decisively beats MLP on 3780-d (92.5% vs 90.0% at H=1024).
+    The hand-crafted pairwise features hurt — the MLP learns better nonlinear
+    combinations from the compact 180-d input.
+  - Accuracy scales strongly with both data and model size. 2K -> 80K -> 250K
+    games: 86.6% -> 92.5% -> 93.1% for H=1024.
+  - H=2048 gives a small bump over H=1024 (+0.2% at 250K games).
+  - Best result: 93.3% (H=2048, 250K games) from move-sequence features alone.
+    For reference, Nanda's probe on Othello-GPT L0 gets 87.1%.
+
+--- C. Learned Heuristic Combos (80K games) ---
+
+Architecture: heuristic features (4766-d) -> Linear(4766, K) -> ReLU ->
+optionally concat with original -> Nanda even/odd probe -> board state.
+Uses the 4766 "convert" mode heuristic rules from Part 7.
+
+  Config                    | 2K games | 80K games
+  --------------------------|----------|----------
+  K=200 concat              |  87.4%   |  90.2%
+  K=200 learned only        |  87.7%   |  89.8%
+  K=500 concat              |  87.5%   |  90.4%
+  K=500 learned only        |  87.6%   |  90.4%
+  K=1000 concat             |  87.5%   |  90.3%
+  K=1000 learned only       |  87.5%   |  90.4%
+
+Key: peaks at ~90.4% regardless of K — well below MLP on 180-d (92.5%).
+The heuristic rules don't provide useful structure beyond what the MLP
+learns from raw move features.
+
+--- Summary ---
+
+Best accuracy from move-sequence features alone (no model activations):
+  Linear probe:        87.8%  (3780-d pairwise, 80K games)
+  Learned heuristic:   90.4%  (K=500, 80K games)
+  MLP 180-d:           93.3%  (H=2048, 250K games)  <-- best
+
+For comparison:
+  Nanda probe on Othello-GPT L0:  87.1%
+  Nanda probe on Othello-GPT L5:  99.2%
+
+A 2-layer MLP on simple move statistics (played/when/parity) surpasses
+Othello-GPT L0 by 6.2% and closes much of the gap to L5. The remaining
+~6% gap (93.3% -> 99.2%) represents what the deeper transformer layers
+compute beyond what is available from move-sequence statistics.
