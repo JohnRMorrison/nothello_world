@@ -1733,19 +1733,22 @@ def _chunk_features_path(output_dir, chunk_id):
 def _save_features(path, X, Y, pos):
     """Save precomputed features to disk."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    feat = X.numpy() if hasattr(X, 'numpy') else X
+    lab = Y.numpy() if hasattr(Y, 'numpy') else Y
+    pos_arr = pos.numpy() if hasattr(pos, 'numpy') else pos
     np.savez(path,
-             features=X.numpy() if hasattr(X, 'numpy') else X,
-             labels=Y.numpy() if hasattr(Y, 'numpy') else Y,
-             positions=pos.numpy() if hasattr(pos, 'numpy') else pos)
+             features=feat.astype(np.float16),
+             labels=lab.astype(np.int8),
+             positions=pos_arr.astype(np.int8))
     print(f"  Saved to {path} ({os.path.getsize(path) / 1e9:.2f} GB)")
 
 
 def _load_features(path):
     """Load precomputed features from disk."""
     data = np.load(path)
-    X = torch.tensor(data['features'], dtype=torch.float32)
-    Y = torch.tensor(data['labels'], dtype=torch.long)
-    pos = torch.tensor(data['positions'], dtype=torch.long)
+    X = torch.tensor(data['features'].astype(np.float32))
+    Y = torch.tensor(data['labels'].astype(np.int64))
+    pos = torch.tensor(data['positions'].astype(np.int64))
     return X, Y, pos
 
 
