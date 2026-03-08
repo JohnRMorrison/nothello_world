@@ -3,21 +3,25 @@
 # Train MLP on move-history features (180-d) with large game datasets
 # ============================================================================
 #
-# Usage:
-#   sbatch mlp_feature_search.sh
-#   sbatch mlp_feature_search.sh files=50 hidden=1024,2048
+# Two-step workflow:
 #
-# Memory: ~35GB per 1M games (180-d features × 49 positions × float32)
-#   20 files (~2M games) → ~70GB features + labels + model ≈ 100GB
-#   30 files (~3M games) → ~105GB features + labels + model ≈ 140GB
+#   Step 1: Precompute features in parallel (one job per file chunk)
+#     sbatch --array=0-25 mlp_feature_search.sh precompute
+#     (26 chunks × 10 files each = 260 files, ~26M games)
+#
+#   Step 2: Train MLPs using cached features
+#     sbatch mlp_feature_search.sh train hidden=1024,2048
+#
+# Or run single-job (small scale):
+#     sbatch mlp_feature_search.sh
 # ============================================================================
 
 #SBATCH --job-name=mlp_feat
 #SBATCH -c 4
-#SBATCH --time=8:00:00
-#SBATCH --mem=180GB
+#SBATCH --time=4:00:00
+#SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
-#SBATCH --output=logs/mlp_feat_%j.out
+#SBATCH --output=logs/mlp_feat_%A_%a.out
 #SBATCH --account=nklab
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
@@ -35,33 +39,69 @@ mkdir -p logs
 
 cd $SLURM_SUBMIT_DIR
 
-# Parse arguments (defaults: 10 files ~1M games, H=1024 and H=2048)
-MAX_FILES=10
+# Parse arguments
+FILES_PER_CHUNK=10
 HIDDEN_DIMS="1024 2048"
+MODE="single"  # precompute, train, or single
 for arg in "$@"; do
-    if [[ "$arg" == files=* ]]; then
-        MAX_FILES="${arg#files=}"
+    if [[ "$arg" == chunk=* ]]; then
+        FILES_PER_CHUNK="${arg#chunk=}"
     elif [[ "$arg" == hidden=* ]]; then
         HIDDEN_DIMS="${arg#hidden=}"
         HIDDEN_DIMS="${HIDDEN_DIMS//,/ }"
+    elif [[ "$arg" == "precompute" ]]; then
+        MODE="precompute"
+    elif [[ "$arg" == "train" ]]; then
+        MODE="train"
     fi
 done
 
+OUTPUT_DIR=experiments/mathematical_transformation_experiments/heuristic_probe_results
+
 echo "============================================"
-echo "Job ID: ${SLURM_JOB_ID}"
-echo "Max files: ${MAX_FILES}"
-echo "Hidden dims: ${HIDDEN_DIMS}"
+echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: ${SLURM_ARRAY_TASK_ID:-N/A}"
+echo "Mode: ${MODE}"
 echo "Node: $(hostname)"
 echo "Started at: $(date)"
-echo "Python: $(python --version 2>&1)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
-    --experiment mlp \
-    --max-files $MAX_FILES \
-    --max-games 99999999 \
-    --mlp-hidden $HIDDEN_DIMS \
-    --mlp-only \
-    --output-dir experiments/mathematical_transformation_experiments/heuristic_probe_results
+if [[ "$MODE" == "precompute" ]]; then
+    # Parallel precompute: each array task handles FILES_PER_CHUNK files
+    CHUNK_ID=${SLURM_ARRAY_TASK_ID:-0}
+    FILE_START=$((CHUNK_ID * FILES_PER_CHUNK))
+    FILE_END=$((FILE_START + FILES_PER_CHUNK))
+
+    echo "Chunk ${CHUNK_ID}: files ${FILE_START}-$((FILE_END - 1))"
+
+    python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
+        --experiment precompute \
+        --chunk-id $CHUNK_ID \
+        --file-start $FILE_START \
+        --file-end $FILE_END \
+        --output-dir $OUTPUT_DIR
+
+elif [[ "$MODE" == "train" ]]; then
+    # Train using precomputed chunks
+    echo "Training with precomputed features"
+    echo "Hidden dims: ${HIDDEN_DIMS}"
+
+    CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
+        --experiment mlp \
+        --precomputed \
+        --mlp-hidden $HIDDEN_DIMS \
+        --mlp-only \
+        --output-dir $OUTPUT_DIR
+
+else
+    # Single-job mode (small scale, no precompute)
+    echo "Single job: files_per_chunk=${FILES_PER_CHUNK}"
+    CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
+        --experiment mlp \
+        --max-files $FILES_PER_CHUNK \
+        --max-games 99999999 \
+        --mlp-hidden $HIDDEN_DIMS \
+        --mlp-only \
+        --output-dir $OUTPUT_DIR
+fi
 
 echo "Completed at: $(date)"
