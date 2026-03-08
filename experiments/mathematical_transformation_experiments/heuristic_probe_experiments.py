@@ -2373,8 +2373,8 @@ def _progressive_ablation(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device,
     l2_odd = np.linalg.norm(W2_odd, axis=0)
     l2_combined = l2_even + l2_odd  # proxy for overall importance
 
-    # Sort by combined L2
-    unit_order = np.argsort(l2_combined)[::-1]
+    # Sort by combined L2 (.copy() needed for torch compatibility with negative strides)
+    unit_order = np.argsort(l2_combined)[::-1].copy()
 
     results = {}
     for N in ns_to_test:
