@@ -1056,21 +1056,74 @@ def _build_move_history_features(game, step, include_pairwise=True):
 def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True):
     """Build move-history features and labels for a list of games.
 
+    Vectorized: converts all games to a (N, 60) move-index array, then
+    computes played/when/even features for all positions using broadcasting.
+
     Returns (features, labels, positions) tensors.
     """
-    features = []
-    labels = []
-    positions = []
-    for game in tqdm(games, desc="  building features", leave=False):
-        states = seq_to_state_normal(game)
-        for t in range(pos_start, pos_end):
-            features.append(_build_move_history_features(
-                game, t, include_pairwise=include_pairwise))
+    n_games = len(games)
+    length = pos_end - pos_start
+    n_samples = n_games * length
+
+    # Convert games to (N, 60) array of move indices
+    game_arr = np.zeros((n_games, 60), dtype=np.int32)
+    for i, game in enumerate(games):
+        for s, move in enumerate(game):
+            game_arr[i, s] = _MOVE_TO_IDX[move]
+
+    # For each position t in [pos_start, pos_end), compute features
+    # played[i] = 1 if move_idx i appears in steps 0..t
+    # when[i] = (step+1)/60 for the step where move_idx i was played
+    # even[i] = 1 if move_idx i was played on an even step
+
+    # Build per-game lookup: for each move index, which step was it played?
+    # step_of_move[g, m] = step when move m was played in game g (-1 if never)
+    step_of_move = np.full((n_games, N_MOVES), -1, dtype=np.int32)
+    for s in range(60):
+        move_indices = game_arr[:, s]  # (N,)
+        step_of_move[np.arange(n_games), move_indices] = s
+
+    # Pre-allocate output
+    features = np.zeros((n_samples, 180), dtype=np.float32)
+    positions = np.zeros(n_samples, dtype=np.int64)
+
+    for ti, t in enumerate(range(pos_start, pos_end)):
+        start = ti * n_games
+        end = start + n_games
+
+        # played: move was played at or before step t
+        played = (step_of_move >= 0) & (step_of_move <= t)  # (N, 60)
+        # when: normalized step
+        when = np.where(played, (step_of_move + 1) / 60.0, 0.0)  # (N, 60)
+        # even: played on even step
+        even = np.where(played, (step_of_move % 2 == 0).astype(np.float32), 0.0)  # (N, 60)
+
+        features[start:end, :N_MOVES] = played.astype(np.float32)
+        features[start:end, N_MOVES:2*N_MOVES] = when
+        features[start:end, 2*N_MOVES:] = even
+        positions[start:end] = t
+
+    if include_pairwise:
+        idx_i, idx_j = np.triu_indices(N_MOVES, k=1)
+        played_all = features[:, :N_MOVES]
+        even_all = features[:, 2*N_MOVES:]
+        pp = played_all[:, idx_i] * played_all[:, idx_j]
+        pe = played_all * even_all
+        ee = even_all[:, idx_i] * even_all[:, idx_j]
+        features = np.concatenate([features, pp, pe, ee], axis=1)
+
+    # Compute labels (still needs board simulation)
+    print("  computing board states for labels...", flush=True)
+    labels = np.zeros((n_samples, 64), dtype=np.int64)
+    for gi, game in enumerate(tqdm(games, desc="  labels", leave=False)):
+        states = seq_to_state_normal(game)  # (60, 8, 8)
+        for ti, t in enumerate(range(pos_start, pos_end)):
+            idx = ti * n_games + gi
             lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
-            labels.append(lbl.reshape(64))
-            positions.append(t)
-    return (torch.tensor(np.stack(features), dtype=torch.float32),
-            torch.tensor(np.stack(labels), dtype=torch.long),
+            labels[idx] = lbl.reshape(64)
+
+    return (torch.tensor(features, dtype=torch.float32),
+            torch.tensor(labels, dtype=torch.long),
             torch.tensor(positions, dtype=torch.long))
 
 
@@ -2074,6 +2127,48 @@ def experiment_combine_heuristic(args):
         device, tr_norm_o.shape[1])
     results["method3_norm_othello"] = acc_norm_o
     print(f"  Normalized heur + Othello L0: {acc_norm_o:.4%}")
+
+    # ---- Method 4: 180-d move features + heuristics ----
+    print(f"\n{'='*60}")
+    print("Method 4: 180-d move features + heuristic features")
+    print(f"{'='*60}")
+
+    # Build 180-d move features
+    print("\n  Building 180-d move features for train...")
+    tr_move, _, _ = _build_move_features_batch(
+        train_games, POS_START, POS_END, include_pairwise=False)
+    print("  Building 180-d move features for eval...")
+    ev_move, _, _ = _build_move_features_batch(
+        eval_games, POS_START, POS_END, include_pairwise=False)
+
+    # 180-d alone (linear probe with even/odd)
+    print("\n  180-d move features alone (Nanda probe)")
+    acc_move = train_nanda_probe(
+        tr_move, tr_labels, tr_positions,
+        ev_move, ev_labels, ev_positions,
+        device, 180)
+    results["move_180_alone"] = acc_move
+    print(f"  180-d alone: {acc_move:.4%}")
+
+    # Concat 180-d + heuristic (4946-d)
+    print("\n  Concat: 180-d + heuristic features")
+    tr_mh = torch.cat([tr_move, tr_heur], dim=1)
+    ev_mh = torch.cat([ev_move, ev_heur], dim=1)
+    acc_mh = train_nanda_probe(
+        tr_mh, tr_labels, tr_positions,
+        ev_mh, ev_labels, ev_positions,
+        device, tr_mh.shape[1])
+    results["move_180_plus_heuristic"] = acc_mh
+    print(f"  180-d + heuristic: {acc_mh:.4%}")
+
+    # MLP on 180-d + heuristic (4946-d)
+    print("\n  MLP on 180-d + heuristic features (H=1024)")
+    acc_mh_mlp = _train_mlp_nanda(
+        tr_mh, tr_labels, tr_positions,
+        ev_mh, ev_labels, ev_positions,
+        device, tr_mh.shape[1], 1024)
+    results["mlp_move_plus_heuristic_H1024"] = acc_mh_mlp
+    print(f"  MLP 180-d + heuristic H=1024: {acc_mh_mlp:.4%}")
 
     # Summary
     print(f"\n{'='*60}")

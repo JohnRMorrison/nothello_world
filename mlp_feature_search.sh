@@ -35,8 +35,8 @@ mkdir -p logs
 
 cd $SLURM_SUBMIT_DIR
 
-# Parse arguments (defaults: 30 files, H=1024 and H=2048)
-MAX_FILES=15
+# Parse arguments (defaults: 10 files ~1M games, H=1024 and H=2048)
+MAX_FILES=10
 HIDDEN_DIMS="1024 2048"
 for arg in "$@"; do
     if [[ "$arg" == files=* ]]; then
