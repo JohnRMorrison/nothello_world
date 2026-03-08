@@ -371,3 +371,65 @@ A 2-layer MLP on simple move statistics (played/when/parity) surpasses
 Othello-GPT L0 by 6.2% and closes much of the gap to L5. The remaining
 ~6% gap (93.3% -> 99.2%) represents what the deeper transformer layers
 compute beyond what is available from move-sequence statistics.
+
+
+================================================================================
+PART 9: Combining Heuristic Features with Model Activations (10K games)
+================================================================================
+
+Tests whether heuristic features (4766-d rules) and model activations (512-d)
+provide complementary information when properly combined. Three combination
+methods tested, each with random-init L0 and Othello-GPT L0 activations.
+
+All probes use Nanda's even/odd split. 10K games, 90/10 train/eval.
+
+--- Baselines ---
+
+  Source                          | Accuracy
+  --------------------------------|---------
+  Heuristic features alone        |  88.84%
+  Random L0 activations alone     |  77.83%
+  Othello-GPT L0 activations alone|  91.29%
+
+--- Method 1: Separate probes, grid-search logit combination ---
+
+Train independent probes on each source, combine logits: α × logits_A + β × logits_B.
+Grid search α, β ∈ {0.0, 0.1, ..., 1.0}.
+
+  Combination               | Accuracy | Best α, β
+  --------------------------|----------|----------
+  Heuristic + random L0     |  88.89%  | α=1.0, β=0.3
+  Heuristic + Othello-GPT L0|  91.54%  | α=0.2, β=0.7
+
+--- Method 2: Stacking (soft predictions + activations) ---
+
+Get soft predictions (64×3 = 192-d) from heuristic probe, concatenate with
+512-d activations (total 704-d), train new probe on concatenation.
+
+  Combination               | Accuracy
+  --------------------------|--------
+  Heuristic preds + random L0|  89.15%
+  Heuristic preds + Othello L0| 91.29%
+
+--- Method 3: Normalized concatenation ---
+
+Z-score normalize each feature group separately (heuristic 4766-d and
+activations 512-d), then concatenate (5278-d) and train probe.
+
+  Combination               | Accuracy
+  --------------------------|--------
+  Normalized heur + random L0|  88.69%
+  Normalized heur + Othello L0| 91.00%
+
+--- Key Findings ---
+
+  - Only Method 1 (logit combo) with Othello-GPT slightly beats Othello L0
+    alone: 91.54% vs 91.29% (+0.25%).
+  - Heuristic features don't add meaningful information on top of Othello-GPT —
+    the model already captures what the heuristics know.
+  - With random L0, Method 2 (stacking) gives the best boost: 89.15% vs
+    88.84% heuristic alone (+0.31%).
+  - Normalization (Method 3) hurts slightly — the scale difference between
+    binary heuristics and continuous activations wasn't the problem.
+  - The original failure of naive concatenation was due to the optimizer
+    ignoring the weaker feature group, not a normalization issue.

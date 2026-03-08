@@ -35,7 +35,7 @@ if PROJECT_ROOT not in sys.path:
 from experiments.mathematical_transformation_experiments.probe_variant_boards import (
     load_games, tokenize_games, extract_activations, seq_to_state_normal,
     seq_to_state_no_flip, get_device, STOI, ITOS, GAME_LEN, VOCAB_SIZE,
-    PAD_IDX, ROWS, COLS, OPTIONS,
+    PAD_IDX, ROWS, COLS, OPTIONS, SYNTHETIC_DIR,
 )
 from mingpt.model import GPT, GPTConfig
 
@@ -1725,26 +1725,156 @@ def _train_mlp_nanda_onthefly(tr_base, tr_Y, tr_pos, ev_base, ev_Y, ev_pos,
     return best_acc
 
 
+def _chunk_features_path(output_dir, chunk_id):
+    """Return path for a chunk's cached features file."""
+    return os.path.join(output_dir, "feature_chunks", f"chunk_{chunk_id:04d}.npz")
+
+
+def _save_features(path, X, Y, pos):
+    """Save precomputed features to disk."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    feat = X.numpy() if hasattr(X, 'numpy') else X
+    lab = Y.numpy() if hasattr(Y, 'numpy') else Y
+    pos_arr = pos.numpy() if hasattr(pos, 'numpy') else pos
+    np.savez(path,
+             features=feat.astype(np.float16),
+             labels=lab.astype(np.int8),
+             positions=pos_arr.astype(np.int8))
+    print(f"  Saved to {path} ({os.path.getsize(path) / 1e9:.2f} GB)")
+
+
+def _load_features(path):
+    """Load precomputed features from disk."""
+    data = np.load(path)
+    X = torch.tensor(data['features'].astype(np.float32))
+    Y = torch.tensor(data['labels'].astype(np.int64))
+    pos = torch.tensor(data['positions'].astype(np.int64))
+    return X, Y, pos
+
+
+def experiment_precompute(args):
+    """Precompute and save 180-d move features + labels to disk.
+
+    Supports chunked computation for parallel SLURM jobs:
+      --file-start 0 --file-end 10 --chunk-id 0
+    Each chunk processes files [file_start, file_end) and saves independently.
+
+    Or compute all at once:
+      --experiment precompute --max-files 30
+    """
+    import pickle
+
+    if args.chunk_id is not None:
+        # Chunked mode: process only files [file_start, file_end)
+        files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
+        chunk_files = files[args.file_start:args.file_end]
+        print(f"Chunk {args.chunk_id}: files {args.file_start}-{args.file_end-1} "
+              f"({len(chunk_files)} files)")
+
+        games = []
+        for fname in chunk_files:
+            with open(os.path.join(SYNTHETIC_DIR, fname), "rb") as f:
+                batch = pickle.load(f)
+            games.extend(g for g in batch if len(g) == GAME_LEN)
+        print(f"  Loaded {len(games)} games")
+
+        print("  Building features (180-d)...")
+        X, Y, pos = _build_move_features_batch(
+            games, POS_START, POS_END, include_pairwise=False)
+
+        path = _chunk_features_path(args.output_dir, args.chunk_id)
+        _save_features(path, X, Y, pos)
+        print(f"  Chunk {args.chunk_id}: {X.shape} -> {path}")
+    else:
+        # Single-job mode: process all files
+        games = load_games(max_files=args.max_files)
+        if args.max_games and len(games) > args.max_games:
+            games = games[:args.max_games]
+        n_games = len(games)
+        print(f"Using {n_games} games")
+
+        print("Building features (180-d)...")
+        X, Y, pos = _build_move_features_batch(
+            games, POS_START, POS_END, include_pairwise=False)
+
+        path = _chunk_features_path(args.output_dir, 0)
+        _save_features(path, X, Y, pos)
+        print(f"\nSaved {X.shape} -> {path}")
+
+    print("Done.")
+
+
+def _load_all_chunks(output_dir, eval_frac=0.1):
+    """Load all chunk files and split into train/eval.
+
+    Returns (tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos).
+    """
+    chunk_dir = os.path.join(output_dir, "feature_chunks")
+    chunk_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".npz"))
+    print(f"Loading {len(chunk_files)} chunks from {chunk_dir}...")
+
+    all_X, all_Y, all_pos = [], [], []
+    for fname in chunk_files:
+        path = os.path.join(chunk_dir, fname)
+        X, Y, pos = _load_features(path)
+        all_X.append(X)
+        all_Y.append(Y)
+        all_pos.append(pos)
+        print(f"  {fname}: {X.shape[0]} samples")
+
+    X = torch.cat(all_X)
+    Y = torch.cat(all_Y)
+    pos = torch.cat(all_pos)
+    print(f"Total: {X.shape[0]} samples, {X.shape}")
+
+    # Split into train/eval (last eval_frac of samples)
+    n_total = X.shape[0]
+    n_eval = max(int(n_total * eval_frac), 49 * 100)  # at least 100 games worth
+    n_train = n_total - n_eval
+
+    return X[:n_train], Y[:n_train], pos[:n_train], X[n_train:], Y[n_train:], pos[n_train:]
+
+
+def _try_load_precomputed(args):
+    """Try to load precomputed features. Returns (tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos) or None."""
+    if not args.precomputed:
+        return None
+    chunk_dir = os.path.join(args.output_dir, "feature_chunks")
+    if not os.path.exists(chunk_dir):
+        print(f"  No feature_chunks directory in {args.output_dir}")
+        return None
+    chunk_files = [f for f in os.listdir(chunk_dir) if f.endswith(".npz")]
+    if not chunk_files:
+        print(f"  No chunk files found in {chunk_dir}")
+        return None
+    return _load_all_chunks(args.output_dir)
+
+
 def experiment_mlp(args):
     """Approach 2: MLP on move-history features (180-d and 3780-d)."""
     device = get_device()
     print(f"Device: {device}")
 
-    games = load_games(max_files=args.max_files)
-    if args.max_games and len(games) > args.max_games:
-        games = games[:args.max_games]
-    n_eval = max(int(len(games) * 0.1), 100)
-    train_games = games[:len(games) - n_eval]
-    eval_games = games[len(games) - n_eval:]
-    print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+    cached = _try_load_precomputed(args)
+    if cached is not None:
+        tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos = cached
+    else:
+        games = load_games(max_files=args.max_files)
+        if args.max_games and len(games) > args.max_games:
+            games = games[:args.max_games]
+        n_eval = max(int(len(games) * 0.1), 100)
+        train_games = games[:len(games) - n_eval]
+        eval_games = games[len(games) - n_eval:]
+        print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
 
-    # Build 180-d base features (kept in memory for all experiments)
-    print("Building train features (180-d base)...")
-    tr_X, tr_Y, tr_pos = _build_move_features_batch(
-        train_games, POS_START, POS_END, include_pairwise=False)
-    print("Building eval features...")
-    ev_X, ev_Y, ev_pos = _build_move_features_batch(
-        eval_games, POS_START, POS_END, include_pairwise=False)
+        # Build 180-d base features (kept in memory for all experiments)
+        print("Building train features (180-d base)...")
+        tr_X, tr_Y, tr_pos = _build_move_features_batch(
+            train_games, POS_START, POS_END, include_pairwise=False)
+        print("Building eval features...")
+        ev_X, ev_Y, ev_pos = _build_move_features_batch(
+            eval_games, POS_START, POS_END, include_pairwise=False)
+
     print(f"  Feature shape: {tr_X.shape}")
 
     # Determine which hidden dims to run
@@ -2780,7 +2910,7 @@ def parse_args():
     p.add_argument("--experiment", type=str, required=True,
                    choices=["standard_probe", "resid_pre", "alt_boards",
                             "by_move", "heuristic", "brute_force",
-                            "learned_heuristic", "mlp",
+                            "learned_heuristic", "mlp", "precompute",
                             "combine_heuristic", "mlp_analysis"],
                    help="Which experiment to run")
     p.add_argument("--ckpt-path", type=str, default="ckpts/gpt_synthetic.ckpt")
@@ -2793,6 +2923,14 @@ def parse_args():
                    help="Hidden dims for MLP experiment (default: 256 512 1024)")
     p.add_argument("--mlp-only", action="store_true",
                    help="For mlp experiment: skip linear baseline and pairwise MLPs")
+    p.add_argument("--precomputed", action="store_true",
+                   help="Load precomputed features from feature_chunks/ (skip feature building)")
+    p.add_argument("--chunk-id", type=int, default=None,
+                   help="Chunk ID for parallel precompute (used with --file-start/--file-end)")
+    p.add_argument("--file-start", type=int, default=0,
+                   help="First file index for chunked precompute")
+    p.add_argument("--file-end", type=int, default=None,
+                   help="Last file index (exclusive) for chunked precompute")
     return p.parse_args()
 
 
@@ -2810,6 +2948,7 @@ def main():
         "brute_force": experiment_brute_force,
         "learned_heuristic": experiment_learned_heuristic,
         "mlp": experiment_mlp,
+        "precompute": experiment_precompute,
         "combine_heuristic": experiment_combine_heuristic,
         "mlp_analysis": experiment_mlp_analysis,
     }
