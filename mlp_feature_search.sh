@@ -59,6 +59,7 @@ echo "============================================"
 CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
     --experiment mlp \
     --max-files $MAX_FILES \
+    --max-games 99999999 \
     --mlp-hidden $HIDDEN_DIMS \
     --mlp-only \
     --output-dir experiments/mathematical_transformation_experiments/heuristic_probe_results
