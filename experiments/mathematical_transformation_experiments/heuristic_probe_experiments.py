@@ -1733,6 +1733,930 @@ def experiment_mlp(args):
     return results
 
 
+# ================== Part A: Fix Heuristic + Activations Combination =========
+
+def _train_nanda_probe_returning_probes(train_X, train_Y, train_positions,
+                                         eval_X, eval_Y, eval_positions,
+                                         device, input_dim, lr=1e-3, epochs=16,
+                                         batch_size=1024):
+    """Like train_nanda_probe but also returns the trained probes."""
+    probe_even = nn.Linear(input_dim, 64 * OPTIONS).to(device)
+    probe_odd = nn.Linear(input_dim, 64 * OPTIONS).to(device)
+    optimizer = torch.optim.Adam(
+        list(probe_even.parameters()) + list(probe_odd.parameters()), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=1)
+
+    best_acc = 0.0
+    best_state = None
+    for epoch in range(1, epochs + 1):
+        probe_even.train()
+        probe_odd.train()
+        perm = torch.randperm(len(train_X))
+        for i in range(0, len(train_X), batch_size):
+            idx = perm[i:i + batch_size]
+            x = train_X[idx].to(device)
+            y = train_Y[idx].to(device)
+            pos = train_positions[idx]
+            even_mask = (pos % 2 == 0)
+            odd_mask = ~even_mask
+            loss = torch.tensor(0.0, device=device)
+            if even_mask.any():
+                logits_e = probe_even(x[even_mask]).view(-1, 64, OPTIONS)
+                loss = loss + nn.functional.cross_entropy(
+                    logits_e.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
+            if odd_mask.any():
+                logits_o = probe_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                loss = loss + nn.functional.cross_entropy(
+                    logits_o.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        probe_even.eval()
+        probe_odd.eval()
+        correct = 0
+        total = 0
+        losses = []
+        with torch.no_grad():
+            for i in range(0, len(eval_X), batch_size):
+                x = eval_X[i:i + batch_size].to(device)
+                y = eval_Y[i:i + batch_size].to(device)
+                pos = eval_positions[i:i + batch_size]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+                preds = torch.zeros_like(y)
+                if even_mask.any():
+                    logits_e = probe_even(x[even_mask]).view(-1, 64, OPTIONS)
+                    preds[even_mask] = logits_e.argmax(-1)
+                    losses.append(nn.functional.cross_entropy(
+                        logits_e.reshape(-1, OPTIONS), y[even_mask].reshape(-1)).item())
+                if odd_mask.any():
+                    logits_o = probe_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                    preds[odd_mask] = logits_o.argmax(-1)
+                    losses.append(nn.functional.cross_entropy(
+                        logits_o.reshape(-1, OPTIONS), y[odd_mask].reshape(-1)).item())
+                correct += (preds == y).sum().item()
+                total += y.numel()
+        acc = correct / total
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {
+                'even': {k: v.clone() for k, v in probe_even.state_dict().items()},
+                'odd': {k: v.clone() for k, v in probe_odd.state_dict().items()},
+            }
+        scheduler.step(np.mean(losses))
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(f"  Epoch {epoch}: acc={acc:.4%}  loss={np.mean(losses):.5f}  lr={cur_lr:.2e}",
+              flush=True)
+
+    # Restore best
+    probe_even.load_state_dict(best_state['even'])
+    probe_odd.load_state_dict(best_state['odd'])
+    return best_acc, probe_even, probe_odd
+
+
+def _get_nanda_logits(probe_even, probe_odd, X, positions, device,
+                      batch_size=1024):
+    """Get per-sample logits from trained even/odd probes.
+
+    Returns (N, 64, 3) tensor of logits.
+    """
+    probe_even.eval()
+    probe_odd.eval()
+    all_logits = torch.zeros(len(X), 64, OPTIONS)
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            x = X[i:i + batch_size].to(device)
+            pos = positions[i:i + batch_size]
+            even_mask = (pos % 2 == 0)
+            odd_mask = ~even_mask
+            if even_mask.any():
+                logits_e = probe_even(x[even_mask]).view(-1, 64, OPTIONS)
+                all_logits[i:i + batch_size][even_mask] = logits_e.cpu()
+            if odd_mask.any():
+                logits_o = probe_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                all_logits[i:i + batch_size][odd_mask] = logits_o.cpu()
+    return all_logits
+
+
+def _eval_combined_logits(logits_A, logits_B, Y, alpha, beta):
+    """Combine logits and compute accuracy."""
+    combined = alpha * logits_A + beta * logits_B  # (N, 64, 3)
+    preds = combined.argmax(-1)  # (N, 64)
+    correct = (preds == Y).sum().item()
+    total = Y.numel()
+    return correct / total
+
+
+def experiment_combine_heuristic(args):
+    """Part A: Fix heuristic + activations combination."""
+    device = get_device()
+    print(f"Device: {device}")
+
+    # Load rules
+    print("Loading heuristic rules...")
+    rules_data = _load_rules_json()
+
+    games = load_games(max_files=args.max_files)
+    if args.max_games and len(games) > args.max_games:
+        games = games[:args.max_games]
+    n_eval = max(int(len(games) * 0.1), 100)
+    train_games = games[:len(games) - n_eval]
+    eval_games = games[len(games) - n_eval:]
+    print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+
+    # Build heuristic features (convert mode)
+    parsed_rules = _build_heuristic_features(rules_data, mode="convert")
+    n_rules = len(parsed_rules)
+    print(f"  {n_rules} rules (convert mode)")
+
+    compiled_rules = _compile_rules(parsed_rules)
+
+    print("  Computing heuristic features for train...")
+    tr_heur = torch.tensor(
+        _compute_heuristic_batch(compiled_rules, train_games, POS_START, POS_END),
+        dtype=torch.float32)
+
+    print("  Computing heuristic features for eval...")
+    ev_heur = torch.tensor(
+        _compute_heuristic_batch(compiled_rules, eval_games, POS_START, POS_END),
+        dtype=torch.float32)
+
+    # Build labels and positions
+    print("  Computing labels...")
+    tr_labels_list = []
+    tr_positions = []
+    for game in train_games:
+        states = seq_to_state_normal(game)
+        for t in range(POS_START, POS_END):
+            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
+            tr_labels_list.append(lbl.reshape(64))
+            tr_positions.append(t)
+    tr_labels = torch.tensor(np.stack(tr_labels_list), dtype=torch.long)
+    tr_positions = torch.tensor(tr_positions, dtype=torch.long)
+
+    ev_labels_list = []
+    ev_positions = []
+    for game in eval_games:
+        states = seq_to_state_normal(game)
+        for t in range(POS_START, POS_END):
+            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
+            ev_labels_list.append(lbl.reshape(64))
+            ev_positions.append(t)
+    ev_labels = torch.tensor(np.stack(ev_labels_list), dtype=torch.long)
+    ev_positions = torch.tensor(ev_positions, dtype=torch.long)
+
+    # Get activations from random and Othello-GPT models
+    random_model = create_random_model(device, block_size=59)
+    othello_model, othello_block_size = load_model(args.ckpt_path, device)
+
+    print("  Collecting random L0 activations...")
+    tr_X_r, _ = collect_activations_and_labels(
+        random_model, train_games, device, 0, 59)
+    ev_X_r, _ = collect_activations_and_labels(
+        random_model, eval_games, device, 0, 59)
+
+    print("  Collecting Othello-GPT L0 activations...")
+    tr_X_o, _ = collect_activations_and_labels(
+        othello_model, train_games, device, 0, othello_block_size)
+    ev_X_o, _ = collect_activations_and_labels(
+        othello_model, eval_games, device, 0, othello_block_size)
+
+    results = {}
+
+    # ---- Method 1: Train separately, combine predictions ----
+    print(f"\n{'='*60}")
+    print("Method 1: Separate probes, combined predictions")
+    print(f"{'='*60}")
+
+    # Train probe A on heuristic features
+    print("\n  Training probe A on heuristic features...")
+    acc_heur, probe_heur_even, probe_heur_odd = _train_nanda_probe_returning_probes(
+        tr_heur, tr_labels, tr_positions,
+        ev_heur, ev_labels, ev_positions,
+        device, n_rules)
+    results["heuristic_alone"] = acc_heur
+    print(f"  Heuristic alone: {acc_heur:.4%}")
+
+    # Train probe B on random L0
+    print("\n  Training probe B on random L0...")
+    acc_rand, probe_rand_even, probe_rand_odd = _train_nanda_probe_returning_probes(
+        tr_X_r, tr_labels, tr_positions,
+        ev_X_r, ev_labels, ev_positions,
+        device, 512)
+    results["random_L0_alone"] = acc_rand
+    print(f"  Random L0 alone: {acc_rand:.4%}")
+
+    # Train probe C on Othello-GPT L0
+    print("\n  Training probe C on Othello-GPT L0...")
+    acc_ogpt, probe_ogpt_even, probe_ogpt_odd = _train_nanda_probe_returning_probes(
+        tr_X_o, tr_labels, tr_positions,
+        ev_X_o, ev_labels, ev_positions,
+        device, 512)
+    results["othello_L0_alone"] = acc_ogpt
+    print(f"  Othello-GPT L0 alone: {acc_ogpt:.4%}")
+
+    # Get logits from each
+    logits_heur = _get_nanda_logits(probe_heur_even, probe_heur_odd,
+                                     ev_heur, ev_positions, device)
+    logits_rand = _get_nanda_logits(probe_rand_even, probe_rand_odd,
+                                     ev_X_r, ev_positions, device)
+    logits_ogpt = _get_nanda_logits(probe_ogpt_even, probe_ogpt_odd,
+                                     ev_X_o, ev_positions, device)
+
+    # Grid search alpha, beta for heuristic + random
+    print("\n  Grid search: heuristic + random L0")
+    best_acc_hr = 0.0
+    best_ab_hr = (0, 0)
+    for a_int in range(11):
+        for b_int in range(11):
+            alpha = a_int / 10.0
+            beta = b_int / 10.0
+            acc = _eval_combined_logits(logits_heur, logits_rand, ev_labels, alpha, beta)
+            if acc > best_acc_hr:
+                best_acc_hr = acc
+                best_ab_hr = (alpha, beta)
+    results["method1_heur_random"] = best_acc_hr
+    results["method1_heur_random_alpha_beta"] = best_ab_hr
+    print(f"  Best: {best_acc_hr:.4%} (alpha={best_ab_hr[0]:.1f}, beta={best_ab_hr[1]:.1f})")
+
+    # Grid search alpha, beta for heuristic + Othello-GPT L0
+    print("\n  Grid search: heuristic + Othello-GPT L0")
+    best_acc_ho = 0.0
+    best_ab_ho = (0, 0)
+    for a_int in range(11):
+        for b_int in range(11):
+            alpha = a_int / 10.0
+            beta = b_int / 10.0
+            acc = _eval_combined_logits(logits_heur, logits_ogpt, ev_labels, alpha, beta)
+            if acc > best_acc_ho:
+                best_acc_ho = acc
+                best_ab_ho = (alpha, beta)
+    results["method1_heur_othello"] = best_acc_ho
+    results["method1_heur_othello_alpha_beta"] = best_ab_ho
+    print(f"  Best: {best_acc_ho:.4%} (alpha={best_ab_ho[0]:.1f}, beta={best_ab_ho[1]:.1f})")
+
+    # ---- Method 2: Stacking / Two-Stage ----
+    print(f"\n{'='*60}")
+    print("Method 2: Stacking (soft predictions + activations)")
+    print(f"{'='*60}")
+
+    # Get soft predictions from heuristic probe on train and eval sets
+    tr_logits_heur = _get_nanda_logits(probe_heur_even, probe_heur_odd,
+                                        tr_heur, tr_positions, device)
+    tr_soft_heur = torch.softmax(tr_logits_heur, dim=-1).reshape(len(tr_heur), -1)  # (N, 192)
+    ev_soft_heur = torch.softmax(logits_heur, dim=-1).reshape(len(ev_heur), -1)  # (N, 192)
+
+    # Stack with random L0
+    print("\n  Stacking: heuristic soft preds + random L0")
+    tr_stack_r = torch.cat([tr_soft_heur, tr_X_r], dim=1)  # (N, 704)
+    ev_stack_r = torch.cat([ev_soft_heur, ev_X_r], dim=1)
+    acc_stack_r = train_nanda_probe(
+        tr_stack_r, tr_labels, tr_positions,
+        ev_stack_r, ev_labels, ev_positions,
+        device, tr_stack_r.shape[1])
+    results["method2_stack_random"] = acc_stack_r
+    print(f"  Stacking heur + random L0: {acc_stack_r:.4%}")
+
+    # Stack with Othello-GPT L0
+    print("\n  Stacking: heuristic soft preds + Othello-GPT L0")
+    tr_stack_o = torch.cat([tr_soft_heur, tr_X_o], dim=1)  # (N, 704)
+    ev_stack_o = torch.cat([ev_soft_heur, ev_X_o], dim=1)
+    acc_stack_o = train_nanda_probe(
+        tr_stack_o, tr_labels, tr_positions,
+        ev_stack_o, ev_labels, ev_positions,
+        device, tr_stack_o.shape[1])
+    results["method2_stack_othello"] = acc_stack_o
+    print(f"  Stacking heur + Othello L0: {acc_stack_o:.4%}")
+
+    # ---- Method 3: Feature Normalization ----
+    print(f"\n{'='*60}")
+    print("Method 3: Normalized concatenation")
+    print(f"{'='*60}")
+
+    # Normalize heuristic features
+    heur_mean = tr_heur.mean(dim=0, keepdim=True)
+    heur_std = tr_heur.std(dim=0, keepdim=True).clamp(min=1e-8)
+    tr_heur_norm = (tr_heur - heur_mean) / heur_std
+    ev_heur_norm = (ev_heur - heur_mean) / heur_std
+
+    # Normalize random L0
+    rand_mean = tr_X_r.mean(dim=0, keepdim=True)
+    rand_std = tr_X_r.std(dim=0, keepdim=True).clamp(min=1e-8)
+    tr_X_r_norm = (tr_X_r - rand_mean) / rand_std
+    ev_X_r_norm = (ev_X_r - rand_mean) / rand_std
+
+    # Normalize Othello-GPT L0
+    ogpt_mean = tr_X_o.mean(dim=0, keepdim=True)
+    ogpt_std = tr_X_o.std(dim=0, keepdim=True).clamp(min=1e-8)
+    tr_X_o_norm = (tr_X_o - ogpt_mean) / ogpt_std
+    ev_X_o_norm = (ev_X_o - ogpt_mean) / ogpt_std
+
+    # Normalized concat with random L0
+    print("\n  Normalized concat: heuristic + random L0")
+    tr_norm_r = torch.cat([tr_heur_norm, tr_X_r_norm], dim=1)
+    ev_norm_r = torch.cat([ev_heur_norm, ev_X_r_norm], dim=1)
+    acc_norm_r = train_nanda_probe(
+        tr_norm_r, tr_labels, tr_positions,
+        ev_norm_r, ev_labels, ev_positions,
+        device, tr_norm_r.shape[1])
+    results["method3_norm_random"] = acc_norm_r
+    print(f"  Normalized heur + random L0: {acc_norm_r:.4%}")
+
+    # Normalized concat with Othello-GPT L0
+    print("\n  Normalized concat: heuristic + Othello-GPT L0")
+    tr_norm_o = torch.cat([tr_heur_norm, tr_X_o_norm], dim=1)
+    ev_norm_o = torch.cat([ev_heur_norm, ev_X_o_norm], dim=1)
+    acc_norm_o = train_nanda_probe(
+        tr_norm_o, tr_labels, tr_positions,
+        ev_norm_o, ev_labels, ev_positions,
+        device, tr_norm_o.shape[1])
+    results["method3_norm_othello"] = acc_norm_o
+    print(f"  Normalized heur + Othello L0: {acc_norm_o:.4%}")
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("COMBINATION EXPERIMENT RESULTS")
+    print(f"{'='*60}")
+    for k, v in results.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4%}")
+        else:
+            print(f"  {k}: {v}")
+
+    _save_results(args, "combine_heuristic", results)
+    return results
+
+
+# ================== Part B: Recover Heuristics from the MLP ================
+
+def _train_mlp_nanda_returning_model(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
+                                      device, input_dim, hidden_dim,
+                                      lr=1e-3, epochs=16, batch_size=1024):
+    """Like _train_mlp_nanda but returns the trained models."""
+    mlp_even = nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, 64 * OPTIONS),
+    ).to(device)
+    mlp_odd = nn.Sequential(
+        nn.Linear(input_dim, hidden_dim),
+        nn.ReLU(),
+        nn.Linear(hidden_dim, 64 * OPTIONS),
+    ).to(device)
+
+    all_params = list(mlp_even.parameters()) + list(mlp_odd.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=1)
+
+    best_acc = 0.0
+    best_state = None
+    for epoch in range(1, epochs + 1):
+        mlp_even.train()
+        mlp_odd.train()
+        perm = torch.randperm(len(tr_X))
+        for i in range(0, len(tr_X), batch_size):
+            idx = perm[i:i + batch_size]
+            x = tr_X[idx].to(device)
+            y = tr_Y[idx].to(device)
+            pos = tr_pos[idx]
+            even_mask = (pos % 2 == 0)
+            odd_mask = ~even_mask
+            loss = torch.tensor(0.0, device=device)
+            if even_mask.any():
+                logits_e = mlp_even(x[even_mask]).view(-1, 64, OPTIONS)
+                loss = loss + nn.functional.cross_entropy(
+                    logits_e.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
+            if odd_mask.any():
+                logits_o = mlp_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                loss = loss + nn.functional.cross_entropy(
+                    logits_o.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        mlp_even.eval()
+        mlp_odd.eval()
+        correct = 0
+        total = 0
+        losses = []
+        with torch.no_grad():
+            for i in range(0, len(ev_X), batch_size):
+                x = ev_X[i:i + batch_size].to(device)
+                y = ev_Y[i:i + batch_size].to(device)
+                pos = ev_pos[i:i + batch_size]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+                preds = torch.zeros_like(y)
+                if even_mask.any():
+                    logits_e = mlp_even(x[even_mask]).view(-1, 64, OPTIONS)
+                    preds[even_mask] = logits_e.argmax(-1)
+                    losses.append(nn.functional.cross_entropy(
+                        logits_e.reshape(-1, OPTIONS),
+                        y[even_mask].reshape(-1)).item())
+                if odd_mask.any():
+                    logits_o = mlp_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                    preds[odd_mask] = logits_o.argmax(-1)
+                    losses.append(nn.functional.cross_entropy(
+                        logits_o.reshape(-1, OPTIONS),
+                        y[odd_mask].reshape(-1)).item())
+                correct += (preds == y).sum().item()
+                total += y.numel()
+        acc = correct / total
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {
+                'even': {k: v.clone() for k, v in mlp_even.state_dict().items()},
+                'odd': {k: v.clone() for k, v in mlp_odd.state_dict().items()},
+            }
+        scheduler.step(np.mean(losses))
+        cur_lr = optimizer.param_groups[0]['lr']
+        print(f"  Epoch {epoch}: acc={acc:.4%}  loss={np.mean(losses):.5f}  lr={cur_lr:.2e}",
+              flush=True)
+
+    mlp_even.load_state_dict(best_state['even'])
+    mlp_odd.load_state_dict(best_state['odd'])
+    return best_acc, mlp_even, mlp_odd
+
+
+def _feature_name(idx):
+    """Convert feature index (0-179) to human-readable name."""
+    if idx < N_MOVES:
+        pos = _VALID_MOVES[idx]
+        row, col = pos // 8, pos % 8
+        return f"played[{chr(65+row)}{col+1}]"
+    elif idx < 2 * N_MOVES:
+        i = idx - N_MOVES
+        pos = _VALID_MOVES[i]
+        row, col = pos // 8, pos % 8
+        return f"when[{chr(65+row)}{col+1}]"
+    else:
+        i = idx - 2 * N_MOVES
+        pos = _VALID_MOVES[i]
+        row, col = pos // 8, pos % 8
+        return f"even[{chr(65+row)}{col+1}]"
+
+
+def _cell_name(cell_idx):
+    """Convert cell index (0-63) to board position name."""
+    row, col = cell_idx // 8, cell_idx % 8
+    return f"{chr(65+row)}{col+1}"
+
+
+def _class_name(cls_idx):
+    """Convert class index to name."""
+    return ["empty", "white", "black"][cls_idx]
+
+
+def _analyze_mlp_weights(mlp, hidden_dim, parity_name):
+    """Analyze weight structure of a trained MLP.
+
+    Steps 1-2 and 4: Extract weight structure, top features, and descriptions.
+    """
+    # Layer 0: Linear(180, hidden_dim) — weights shape (hidden_dim, 180)
+    W1 = mlp[0].weight.detach().cpu().numpy()  # (H, 180)
+    b1 = mlp[0].bias.detach().cpu().numpy()     # (H,)
+
+    # Layer 2: Linear(hidden_dim, 64*3) — weights shape (192, H)
+    W2 = mlp[2].weight.detach().cpu().numpy()  # (192, H)
+    b2 = mlp[2].bias.detach().cpu().numpy()     # (192,)
+
+    units = []
+    for j in range(hidden_dim):
+        # Input weights for unit j
+        w_in = W1[j]  # (180,)
+        bias = float(b1[j])
+
+        # Top 10 input features by absolute weight
+        top_in_idx = np.argsort(np.abs(w_in))[::-1][:10]
+        top_inputs = []
+        for k in top_in_idx:
+            top_inputs.append({
+                "feature": _feature_name(int(k)),
+                "index": int(k),
+                "weight": float(w_in[k]),
+            })
+
+        # Output weights for unit j — column j of W2
+        w_out = W2[:, j]  # (192,)
+        # Reshape to (64, 3) to identify cell and class
+        w_out_reshaped = w_out.reshape(64, OPTIONS)
+
+        # Top 5 output contributions by absolute weight
+        flat_idx = np.argsort(np.abs(w_out))[::-1][:5]
+        top_outputs = []
+        for k in flat_idx:
+            cell = int(k) // OPTIONS
+            cls = int(k) % OPTIONS
+            top_outputs.append({
+                "cell": _cell_name(cell),
+                "cell_idx": cell,
+                "class": _class_name(cls),
+                "class_idx": cls,
+                "weight": float(w_out[k]),
+            })
+
+        # Output L2 norm (for progressive ablation sorting)
+        out_l2 = float(np.linalg.norm(w_out))
+
+        # Generate description (Step 4)
+        desc_parts = []
+        for inp in top_inputs[:3]:
+            sign = "+" if inp["weight"] > 0 else "-"
+            desc_parts.append(f"{sign}{inp['feature']}")
+        input_desc = ", ".join(desc_parts)
+
+        output_parts = []
+        for out in top_outputs[:2]:
+            sign = "+" if out["weight"] > 0 else "-"
+            output_parts.append(f"{sign}{out['cell']}={out['class']}")
+        output_desc = ", ".join(output_parts)
+
+        description = f"[{parity_name}] Unit {j}: IF {input_desc} THEN {output_desc}"
+
+        # Categorize (Step 5)
+        # Count feature types in top 10
+        n_played = sum(1 for inp in top_inputs if inp["feature"].startswith("played"))
+        n_when = sum(1 for inp in top_inputs if inp["feature"].startswith("when"))
+        n_even = sum(1 for inp in top_inputs if inp["feature"].startswith("even"))
+
+        # Determine primary category
+        max_count = max(n_played, n_when, n_even)
+        if n_played == max_count and n_when < max_count and n_even < max_count:
+            category = "placement"
+        elif n_when == max_count and n_played < max_count and n_even < max_count:
+            category = "temporal"
+        elif n_even == max_count and n_played < max_count and n_when < max_count:
+            category = "parity"
+        else:
+            category = "interaction"
+
+        # Output scope: how many cells does it contribute to significantly?
+        cell_contributions = np.abs(w_out_reshaped).max(axis=1)  # (64,)
+        threshold = cell_contributions.max() * 0.1
+        n_significant_cells = int((cell_contributions > threshold).sum())
+        output_scope = "global" if n_significant_cells > 5 else "local"
+
+        # Primary prediction class
+        class_totals = np.abs(w_out_reshaped).sum(axis=0)  # (3,)
+        primary_class = _class_name(int(np.argmax(class_totals)))
+
+        units.append({
+            "unit": j,
+            "parity": parity_name,
+            "bias": bias,
+            "top_inputs": top_inputs,
+            "top_outputs": top_outputs,
+            "out_l2": out_l2,
+            "description": description,
+            "category": category,
+            "output_scope": output_scope,
+            "primary_class": primary_class,
+            "n_played": n_played,
+            "n_when": n_when,
+            "n_even": n_even,
+        })
+
+    return units
+
+
+def _find_max_activating(mlp, X, positions, hidden_dim, n_top=20,
+                          batch_size=1024):
+    """Step 3: Find max-activating examples for each hidden unit.
+
+    Returns dict mapping unit index to list of (activation, sample_idx) tuples.
+    """
+    mlp.eval()
+    # Extract hidden activations (after ReLU)
+    # MLP: layer 0 = Linear, layer 1 = ReLU
+    W1 = mlp[0].weight.detach()  # (H, 180)
+    b1 = mlp[0].bias.detach()    # (H,)
+
+    # Collect activations for all samples
+    n_samples = len(X)
+    # Store top-n per unit using a running buffer
+    top_acts = {j: [] for j in range(hidden_dim)}  # list of (act_value, sample_idx)
+
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            x = X[i:i + batch_size]  # (B, 180)
+            # Hidden activations after ReLU
+            h = torch.relu(x @ W1.cpu().T + b1.cpu())  # (B, H)
+            for j in range(hidden_dim):
+                acts_j = h[:, j].numpy()
+                for bi, act_val in enumerate(acts_j):
+                    sample_idx = i + bi
+                    if len(top_acts[j]) < n_top:
+                        top_acts[j].append((float(act_val), sample_idx))
+                        if len(top_acts[j]) == n_top:
+                            top_acts[j].sort(key=lambda x: -x[0])
+                    elif act_val > top_acts[j][-1][0]:
+                        top_acts[j][-1] = (float(act_val), sample_idx)
+                        top_acts[j].sort(key=lambda x: -x[0])
+
+    return top_acts
+
+
+def _progressive_ablation(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device,
+                           hidden_dim, ns_to_test=None):
+    """Step 7: Test accuracy using only top-N hidden units by output L2 norm."""
+    if ns_to_test is None:
+        ns_to_test = [50, 100, 200, 500, 1000, hidden_dim]
+
+    # Get output weight L2 norms for each unit
+    W2_even = mlp_even[2].weight.detach().cpu().numpy()  # (192, H)
+    W2_odd = mlp_odd[2].weight.detach().cpu().numpy()
+
+    l2_even = np.linalg.norm(W2_even, axis=0)  # (H,)
+    l2_odd = np.linalg.norm(W2_odd, axis=0)
+    l2_combined = l2_even + l2_odd  # proxy for overall importance
+
+    # Sort by combined L2
+    unit_order = np.argsort(l2_combined)[::-1]
+
+    results = {}
+    for N in ns_to_test:
+        if N > hidden_dim:
+            continue
+        # Create ablated copies
+        mlp_even_abl = nn.Sequential(
+            nn.Linear(180, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 64 * OPTIONS),
+        ).to(device)
+        mlp_odd_abl = nn.Sequential(
+            nn.Linear(180, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 64 * OPTIONS),
+        ).to(device)
+        mlp_even_abl.load_state_dict(mlp_even.state_dict())
+        mlp_odd_abl.load_state_dict(mlp_odd.state_dict())
+
+        # Zero out units not in top N
+        mask = torch.zeros(hidden_dim)
+        mask[unit_order[:N]] = 1.0
+        mask = mask.to(device)
+
+        # Hook to apply mask after ReLU (layer 1)
+        def make_hook(m):
+            def hook_fn(module, input, output):
+                return output * m
+            return hook_fn
+
+        h_even = mlp_even_abl[1].register_forward_hook(make_hook(mask))
+        h_odd = mlp_odd_abl[1].register_forward_hook(make_hook(mask))
+
+        # Evaluate
+        mlp_even_abl.eval()
+        mlp_odd_abl.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for i in range(0, len(ev_X), 1024):
+                x = ev_X[i:i + 1024].to(device)
+                y = ev_Y[i:i + 1024].to(device)
+                pos = ev_pos[i:i + 1024]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+                preds = torch.zeros_like(y)
+                if even_mask.any():
+                    preds[even_mask] = mlp_even_abl(x[even_mask]).view(-1, 64, OPTIONS).argmax(-1)
+                if odd_mask.any():
+                    preds[odd_mask] = mlp_odd_abl(x[odd_mask]).view(-1, 64, OPTIONS).argmax(-1)
+                correct += (preds == y).sum().item()
+                total += y.numel()
+
+        h_even.remove()
+        h_odd.remove()
+
+        acc = correct / total
+        results[N] = acc
+        print(f"  Top {N:5d} units: {acc:.4%}")
+
+    return results
+
+
+def experiment_mlp_analysis(args):
+    """Part B: Recover heuristics from the trained MLP."""
+    device = get_device()
+    print(f"Device: {device}")
+
+    hidden_dim = args.mlp_hidden[0] if args.mlp_hidden else 2048
+    print(f"Hidden dim: {hidden_dim}")
+
+    games = load_games(max_files=args.max_files)
+    if args.max_games and len(games) > args.max_games:
+        games = games[:args.max_games]
+    n_eval = max(int(len(games) * 0.1), 100)
+    train_games = games[:len(games) - n_eval]
+    eval_games = games[len(games) - n_eval:]
+    print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+
+    # Build 180-d features
+    print("Building train features (180-d)...")
+    tr_X, tr_Y, tr_pos = _build_move_features_batch(
+        train_games, POS_START, POS_END, include_pairwise=False)
+    print("Building eval features (180-d)...")
+    ev_X, ev_Y, ev_pos = _build_move_features_batch(
+        eval_games, POS_START, POS_END, include_pairwise=False)
+    print(f"  Train: {tr_X.shape}, Eval: {ev_X.shape}")
+
+    # Train MLP
+    print(f"\n--- Training MLP H={hidden_dim} ---")
+    best_acc, mlp_even, mlp_odd = _train_mlp_nanda_returning_model(
+        tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
+        device, 180, hidden_dim)
+    print(f"  Best accuracy: {best_acc:.4%}")
+
+    results = {"accuracy": best_acc, "hidden_dim": hidden_dim}
+
+    # Step 1-2, 4-5: Analyze weight structure
+    print("\n--- Analyzing weight structure ---")
+    even_units = _analyze_mlp_weights(mlp_even, hidden_dim, "even")
+    odd_units = _analyze_mlp_weights(mlp_odd, hidden_dim, "odd")
+    all_units = even_units + odd_units
+
+    # Step 5: Category distribution
+    categories = {}
+    scopes = {}
+    primary_classes = {}
+    for u in all_units:
+        cat = u["category"]
+        categories[cat] = categories.get(cat, 0) + 1
+        sc = u["output_scope"]
+        scopes[sc] = scopes.get(sc, 0) + 1
+        pc = u["primary_class"]
+        primary_classes[pc] = primary_classes.get(pc, 0) + 1
+
+    results["category_distribution"] = categories
+    results["scope_distribution"] = scopes
+    results["primary_class_distribution"] = primary_classes
+
+    print("\n  Category distribution:")
+    for cat, count in sorted(categories.items()):
+        print(f"    {cat}: {count}")
+    print("  Output scope distribution:")
+    for sc, count in sorted(scopes.items()):
+        print(f"    {sc}: {count}")
+    print("  Primary class distribution:")
+    for pc, count in sorted(primary_classes.items()):
+        print(f"    {pc}: {count}")
+
+    # Step 3: Max-activating examples
+    print("\n--- Finding max-activating examples ---")
+    print("  Even MLP...")
+    top_acts_even = _find_max_activating(mlp_even, ev_X, ev_pos, hidden_dim, n_top=20)
+    print("  Odd MLP...")
+    top_acts_odd = _find_max_activating(mlp_odd, ev_X, ev_pos, hidden_dim, n_top=20)
+
+    # Build game index for eval samples
+    # Each game has LENGTH=49 positions, so sample_idx -> (game_idx, move_number)
+    def sample_to_game_info(sample_idx):
+        game_idx = sample_idx // LENGTH
+        move_within = sample_idx % LENGTH
+        move_number = POS_START + move_within
+        if game_idx < len(eval_games):
+            game = eval_games[game_idx]
+            moves_so_far = game[:move_number + 1]
+            # Board state
+            states = seq_to_state_normal(game)
+            board = states[move_number]  # (8, 8)
+            return {
+                "game_idx": int(game_idx),
+                "move_number": int(move_number),
+                "moves": [int(m) for m in moves_so_far],
+                "board": board.tolist(),
+            }
+        return {"game_idx": int(game_idx), "move_number": int(move_number)}
+
+    # Save max-activating for top 50 most important units (by output L2)
+    all_units_sorted = sorted(all_units, key=lambda u: -u["out_l2"])
+    top_unit_indices = []
+    max_act_data = {}
+    for u in all_units_sorted[:50]:
+        j = u["unit"]
+        parity = u["parity"]
+        key = f"{parity}_unit_{j}"
+        top_acts = top_acts_even[j] if parity == "even" else top_acts_odd[j]
+        examples = []
+        for act_val, sample_idx in top_acts[:10]:
+            info = sample_to_game_info(sample_idx)
+            info["activation"] = act_val
+            examples.append(info)
+        max_act_data[key] = {
+            "description": u["description"],
+            "category": u["category"],
+            "examples": examples,
+        }
+        top_unit_indices.append((parity, j))
+
+    # Step 6: Validate individual heuristics
+    print("\n--- Validating individual heuristics ---")
+    validation = []
+    for parity, j in top_unit_indices[:20]:
+        mlp = mlp_even if parity == "even" else mlp_odd
+        u = [u for u in all_units if u["unit"] == j and u["parity"] == parity][0]
+
+        # Get the top output cell and class for this unit
+        top_out = u["top_outputs"][0]
+        cell_idx = top_out["cell_idx"]
+        cls_idx = top_out["class_idx"]
+
+        # Compute standalone accuracy for this one cell
+        W1 = mlp[0].weight.detach().cpu()
+        b1 = mlp[0].bias.detach().cpu()
+        W2 = mlp[2].weight.detach().cpu()
+
+        # Get hidden unit j's contribution to cell_idx predictions
+        # For each eval sample of matching parity:
+        pos_mask = (ev_pos % 2 == 0) if parity == "even" else (ev_pos % 2 == 1)
+        x_sub = ev_X[pos_mask]
+        y_sub = ev_Y[pos_mask]
+
+        # Unit j activation
+        h_j = torch.relu(x_sub @ W1[j] + b1[j])  # (N,)
+
+        # Unit j's output for this cell: W2[cell_idx*3:(cell_idx+1)*3, j] * h_j
+        w2_cell = W2[cell_idx * OPTIONS:(cell_idx + 1) * OPTIONS, j]  # (3,)
+        logits_j = h_j.unsqueeze(1) * w2_cell.unsqueeze(0)  # (N, 3)
+
+        preds_j = logits_j.argmax(-1)
+        gt = y_sub[:, cell_idx]
+        cell_acc = (preds_j == gt).float().mean().item()
+
+        validation.append({
+            "parity": parity,
+            "unit": j,
+            "description": u["description"],
+            "category": u["category"],
+            "target_cell": top_out["cell"],
+            "target_class": top_out["class"],
+            "standalone_cell_accuracy": cell_acc,
+            "out_l2": u["out_l2"],
+        })
+        print(f"  [{parity}] Unit {j}: cell {top_out['cell']} acc={cell_acc:.4%}  "
+              f"({u['category']}, L2={u['out_l2']:.3f})")
+
+    results["validation"] = validation
+
+    # Step 7: Progressive ablation
+    print("\n--- Progressive ablation ---")
+    ns = [50, 100, 200, 500, 1000, hidden_dim]
+    ablation_results = _progressive_ablation(
+        mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device, hidden_dim, ns)
+    results["ablation"] = {str(k): v for k, v in ablation_results.items()}
+
+    # Save everything
+    out_dir = args.output_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Save unit analysis JSON
+    unit_data = {
+        "even_units": even_units,
+        "odd_units": odd_units,
+    }
+    with open(os.path.join(out_dir, "mlp_unit_analysis.json"), "w") as f:
+        json.dump(unit_data, f, indent=2)
+    print(f"  Saved unit analysis to mlp_unit_analysis.json")
+
+    # Save max-activating examples
+    with open(os.path.join(out_dir, "mlp_max_activating.json"), "w") as f:
+        json.dump(max_act_data, f, indent=2)
+    print(f"  Saved max-activating examples to mlp_max_activating.json")
+
+    # Save descriptions text file
+    desc_path = os.path.join(out_dir, "mlp_unit_descriptions.txt")
+    with open(desc_path, "w") as f:
+        f.write(f"MLP Unit Descriptions (H={hidden_dim})\n")
+        f.write(f"Best accuracy: {best_acc:.4%}\n")
+        f.write(f"{'='*80}\n\n")
+        for u in all_units_sorted:
+            f.write(f"{u['description']}\n")
+            f.write(f"  Category: {u['category']}, Scope: {u['output_scope']}, "
+                    f"Primary class: {u['primary_class']}, L2: {u['out_l2']:.4f}\n")
+            inp_strs = [inp['feature'] + '({:.4f})'.format(inp['weight']) for inp in u['top_inputs'][:5]]
+            f.write("  Top inputs: {}\n".format(', '.join(inp_strs)))
+            out_strs = [out['cell'] + '=' + out['class'] + '({:.4f})'.format(out['weight']) for out in u['top_outputs'][:3]]
+            f.write("  Top outputs: {}\n\n".format(', '.join(out_strs)))
+    print(f"  Saved descriptions to mlp_unit_descriptions.txt")
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("MLP ANALYSIS RESULTS")
+    print(f"{'='*60}")
+    print(f"  Accuracy: {best_acc:.4%}")
+    print(f"  Hidden dim: {hidden_dim}")
+    print(f"  Categories: {categories}")
+    print(f"  Ablation:")
+    for n, acc in sorted(ablation_results.items()):
+        print(f"    Top {n}: {acc:.4%}")
+
+    _save_results(args, "mlp_analysis", results)
+    return results
+
+
 # ============================= Utilities =====================================
 
 def _save_results(args, exp_name, results):
@@ -1761,7 +2685,8 @@ def parse_args():
     p.add_argument("--experiment", type=str, required=True,
                    choices=["standard_probe", "resid_pre", "alt_boards",
                             "by_move", "heuristic", "brute_force",
-                            "learned_heuristic", "mlp"],
+                            "learned_heuristic", "mlp",
+                            "combine_heuristic", "mlp_analysis"],
                    help="Which experiment to run")
     p.add_argument("--ckpt-path", type=str, default="ckpts/gpt_synthetic.ckpt")
     p.add_argument("--layer", type=int, default=6)
@@ -1790,6 +2715,8 @@ def main():
         "brute_force": experiment_brute_force,
         "learned_heuristic": experiment_learned_heuristic,
         "mlp": experiment_mlp,
+        "combine_heuristic": experiment_combine_heuristic,
+        "mlp_analysis": experiment_mlp_analysis,
     }
 
     experiments[args.experiment](args)
