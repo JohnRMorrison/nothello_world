@@ -9,8 +9,11 @@
 #     sbatch --array=0-25 mlp_feature_search.sh precompute
 #     (26 chunks × 10 files each = 260 files, ~26M games)
 #
-#   Step 2: Train MLPs using cached features
-#     sbatch mlp_feature_search.sh train hidden=1024,2048
+#   Step 2: Train MLPs (width sweep) using cached features
+#     sbatch mlp_feature_search.sh train hidden=4,8,16,32,64,128,256,512,1024
+#
+#   Step 3: Dropout evaluation on trained H=1024 MLP
+#     sbatch mlp_feature_search.sh dropout
 #
 # Or run single-job (small scale):
 #     sbatch mlp_feature_search.sh
@@ -41,8 +44,8 @@ cd $SLURM_SUBMIT_DIR
 
 # Parse arguments
 FILES_PER_CHUNK=10
-HIDDEN_DIMS="1024 2048"
-MODE="single"  # precompute, train, or single
+HIDDEN_DIMS="4 8 16 32 64 128 256 512 1024"
+MODE="single"  # precompute, train, dropout, or single
 for arg in "$@"; do
     if [[ "$arg" == chunk=* ]]; then
         FILES_PER_CHUNK="${arg#chunk=}"
@@ -53,6 +56,8 @@ for arg in "$@"; do
         MODE="precompute"
     elif [[ "$arg" == "train" ]]; then
         MODE="train"
+    elif [[ "$arg" == "dropout" ]]; then
+        MODE="dropout"
     fi
 done
 
@@ -90,6 +95,15 @@ elif [[ "$MODE" == "train" ]]; then
         --precomputed \
         --mlp-hidden $HIDDEN_DIMS \
         --mlp-only \
+        --output-dir $OUTPUT_DIR
+
+elif [[ "$MODE" == "dropout" ]]; then
+    # Dropout evaluation on trained H=1024 MLP
+    echo "Dropout evaluation"
+    CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
+        --experiment mlp_dropout \
+        --precomputed \
+        --mlp-hidden 1024 \
         --output-dir $OUTPUT_DIR
 
 else
