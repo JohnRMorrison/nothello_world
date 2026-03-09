@@ -71,11 +71,20 @@ def do_extract(args):
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
 
-    def collect_acts_and_labels(model, games_list, device, layer, block_size, use_pre=False):
-        """Collect activations and labels in batches."""
-        acts_list = []
-        labels_list = []
-        game_batch = 64
+    d_model = 512  # Othello-GPT embedding dim
+    game_batch = 64
+
+    def extract_to_memmap(model, games_list, device, layer, block_size,
+                          acts_path, labels_path=None):
+        """Extract activations directly to memory-mapped files (no RAM accumulation)."""
+        n_total = len(games_list) * LENGTH
+        acts_mm = np.memmap(acts_path, dtype=np.float16, mode='w+',
+                            shape=(n_total, d_model))
+        if labels_path is not None:
+            labels_mm = np.memmap(labels_path, dtype=np.int8, mode='w+',
+                                  shape=(n_total, 64))
+
+        row = 0
         for start in range(0, len(games_list), game_batch):
             if start % (game_batch * 100) == 0:
                 print(f"    batch {start}/{len(games_list)}", flush=True)
@@ -83,60 +92,70 @@ def do_extract(args):
             tokens = tokenize_games(batch_games, seq_len=block_size).to(device)
 
             with torch.no_grad():
-                if use_pre:
-                    h = extract_activations_pre(model, tokens)
-                else:
-                    h = extract_activations(model, tokens, layer)
-            h = h[:, POS_START:POS_END]
+                h = extract_activations(model, tokens, layer)
+            h = h[:, POS_START:POS_END].cpu().numpy()  # (B, 49, 512)
 
-            states = get_board_states(batch_games, seq_to_state_normal, POS_START, POS_END)
-            labels = states_to_labels(states)
-            labels = labels.reshape(len(batch_games), LENGTH, 64)
+            if labels_path is not None:
+                states = get_board_states(batch_games, seq_to_state_normal, POS_START, POS_END)
+                labels = states_to_labels(states).reshape(len(batch_games), LENGTH, 64)
 
-            for gi in range(len(batch_games)):
-                acts_list.append(h[gi].cpu())
-                labels_list.append(torch.tensor(labels[gi], dtype=torch.long))
+            n_games = len(batch_games)
+            chunk = h.reshape(n_games * LENGTH, d_model).astype(np.float16)
+            acts_mm[row:row + len(chunk)] = chunk
+            if labels_path is not None:
+                labels_mm[row:row + len(chunk)] = labels.reshape(
+                    n_games * LENGTH, 64).astype(np.int8)
+            row += len(chunk)
 
-        return torch.cat(acts_list, dim=0), torch.cat(labels_list, dim=0)
+        acts_mm.flush()
+        if labels_path is not None:
+            labels_mm.flush()
+        return n_total
 
     # Build position arrays
     tr_n = len(train_games) * LENGTH
     ev_n = len(eval_games) * LENGTH
     tr_pos = np.array([POS_START + (i % LENGTH) for i in range(tr_n)], dtype=np.int16)
     ev_pos = np.array([POS_START + (i % LENGTH) for i in range(ev_n)], dtype=np.int16)
+    np.savez_compressed(os.path.join(out_dir, 'positions.npz'),
+                        tr_pos=tr_pos, ev_pos=ev_pos)
 
-    # Extract layer 0 first (to get labels)
-    print("\nExtracting layer 0...")
-    t0 = time.time()
-    tr_X, tr_Y = collect_acts_and_labels(model, train_games, device, 0, block_size)
-    ev_X, ev_Y = collect_acts_and_labels(model, eval_games, device, 0, block_size)
-    print(f"  Done in {time.time()-t0:.0f}s. Shape: tr={tr_X.shape}, ev={ev_X.shape}")
-
-    # Save labels and positions
-    np.savez_compressed(os.path.join(out_dir, 'labels_and_pos.npz'),
-        tr_Y=tr_Y.numpy().astype(np.int8),
-        ev_Y=ev_Y.numpy().astype(np.int8),
-        tr_pos=tr_pos, ev_pos=ev_pos)
-    print(f"  Saved labels")
-
-    # Save layer 0
-    np.savez_compressed(os.path.join(out_dir, 'layer0.npz'),
-        tr_X=tr_X.numpy().astype(np.float16),
-        ev_X=ev_X.numpy().astype(np.float16))
-    print(f"  Saved layer 0")
-    del tr_X, ev_X
-
-    # Layers 1-8
-    for layer in range(1, 9):
+    # Extract layer 0 + labels
+    for layer in range(9):
         print(f"\nExtracting layer {layer}...")
         t0 = time.time()
-        tr_X, _ = collect_acts_and_labels(model, train_games, device, layer, block_size)
-        ev_X, _ = collect_acts_and_labels(model, eval_games, device, layer, block_size)
-        np.savez_compressed(os.path.join(out_dir, f'layer{layer}.npz'),
-            tr_X=tr_X.numpy().astype(np.float16),
-            ev_X=ev_X.numpy().astype(np.float16))
-        print(f"  Saved layer {layer} in {time.time()-t0:.0f}s: {tr_X.shape}")
-        del tr_X, ev_X
+
+        tr_acts_path = os.path.join(out_dir, f'layer{layer}_train.raw')
+        ev_acts_path = os.path.join(out_dir, f'layer{layer}_eval.raw')
+
+        if layer == 0:
+            tr_labels_path = os.path.join(out_dir, 'labels_train.raw')
+            ev_labels_path = os.path.join(out_dir, 'labels_eval.raw')
+        else:
+            tr_labels_path = None
+            ev_labels_path = None
+
+        extract_to_memmap(model, train_games, device, layer, block_size,
+                          tr_acts_path, tr_labels_path)
+        extract_to_memmap(model, eval_games, device, layer, block_size,
+                          ev_acts_path, ev_labels_path)
+
+        elapsed = time.time() - t0
+        tr_size_mb = os.path.getsize(tr_acts_path) / 1e6
+        ev_size_mb = os.path.getsize(ev_acts_path) / 1e6
+        print(f"  Layer {layer} done in {elapsed:.0f}s. "
+              f"Train: {tr_size_mb:.0f}MB, Eval: {ev_size_mb:.0f}MB")
+
+    # Save metadata
+    meta = {
+        'n_train_games': len(train_games),
+        'n_eval_games': len(eval_games),
+        'tr_n': tr_n, 'ev_n': ev_n,
+        'd_model': d_model,
+        'n_layers': 9,
+    }
+    with open(os.path.join(out_dir, 'metadata.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
 
     print(f"\nAll saved to {out_dir}/")
     for f in sorted(os.listdir(out_dir)):
@@ -151,20 +170,36 @@ def do_train(args):
 
     acts_dir = args.acts_dir
 
-    # Load labels and positions
-    lp = np.load(os.path.join(acts_dir, 'labels_and_pos.npz'))
-    tr_Y = torch.tensor(lp['tr_Y'].astype(np.int64))
-    ev_Y = torch.tensor(lp['ev_Y'].astype(np.int64))
-    tr_pos = torch.tensor(lp['tr_pos'].astype(np.int64))
-    ev_pos = torch.tensor(lp['ev_pos'].astype(np.int64))
+    # Load metadata
+    with open(os.path.join(acts_dir, 'metadata.json')) as f:
+        meta = json.load(f)
+    tr_n, ev_n, d_model = meta['tr_n'], meta['ev_n'], meta['d_model']
+
+    # Load labels from memmap
+    tr_Y = torch.from_numpy(
+        np.memmap(os.path.join(acts_dir, 'labels_train.raw'),
+                  dtype=np.int8, mode='r', shape=(tr_n, 64)).copy()).long()
+    ev_Y = torch.from_numpy(
+        np.memmap(os.path.join(acts_dir, 'labels_eval.raw'),
+                  dtype=np.int8, mode='r', shape=(ev_n, 64)).copy()).long()
+
+    # Load positions
+    pos_data = np.load(os.path.join(acts_dir, 'positions.npz'))
+    tr_pos = torch.from_numpy(pos_data['tr_pos'].astype(np.int64))
+    ev_pos = torch.from_numpy(pos_data['ev_pos'].astype(np.int64))
     print(f"Labels: tr={tr_Y.shape}, ev={ev_Y.shape}")
 
-    # Load activations for the requested layer
+    # Load activations for the requested layer from memmap
     layer = args.layer
     print(f"\nLoading layer {layer} activations...")
-    data = np.load(os.path.join(acts_dir, f'layer{layer}.npz'))
-    tr_X = torch.tensor(data['tr_X'].astype(np.float32))
-    ev_X = torch.tensor(data['ev_X'].astype(np.float32))
+    tr_X = torch.from_numpy(
+        np.memmap(os.path.join(acts_dir, f'layer{layer}_train.raw'),
+                  dtype=np.float16, mode='r', shape=(tr_n, d_model)).copy()
+    ).float()
+    ev_X = torch.from_numpy(
+        np.memmap(os.path.join(acts_dir, f'layer{layer}_eval.raw'),
+                  dtype=np.float16, mode='r', shape=(ev_n, d_model)).copy()
+    ).float()
     print(f"  Shape: tr={tr_X.shape}, ev={ev_X.shape}")
     input_dim = tr_X.shape[1]
 
