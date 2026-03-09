@@ -2971,28 +2971,55 @@ def experiment_mlp_analysis(args):
     hidden_dim = args.mlp_hidden[0] if args.mlp_hidden else 2048
     print(f"Hidden dim: {hidden_dim}")
 
-    games = load_games(max_files=args.max_files)
-    if args.max_games and len(games) > args.max_games:
-        games = games[:args.max_games]
-    n_eval = max(int(len(games) * 0.1), 100)
-    train_games = games[:len(games) - n_eval]
-    eval_games = games[len(games) - n_eval:]
-    print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+    # Try loading saved checkpoint
+    ckpt_dir = os.path.join(args.output_dir, "mlp_checkpoints")
+    n_layers = getattr(args, 'mlp_layers', 1)
+    layer_str = f"_{n_layers}L" if n_layers > 1 else ""
+    ckpt_path = os.path.join(ckpt_dir, f"mlp_180_H{hidden_dim}{layer_str}.pt")
 
-    # Build 180-d features
-    print("Building train features (180-d)...")
-    tr_X, tr_Y, tr_pos = _build_move_features_batch(
-        train_games, POS_START, POS_END, include_pairwise=False)
-    print("Building eval features (180-d)...")
-    ev_X, ev_Y, ev_pos = _build_move_features_batch(
-        eval_games, POS_START, POS_END, include_pairwise=False)
-    print(f"  Train: {tr_X.shape}, Eval: {ev_X.shape}")
+    # Load features (precomputed or from games)
+    cached = _try_load_precomputed(args) if getattr(args, 'precomputed', False) else None
+    if cached is not None:
+        tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos = cached
+        # Need games for max-activating example board states
+        games = load_games(max_files=args.max_files)
+        if args.max_games and len(games) > args.max_games:
+            games = games[:args.max_games]
+        n_eval = max(int(len(games) * 0.1), 100)
+        eval_games = games[len(games) - n_eval:]
+    else:
+        games = load_games(max_files=args.max_files)
+        if args.max_games and len(games) > args.max_games:
+            games = games[:args.max_games]
+        n_eval = max(int(len(games) * 0.1), 100)
+        train_games = games[:len(games) - n_eval]
+        eval_games = games[len(games) - n_eval:]
+        print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+        print("Building train features (180-d)...")
+        tr_X, tr_Y, tr_pos = _build_move_features_batch(
+            train_games, POS_START, POS_END, include_pairwise=False)
+        print("Building eval features (180-d)...")
+        ev_X, ev_Y, ev_pos = _build_move_features_batch(
+            eval_games, POS_START, POS_END, include_pairwise=False)
+        print(f"  Train: {tr_X.shape}, Eval: {ev_X.shape}")
 
-    # Train MLP
-    print(f"\n--- Training MLP H={hidden_dim} ---")
-    best_acc, mlp_even, mlp_odd = _train_mlp_nanda_returning_model(
-        tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
-        device, 180, hidden_dim)
+    if os.path.exists(ckpt_path):
+        print(f"Loading saved checkpoint: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        mlp_even = _build_mlp(ckpt['input_dim'], ckpt['hidden_dim'],
+                              64 * OPTIONS, ckpt.get('num_hidden_layers', 1)).to(device)
+        mlp_odd = _build_mlp(ckpt['input_dim'], ckpt['hidden_dim'],
+                             64 * OPTIONS, ckpt.get('num_hidden_layers', 1)).to(device)
+        mlp_even.load_state_dict(ckpt['even'])
+        mlp_odd.load_state_dict(ckpt['odd'])
+        best_acc, _ = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device)
+        print(f"  Checkpoint accuracy: {best_acc:.4%}")
+    else:
+        # Train MLP from scratch
+        print(f"\n--- Training MLP H={hidden_dim} ---")
+        best_acc, mlp_even, mlp_odd = _train_mlp_nanda_returning_model(
+            tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
+            device, 180, hidden_dim)
     print(f"  Best accuracy: {best_acc:.4%}")
 
     results = {"accuracy": best_acc, "hidden_dim": hidden_dim}
