@@ -1053,6 +1053,50 @@ def _build_move_history_features(game, step, include_pairwise=True):
     return np.concatenate([base, pp, pe, ee])  # (3780,)
 
 
+def _compute_labels_for_games(args):
+    """Worker function for parallel label computation."""
+    games_chunk, pos_start, pos_end = args
+    length = pos_end - pos_start
+    n = len(games_chunk)
+    labels = np.zeros((n, length, 64), dtype=np.int64)
+    for gi, game in enumerate(games_chunk):
+        states = seq_to_state_normal(game)  # (60, 8, 8)
+        for ti, t in enumerate(range(pos_start, pos_end)):
+            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
+            labels[gi, ti] = lbl.reshape(64)
+    return labels
+
+
+def _compute_labels_parallel(games, pos_start, pos_end, n_games):
+    """Compute labels using multiprocessing. Returns (n_samples, 64) array."""
+    from multiprocessing import Pool, cpu_count
+    length = pos_end - pos_start
+    n_samples = n_games * length
+
+    n_workers = min(cpu_count(), 8)
+    chunk_size = (n_games + n_workers - 1) // n_workers
+    chunks = []
+    for i in range(0, n_games, chunk_size):
+        chunks.append((games[i:i+chunk_size], pos_start, pos_end))
+
+    print(f"  Using {n_workers} workers for {n_games} games...", flush=True)
+    with Pool(n_workers) as pool:
+        results = pool.map(_compute_labels_for_games, chunks)
+
+    # Reassemble: each result is (chunk_n, length, 64), need to interleave
+    # into (length * n_games, 64) where index = ti * n_games + gi
+    labels = np.zeros((n_samples, 64), dtype=np.int64)
+    gi_offset = 0
+    for res in results:
+        chunk_n = res.shape[0]
+        for ti in range(length):
+            idx_start = ti * n_games + gi_offset
+            labels[idx_start:idx_start + chunk_n] = res[:, ti]
+        gi_offset += chunk_n
+
+    return labels
+
+
 def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True):
     """Build move-history features and labels for a list of games.
 
@@ -1112,15 +1156,9 @@ def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True)
         ee = even_all[:, idx_i] * even_all[:, idx_j]
         features = np.concatenate([features, pp, pe, ee], axis=1)
 
-    # Compute labels (still needs board simulation)
+    # Compute labels (board simulation — parallelized across CPU cores)
     print("  computing board states for labels...", flush=True)
-    labels = np.zeros((n_samples, 64), dtype=np.int64)
-    for gi, game in enumerate(tqdm(games, desc="  labels", leave=False)):
-        states = seq_to_state_normal(game)  # (60, 8, 8)
-        for ti, t in enumerate(range(pos_start, pos_end)):
-            idx = ti * n_games + gi
-            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
-            labels[idx] = lbl.reshape(64)
+    labels = _compute_labels_parallel(games, pos_start, pos_end, n_games)
 
     return (torch.tensor(features, dtype=torch.float32),
             torch.tensor(labels, dtype=torch.long),
@@ -1505,14 +1543,47 @@ def _build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers=1):
     return nn.Sequential(*layers)
 
 
+def _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device, batch_size=1024):
+    """Evaluate an even/odd MLP pair. Returns (accuracy, mean_loss)."""
+    mlp_even.eval()
+    mlp_odd.eval()
+    correct = 0
+    total = 0
+    losses = []
+    with torch.no_grad():
+        for i in range(0, len(ev_X), batch_size):
+            x = ev_X[i:i + batch_size].to(device)
+            y = ev_Y[i:i + batch_size].to(device)
+            pos = ev_pos[i:i + batch_size]
+            even_mask = (pos % 2 == 0)
+            odd_mask = ~even_mask
+
+            preds = torch.zeros_like(y)
+            if even_mask.any():
+                logits_e = mlp_even(x[even_mask]).view(-1, 64, OPTIONS)
+                preds[even_mask] = logits_e.argmax(-1)
+                losses.append(nn.functional.cross_entropy(
+                    logits_e.reshape(-1, OPTIONS),
+                    y[even_mask].reshape(-1)).item())
+            if odd_mask.any():
+                logits_o = mlp_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                preds[odd_mask] = logits_o.argmax(-1)
+                losses.append(nn.functional.cross_entropy(
+                    logits_o.reshape(-1, OPTIONS),
+                    y[odd_mask].reshape(-1)).item())
+            correct += (preds == y).sum().item()
+            total += y.numel()
+    return correct / total, np.mean(losses)
+
+
 def _train_mlp_nanda(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
                      device, input_dim, hidden_dim,
                      lr=1e-3, epochs=16, batch_size=1024,
-                     num_hidden_layers=1):
+                     num_hidden_layers=1, save_path=None):
     """Train an MLP with Nanda's even/odd split.
 
-    Even MLP: Linear(input_dim, hidden_dim) -> [ReLU -> Linear(hidden_dim, hidden_dim)] * (L-1) -> ReLU -> Linear(hidden_dim, 64*3)
-    Odd MLP:  same architecture, separate weights
+    Returns (best_acc, mlp_even, mlp_odd) if save_path is given, else best_acc.
+    If save_path is given, saves best checkpoint to save_path.
     """
     mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden_layers).to(device)
     mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden_layers).to(device)
@@ -1523,6 +1594,7 @@ def _train_mlp_nanda(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
         optimizer, mode='min', factor=0.75, patience=1)
 
     best_acc = 0.0
+    best_state = None
     for epoch in range(1, epochs + 1):
         mlp_even.train()
         mlp_odd.train()
@@ -1549,42 +1621,36 @@ def _train_mlp_nanda(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
             optimizer.step()
 
         # Eval
-        mlp_even.eval()
-        mlp_odd.eval()
-        correct = 0
-        total = 0
-        losses = []
-        with torch.no_grad():
-            for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y = ev_Y[i:i + batch_size].to(device)
-                pos = ev_pos[i:i + batch_size]
-                even_mask = (pos % 2 == 0)
-                odd_mask = ~even_mask
-
-                preds = torch.zeros_like(y)
-                if even_mask.any():
-                    logits_e = mlp_even(x[even_mask]).view(-1, 64, OPTIONS)
-                    preds[even_mask] = logits_e.argmax(-1)
-                    losses.append(nn.functional.cross_entropy(
-                        logits_e.reshape(-1, OPTIONS),
-                        y[even_mask].reshape(-1)).item())
-                if odd_mask.any():
-                    logits_o = mlp_odd(x[odd_mask]).view(-1, 64, OPTIONS)
-                    preds[odd_mask] = logits_o.argmax(-1)
-                    losses.append(nn.functional.cross_entropy(
-                        logits_o.reshape(-1, OPTIONS),
-                        y[odd_mask].reshape(-1)).item())
-                correct += (preds == y).sum().item()
-                total += y.numel()
-
-        acc = correct / total
-        best_acc = max(best_acc, acc)
-        scheduler.step(np.mean(losses))
+        acc, mean_loss = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos,
+                                         device, batch_size)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {
+                'even': {k: v.cpu().clone() for k, v in mlp_even.state_dict().items()},
+                'odd': {k: v.cpu().clone() for k, v in mlp_odd.state_dict().items()},
+            }
+        scheduler.step(mean_loss)
         cur_lr = optimizer.param_groups[0]['lr']
-        print(f"  Epoch {epoch}: acc={acc:.4%}  loss={np.mean(losses):.5f}  lr={cur_lr:.2e}",
+        print(f"  Epoch {epoch}: acc={acc:.4%}  loss={mean_loss:.5f}  lr={cur_lr:.2e}",
               flush=True)
 
+    # Restore best and optionally save
+    if best_state is not None:
+        mlp_even.load_state_dict(best_state['even'])
+        mlp_odd.load_state_dict(best_state['odd'])
+        if save_path is not None:
+            torch.save({
+                'even': best_state['even'],
+                'odd': best_state['odd'],
+                'hidden_dim': hidden_dim,
+                'input_dim': input_dim,
+                'num_hidden_layers': num_hidden_layers,
+                'best_acc': best_acc,
+            }, save_path)
+            print(f"  Saved checkpoint to {save_path}")
+
+    if save_path is not None:
+        return best_acc, mlp_even, mlp_odd
     return best_acc
 
 
@@ -1877,6 +1943,18 @@ def experiment_mlp(args):
         ev_X, ev_Y, ev_pos = _build_move_features_batch(
             eval_games, POS_START, POS_END, include_pairwise=False)
 
+    # Cap at max_games worth of samples if requested
+    if args.max_games:
+        max_samples = args.max_games * LENGTH
+        if len(tr_X) + len(ev_X) > max_samples:
+            n_eval = max(int(max_samples * 0.1), 49 * 100)
+            n_train = max_samples - n_eval
+            if n_train < len(tr_X):
+                tr_X, tr_Y, tr_pos = tr_X[:n_train], tr_Y[:n_train], tr_pos[:n_train]
+            if n_eval < len(ev_X):
+                ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
+            print(f"  Capped to ~{args.max_games} games: {len(tr_X)} train, {len(ev_X)} eval samples")
+
     print(f"  Feature shape: {tr_X.shape}")
 
     # Determine which hidden dims to run
@@ -1893,12 +1971,19 @@ def experiment_mlp(args):
 
     # MLP on 180-d with various hidden dimensions
     n_layers = getattr(args, 'mlp_layers', 1)
+    n_epochs = getattr(args, 'epochs', None) or 16
+    ckpt_dir = os.path.join(args.output_dir, "mlp_checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
     for H in hidden_dims:
         layer_str = f"_{n_layers}L" if n_layers > 1 else ""
-        print(f"\n--- MLP 180-d hidden={H} x{n_layers} layers with even/odd split ---")
+        print(f"\n--- MLP 180-d hidden={H} x{n_layers} layers, {n_epochs} epochs ---")
+        save_path = os.path.join(ckpt_dir, f"mlp_180_H{H}{layer_str}.pt")
         acc_mlp = _train_mlp_nanda(
             tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
-            device, 180, H, num_hidden_layers=n_layers)
+            device, 180, H, num_hidden_layers=n_layers,
+            epochs=n_epochs, save_path=save_path)
+        if isinstance(acc_mlp, tuple):
+            acc_mlp = acc_mlp[0]  # _train_mlp_nanda returns (acc, even, odd) when save_path set
         results[f"mlp_180_H{H}{layer_str}"] = acc_mlp
 
     # MLP on 3780-d pairwise features (computed on-the-fly from 180-d base)
@@ -1917,7 +2002,218 @@ def experiment_mlp(args):
         print(f"  {k}: {v:.4%}")
 
     _save_results(args, "mlp", results)
+
+    # Plot accuracy vs hidden dim
+    mlp_results = {k: v for k, v in results.items() if k.startswith("mlp_180_H")}
+    if len(mlp_results) > 1:
+        _plot_mlp_width_sweep(mlp_results, args.output_dir)
+
     return results
+
+
+def _plot_mlp_width_sweep(mlp_results, output_dir):
+    """Plot accuracy vs hidden dimension."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    # Parse H values and accuracies
+    items = []
+    for k, v in mlp_results.items():
+        # k is like "mlp_180_H64" or "mlp_180_H1024_2L"
+        h_str = k.split("_H")[1].split("_")[0]
+        items.append((int(h_str), v * 100))
+    items.sort()
+    hs, accs = zip(*items)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(hs, accs, 'o-', markersize=6, linewidth=2)
+    ax.set_xscale('log', base=2)
+    ax.set_xlabel('Hidden dimension (H)')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title('MLP on 180-d Move Features: Accuracy vs Width')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(hs)
+    ax.set_xticklabels([str(h) for h in hs], rotation=45)
+
+    out_path = os.path.join(output_dir, 'mlp_width_sweep.png')
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f"  Saved plot to {out_path}")
+    plt.close()
+
+
+def experiment_mlp_dropout(args):
+    """Evaluate trained MLP with hidden unit dropout (zeroing out units)."""
+    device = get_device()
+    print(f"Device: {device}")
+
+    cached = _try_load_precomputed(args)
+    if cached is not None:
+        tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos = cached
+    else:
+        games = load_games(max_files=args.max_files)
+        if args.max_games and len(games) > args.max_games:
+            games = games[:args.max_games]
+        n_eval = max(int(len(games) * 0.1), 100)
+        train_games = games[:len(games) - n_eval]
+        eval_games = games[len(games) - n_eval:]
+        print(f"Using {len(games)} games ({len(train_games)} train, {len(eval_games)} eval)")
+        print("Building eval features (180-d base)...")
+        _, _, _ = None, None, None  # don't need train features
+        ev_X, ev_Y, ev_pos = _build_move_features_batch(
+            eval_games, POS_START, POS_END, include_pairwise=False)
+
+    print(f"  Eval shape: {ev_X.shape}")
+
+    # Load the H=1024 checkpoint
+    ckpt_dir = os.path.join(args.output_dir, "mlp_checkpoints")
+    H = args.mlp_hidden[0] if args.mlp_hidden else 1024
+    n_layers = getattr(args, 'mlp_layers', 1)
+    layer_str = f"_{n_layers}L" if n_layers > 1 else ""
+    ckpt_path = os.path.join(ckpt_dir, f"mlp_180_H{H}{layer_str}.pt")
+    print(f"Loading checkpoint: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device)
+
+    mlp_even = _build_mlp(ckpt['input_dim'], ckpt['hidden_dim'],
+                          64 * OPTIONS, ckpt.get('num_hidden_layers', 1)).to(device)
+    mlp_odd = _build_mlp(ckpt['input_dim'], ckpt['hidden_dim'],
+                         64 * OPTIONS, ckpt.get('num_hidden_layers', 1)).to(device)
+    mlp_even.load_state_dict(ckpt['even'])
+    mlp_odd.load_state_dict(ckpt['odd'])
+
+    # Baseline accuracy (no dropout)
+    base_acc, _ = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device)
+    print(f"Baseline (0 dropped): {base_acc:.4%}")
+
+    # Dropout schedule: 0, 4, 8, 16, 32, 64, 128, 256, 512
+    drop_counts = [0, 4, 8, 16, 32, 64, 128, 256, 512]
+    drop_counts = [d for d in drop_counts if d <= H]
+
+    # Rank units by L2 norm of output weights (importance)
+    # For a Sequential: [Linear, ReLU, Linear], output layer is index 2
+    # Weight shape: (64*3, H) — each column is one hidden unit's contribution
+    out_weight_even = mlp_even[-1].weight.data  # (192, H)
+    out_weight_odd = mlp_odd[-1].weight.data    # (192, H)
+    importance_even = out_weight_even.norm(dim=0)  # (H,)
+    importance_odd = out_weight_odd.norm(dim=0)
+
+    # Sort by importance (least important first for progressive dropout)
+    order_even = importance_even.argsort()  # ascending
+    order_odd = importance_odd.argsort()
+
+    results = {}
+    n_trials = 5  # average over random orderings too
+
+    for n_drop in drop_counts:
+        if n_drop == 0:
+            results[0] = base_acc
+            continue
+
+        # Method 1: Drop least important units
+        accs_least = []
+        for mlp, order, state_key in [(mlp_even, order_even, 'even'),
+                                       (mlp_odd, order_odd, 'odd')]:
+            mlp.load_state_dict(ckpt[state_key])
+
+        # Zero out least important units in the first hidden layer output
+        mask_even = torch.ones(H, device=device)
+        mask_odd = torch.ones(H, device=device)
+        mask_even[order_even[:n_drop]] = 0
+        mask_odd[order_odd[:n_drop]] = 0
+
+        # Apply mask by modifying the bias and zeroing weights
+        # Hook approach: modify forward pass
+        with torch.no_grad():
+            # Save original weights
+            orig_even_w = mlp_even[0].weight.data.clone()
+            orig_even_b = mlp_even[0].bias.data.clone()
+            orig_odd_w = mlp_odd[0].weight.data.clone()
+            orig_odd_b = mlp_odd[0].bias.data.clone()
+
+            # Zero out dropped units' rows in first layer
+            mlp_even[0].weight.data[order_even[:n_drop]] = 0
+            mlp_even[0].bias.data[order_even[:n_drop]] = 0
+            mlp_odd[0].weight.data[order_odd[:n_drop]] = 0
+            mlp_odd[0].bias.data[order_odd[:n_drop]] = 0
+
+        acc_least, _ = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device)
+
+        # Method 2: Drop random units (average over trials)
+        accs_random = []
+        for trial in range(n_trials):
+            mlp_even.load_state_dict(ckpt['even'])
+            mlp_odd.load_state_dict(ckpt['odd'])
+            mlp_even.to(device)
+            mlp_odd.to(device)
+
+            rng = np.random.RandomState(trial)
+            rand_even = rng.permutation(H)[:n_drop]
+            rand_odd = rng.permutation(H)[:n_drop]
+
+            with torch.no_grad():
+                mlp_even[0].weight.data[rand_even] = 0
+                mlp_even[0].bias.data[rand_even] = 0
+                mlp_odd[0].weight.data[rand_odd] = 0
+                mlp_odd[0].bias.data[rand_odd] = 0
+
+            acc_rand, _ = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos, device)
+            accs_random.append(acc_rand)
+
+        acc_random = np.mean(accs_random)
+        results[n_drop] = {
+            'least_important': acc_least,
+            'random': acc_random,
+            'random_std': np.std(accs_random),
+        }
+        print(f"  Drop {n_drop:>4}: least_important={acc_least:.4%}  "
+              f"random={acc_random:.4%} ± {np.std(accs_random):.4%}")
+
+        # Restore
+        mlp_even.load_state_dict(ckpt['even'])
+        mlp_odd.load_state_dict(ckpt['odd'])
+        mlp_even.to(device)
+        mlp_odd.to(device)
+
+    # Plot
+    _plot_mlp_dropout(results, H, args.output_dir)
+    _save_results(args, "mlp_dropout", results)
+    return results
+
+
+def _plot_mlp_dropout(results, H, output_dir):
+    """Plot accuracy vs number of dropped hidden units."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    drop_counts = sorted(results.keys())
+    acc_least = []
+    acc_random = []
+    acc_random_std = []
+    for d in drop_counts:
+        if d == 0:
+            acc_least.append(results[0] * 100)
+            acc_random.append(results[0] * 100)
+            acc_random_std.append(0)
+        else:
+            acc_least.append(results[d]['least_important'] * 100)
+            acc_random.append(results[d]['random'] * 100)
+            acc_random_std.append(results[d]['random_std'] * 100)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(drop_counts, acc_least, 'o-', label='Drop least important', markersize=6)
+    ax.errorbar(drop_counts, acc_random, yerr=acc_random_std,
+                fmt='s-', label='Drop random', markersize=5, capsize=3)
+    ax.set_xlabel(f'Number of hidden units dropped (out of {H})')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title(f'MLP H={H} on 180-d Features: Effect of Dropping Hidden Units')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    out_path = os.path.join(output_dir, 'mlp_dropout.png')
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    print(f"  Saved plot to {out_path}")
+    plt.close()
 
 
 # ================== Part A: Fix Heuristic + Activations Combination =========
@@ -3410,7 +3706,7 @@ def parse_args():
                             "by_move", "heuristic", "brute_force",
                             "learned_heuristic", "mlp", "precompute",
                             "combine_heuristic", "mlp_analysis",
-                            "probe_directions"],
+                            "probe_directions", "mlp_dropout"],
                    help="Which experiment to run")
     p.add_argument("--ckpt-path", type=str, default="ckpts/gpt_synthetic.ckpt")
     p.add_argument("--layer", type=int, default=6)
@@ -3424,6 +3720,8 @@ def parse_args():
                    help="For mlp experiment: skip linear baseline and pairwise MLPs")
     p.add_argument("--mlp-layers", type=int, default=1,
                    help="Number of hidden layers in MLP (default: 1)")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Training epochs (default: 16 for mlp, 10 for others)")
     p.add_argument("--precomputed", action="store_true",
                    help="Load precomputed features from feature_chunks/ (skip feature building)")
     p.add_argument("--chunk-id", type=int, default=None,
@@ -3453,6 +3751,7 @@ def main():
         "combine_heuristic": experiment_combine_heuristic,
         "mlp_analysis": experiment_mlp_analysis,
         "probe_directions": experiment_probe_directions,
+        "mlp_dropout": experiment_mlp_dropout,
     }
 
     experiments[args.experiment](args)

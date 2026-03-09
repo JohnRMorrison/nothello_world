@@ -6,18 +6,22 @@
 # Two-step workflow:
 #
 #   Step 1: Precompute features in parallel (one job per file chunk)
-#     sbatch --array=0-25 mlp_feature_search.sh precompute
-#     (26 chunks × 10 files each = 260 files, ~26M games)
+#     sbatch --array=0-3 mlp_feature_search.sh precompute
+#     (4 chunks × 3 files each = 12 files, ~1.2M games)
 #
-#   Step 2: Train MLPs using cached features
-#     sbatch mlp_feature_search.sh train hidden=1024,2048
+#   Step 2: Train MLPs (width sweep), one per array task
+#     sbatch --array=0-8 mlp_feature_search.sh train
+#     (trains H=4,8,16,32,64,128,256,512,1024 — one per task)
+#
+#   Step 3: Dropout evaluation on trained H=1024 MLP
+#     sbatch mlp_feature_search.sh dropout
 #
 # Or run single-job (small scale):
 #     sbatch mlp_feature_search.sh
 # ============================================================================
 
 #SBATCH --job-name=mlp_feat
-#SBATCH -c 4
+#SBATCH -c 8
 #SBATCH --time=4:00:00
 #SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
@@ -40,21 +44,28 @@ mkdir -p logs
 cd $SLURM_SUBMIT_DIR
 
 # Parse arguments
-FILES_PER_CHUNK=10
-HIDDEN_DIMS="1024 2048"
-MODE="single"  # precompute, train, or single
+FILES_PER_CHUNK=3
+MODE="single"  # precompute, train, dropout, or single
+MAX_GAMES=1000000
+EPOCHS=10
 for arg in "$@"; do
     if [[ "$arg" == chunk=* ]]; then
         FILES_PER_CHUNK="${arg#chunk=}"
-    elif [[ "$arg" == hidden=* ]]; then
-        HIDDEN_DIMS="${arg#hidden=}"
-        HIDDEN_DIMS="${HIDDEN_DIMS//,/ }"
+    elif [[ "$arg" == games=* ]]; then
+        MAX_GAMES="${arg#games=}"
+    elif [[ "$arg" == epochs=* ]]; then
+        EPOCHS="${arg#epochs=}"
     elif [[ "$arg" == "precompute" ]]; then
         MODE="precompute"
     elif [[ "$arg" == "train" ]]; then
         MODE="train"
+    elif [[ "$arg" == "dropout" ]]; then
+        MODE="dropout"
     fi
 done
+
+# Hidden dims indexed by array task ID
+HIDDEN_ARRAY=(4 8 16 32 64 128 256 512 1024)
 
 OUTPUT_DIR=experiments/mathematical_transformation_experiments/heuristic_probe_results
 
@@ -81,15 +92,28 @@ if [[ "$MODE" == "precompute" ]]; then
         --output-dir $OUTPUT_DIR
 
 elif [[ "$MODE" == "train" ]]; then
-    # Train using precomputed chunks
-    echo "Training with precomputed features"
-    echo "Hidden dims: ${HIDDEN_DIMS}"
+    # Each array task trains one hidden dim
+    TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
+    H=${HIDDEN_ARRAY[$TASK_ID]}
+    echo "Training MLP H=${H} on ${MAX_GAMES} games, ${EPOCHS} epochs"
 
     CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
         --experiment mlp \
         --precomputed \
-        --mlp-hidden $HIDDEN_DIMS \
+        --mlp-hidden $H \
         --mlp-only \
+        --max-games $MAX_GAMES \
+        --epochs $EPOCHS \
+        --output-dir $OUTPUT_DIR
+
+elif [[ "$MODE" == "dropout" ]]; then
+    # Dropout evaluation on trained H=1024 MLP
+    echo "Dropout evaluation"
+    CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
+        --experiment mlp_dropout \
+        --precomputed \
+        --mlp-hidden 1024 \
+        --max-games $MAX_GAMES \
         --output-dir $OUTPUT_DIR
 
 else
@@ -98,9 +122,10 @@ else
     CUDA_VISIBLE_DEVICES=0 python -m experiments.mathematical_transformation_experiments.heuristic_probe_experiments \
         --experiment mlp \
         --max-files $FILES_PER_CHUNK \
-        --max-games 99999999 \
-        --mlp-hidden $HIDDEN_DIMS \
+        --max-games $MAX_GAMES \
+        --mlp-hidden ${HIDDEN_ARRAY[@]} \
         --mlp-only \
+        --epochs $EPOCHS \
         --output-dir $OUTPUT_DIR
 fi
 

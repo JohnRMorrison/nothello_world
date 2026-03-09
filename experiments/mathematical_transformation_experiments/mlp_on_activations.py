@@ -72,17 +72,24 @@ def do_extract(args):
     os.makedirs(out_dir, exist_ok=True)
 
     d_model = 512  # Othello-GPT embedding dim
+    n_layers = 9   # layers 0-8 (8 blocks, layer i = after block i)
     game_batch = 64
 
-    def extract_to_memmap(model, games_list, device, layer, block_size,
-                          acts_path, labels_path=None):
-        """Extract activations directly to memory-mapped files (no RAM accumulation)."""
+    def extract_all_layers(model, games_list, device, block_size, out_dir, split):
+        """Extract all layers in a single forward pass per batch, write to memmaps."""
         n_total = len(games_list) * LENGTH
-        acts_mm = np.memmap(acts_path, dtype=np.float16, mode='w+',
-                            shape=(n_total, d_model))
-        if labels_path is not None:
-            labels_mm = np.memmap(labels_path, dtype=np.int8, mode='w+',
-                                  shape=(n_total, 64))
+
+        # Create memmaps for all layers + labels
+        acts_mms = []
+        for layer in range(n_layers):
+            path = os.path.join(out_dir, f'layer{layer}_{split}.raw')
+            mm = np.memmap(path, dtype=np.float16, mode='w+',
+                           shape=(n_total, d_model))
+            acts_mms.append(mm)
+
+        labels_path = os.path.join(out_dir, f'labels_{split}.raw')
+        labels_mm = np.memmap(labels_path, dtype=np.int8, mode='w+',
+                              shape=(n_total, 64))
 
         row = 0
         for start in range(0, len(games_list), game_batch):
@@ -91,25 +98,30 @@ def do_extract(args):
             batch_games = games_list[start:start + game_batch]
             tokens = tokenize_games(batch_games, seq_len=block_size).to(device)
 
+            # Single forward pass: run through all blocks, save each layer
             with torch.no_grad():
-                h = extract_activations(model, tokens, layer)
-            h = h[:, POS_START:POS_END].cpu().numpy()  # (B, 49, 512)
+                b, t = tokens.size()
+                tok = model.tok_emb(tokens)
+                pos = model.pos_emb[:, :t, :]
+                h = model.drop(tok + pos)
+                for layer_idx, block in enumerate(model.blocks):
+                    h = block(h)
+                    chunk = h[:, POS_START:POS_END].cpu().numpy()
+                    n_games = len(batch_games)
+                    flat = chunk.reshape(n_games * LENGTH, d_model).astype(np.float16)
+                    acts_mms[layer_idx][row:row + len(flat)] = flat
 
-            if labels_path is not None:
-                states = get_board_states(batch_games, seq_to_state_normal, POS_START, POS_END)
-                labels = states_to_labels(states).reshape(len(batch_games), LENGTH, 64)
+            # Labels (only need to compute once)
+            states = get_board_states(batch_games, seq_to_state_normal, POS_START, POS_END)
+            labels = states_to_labels(states).reshape(len(batch_games), LENGTH, 64)
+            labels_mm[row:row + len(flat)] = labels.reshape(
+                len(batch_games) * LENGTH, 64).astype(np.int8)
 
-            n_games = len(batch_games)
-            chunk = h.reshape(n_games * LENGTH, d_model).astype(np.float16)
-            acts_mm[row:row + len(chunk)] = chunk
-            if labels_path is not None:
-                labels_mm[row:row + len(chunk)] = labels.reshape(
-                    n_games * LENGTH, 64).astype(np.int8)
-            row += len(chunk)
+            row += len(flat)
 
-        acts_mm.flush()
-        if labels_path is not None:
-            labels_mm.flush()
+        for mm in acts_mms:
+            mm.flush()
+        labels_mm.flush()
         return n_total
 
     # Build position arrays
@@ -120,31 +132,16 @@ def do_extract(args):
     np.savez_compressed(os.path.join(out_dir, 'positions.npz'),
                         tr_pos=tr_pos, ev_pos=ev_pos)
 
-    # Extract layer 0 + labels
-    for layer in range(9):
-        print(f"\nExtracting layer {layer}...")
-        t0 = time.time()
+    # Extract all layers in one pass
+    print("\nExtracting train activations (all layers, single pass)...")
+    t0 = time.time()
+    extract_all_layers(model, train_games, device, block_size, out_dir, 'train')
+    print(f"  Train done in {time.time()-t0:.0f}s")
 
-        tr_acts_path = os.path.join(out_dir, f'layer{layer}_train.raw')
-        ev_acts_path = os.path.join(out_dir, f'layer{layer}_eval.raw')
-
-        if layer == 0:
-            tr_labels_path = os.path.join(out_dir, 'labels_train.raw')
-            ev_labels_path = os.path.join(out_dir, 'labels_eval.raw')
-        else:
-            tr_labels_path = None
-            ev_labels_path = None
-
-        extract_to_memmap(model, train_games, device, layer, block_size,
-                          tr_acts_path, tr_labels_path)
-        extract_to_memmap(model, eval_games, device, layer, block_size,
-                          ev_acts_path, ev_labels_path)
-
-        elapsed = time.time() - t0
-        tr_size_mb = os.path.getsize(tr_acts_path) / 1e6
-        ev_size_mb = os.path.getsize(ev_acts_path) / 1e6
-        print(f"  Layer {layer} done in {elapsed:.0f}s. "
-              f"Train: {tr_size_mb:.0f}MB, Eval: {ev_size_mb:.0f}MB")
+    print("\nExtracting eval activations (all layers, single pass)...")
+    t0 = time.time()
+    extract_all_layers(model, eval_games, device, block_size, out_dir, 'eval')
+    print(f"  Eval done in {time.time()-t0:.0f}s")
 
     # Save metadata
     meta = {
@@ -152,15 +149,15 @@ def do_extract(args):
         'n_eval_games': len(eval_games),
         'tr_n': tr_n, 'ev_n': ev_n,
         'd_model': d_model,
-        'n_layers': 9,
+        'n_layers': n_layers,
     }
     with open(os.path.join(out_dir, 'metadata.json'), 'w') as f:
         json.dump(meta, f, indent=2)
 
     print(f"\nAll saved to {out_dir}/")
-    for f in sorted(os.listdir(out_dir)):
-        size_mb = os.path.getsize(os.path.join(out_dir, f)) / 1e6
-        print(f"  {f}: {size_mb:.1f} MB")
+    for fn in sorted(os.listdir(out_dir)):
+        size_mb = os.path.getsize(os.path.join(out_dir, fn)) / 1e6
+        print(f"  {fn}: {size_mb:.1f} MB")
 
 
 def do_train(args):
