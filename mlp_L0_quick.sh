@@ -2,7 +2,7 @@
 #SBATCH --job-name=mlp_L0
 #SBATCH -c 4
 #SBATCH --time=2:00:00
-#SBATCH --mem=60GB
+#SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/mlp_L0_%j.out
 #SBATCH --account=nklab
@@ -31,13 +31,19 @@ print(f'Loaded {len(games)} games', flush=True)
 tr, ev = games[:225000], games[225000:]
 print('Extracting train activations...', flush=True)
 tr_X, tr_Y = collect_activations_and_labels(model, tr, device, 0, bs)
+tr_X, tr_Y = tr_X.cpu(), tr_Y.cpu()
 tr_pos = torch.tensor([POS_START + (i % LENGTH) for i in range(len(tr_X))])
 print(f'Train: {tr_X.shape}', flush=True)
 print('Extracting eval activations...', flush=True)
 ev_X, ev_Y = collect_activations_and_labels(model, ev, device, 0, bs)
+ev_X, ev_Y = ev_X.cpu(), ev_Y.cpu()
 ev_pos = torch.tensor([POS_START + (i % LENGTH) for i in range(len(ev_X))])
 print(f'Eval: {ev_X.shape}', flush=True)
+# Free model from GPU
+del model
+torch.cuda.empty_cache()
+import gc; gc.collect()
 print('Training MLP H=1024...', flush=True)
-acc = _train_mlp_nanda(tr_X.cpu(), tr_Y.cpu(), tr_pos, ev_X.cpu(), ev_Y.cpu(), ev_pos, device, 512, 1024, epochs=16)
+acc = _train_mlp_nanda(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos, device, 512, 1024, epochs=16)
 print(f'MLP H=1024 on L0: {acc}')
 "
