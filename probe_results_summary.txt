@@ -433,3 +433,183 @@ activations 512-d), then concatenate (5278-d) and train probe.
     binary heuristics and continuous activations wasn't the problem.
   - The original failure of naive concatenation was due to the optimizer
     ignoring the weaker feature group, not a normalization issue.
+
+================================================================================
+PART 10: MLP on Move-History Features — Scaling to 1M Games
+================================================================================
+
+Continued from Part 8, training on ~1M games on cluster with GPU.
+
+180-d base features, Nanda even/odd split:
+
+  Hidden dim  |  2K games  |  80K games  | 250K games  |  1M games
+  ------------|------------|-------------|-------------|----------
+  Linear      |   83.4%    |   87.3%     |     —       |    —
+  H = 256     |   86.3%    |   90.4%     |     —       |    —
+  H = 512     |   86.4%    |   91.9%     |     —       |    —
+  H = 1024    |   86.6%    |   92.5%     |   93.1%     |  ~93.3%
+  H = 2048    |     —      |     —       |   93.3%     |  (running)
+
+Key observations:
+  - Diminishing returns: 250K -> 1M games gives <0.2% improvement for H=1024.
+  - The accuracy ceiling at ~93.3% appears to be a fundamental limit of what
+    2-layer MLPs can extract from the 180-d move-history features, not a
+    data limitation.
+  - For reference: Nanda probe on Othello-GPT L0 = 87.1%, L5 = 99.2%.
+    The ~6% gap (93.3% -> 99.2%) represents what transformer depth computes
+    beyond what is available from move-sequence statistics.
+
+================================================================================
+PART 11: MLP Unit Analysis and Interpretability (H=256, 500 games)
+================================================================================
+
+Analyzed the trained MLP (H=256) to understand what heuristics the hidden units
+learn. Each unit was categorized by its input weight structure and validated
+against individual cell accuracy.
+
+--- Weight Structure Categories ---
+
+  Category      | Count | Description
+  --------------|-------|-----------------------------------------------------
+  Parity        |  216  | Primarily reads from even[i] features
+  Placement     |  210  | Primarily reads from played[i] features
+  Temporal      |   24  | Primarily reads from when[i] features
+  Interaction   |   62  | Mixed weights across multiple feature groups
+
+--- Progressive Ablation ---
+
+  Top units used | Accuracy
+  ---------------|----------
+  Top 50         |  54.8%
+  Top 100        |  56.5%
+  Top 200        |  67.4%
+  All 256        |  82.1%
+
+Key observations:
+  - Parity and placement features dominate — temporal features are rarely
+    primary, suggesting the MLP relies more on what was played and by whom
+    than on when it was played.
+  - The distribution is broad: even the top 200 units only reach 67.4%,
+    with the last 56 units contributing a large jump to 82.1%. Many units
+    are specialized and collectively important.
+  - Individual top units achieve single-cell accuracies of 60-82%,
+    suggesting they specialize in tracking specific board positions.
+
+================================================================================
+PART 12: Probe Direction Comparison Across Board States (500 games, preliminary)
+================================================================================
+
+Trains 4 Nanda even/odd probes per layer (0-8) on Othello-GPT activations:
+  - Othello:    Real Othello board state
+  - Othello2:   Same task, independent random seed (reproducibility check)
+  - No Flip:    Board state without flipping (placement tracking only)
+  - Shuffled:   Real Othello labels with sample order randomized (baseline —
+                breaks activation-label correspondence, preserves label stats)
+
+For each pair, measures:
+  - |Cosine similarity|: mean absolute cosine similarity of black-white
+    direction vectors across 64 cells (from even probe weights)
+  - Subspace overlap: ||V1_k^T V2_k||_F^2 / k, where V1_k, V2_k are
+    top-k right singular vectors of each probe's weight matrix (192 x 512)
+
+--- A. Probe Accuracy ---
+
+Layer | Othello  | Othello2 | No Flip  | Shuffled
+------|----------|----------|----------|----------
+  0   |  87.3%   |  87.3%   |  86.4%   |  53.4%
+  1   |  93.7%   |  93.7%   |  87.2%   |  53.1%
+  2   |  97.1%   |  97.1%   |  87.3%   |  53.0%
+  3   |  98.5%   |  98.5%   |  87.2%   |  52.8%
+  4   |  99.1%   |  99.1%   |  87.0%   |  52.6%
+  5   |  99.0%   |  98.9%   |  86.5%   |  52.4%
+  6   |  97.9%   |  98.0%   |  85.6%   |  52.4%
+  7   |  97.4%   |  97.4%   |  85.3%   |  52.5%
+  8   |  97.4%   |  97.4%   |  85.3%   |  52.5%
+
+Shuffled accuracy (~53%) confirms labels are unlearnable — near 3-class chance.
+Othello and Othello2 match almost exactly, confirming probe reproducibility.
+
+--- B. Pairwise Direction Similarity (mean |cosine similarity| over 64 cells) ---
+
+Layer | Oth vs Oth2 | Oth vs NF | Oth vs Shuf | NF vs Shuf
+------|-------------|-----------|-------------|----------
+  0   |    0.968    |   0.073   |    0.033    |   0.055
+  1   |    0.974    |   0.063   |    0.032    |   0.047
+  2   |    0.973    |   0.055   |    0.029    |   0.044
+  3   |    0.968    |   0.050   |    0.030    |   0.042
+  4   |    0.960    |   0.045   |    0.030    |   0.036
+  5   |    0.954    |   0.046   |    0.029    |   0.034
+  6   |    0.949    |   0.050   |    0.033    |   0.036
+  7   |    0.945    |   0.058   |    0.033    |   0.038
+  8   |    0.945    |   0.058   |    0.033    |   0.038
+
+Key: Othello vs Othello2 ~0.95-0.97 (highly reproducible directions).
+All other pairs near zero — Othello, No Flip, and Shuffled probes find
+completely independent directions at every layer.
+
+--- C. Pairwise Subspace Overlap ---
+
+Layer | Oth vs Oth2 | Oth vs NF | Oth vs Shuf | NF vs Shuf
+------|-------------|-----------|-------------|----------
+  0   |    0.94     |   0.69    |    0.23     |   0.24
+  1   |    0.94     |   0.65    |    0.23     |   0.24
+  2   |    0.93     |   0.61    |    0.23     |   0.24
+  3   |    0.92     |   0.58    |    0.22     |   0.24
+  4   |    0.89     |   0.55    |    0.21     |   0.23
+  5   |    0.86     |   0.52    |    0.20     |   0.22
+  6   |    0.84     |   0.52    |    0.22     |   0.23
+  7   |    0.81     |   0.51    |    0.23     |   0.24
+  8   |    0.81     |   0.51    |    0.23     |   0.24
+
+Shuffled subspace overlap (~0.22) is the random baseline. No Flip overlap
+with Othello (0.51-0.69) is genuinely above baseline — the probes read from
+partially overlapping regions of activation space, even though individual
+directions are unrelated.
+
+--- D. Cross-Layer Direction Stability (adjacent layers, mean |cos|) ---
+
+               Othello              No Flip
+  L0->L1:      0.83                  0.84
+  L1->L2:      0.89                  0.89
+  L2->L3:      0.91                  0.89
+  L3->L4:      0.90                  0.87
+  L4->L5:      0.93                  0.85
+  L5->L6:      0.96                  0.86
+  L6->L7:      0.99                  0.97
+  L7->L8:      1.00                  1.00
+  L0->L8:      0.57                  0.45
+
+Othello probe directions evolve gradually and stabilize in later layers
+(L5-L8 very similar). No Flip directions are less stable — they shift more
+between layers because the network doesn't natively represent that information.
+
+--- E. Key Findings ---
+
+  1. DIRECTION INDEPENDENCE: Othello and No Flip probes find completely
+     different directions at every layer (|cos| ~ 0.05, indistinguishable
+     from the shuffled baseline of ~0.03). Despite both achieving high
+     accuracy, they read orthogonal information from the same activations.
+
+  2. PARTIAL SUBSPACE SHARING: Despite orthogonal directions, Othello and
+     No Flip probes read from partially overlapping subspaces (overlap ~0.55
+     vs random baseline ~0.22). The probes use different linear combinations
+     within a shared region of activation space.
+
+  3. PROBE REPRODUCIBILITY: Two independently trained Othello probes
+     (Othello vs Othello2) recover nearly identical directions (|cos| ~0.96)
+     and subspaces (overlap ~0.90). The directions are not arbitrary.
+
+  4. GRADUAL EVOLUTION: Othello probe directions change smoothly across
+     layers (adjacent |cos| > 0.83) with increasing stability in later
+     layers. No Flip directions are less stable, consistent with No Flip
+     being a less natural representation for this network.
+
+  5. SUBSPACE DIVERGENCE: Both direction similarity and subspace overlap
+     between Othello and No Flip decrease with depth (0.69->0.51 subspace,
+     0.07->0.05 cosine). Later layers specialize further for real Othello.
+
+NOTE: These are preliminary results from 500 games. Full 250K game run in
+progress — results will be updated when complete.
+
+Figures and probe checkpoints saved to:
+  experiments/.../heuristic_probe_results/probe_directions/
