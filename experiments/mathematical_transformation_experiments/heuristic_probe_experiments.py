@@ -1905,6 +1905,18 @@ def experiment_mlp(args):
         ev_X, ev_Y, ev_pos = _build_move_features_batch(
             eval_games, POS_START, POS_END, include_pairwise=False)
 
+    # Cap at max_games worth of samples if requested
+    if args.max_games:
+        max_samples = args.max_games * LENGTH
+        if len(tr_X) + len(ev_X) > max_samples:
+            n_eval = max(int(max_samples * 0.1), 49 * 100)
+            n_train = max_samples - n_eval
+            if n_train < len(tr_X):
+                tr_X, tr_Y, tr_pos = tr_X[:n_train], tr_Y[:n_train], tr_pos[:n_train]
+            if n_eval < len(ev_X):
+                ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
+            print(f"  Capped to ~{args.max_games} games: {len(tr_X)} train, {len(ev_X)} eval samples")
+
     print(f"  Feature shape: {tr_X.shape}")
 
     # Determine which hidden dims to run
@@ -1921,16 +1933,17 @@ def experiment_mlp(args):
 
     # MLP on 180-d with various hidden dimensions
     n_layers = getattr(args, 'mlp_layers', 1)
+    n_epochs = getattr(args, 'epochs', None) or 16
     ckpt_dir = os.path.join(args.output_dir, "mlp_checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     for H in hidden_dims:
         layer_str = f"_{n_layers}L" if n_layers > 1 else ""
-        print(f"\n--- MLP 180-d hidden={H} x{n_layers} layers with even/odd split ---")
+        print(f"\n--- MLP 180-d hidden={H} x{n_layers} layers, {n_epochs} epochs ---")
         save_path = os.path.join(ckpt_dir, f"mlp_180_H{H}{layer_str}.pt")
         acc_mlp = _train_mlp_nanda(
             tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
             device, 180, H, num_hidden_layers=n_layers,
-            save_path=save_path)
+            epochs=n_epochs, save_path=save_path)
         if isinstance(acc_mlp, tuple):
             acc_mlp = acc_mlp[0]  # _train_mlp_nanda returns (acc, even, odd) when save_path set
         results[f"mlp_180_H{H}{layer_str}"] = acc_mlp
@@ -3669,6 +3682,8 @@ def parse_args():
                    help="For mlp experiment: skip linear baseline and pairwise MLPs")
     p.add_argument("--mlp-layers", type=int, default=1,
                    help="Number of hidden layers in MLP (default: 1)")
+    p.add_argument("--epochs", type=int, default=None,
+                   help="Training epochs (default: 16 for mlp, 10 for others)")
     p.add_argument("--precomputed", action="store_true",
                    help="Load precomputed features from feature_chunks/ (skip feature building)")
     p.add_argument("--chunk-id", type=int, default=None,
