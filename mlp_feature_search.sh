@@ -23,7 +23,7 @@
 #SBATCH --job-name=mlp_feat
 #SBATCH -c 8
 #SBATCH --time=4:00:00
-#SBATCH --mem=60GB
+#SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/mlp_feat_%A_%a.out
 #SBATCH --account=nklab
