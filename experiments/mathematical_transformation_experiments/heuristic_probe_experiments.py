@@ -1496,24 +1496,26 @@ def experiment_learned_heuristic(args):
 
 # ==================== Approach 2: MLP on Move-History =======================
 
+def _build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers=1):
+    """Build an MLP with the given number of hidden layers."""
+    layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+    for _ in range(num_hidden_layers - 1):
+        layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+    layers.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
 def _train_mlp_nanda(tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
                      device, input_dim, hidden_dim,
-                     lr=1e-3, epochs=16, batch_size=1024):
-    """Train a 2-layer MLP with Nanda's even/odd split.
+                     lr=1e-3, epochs=16, batch_size=1024,
+                     num_hidden_layers=1):
+    """Train an MLP with Nanda's even/odd split.
 
-    Even MLP: Linear(input_dim, hidden_dim) -> ReLU -> Linear(hidden_dim, 64*3)
+    Even MLP: Linear(input_dim, hidden_dim) -> [ReLU -> Linear(hidden_dim, hidden_dim)] * (L-1) -> ReLU -> Linear(hidden_dim, 64*3)
     Odd MLP:  same architecture, separate weights
     """
-    mlp_even = nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, 64 * OPTIONS),
-    ).to(device)
-    mlp_odd = nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, 64 * OPTIONS),
-    ).to(device)
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden_layers).to(device)
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden_layers).to(device)
 
     all_params = list(mlp_even.parameters()) + list(mlp_odd.parameters())
     optimizer = torch.optim.Adam(all_params, lr=lr)
@@ -1890,12 +1892,14 @@ def experiment_mlp(args):
         results["linear_180_nanda"] = acc_linear
 
     # MLP on 180-d with various hidden dimensions
+    n_layers = getattr(args, 'mlp_layers', 1)
     for H in hidden_dims:
-        print(f"\n--- MLP 180-d hidden={H} with even/odd split ---")
+        layer_str = f"_{n_layers}L" if n_layers > 1 else ""
+        print(f"\n--- MLP 180-d hidden={H} x{n_layers} layers with even/odd split ---")
         acc_mlp = _train_mlp_nanda(
             tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos,
-            device, 180, H)
-        results[f"mlp_180_H{H}"] = acc_mlp
+            device, 180, H, num_hidden_layers=n_layers)
+        results[f"mlp_180_H{H}{layer_str}"] = acc_mlp
 
     # MLP on 3780-d pairwise features (computed on-the-fly from 180-d base)
     if not args.mlp_only:
@@ -2905,13 +2909,508 @@ def _save_results(args, exp_name, results):
     print(f"Saved to {out_path}")
 
 
+def experiment_probe_directions(args):
+    """Compare probe directions and subspaces across board state variants.
+
+    Trains 4 probes per layer (Othello, Othello2, No Flip, Random Perm) at
+    layers 0-8. Computes pairwise cosine similarity, subspace overlap,
+    and cross-layer direction stability. Saves all probe checkpoints.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    device = get_device()
+    print(f"Device: {device}")
+
+    model, block_size = load_model(args.ckpt_path, device)
+    print(f"Loaded Othello-GPT from {args.ckpt_path}")
+
+    games = load_games(max_files=args.max_files)
+    if args.max_games and len(games) > args.max_games:
+        games = games[:args.max_games]
+    n_eval = max(int(len(games) * 0.1), 100)
+    n_train = len(games) - n_eval
+    train_games = games[:n_train]
+    eval_games = games[n_train:]
+    print(f"Using {len(games)} games ({n_train} train, {n_eval} eval)")
+
+    # Output directory
+    out_dir = os.path.join(args.output_dir, "probe_directions")
+    os.makedirs(out_dir, exist_ok=True)
+    probe_dir = os.path.join(out_dir, "probe_checkpoints")
+    os.makedirs(probe_dir, exist_ok=True)
+    fig_dir = os.path.join(out_dir, "figures")
+    os.makedirs(fig_dir, exist_ok=True)
+
+    # Probe names: othello, othello2 (independent seed), no_flip, shuffled
+    # "shuffled" = real Othello labels with sample order randomized (breaks
+    # the activation-label correspondence while preserving label statistics)
+    probe_names = ["othello", "othello2", "no_flip", "shuffled"]
+    simulators = {
+        "othello": seq_to_state_normal,
+        "othello2": seq_to_state_normal,
+        "no_flip": seq_to_state_no_flip,
+        "shuffled": seq_to_state_normal,  # labels will be shuffled below
+    }
+
+    # Helpers
+    def get_directions(probe_even):
+        """Extract black-white direction for each cell from even probe."""
+        w = probe_even.weight.data.cpu()  # (64*3, d_model)
+        w = w.view(64, OPTIONS, -1)  # (64, 3, d_model)
+        return w[:, 2, :] - w[:, 1, :]  # (64, d_model)
+
+    def cosine_sim_per_cell(d1, d2):
+        """Absolute cosine similarity for each of 64 cells."""
+        d1_n = d1 / (d1.norm(dim=1, keepdim=True) + 1e-8)
+        d2_n = d2 / (d2.norm(dim=1, keepdim=True) + 1e-8)
+        return (d1_n * d2_n).sum(dim=1).abs()  # (64,)
+
+    def _probe_svd(probe_even):
+        """SVD of probe weight matrix. Returns singular values and right vectors."""
+        w = probe_even.weight.data.cpu().float()  # (192, d_model)
+        _, s, vt = torch.linalg.svd(w, full_matrices=False)
+        return s, vt  # s: (192,), vt: (192, d_model)
+
+    def _effective_rank(s, threshold=0.9):
+        """Number of singular values capturing `threshold` fraction of variance."""
+        cumvar = (s ** 2).cumsum(0) / (s ** 2).sum()
+        return int((cumvar < threshold).sum().item()) + 1
+
+    def subspace_overlap(probe1_even, probe2_even, k=None):
+        """Compute subspace overlap between two probes.
+
+        Returns dict with:
+          unweighted: ||V1_k^T V2_k||_F^2 / k  (treats all top-k dims equally)
+          weighted:   sum_i sum_j w1_i * w2_j * (v1_i . v2_j)^2 / (sum w1 * sum w2)
+                      where w_i = s_i^2 / sum(s^2) (variance fraction)
+          k1, k2:     effective rank of each probe (90% variance)
+          k_used:     max(k1, k2), used for unweighted overlap
+        """
+        s1, v1t = _probe_svd(probe1_even)
+        s2, v2t = _probe_svd(probe2_even)
+        k1 = _effective_rank(s1)
+        k2 = _effective_rank(s2)
+        if k is None:
+            k = max(k1, k2)
+        v1 = v1t[:k]  # (k, d_model)
+        v2 = v2t[:k]  # (k, d_model)
+        gram = v1 @ v2.T  # (k, k)
+        unweighted = (gram ** 2).sum().item() / k
+
+        # Variance-weighted overlap: for each of probe1's top-k directions,
+        # measure how much of it lies in probe2's top-k subspace, weighted
+        # by probe1's singular value. Then normalize.
+        # projection_i = ||V2_k^T @ v1_i||^2 (fraction of v1_i in V2's subspace)
+        # weighted = sum_i (s1_i^2 / sum(s1^2)) * projection_i
+        var1 = s1[:k] ** 2
+        w1 = var1 / var1.sum()  # (k,)
+        # gram[i,j] = v1_i . v2_j, so projection_i = sum_j gram[i,j]^2
+        projections = (gram ** 2).sum(dim=1)  # (k,)
+        weighted = (w1 * projections).sum().item()
+
+        return {
+            "unweighted": unweighted,
+            "weighted": weighted,
+            "k1": k1,
+            "k2": k2,
+            "k_used": k,
+        }
+
+    # Pre-compute labels for each simulator (same across layers)
+    print("\nPre-computing board state labels...")
+    n_tr_games = len(train_games)
+    n_ev_games = len(eval_games)
+    tr_pos = torch.arange(POS_START, POS_END).repeat(n_tr_games)
+    ev_pos = torch.arange(POS_START, POS_END).repeat(n_ev_games)
+
+    all_tr_labels = {}
+    all_ev_labels = {}
+    # othello and othello2 share the same labels
+    for name in ["othello", "no_flip"]:
+        sim = simulators[name]
+        tr_states = get_board_states(train_games, sim, POS_START, POS_END)
+        all_tr_labels[name] = torch.tensor(
+            states_to_labels(tr_states).reshape(n_tr_games * LENGTH, 64),
+            dtype=torch.long)
+        ev_states = get_board_states(eval_games, sim, POS_START, POS_END)
+        all_ev_labels[name] = torch.tensor(
+            states_to_labels(ev_states).reshape(n_ev_games * LENGTH, 64),
+            dtype=torch.long)
+        print(f"  {name}: done")
+    all_tr_labels["othello2"] = all_tr_labels["othello"]
+    all_ev_labels["othello2"] = all_ev_labels["othello"]
+
+    # Shuffled: randomly permute the sample order of Othello labels
+    # This breaks the activation-label correspondence while preserving
+    # the marginal distribution of labels
+    shuffle_rng = np.random.RandomState(12345)
+    tr_shuffle_idx = shuffle_rng.permutation(len(all_tr_labels["othello"]))
+    ev_shuffle_idx = shuffle_rng.permutation(len(all_ev_labels["othello"]))
+    all_tr_labels["shuffled"] = all_tr_labels["othello"][tr_shuffle_idx]
+    all_ev_labels["shuffled"] = all_ev_labels["othello"][ev_shuffle_idx]
+    print(f"  shuffled: done (permuted {len(tr_shuffle_idx)} train, {len(ev_shuffle_idx)} eval samples)")
+
+    # Pairwise comparisons
+    pairs = [
+        ("othello", "othello2"),
+        ("othello", "no_flip"),
+        ("othello", "shuffled"),
+        ("othello2", "no_flip"),
+        ("othello2", "shuffled"),
+        ("no_flip", "shuffled"),
+    ]
+    pair_names = [f"{a}_vs_{b}" for a, b in pairs]
+
+    # Storage across layers
+    results_table = []
+    dirs_by_layer = {name: {} for name in probe_names}  # name -> {layer -> (64, d)}
+    pairwise_cossim = {pn: {} for pn in pair_names}  # pair -> {layer -> (64,)}
+    pairwise_subspace = {pn: {} for pn in pair_names}  # pair -> {layer -> dict}
+    probe_eff_rank = {name: {} for name in probe_names}  # name -> {layer -> k}
+
+    for layer in range(9):
+        print(f"\n{'='*60}")
+        print(f"Layer {layer}")
+        print(f"{'='*60}")
+
+        # Collect activations
+        print("  Collecting activations...")
+        tr_acts, _ = collect_activations_and_labels(
+            model, train_games, device, layer, block_size,
+            simulator=seq_to_state_normal)
+        ev_acts, _ = collect_activations_and_labels(
+            model, eval_games, device, layer, block_size,
+            simulator=seq_to_state_normal)
+
+        # Train all 4 probes
+        probes = {}
+        accs = {}
+        for name in probe_names:
+            # Use different random seed for othello2
+            if name == "othello2":
+                torch.manual_seed(99999)
+                np.random.seed(99999)
+            print(f"\n  --- {name} probe ---")
+            acc, pe, po = _train_nanda_probe_returning_probes(
+                tr_acts, all_tr_labels[name], tr_pos,
+                ev_acts, all_ev_labels[name], ev_pos,
+                device, input_dim=tr_acts.shape[1])
+            # Restore default seed
+            if name == "othello2":
+                torch.manual_seed(42)
+                np.random.seed(42)
+            accs[name] = acc
+            probes[name] = {"even": pe, "odd": po}
+
+            # Save probe checkpoint
+            ckpt_path = os.path.join(probe_dir, f"{name}_layer{layer}.pt")
+            torch.save({
+                "even": pe.state_dict(),
+                "odd": po.state_dict(),
+                "accuracy": acc,
+            }, ckpt_path)
+
+        # Extract directions
+        for name in probe_names:
+            dirs_by_layer[name][layer] = get_directions(probes[name]["even"])
+
+        # Compute effective rank for each probe
+        for name in probe_names:
+            s, _ = _probe_svd(probes[name]["even"])
+            probe_eff_rank[name][layer] = _effective_rank(s)
+
+        # Pairwise cosine similarity and subspace overlap
+        for (a, b), pn in zip(pairs, pair_names):
+            cs = cosine_sim_per_cell(dirs_by_layer[a][layer], dirs_by_layer[b][layer])
+            pairwise_cossim[pn][layer] = cs.numpy()
+            pairwise_subspace[pn][layer] = subspace_overlap(
+                probes[a]["even"], probes[b]["even"])
+
+        # Print layer summary
+        print(f"\n  Layer {layer} Summary:")
+        print(f"  {'Probe':<15} {'Accuracy':>10} {'Eff. Rank':>10}")
+        for name in probe_names:
+            print(f"  {name:<15} {accs[name]:>10.4%} {probe_eff_rank[name][layer]:>10}")
+        print(f"\n  {'Pair':<30} {'Mean |cos|':>10} {'Unwt Sub':>10} {'Wt Sub':>10} {'k':>5}")
+        for (a, b), pn in zip(pairs, pair_names):
+            mc = pairwise_cossim[pn][layer].mean()
+            sd = pairwise_subspace[pn][layer]
+            print(f"  {pn:<30} {mc:>10.4f} {sd['unweighted']:>10.4f} {sd['weighted']:>10.4f} {sd['k_used']:>5}")
+
+        # Store for table
+        row = {"layer": layer}
+        for name in probe_names:
+            row[f"{name}_acc"] = accs[name]
+            row[f"{name}_eff_rank"] = probe_eff_rank[name][layer]
+        for pn in pair_names:
+            row[f"cossim_{pn}"] = float(pairwise_cossim[pn][layer].mean())
+            row[f"subspace_unweighted_{pn}"] = pairwise_subspace[pn][layer]["unweighted"]
+            row[f"subspace_weighted_{pn}"] = pairwise_subspace[pn][layer]["weighted"]
+            row[f"subspace_k_{pn}"] = pairwise_subspace[pn][layer]["k_used"]
+        results_table.append(row)
+
+    # ==================== Summary Tables ====================
+    print(f"\n{'='*80}")
+    print("PROBE ACCURACY BY LAYER")
+    print(f"{'='*80}")
+    print(f"{'Layer':>5}", end="")
+    for name in probe_names:
+        print(f"  {name:>12}", end="")
+    print()
+    for row in results_table:
+        print(f"{row['layer']:>5}", end="")
+        for name in probe_names:
+            print(f"  {row[f'{name}_acc']:>12.4%}", end="")
+        print()
+
+    print(f"\n{'='*80}")
+    print("PAIRWISE MEAN |COSINE SIMILARITY| BY LAYER")
+    print(f"{'='*80}")
+    print(f"{'Layer':>5}", end="")
+    for pn in pair_names:
+        print(f"  {pn:>14}", end="")
+    print()
+    for row in results_table:
+        print(f"{row['layer']:>5}", end="")
+        for pn in pair_names:
+            print(f"  {row[f'cossim_{pn}']:>14.4f}", end="")
+        print()
+
+    print(f"\n{'='*80}")
+    print("PROBE EFFECTIVE RANK (90% variance) BY LAYER")
+    print(f"{'='*80}")
+    print(f"{'Layer':>5}", end="")
+    for name in probe_names:
+        print(f"  {name:>12}", end="")
+    print()
+    for row in results_table:
+        print(f"{row['layer']:>5}", end="")
+        for name in probe_names:
+            print(f"  {row[f'{name}_eff_rank']:>12}", end="")
+        print()
+
+    print(f"\n{'='*80}")
+    print("PAIRWISE SUBSPACE OVERLAP BY LAYER (unweighted / weighted)")
+    print(f"{'='*80}")
+    for pn in pair_names:
+        print(f"\n  {pn}:")
+        print(f"  {'Layer':>5} {'Unweighted':>12} {'Weighted':>12} {'k':>5}")
+        for row in results_table:
+            print(f"  {row['layer']:>5} {row[f'subspace_unweighted_{pn}']:>12.4f} "
+                  f"{row[f'subspace_weighted_{pn}']:>12.4f} {row[f'subspace_k_{pn}']:>5}")
+
+    # ==================== Figures ====================
+
+    # Fig 1: Pairwise cosine similarity heatmaps (8x8) per layer, one row per pair
+    fig1, axes1 = plt.subplots(len(pairs), 9, figsize=(27, len(pairs) * 3))
+    for pi, (pn, (a, b)) in enumerate(zip(pair_names, pairs)):
+        for layer in range(9):
+            ax = axes1[pi, layer]
+            cs = pairwise_cossim[pn][layer].reshape(8, 8)
+            im = ax.imshow(cs, vmin=0, vmax=1, cmap="RdYlBu_r")
+            ax.set_xticks(range(8))
+            ax.set_xticklabels([str(i+1) for i in range(8)], fontsize=6)
+            ax.set_yticks(range(8))
+            ax.set_yticklabels([chr(65+i) for i in range(8)], fontsize=6)
+            if pi == 0:
+                ax.set_title(f"L{layer}", fontsize=9)
+            if layer == 0:
+                ax.set_ylabel(f"{a}\nvs {b}", fontsize=8)
+    fig1.colorbar(im, ax=axes1, shrink=0.6, label="|cosine similarity|")
+    fig1.suptitle("Per-Cell |Cosine Similarity| Between Probe Directions", fontsize=14)
+    fig1.savefig(os.path.join(fig_dir, "pairwise_cossim_heatmaps.png"),
+                 dpi=150, bbox_inches="tight")
+    plt.close(fig1)
+    print(f"\nSaved pairwise cosine similarity heatmaps")
+
+    # Fig 2: Summary line plots — cosine sim, unweighted subspace, weighted subspace
+    fig2, (ax_cos, ax_sub_u, ax_sub_w) = plt.subplots(1, 3, figsize=(21, 6))
+    for pn in pair_names:
+        cos_vals = [float(pairwise_cossim[pn][l].mean()) for l in range(9)]
+        sub_u_vals = [pairwise_subspace[pn][l]["unweighted"] for l in range(9)]
+        sub_w_vals = [pairwise_subspace[pn][l]["weighted"] for l in range(9)]
+        ax_cos.plot(range(9), cos_vals, "o-", label=pn, markersize=5)
+        ax_sub_u.plot(range(9), sub_u_vals, "o-", label=pn, markersize=5)
+        ax_sub_w.plot(range(9), sub_w_vals, "o-", label=pn, markersize=5)
+    for ax, title, ylabel in [
+        (ax_cos, "Direction Similarity", "Mean |Cosine Similarity|"),
+        (ax_sub_u, "Subspace Overlap (unweighted)", "Overlap"),
+        (ax_sub_w, "Subspace Overlap (variance-weighted)", "Overlap"),
+    ]:
+        ax.set_xlabel("Layer")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.set_xticks(range(9))
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    fig2.savefig(os.path.join(fig_dir, "pairwise_summary_lines.png"),
+                 dpi=150, bbox_inches="tight")
+    plt.close(fig2)
+    print("Saved pairwise summary line plots")
+
+    # Fig 3: Cross-layer direction similarity for each probe type
+    n_layers = 9
+
+    def compute_cross_layer_mat(dirs_dict):
+        mat = np.zeros((n_layers, n_layers))
+        for li in range(n_layers):
+            for lj in range(n_layers):
+                cs = cosine_sim_per_cell(dirs_dict[li], dirs_dict[lj])
+                mat[li, lj] = cs.mean().item()
+        return mat
+
+    cross_layer_mats = {}
+    for name in probe_names:
+        cross_layer_mats[name] = compute_cross_layer_mat(dirs_by_layer[name])
+
+    fig3, axes3 = plt.subplots(1, 4, figsize=(24, 6))
+    for ax, name in zip(axes3, probe_names):
+        mat = cross_layer_mats[name]
+        im = ax.imshow(mat, vmin=0, vmax=1, cmap="RdYlBu_r")
+        ax.set_xticks(range(n_layers))
+        ax.set_xticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_yticks(range(n_layers))
+        ax.set_yticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_title(f"{name}")
+        for i in range(n_layers):
+            for j in range(n_layers):
+                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center",
+                        fontsize=6, color="white" if mat[i, j] > 0.5 else "black")
+    fig3.colorbar(im, ax=axes3, shrink=0.8, label="|cosine similarity|")
+    fig3.suptitle("Cross-Layer Probe Direction Stability (mean |cos| over 64 cells)", fontsize=14)
+    plt.tight_layout()
+    fig3.savefig(os.path.join(fig_dir, "cross_layer_direction_stability.png"),
+                 dpi=150, bbox_inches="tight")
+    plt.close(fig3)
+    print("Saved cross-layer direction stability heatmaps")
+
+    # Fig 4: Cross-layer subspace overlap for each probe type
+    def compute_cross_layer_subspace(name):
+        """Load saved probes and compute pairwise subspace overlap across layers."""
+        mat_u = np.zeros((n_layers, n_layers))
+        mat_w = np.zeros((n_layers, n_layers))
+        probes_loaded = {}
+        for l in range(n_layers):
+            ckpt = torch.load(
+                os.path.join(probe_dir, f"{name}_layer{l}.pt"),
+                map_location="cpu")
+            pe = nn.Linear(512, 64 * OPTIONS)
+            pe.load_state_dict(ckpt["even"])
+            probes_loaded[l] = pe
+        for li in range(n_layers):
+            for lj in range(n_layers):
+                result = subspace_overlap(probes_loaded[li], probes_loaded[lj])
+                mat_u[li, lj] = result["unweighted"]
+                mat_w[li, lj] = result["weighted"]
+        return mat_u, mat_w
+
+    cross_layer_subspace_u = {}
+    cross_layer_subspace_w = {}
+    for name in probe_names:
+        print(f"  Computing cross-layer subspace overlap for {name}...")
+        mat_u, mat_w = compute_cross_layer_subspace(name)
+        cross_layer_subspace_u[name] = mat_u
+        cross_layer_subspace_w[name] = mat_w
+
+    # Unweighted cross-layer subspace
+    fig4, axes4 = plt.subplots(1, 4, figsize=(24, 6))
+    for ax, name in zip(axes4, probe_names):
+        mat = cross_layer_subspace_u[name]
+        im = ax.imshow(mat, vmin=0, vmax=1, cmap="RdYlBu_r")
+        ax.set_xticks(range(n_layers))
+        ax.set_xticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_yticks(range(n_layers))
+        ax.set_yticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_title(f"{name}")
+        for i in range(n_layers):
+            for j in range(n_layers):
+                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center",
+                        fontsize=6, color="white" if mat[i, j] > 0.5 else "black")
+    fig4.colorbar(im, ax=axes4, shrink=0.8, label="subspace overlap")
+    fig4.suptitle("Cross-Layer Subspace Overlap (unweighted)", fontsize=14)
+    plt.tight_layout()
+    fig4.savefig(os.path.join(fig_dir, "cross_layer_subspace_unweighted.png"),
+                 dpi=150, bbox_inches="tight")
+    plt.close(fig4)
+
+    # Weighted cross-layer subspace
+    fig5, axes5 = plt.subplots(1, 4, figsize=(24, 6))
+    for ax, name in zip(axes5, probe_names):
+        mat = cross_layer_subspace_w[name]
+        im = ax.imshow(mat, vmin=0, vmax=1, cmap="RdYlBu_r")
+        ax.set_xticks(range(n_layers))
+        ax.set_xticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_yticks(range(n_layers))
+        ax.set_yticklabels([f"L{i}" for i in range(n_layers)])
+        ax.set_title(f"{name}")
+        for i in range(n_layers):
+            for j in range(n_layers):
+                ax.text(j, i, f"{mat[i, j]:.2f}", ha="center", va="center",
+                        fontsize=6, color="white" if mat[i, j] > 0.5 else "black")
+    fig5.colorbar(im, ax=axes5, shrink=0.8, label="subspace overlap (weighted)")
+    fig5.suptitle("Cross-Layer Subspace Overlap (variance-weighted)", fontsize=14)
+    plt.tight_layout()
+    fig5.savefig(os.path.join(fig_dir, "cross_layer_subspace_weighted.png"),
+                 dpi=150, bbox_inches="tight")
+    plt.close(fig5)
+    print("Saved cross-layer subspace overlap heatmaps (unweighted + weighted)")
+
+    # ==================== Save Results JSON ====================
+    out_path = os.path.join(out_dir, "probe_directions_results.json")
+    json_results = {
+        "config": {
+            "n_games": len(games),
+            "n_train": n_train,
+            "n_eval": n_eval,
+            "shuffle_seed": 12345,
+        },
+        "table": results_table,
+        "pairwise_cossim_per_cell": {
+            pn: {str(l): pairwise_cossim[pn][l].tolist() for l in range(9)}
+            for pn in pair_names
+        },
+        "pairwise_subspace": {
+            pn: {str(l): pairwise_subspace[pn][l] for l in range(9)}
+            for pn in pair_names
+        },
+        "cross_layer_direction": {
+            name: cross_layer_mats[name].tolist() for name in probe_names
+        },
+        "cross_layer_subspace_unweighted": {
+            name: cross_layer_subspace_u[name].tolist() for name in probe_names
+        },
+        "cross_layer_subspace_weighted": {
+            name: cross_layer_subspace_w[name].tolist() for name in probe_names
+        },
+        "probe_effective_rank": {
+            name: {str(l): probe_eff_rank[name][l] for l in range(9)}
+            for name in probe_names
+        },
+    }
+    with open(out_path, "w") as f:
+        json.dump(json_results, f, indent=2)
+
+    print(f"\n{'='*80}")
+    print("ALL RESULTS SAVED")
+    print(f"{'='*80}")
+    print(f"  Results JSON: {out_path}")
+    print(f"  Probe checkpoints: {probe_dir}/")
+    print(f"  Figures: {fig_dir}/")
+    print(f"  Probes saved: {len(probe_names) * 9} total ({len(probe_names)} types x 9 layers)")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Heuristic & baseline probing experiments")
     p.add_argument("--experiment", type=str, required=True,
                    choices=["standard_probe", "resid_pre", "alt_boards",
                             "by_move", "heuristic", "brute_force",
                             "learned_heuristic", "mlp", "precompute",
-                            "combine_heuristic", "mlp_analysis"],
+                            "combine_heuristic", "mlp_analysis",
+                            "probe_directions"],
                    help="Which experiment to run")
     p.add_argument("--ckpt-path", type=str, default="ckpts/gpt_synthetic.ckpt")
     p.add_argument("--layer", type=int, default=6)
@@ -2923,6 +3422,8 @@ def parse_args():
                    help="Hidden dims for MLP experiment (default: 256 512 1024)")
     p.add_argument("--mlp-only", action="store_true",
                    help="For mlp experiment: skip linear baseline and pairwise MLPs")
+    p.add_argument("--mlp-layers", type=int, default=1,
+                   help="Number of hidden layers in MLP (default: 1)")
     p.add_argument("--precomputed", action="store_true",
                    help="Load precomputed features from feature_chunks/ (skip feature building)")
     p.add_argument("--chunk-id", type=int, default=None,
@@ -2951,6 +3452,7 @@ def main():
         "precompute": experiment_precompute,
         "combine_heuristic": experiment_combine_heuristic,
         "mlp_analysis": experiment_mlp_analysis,
+        "probe_directions": experiment_probe_directions,
     }
 
     experiments[args.experiment](args)
