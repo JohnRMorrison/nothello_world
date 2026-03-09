@@ -1053,6 +1053,50 @@ def _build_move_history_features(game, step, include_pairwise=True):
     return np.concatenate([base, pp, pe, ee])  # (3780,)
 
 
+def _compute_labels_for_games(args):
+    """Worker function for parallel label computation."""
+    games_chunk, pos_start, pos_end = args
+    length = pos_end - pos_start
+    n = len(games_chunk)
+    labels = np.zeros((n, length, 64), dtype=np.int64)
+    for gi, game in enumerate(games_chunk):
+        states = seq_to_state_normal(game)  # (60, 8, 8)
+        for ti, t in enumerate(range(pos_start, pos_end)):
+            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
+            labels[gi, ti] = lbl.reshape(64)
+    return labels
+
+
+def _compute_labels_parallel(games, pos_start, pos_end, n_games):
+    """Compute labels using multiprocessing. Returns (n_samples, 64) array."""
+    from multiprocessing import Pool, cpu_count
+    length = pos_end - pos_start
+    n_samples = n_games * length
+
+    n_workers = min(cpu_count(), 8)
+    chunk_size = (n_games + n_workers - 1) // n_workers
+    chunks = []
+    for i in range(0, n_games, chunk_size):
+        chunks.append((games[i:i+chunk_size], pos_start, pos_end))
+
+    print(f"  Using {n_workers} workers for {n_games} games...", flush=True)
+    with Pool(n_workers) as pool:
+        results = pool.map(_compute_labels_for_games, chunks)
+
+    # Reassemble: each result is (chunk_n, length, 64), need to interleave
+    # into (length * n_games, 64) where index = ti * n_games + gi
+    labels = np.zeros((n_samples, 64), dtype=np.int64)
+    gi_offset = 0
+    for res in results:
+        chunk_n = res.shape[0]
+        for ti in range(length):
+            idx_start = ti * n_games + gi_offset
+            labels[idx_start:idx_start + chunk_n] = res[:, ti]
+        gi_offset += chunk_n
+
+    return labels
+
+
 def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True):
     """Build move-history features and labels for a list of games.
 
@@ -1112,15 +1156,9 @@ def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True)
         ee = even_all[:, idx_i] * even_all[:, idx_j]
         features = np.concatenate([features, pp, pe, ee], axis=1)
 
-    # Compute labels (still needs board simulation)
+    # Compute labels (board simulation — parallelized across CPU cores)
     print("  computing board states for labels...", flush=True)
-    labels = np.zeros((n_samples, 64), dtype=np.int64)
-    for gi, game in enumerate(tqdm(games, desc="  labels", leave=False)):
-        states = seq_to_state_normal(game)  # (60, 8, 8)
-        for ti, t in enumerate(range(pos_start, pos_end)):
-            idx = ti * n_games + gi
-            lbl = states_to_labels(states[t:t+1].reshape(1, 8, 8))
-            labels[idx] = lbl.reshape(64)
+    labels = _compute_labels_parallel(games, pos_start, pos_end, n_games)
 
     return (torch.tensor(features, dtype=torch.float32),
             torch.tensor(labels, dtype=torch.long),
