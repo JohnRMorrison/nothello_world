@@ -6,8 +6,8 @@
 # Two-step workflow:
 #
 #   Step 1: Precompute features in parallel (one job per file chunk)
-#     sbatch --array=0-25 mlp_feature_search.sh precompute
-#     (26 chunks × 10 files each = 260 files, ~26M games)
+#     sbatch --array=0-3 mlp_feature_search.sh precompute
+#     (4 chunks × 3 files each = 12 files, ~1.2M games)
 #
 #   Step 2: Train MLPs (width sweep), one per array task
 #     sbatch --array=0-8 mlp_feature_search.sh train
@@ -21,7 +21,7 @@
 # ============================================================================
 
 #SBATCH --job-name=mlp_feat
-#SBATCH -c 4
+#SBATCH -c 8
 #SBATCH --time=4:00:00
 #SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
@@ -44,7 +44,7 @@ mkdir -p logs
 cd $SLURM_SUBMIT_DIR
 
 # Parse arguments
-FILES_PER_CHUNK=10
+FILES_PER_CHUNK=3
 MODE="single"  # precompute, train, dropout, or single
 MAX_GAMES=1000000
 EPOCHS=10
