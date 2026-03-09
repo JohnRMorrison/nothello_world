@@ -1872,8 +1872,11 @@ def experiment_precompute(args):
     print("Done.")
 
 
-def _load_all_chunks(output_dir, eval_frac=0.1):
+def _load_all_chunks(output_dir, eval_frac=0.1, max_samples=None):
     """Load all chunk files and split into train/eval.
+
+    Args:
+        max_samples: If set, stop loading after this many samples to save memory.
 
     Returns (tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos).
     """
@@ -1882,17 +1885,30 @@ def _load_all_chunks(output_dir, eval_frac=0.1):
     print(f"Loading {len(chunk_files)} chunks from {chunk_dir}...")
 
     all_X, all_Y, all_pos = [], [], []
+    total_loaded = 0
     for fname in chunk_files:
         path = os.path.join(chunk_dir, fname)
-        X, Y, pos = _load_features(path)
-        all_X.append(X)
-        all_Y.append(Y)
-        all_pos.append(pos)
-        print(f"  {fname}: {X.shape[0]} samples")
+        data = np.load(path)
+        n = data['features'].shape[0]
+        # Cap this chunk if we'd exceed max_samples
+        if max_samples and total_loaded + n > max_samples:
+            n = max_samples - total_loaded
+        if n <= 0:
+            break
+        all_X.append(torch.tensor(data['features'][:n].astype(np.float32)))
+        all_Y.append(torch.tensor(data['labels'][:n].astype(np.int8)).long())
+        all_pos.append(torch.tensor(data['positions'][:n].astype(np.int8)).long())
+        total_loaded += n
+        print(f"  {fname}: {n} samples (total: {total_loaded})")
+        if max_samples and total_loaded >= max_samples:
+            break
 
     X = torch.cat(all_X)
+    del all_X
     Y = torch.cat(all_Y)
+    del all_Y
     pos = torch.cat(all_pos)
+    del all_pos
     print(f"Total: {X.shape[0]} samples, {X.shape}")
 
     # Split into train/eval (last eval_frac of samples)
@@ -1915,7 +1931,8 @@ def _try_load_precomputed(args):
     if not chunk_files:
         print(f"  No chunk files found in {chunk_dir}")
         return None
-    return _load_all_chunks(args.output_dir)
+    max_samples = args.max_games * LENGTH if args.max_games else None
+    return _load_all_chunks(args.output_dir, max_samples=max_samples)
 
 
 def experiment_mlp(args):
