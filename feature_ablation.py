@@ -34,12 +34,29 @@ device = get_device()
 print(f"Device: {device}")
 
 if args.precomputed:
+    import os
+    from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import _load_features
     max_samples = args.max_games * LENGTH if args.max_games else None
-    data = _load_all_chunks(args.output_dir, max_samples=max_samples)
-    if data is None:
-        print("ERROR: No precomputed chunks found")
-        sys.exit(1)
-    tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos = data
+    chunk_dir = os.path.join(args.output_dir, "feature_chunks")
+    chunk_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".npz"))
+    all_X, all_Y, all_pos = [], [], []
+    total = 0
+    for fname in chunk_files:
+        X, Y, pos = _load_features(os.path.join(chunk_dir, fname))
+        all_X.append(X); all_Y.append(Y); all_pos.append(pos)
+        total += X.shape[0]
+        print(f"  {fname}: {X.shape[0]} samples (total: {total})")
+        if max_samples and total >= max_samples:
+            break
+    X = torch.cat(all_X); Y = torch.cat(all_Y); pos = torch.cat(all_pos)
+    del all_X, all_Y, all_pos
+    if max_samples and len(X) > max_samples:
+        X = X[:max_samples]; Y = Y[:max_samples]; pos = pos[:max_samples]
+    n_eval = max(int(len(X) * 0.1), 49 * 100)
+    n_train = len(X) - n_eval
+    tr_X, tr_Y, tr_pos = X[:n_train], Y[:n_train], pos[:n_train]
+    ev_X, ev_Y, ev_pos = X[n_train:], Y[n_train:], pos[n_train:]
+    del X, Y, pos
 else:
     games = load_games()
     if len(games) > args.max_games:
