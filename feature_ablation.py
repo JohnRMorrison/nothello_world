@@ -7,9 +7,10 @@ Trains H=1024 MLP with different feature subsets:
   - 180-d: all three (baseline)
 
 Usage:
-    python feature_ablation.py [--max-games 100000] [--epochs 10]
+    python feature_ablation.py --subset-id 0  [--precomputed] [--max-games 1000000]
+    sbatch --array=0-6 feature_ablation.sh
 """
-import sys
+import sys, os, json
 sys.path.insert(0, '.')
 
 import torch
@@ -21,47 +22,37 @@ from experiments.mathematical_transformation_experiments.heuristic_probe_experim
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--max-games", type=int, default=500000)
-parser.add_argument("--epochs", type=int, default=10)
+parser.add_argument("--max-games", type=int, default=1000000)
+parser.add_argument("--epochs", type=int, default=4)
 parser.add_argument("--hidden", type=int, default=1024)
-parser.add_argument("--precomputed", action="store_true",
-                    help="Load from precomputed feature chunks")
+parser.add_argument("--subset-id", type=int, default=None,
+                    help="Which feature subset (0-6). If None, run all sequentially.")
+parser.add_argument("--precomputed", action="store_true")
 parser.add_argument("--output-dir",
                     default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
 args = parser.parse_args()
 
+# Feature subsets indexed by ID
+SUBSETS = [
+    ("when_only (60-d)",        list(range(N_MOVES, 2*N_MOVES))),
+    ("played+when (120-d)",     list(range(0, 2*N_MOVES))),
+    ("when+even (120-d)",       list(range(N_MOVES, 3*N_MOVES))),
+    ("played+even (120-d)",     list(range(0, N_MOVES)) + list(range(2*N_MOVES, 3*N_MOVES))),
+    ("played_only (60-d)",      list(range(0, N_MOVES))),
+    ("even_only (60-d)",        list(range(2*N_MOVES, 3*N_MOVES))),
+    ("all (180-d)",             list(range(3*N_MOVES))),
+]
+
 device = get_device()
 print(f"Device: {device}")
 
+# Load data
 if args.precomputed:
-    import os
-    from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import _load_features
-    max_samples = args.max_games * LENGTH if args.max_games else None
-    chunk_dir = os.path.join(args.output_dir, "feature_chunks")
-    chunk_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".npz"))
-    all_X, all_Y, all_pos = [], [], []
-    total = 0
-    for fname in chunk_files:
-        data = np.load(os.path.join(chunk_dir, fname))
-        n = data['features'].shape[0]
-        needed = max_samples - total if max_samples else n
-        needed = min(needed, n)
-        all_X.append(torch.from_numpy(data['features'][:needed].astype(np.float32)))
-        all_Y.append(torch.from_numpy(data['labels'][:needed].astype(np.int64)))
-        all_pos.append(torch.from_numpy(data['positions'][:needed].astype(np.int64)))
-        total += needed
-        print(f"  {fname}: {needed} samples (total: {total})", flush=True)
-        del data
-        if max_samples and total >= max_samples:
-            break
-    X = torch.cat(all_X); del all_X
-    Y = torch.cat(all_Y); del all_Y
-    pos = torch.cat(all_pos); del all_pos
-    n_eval = max(int(len(X) * 0.1), 49 * 100)
-    n_train = len(X) - n_eval
-    tr_X, tr_Y, tr_pos = X[:n_train], Y[:n_train], pos[:n_train]
-    ev_X, ev_Y, ev_pos = X[n_train:], Y[n_train:], pos[n_train:]
-    del X, Y, pos
+    data = _load_all_chunks(args.output_dir)
+    if data is None:
+        print("ERROR: No precomputed chunks found")
+        sys.exit(1)
+    tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos = data
 else:
     games = load_games()
     if len(games) > args.max_games:
@@ -77,19 +68,14 @@ else:
 
 print(f"  Train: {tr_X.shape}, Eval: {ev_X.shape}")
 
-# Feature slices: played=0:60, when=60:120, even=120:180
-subsets = {
-    "when_only (60-d)":        list(range(N_MOVES, 2*N_MOVES)),
-    "played+when (120-d)":     list(range(0, 2*N_MOVES)),
-    "when+even (120-d)":       list(range(N_MOVES, 3*N_MOVES)),
-    "played+even (120-d)":     list(range(0, N_MOVES)) + list(range(2*N_MOVES, 3*N_MOVES)),
-    "played_only (60-d)":      list(range(0, N_MOVES)),
-    "even_only (60-d)":        list(range(2*N_MOVES, 3*N_MOVES)),
-    "all (180-d)":             list(range(3*N_MOVES)),
-}
+# Select which subsets to run
+if args.subset_id is not None:
+    to_run = [SUBSETS[args.subset_id]]
+else:
+    to_run = SUBSETS
 
 results = {}
-for name, cols in subsets.items():
+for name, cols in to_run:
     input_dim = len(cols)
     print(f"\n{'='*60}")
     print(f"  {name}: {input_dim} features, H={args.hidden}")
@@ -104,8 +90,23 @@ for name, cols in subsets.items():
     results[name] = acc
     print(f"  -> {name}: {acc:.4%}")
 
+    # Free column slices
+    del tr_sub, ev_sub
+
 print(f"\n{'='*60}")
 print("FEATURE ABLATION RESULTS")
 print(f"{'='*60}")
 for name, acc in sorted(results.items(), key=lambda x: -x[1]):
     print(f"  {name:30s}: {acc:.4%}")
+
+# Save results
+out_path = os.path.join(args.output_dir, "feature_ablation_results.json")
+if os.path.exists(out_path):
+    with open(out_path) as f:
+        all_results = json.load(f)
+else:
+    all_results = {}
+all_results.update({k: float(v) for k, v in results.items()})
+with open(out_path, "w") as f:
+    json.dump(all_results, f, indent=2)
+print(f"Saved to {out_path}")
