@@ -32,11 +32,9 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 python feature_ablation.py \
-    --subset-id 6 \
-    --max-games $N_GAMES \
+CUDA_VISIBLE_DEVICES=0 python game_scaling.py \
+    --n-games $N_GAMES \
     --epochs 10 \
-    --hidden 1024 \
-    --precomputed
+    --hidden 1024
 
 echo "Completed at: $(date)"
