@@ -7,7 +7,7 @@
 #SBATCH --job-name=spatial
 #SBATCH -c 8
 #SBATCH --time=8:00:00
-#SBATCH --mem=60GB
+#SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/spatial_%A_%a.out
 #SBATCH --account=nklab
