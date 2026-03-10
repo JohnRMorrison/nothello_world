@@ -1534,6 +1534,117 @@ def experiment_learned_heuristic(args):
 
 # ==================== Approach 2: MLP on Move-History =======================
 
+def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
+                         feature_cols=None, lr=1e-3, epochs=10,
+                         batch_size=1024, eval_frac=0.1, save_path=None):
+    """Train MLP streaming through chunk files — constant memory usage.
+
+    Loads one chunk at a time for training, keeps one chunk for eval.
+    feature_cols: optional list of column indices to select from 180-d features.
+    """
+    chunk_files = sorted(os.path.join(chunk_dir, f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz"))
+    if not chunk_files:
+        raise ValueError(f"No chunk files in {chunk_dir}")
+    print(f"Streaming training: {len(chunk_files)} chunks, H={hidden_dim}, "
+          f"input={input_dim}, {epochs} epochs")
+
+    # Use last chunk for eval
+    eval_path = chunk_files[-1]
+    train_paths = chunk_files[:-1]
+    print(f"  Train chunks: {len(train_paths)}, Eval chunk: {os.path.basename(eval_path)}")
+
+    ev_X, ev_Y, ev_pos = _load_features(eval_path)
+    if feature_cols is not None:
+        ev_X = ev_X[:, feature_cols]
+    # Use subset for eval to save memory
+    n_eval = min(len(ev_X), 49 * 10000)  # ~10K games worth
+    ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
+    print(f"  Eval samples: {len(ev_X)}")
+
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS).to(device)
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS).to(device)
+    all_params = list(mlp_even.parameters()) + list(mlp_odd.parameters())
+    optimizer = torch.optim.Adam(all_params, lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=1)
+
+    best_acc = 0.0
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
+        mlp_even.train()
+        mlp_odd.train()
+
+        # Shuffle chunk order each epoch
+        rng = np.random.RandomState(epoch)
+        chunk_order = rng.permutation(len(train_paths))
+
+        epoch_loss = 0.0
+        epoch_batches = 0
+
+        for ci in chunk_order:
+            path = train_paths[ci]
+            tr_X, tr_Y, tr_pos = _load_features(path)
+            if feature_cols is not None:
+                tr_X = tr_X[:, feature_cols]
+
+            perm = torch.randperm(len(tr_X))
+            for i in range(0, len(tr_X), batch_size):
+                idx = perm[i:i + batch_size]
+                x = tr_X[idx].to(device)
+                y = tr_Y[idx].to(device)
+                pos = tr_pos[idx]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+
+                loss = torch.tensor(0.0, device=device)
+                if even_mask.any():
+                    logits_e = mlp_even(x[even_mask]).view(-1, 64, OPTIONS)
+                    loss = loss + nn.functional.cross_entropy(
+                        logits_e.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
+                if odd_mask.any():
+                    logits_o = mlp_odd(x[odd_mask]).view(-1, 64, OPTIONS)
+                    loss = loss + nn.functional.cross_entropy(
+                        logits_o.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                epoch_batches += 1
+
+            del tr_X, tr_Y, tr_pos  # free chunk memory
+
+        # Eval
+        acc, mean_loss = _eval_mlp_nanda(mlp_even, mlp_odd, ev_X, ev_Y, ev_pos,
+                                         device, batch_size)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {
+                'even': {k: v.cpu().clone() for k, v in mlp_even.state_dict().items()},
+                'odd': {k: v.cpu().clone() for k, v in mlp_odd.state_dict().items()},
+            }
+        scheduler.step(mean_loss)
+        cur_lr = optimizer.param_groups[0]['lr']
+        avg_loss = epoch_loss / max(epoch_batches, 1)
+        print(f"  Epoch {epoch}: acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
+              flush=True)
+
+    # Save
+    if best_state is not None and save_path is not None:
+        torch.save({
+            'even': best_state['even'],
+            'odd': best_state['odd'],
+            'hidden_dim': hidden_dim,
+            'input_dim': input_dim,
+            'num_hidden_layers': 1,
+            'best_acc': best_acc,
+        }, save_path)
+        print(f"  Saved checkpoint to {save_path}")
+
+    return best_acc
+
+
 def _build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers=1):
     """Build an MLP with the given number of hidden layers."""
     layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
