@@ -1559,11 +1559,11 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
+    # Cap eval BEFORE transform to save memory
+    n_eval = min(len(ev_X), 49 * 10000)  # ~10K games worth
+    ev_X, ev_Y, ev_pos = ev_X[:n_eval].clone(), ev_Y[:n_eval].clone(), ev_pos[:n_eval].clone()
     if transform_fn is not None:
         ev_X = transform_fn(ev_X)
-    # Use subset for eval to save memory
-    n_eval = min(len(ev_X), 49 * 10000)  # ~10K games worth
-    ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
     print(f"  Eval samples: {len(ev_X)}")
 
     mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS).to(device)
