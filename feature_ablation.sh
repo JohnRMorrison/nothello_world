@@ -26,6 +26,6 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-python feature_ablation.py --max-games 1000000 --epochs 4 --hidden 1024 --precomputed
+python feature_ablation.py --max-games 500000 --epochs 4 --hidden 1024 --precomputed
 
 echo "Completed at: $(date)"
