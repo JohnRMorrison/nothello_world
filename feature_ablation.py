@@ -21,7 +21,7 @@ from experiments.mathematical_transformation_experiments.heuristic_probe_experim
 
 import argparse
 parser = argparse.ArgumentParser()
-parser.add_argument("--max-games", type=int, default=100000)
+parser.add_argument("--max-games", type=int, default=500000)
 parser.add_argument("--epochs", type=int, default=10)
 parser.add_argument("--hidden", type=int, default=1024)
 parser.add_argument("--precomputed", action="store_true",
@@ -42,16 +42,21 @@ if args.precomputed:
     all_X, all_Y, all_pos = [], [], []
     total = 0
     for fname in chunk_files:
-        X, Y, pos = _load_features(os.path.join(chunk_dir, fname))
-        all_X.append(X); all_Y.append(Y); all_pos.append(pos)
-        total += X.shape[0]
-        print(f"  {fname}: {X.shape[0]} samples (total: {total})")
+        data = np.load(os.path.join(chunk_dir, fname))
+        n = data['features'].shape[0]
+        needed = max_samples - total if max_samples else n
+        needed = min(needed, n)
+        all_X.append(torch.from_numpy(data['features'][:needed].astype(np.float32)))
+        all_Y.append(torch.from_numpy(data['labels'][:needed].astype(np.int64)))
+        all_pos.append(torch.from_numpy(data['positions'][:needed].astype(np.int64)))
+        total += needed
+        print(f"  {fname}: {needed} samples (total: {total})", flush=True)
+        del data
         if max_samples and total >= max_samples:
             break
-    X = torch.cat(all_X); Y = torch.cat(all_Y); pos = torch.cat(all_pos)
-    del all_X, all_Y, all_pos
-    if max_samples and len(X) > max_samples:
-        X = X[:max_samples]; Y = Y[:max_samples]; pos = pos[:max_samples]
+    X = torch.cat(all_X); del all_X
+    Y = torch.cat(all_Y); del all_Y
+    pos = torch.cat(all_pos); del all_pos
     n_eval = max(int(len(X) * 0.1), 49 * 100)
     n_train = len(X) - n_eval
     tr_X, tr_Y, tr_pos = X[:n_train], Y[:n_train], pos[:n_train]
