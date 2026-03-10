@@ -1535,12 +1535,14 @@ def experiment_learned_heuristic(args):
 # ==================== Approach 2: MLP on Move-History =======================
 
 def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
-                         feature_cols=None, lr=1e-3, epochs=10,
-                         batch_size=1024, eval_frac=0.1, save_path=None):
+                         feature_cols=None, transform_fn=None, lr=1e-3,
+                         epochs=10, batch_size=1024, eval_frac=0.1,
+                         save_path=None):
     """Train MLP streaming through chunk files — constant memory usage.
 
     Loads one chunk at a time for training, keeps one chunk for eval.
     feature_cols: optional list of column indices to select from 180-d features.
+    transform_fn: optional function(X) -> X' applied after column selection.
     """
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir) if f.endswith(".npz"))
@@ -1557,6 +1559,8 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
+    if transform_fn is not None:
+        ev_X = transform_fn(ev_X)
     # Use subset for eval to save memory
     n_eval = min(len(ev_X), 49 * 10000)  # ~10K games worth
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
@@ -1588,6 +1592,8 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
             tr_X, tr_Y, tr_pos = _load_features(path)
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
+            if transform_fn is not None:
+                tr_X = transform_fn(tr_X)
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):

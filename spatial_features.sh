@@ -1,13 +1,13 @@
 #!/bin/bash
-# Train MLP on 300-d features (180 base + 120 spatial)
+# Train MLP on 300-d features (180 base + 120 spatial) using streaming
 # Usage: sbatch --array=0-1 spatial_features.sh
 #
 # Task 0: H=1024,  Task 1: H=2048
 
 #SBATCH --job-name=spatial
 #SBATCH -c 8
-#SBATCH --time=4:00:00
-#SBATCH --mem=120GB
+#SBATCH --time=8:00:00
+#SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/spatial_%A_%a.out
 #SBATCH --account=nklab
@@ -26,16 +26,15 @@ TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 H=${H_ARRAY[$TASK_ID]}
 
 echo "============================================"
-echo "Spatial Features: 300-d, H=$H"
+echo "Spatial Features (streaming): 300-d, H=$H, ~6M games"
 echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: $TASK_ID"
 echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 python spatial_features.py \
+CUDA_VISIBLE_DEVICES=0 python train_streaming.py \
     --hidden $H \
     --epochs 10 \
-    --max-games 500000 \
-    --precomputed
+    --spatial
 
 echo "Completed at: $(date)"
