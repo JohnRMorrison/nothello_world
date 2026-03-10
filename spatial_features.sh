@@ -26,8 +26,12 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
+H=${1:-1024}
+
+echo "Training H=$H"
+
 CUDA_VISIBLE_DEVICES=0 python spatial_features.py \
-    --hidden 1024 2048 \
+    --hidden $H \
     --epochs 10 \
     --max-games 1000000 \
     --precomputed

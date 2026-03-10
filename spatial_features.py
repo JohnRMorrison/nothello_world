@@ -66,7 +66,14 @@ for path in chunk_files:
     needed = min(n, max_samples - total) if max_samples else n
     if needed <= 0:
         break
-    all_X.append(torch.from_numpy(data['features'][:needed].astype(np.float32)))
+    feat = data['features'][:needed].astype(np.float32)
+    # Compute spatial features from played[] columns before converting to tensor
+    played = feat[:, :N_MOVES]  # (N, 60)
+    rows_feat = played * _ROWS  # (N, 60)
+    cols_feat = played * _COLS  # (N, 60)
+    feat_300 = np.concatenate([feat, rows_feat, cols_feat], axis=1)  # (N, 300)
+    all_X.append(torch.from_numpy(feat_300))
+    del feat, played, rows_feat, cols_feat, feat_300
     all_Y.append(torch.from_numpy(data['labels'][:needed].astype(np.int64)))
     all_pos.append(torch.from_numpy(data['positions'][:needed].astype(np.int64)))
     total += needed
@@ -78,10 +85,6 @@ for path in chunk_files:
 X = torch.cat(all_X); del all_X
 Y = torch.cat(all_Y); del all_Y
 pos = torch.cat(all_pos); del all_pos
-
-# Add spatial features
-print("Adding spatial features (120-d)...")
-X = add_spatial_features(X)
 print(f"  Feature shape: {X.shape}")
 
 n_eval = max(int(len(X) * 0.1), 49 * 100)
