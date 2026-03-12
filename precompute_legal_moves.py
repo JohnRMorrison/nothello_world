@@ -55,6 +55,8 @@ def main():
                                 "heuristic_probe_results/adversarial")
     parser.add_argument("--chunk-size", type=int, default=500000,
                         help="Games per output file (to avoid huge single files)")
+    parser.add_argument("--chunk-id", type=int, default=None,
+                        help="Process only this chunk (for SLURM array jobs)")
     args = parser.parse_args()
 
     print("Loading games...")
@@ -66,17 +68,24 @@ def main():
     n_workers = args.n_workers or min(cpu_count(), 16)
     pos_start = POS_START
     pos_end = POS_END_LEGAL
-    length = pos_end - pos_start
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Process in output chunks to avoid huge single files
     chunk_size = args.chunk_size
     n_output_chunks = (len(games) + chunk_size - 1) // chunk_size
 
-    for ci in range(n_output_chunks):
+    # If --chunk-id given, process only that chunk
+    if args.chunk_id is not None:
+        chunk_ids = [args.chunk_id]
+    else:
+        chunk_ids = list(range(n_output_chunks))
+
+    for ci in chunk_ids:
         g_start = ci * chunk_size
         g_end = min(g_start + chunk_size, len(games))
+        if g_start >= len(games):
+            print(f"Chunk {ci} out of range (only {n_output_chunks} chunks), skipping")
+            continue
         chunk_games = games[g_start:g_end]
         n_games = len(chunk_games)
 
@@ -110,7 +119,7 @@ def main():
         size_mb = os.path.getsize(out_path) / 1e6
         print(f"  Saved to {out_path} ({size_mb:.1f} MB)")
 
-    print(f"\nDone! {n_output_chunks} chunk(s) saved to {args.output_dir}")
+    print(f"\nDone!")
 
 
 if __name__ == "__main__":
