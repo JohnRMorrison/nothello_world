@@ -284,37 +284,18 @@ def train_policy(args):
           f"of {game_chunk_size}")
 
     n_train = len(train_games)  # offset for eval games in original ordering
-    logits_cache_dir = os.path.join(args.output_dir, "logits_cache")
-    os.makedirs(logits_cache_dir, exist_ok=True)
 
-    def _get_or_build_logits(game_chunk, chunk_id):
-        """Load cached board logits or compute and save them."""
-        cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{chunk_id:04d}.npy")
-        if os.path.exists(cache_path):
-            return torch.tensor(np.load(cache_path), dtype=torch.float32)
-        print(f"  Computing board logits for chunk {chunk_id}...")
-        logits, _ = _build_chunk_logits(
-            game_chunk, mlp_even, mlp_odd, device, pos_start, pos_end)
-        np.save(cache_path, logits.numpy().astype(np.float16))
-        print(f"  Saved to {cache_path}")
-        return logits
-
-    # --- Precompute all board logits (one-time cost) ---
-    print("Precomputing board logits for all chunks...", flush=True)
-    for ci in range(n_train_chunks):
-        g_start = ci * game_chunk_size
-        g_end = min(g_start + game_chunk_size, len(train_games))
-        _get_or_build_logits(train_games[g_start:g_end], ci)
-
-    # Eval logits
-    ev_logits = _get_or_build_logits(eval_games, 9999)
+    # --- Precompute eval data (small, fits in memory) ---
+    print("Building eval data...", flush=True)
+    ev_logits, ev_pos = _build_chunk_logits(
+        eval_games, mlp_even, mlp_odd, device, pos_start, pos_end)
     ev_targets = _get_legal_moves(eval_games, pos_start, pos_end,
                                    chunk_dir=args.output_dir,
                                    game_offset=n_train)
     print(f"  Eval: {len(ev_logits)} samples")
 
     # --- Estimate pos_weight from first chunk ---
-    print("Estimating class balance from first chunk...")
+    print("Estimating class balance from first chunk...", flush=True)
     first_legal = _get_legal_moves(train_games[:game_chunk_size], pos_start, pos_end,
                                     chunk_dir=args.output_dir,
                                     game_offset=0)
@@ -324,10 +305,6 @@ def train_policy(args):
     print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
     pos_weight = torch.tensor([pw], device=device)
     del first_legal
-
-    # Free games from memory — only need cached logits from here
-    del games, train_games, eval_games
-    import gc; gc.collect()
 
     # --- Train ---
     policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
@@ -349,15 +326,15 @@ def train_policy(args):
         # Shuffle chunk order each epoch
         chunk_order = torch.randperm(n_train_chunks).tolist()
         for ci in chunk_order:
-            # Load cached logits and legal moves from disk
-            cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{ci:04d}.npy")
-            ch_logits = torch.tensor(np.load(cache_path), dtype=torch.float32)
+            # Build board logits for this chunk (features + MLP, skip_labels=True)
             g_start = ci * game_chunk_size
             g_end = min(g_start + game_chunk_size, n_train)
-            ch_targets = _get_legal_moves(None, pos_start, pos_end,
+            chunk_games = train_games[g_start:g_end]
+            ch_logits, _ = _build_chunk_logits(
+                chunk_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+            ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
                                            chunk_dir=args.output_dir,
-                                           game_offset=g_start,
-                                           n_games=g_end - g_start)
+                                           game_offset=g_start)
 
             # Shuffle within chunk
             perm = torch.randperm(len(ch_logits))
