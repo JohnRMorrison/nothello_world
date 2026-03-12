@@ -81,31 +81,73 @@ class PolicyHead(nn.Module):
 # Train policy head
 # ---------------------------------------------------------------------------
 
-def _compute_legal_moves(game_list, pos_start, pos_end):
-    """Compute binary legal-move vectors for each position in each game.
-
-    For position t, legal_moves[i] = 1 if move index i is legal at position t+1.
-    Returns: (n_samples, 60) float32 tensor
-    """
-    n_games = len(game_list)
+def _compute_legal_moves_chunk(args):
+    """Worker: compute legal moves for a chunk of games."""
+    games_chunk, pos_start, pos_end = args
     length = pos_end - pos_start
-    legal = np.zeros((n_games * length, N_MOVES), dtype=np.float32)
+    n = len(games_chunk)
+    legal = np.zeros((n, length, N_MOVES), dtype=np.int8)
 
-    for gi, game in enumerate(game_list):
+    for gi, game in enumerate(games_chunk):
         board = OthelloBoardState()
-        # Play up to pos_start
         for s in range(pos_start):
             board.umpire(game[s])
-        # For each position in range
         for ti, t in enumerate(range(pos_start, pos_end)):
             board.umpire(game[t])
-            valid_moves = board.get_valid_moves()
-            idx = gi * length + ti
-            for m in valid_moves:
+            for m in board.get_valid_moves():
                 if m in _MOVE_TO_IDX:
-                    legal[idx, _MOVE_TO_IDX[m]] = 1.0
-        if (gi + 1) % 10000 == 0:
-            print(f"    Legal moves: {gi + 1}/{n_games} games", flush=True)
+                    legal[gi, ti, _MOVE_TO_IDX[m]] = 1
+    return legal
+
+
+def _compute_legal_moves_parallel(game_list, pos_start, pos_end):
+    """Compute legal-move vectors using multiprocessing."""
+    from multiprocessing import Pool, cpu_count
+
+    n_games = len(game_list)
+    length = pos_end - pos_start
+    n_workers = min(cpu_count(), 8)
+    chunk_size = (n_games + n_workers - 1) // n_workers
+
+    chunks = []
+    for i in range(0, n_games, chunk_size):
+        chunks.append((game_list[i:i + chunk_size], pos_start, pos_end))
+
+    print(f"    Using {n_workers} workers for {n_games} games...", flush=True)
+    with Pool(n_workers) as pool:
+        results = pool.map(_compute_legal_moves_chunk, chunks)
+
+    # Reassemble: each result is (chunk_n, length, 60)
+    # Need shape (n_games * length, 60) with games interleaved per position
+    legal = np.zeros((n_games * length, N_MOVES), dtype=np.float32)
+    gi_offset = 0
+    for res in results:
+        chunk_n = res.shape[0]
+        for ti in range(length):
+            idx_start = ti * n_games + gi_offset
+            legal[idx_start:idx_start + chunk_n] = res[:, ti]
+        gi_offset += chunk_n
+
+    return legal
+
+
+def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
+    """Compute or load cached legal-move vectors.
+
+    Returns: (n_samples, 60) float32 tensor
+    """
+    if cache_path and os.path.exists(cache_path):
+        print(f"  Loading cached legal moves from {cache_path}")
+        legal = np.load(cache_path)['legal']
+        return torch.tensor(legal, dtype=torch.float32)
+
+    print("  Computing legal moves for each position...")
+    legal = _compute_legal_moves_parallel(game_list, pos_start, pos_end)
+
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        np.savez_compressed(cache_path, legal=legal.astype(np.int8))
+        print(f"  Cached legal moves to {cache_path}")
 
     return torch.tensor(legal, dtype=torch.float32)
 
@@ -144,7 +186,7 @@ def train_policy(args):
     train_games = games[:len(games) - n_eval]
     eval_games = games[len(games) - n_eval:]
 
-    def build_policy_data(game_list):
+    def build_policy_data(game_list, split_name=""):
         batch_size = 2048
         from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
             _build_move_features_batch,
@@ -154,8 +196,11 @@ def train_policy(args):
                                                 include_pairwise=False)
 
         # Targets: binary vector of legal moves at each position
-        print("  Computing legal moves for each position...")
-        legal_targets = _compute_legal_moves(game_list, POS_START, POS_END - 1)
+        cache_path = os.path.join(
+            args.output_dir, f"legal_moves_{split_name}_{len(game_list)}.npz"
+        ) if split_name else None
+        legal_targets = _get_legal_moves(game_list, POS_START, POS_END - 1,
+                                          cache_path=cache_path)
 
         # Compute board logits from frozen MLP
         print("  Computing board logits from frozen MLP...")
@@ -176,10 +221,10 @@ def train_policy(args):
         return board_logits, legal_targets, pos
 
     print("Building training data...")
-    tr_logits, tr_targets, tr_pos = build_policy_data(train_games)
+    tr_logits, tr_targets, tr_pos = build_policy_data(train_games, "train")
     print(f"  Train: {len(tr_logits)} samples")
     print("Building eval data...")
-    ev_logits, ev_targets, ev_pos = build_policy_data(eval_games)
+    ev_logits, ev_targets, ev_pos = build_policy_data(eval_games, "eval")
     print(f"  Eval: {len(ev_logits)} samples")
 
     # Train policy head
