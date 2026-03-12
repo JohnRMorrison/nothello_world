@@ -1097,13 +1097,15 @@ def _compute_labels_parallel(games, pos_start, pos_end, n_games):
     return labels
 
 
-def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True):
+def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True,
+                               skip_labels=False):
     """Build move-history features and labels for a list of games.
 
     Vectorized: converts all games to a (N, 60) move-index array, then
     computes played/when/even features for all positions using broadcasting.
 
-    Returns (features, labels, positions) tensors.
+    Returns (features, labels, positions) tensors. If skip_labels=True,
+    labels will be None (avoids expensive board simulation).
     """
     n_games = len(games)
     length = pos_end - pos_start
@@ -1157,11 +1159,15 @@ def _build_move_features_batch(games, pos_start, pos_end, include_pairwise=True)
         features = np.concatenate([features, pp, pe, ee], axis=1)
 
     # Compute labels (board simulation — parallelized across CPU cores)
-    print("  computing board states for labels...", flush=True)
-    labels = _compute_labels_parallel(games, pos_start, pos_end, n_games)
+    if skip_labels:
+        labels = None
+    else:
+        print("  computing board states for labels...", flush=True)
+        labels = _compute_labels_parallel(games, pos_start, pos_end, n_games)
+        labels = torch.tensor(labels, dtype=torch.long)
 
     return (torch.tensor(features, dtype=torch.float32),
-            torch.tensor(labels, dtype=torch.long),
+            labels,
             torch.tensor(positions, dtype=torch.long))
 
 
