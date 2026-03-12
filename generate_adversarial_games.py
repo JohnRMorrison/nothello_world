@@ -81,11 +81,41 @@ class PolicyHead(nn.Module):
 # Train policy head
 # ---------------------------------------------------------------------------
 
+def _compute_legal_moves(game_list, pos_start, pos_end):
+    """Compute binary legal-move vectors for each position in each game.
+
+    For position t, legal_moves[i] = 1 if move index i is legal at position t+1.
+    Returns: (n_samples, 60) float32 tensor
+    """
+    n_games = len(game_list)
+    length = pos_end - pos_start
+    legal = np.zeros((n_games * length, N_MOVES), dtype=np.float32)
+
+    for gi, game in enumerate(game_list):
+        board = OthelloBoardState()
+        # Play up to pos_start
+        for s in range(pos_start):
+            board.umpire(game[s])
+        # For each position in range
+        for ti, t in enumerate(range(pos_start, pos_end)):
+            board.umpire(game[t])
+            valid_moves = board.get_valid_moves()
+            idx = gi * length + ti
+            for m in valid_moves:
+                if m in _MOVE_TO_IDX:
+                    legal[idx, _MOVE_TO_IDX[m]] = 1.0
+        if (gi + 1) % 10000 == 0:
+            print(f"    Legal moves: {gi + 1}/{n_games} games", flush=True)
+
+    return torch.tensor(legal, dtype=torch.float32)
+
+
 def train_policy(args):
     """Train a policy head on real Othello games.
 
-    For each position t in a game, the input is the board MLP's output (192-d)
-    and the target is the actual next move played at position t+1.
+    For each position t, the input is the board MLP's output (192-d)
+    and the target is a binary vector of all legal moves (not just the one played).
+    Trained with binary cross-entropy.
     """
     device = get_device()
     print(f"Device: {device}")
@@ -114,30 +144,18 @@ def train_policy(args):
     train_games = games[:len(games) - n_eval]
     eval_games = games[len(games) - n_eval:]
 
-    # Build training data: for each position t, predict the move at t+1
-    # We use positions POS_START to POS_END-1 (predicting moves POS_START+1 to POS_END)
     def build_policy_data(game_list):
-        all_features = []
-        all_board_logits = []
-        all_targets = []
-        all_positions = []
-
         batch_size = 2048
-        # Build move features for all positions
         from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
             _build_move_features_batch,
         )
-        # We need positions [POS_START, POS_END-1] to predict moves at [POS_START+1, POS_END]
+        # Positions [POS_START, POS_END-1]: after move t is played, what's legal next?
         X, _, pos = _build_move_features_batch(game_list, POS_START, POS_END - 1,
                                                 include_pairwise=False)
-        # Targets: the actual next move at each position
-        n_games = len(game_list)
-        length = (POS_END - 1) - POS_START  # positions we predict FROM
-        targets = np.zeros(n_games * length, dtype=np.int64)
-        for gi, game in enumerate(game_list):
-            for ti, t in enumerate(range(POS_START, POS_END - 1)):
-                targets[gi * length + ti] = _MOVE_TO_IDX[game[t + 1]]
-        targets = torch.tensor(targets, dtype=torch.long)
+
+        # Targets: binary vector of legal moves at each position
+        print("  Computing legal moves for each position...")
+        legal_targets = _compute_legal_moves(game_list, POS_START, POS_END - 1)
 
         # Compute board logits from frozen MLP
         print("  Computing board logits from frozen MLP...")
@@ -155,7 +173,7 @@ def train_policy(args):
                     out[odd_mask] = mlp_odd(x[odd_mask])
                 board_logits[i:i + batch_size] = out.cpu()
 
-        return board_logits, targets, pos
+        return board_logits, legal_targets, pos
 
     print("Building training data...")
     tr_logits, tr_targets, tr_pos = build_policy_data(train_games)
@@ -184,17 +202,20 @@ def train_policy(args):
             x = tr_logits[idx].to(device)
             y = tr_targets[idx].to(device)
             logits = policy(x)
-            loss = nn.functional.cross_entropy(logits, y)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, y)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item()
             n_batches += 1
 
-        # Eval
+        # Eval: measure per-move classification accuracy (legal vs illegal)
         policy.eval()
-        correct = 0
-        total = 0
+        tp = 0  # true positives (predicted legal & actually legal)
+        fp = 0  # false positives
+        fn = 0  # false negatives
+        total_correct = 0
+        total_moves = 0
         eval_loss = 0.0
         n_eval_batches = 0
         with torch.no_grad():
@@ -202,19 +223,27 @@ def train_policy(args):
                 x = ev_logits[i:i + batch_size].to(device)
                 y = ev_targets[i:i + batch_size].to(device)
                 logits = policy(x)
-                eval_loss += nn.functional.cross_entropy(logits, y).item()
+                eval_loss += nn.functional.binary_cross_entropy_with_logits(logits, y).item()
                 n_eval_batches += 1
-                correct += (logits.argmax(-1) == y).sum().item()
-                total += len(y)
-        acc = correct / total
+                preds = (logits > 0).float()
+                total_correct += (preds == y).sum().item()
+                total_moves += y.numel()
+                tp += ((preds == 1) & (y == 1)).sum().item()
+                fp += ((preds == 1) & (y == 0)).sum().item()
+                fn += ((preds == 0) & (y == 1)).sum().item()
+
+        acc = total_correct / total_moves
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
         mean_loss = eval_loss / n_eval_batches
         scheduler.step(mean_loss)
         lr = optimizer.param_groups[0]['lr']
-        print(f"  Epoch {epoch}: train_loss={epoch_loss/n_batches:.4f}  "
-              f"eval_acc={acc:.4%}  eval_loss={mean_loss:.4f}  lr={lr:.2e}")
+        print(f"  Epoch {epoch}: loss={mean_loss:.4f}  acc={acc:.4%}  "
+              f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}")
 
-        if acc > best_acc:
-            best_acc = acc
+        if f1 > best_acc:
+            best_acc = f1
             best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
 
     # Save
@@ -223,9 +252,9 @@ def train_policy(args):
     torch.save({
         'state_dict': best_state,
         'hidden_dim': 256,
-        'best_acc': best_acc,
+        'best_f1': best_acc,
     }, save_path)
-    print(f"\nBest policy accuracy: {best_acc:.4%}")
+    print(f"\nBest policy F1: {best_acc:.4f}")
     print(f"Saved to {save_path}")
 
 
@@ -313,21 +342,20 @@ def generate_games(args):
     policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim']).to(device)
     policy.load_state_dict(policy_ckpt['state_dict'])
     policy.eval()
-    print(f"Loaded policy head (acc={policy_ckpt['best_acc']:.4%})")
+    print(f"Loaded policy head (F1={policy_ckpt.get('best_f1', policy_ckpt.get('best_acc', 0)):.4f})")
 
     # Generate games
     games = []
-    n_short = 0  # games that ended early (no valid move predicted)
-    temperature = args.temperature
+    n_short = 0  # games that ended early (no predicted legal move available)
 
     for gi in range(args.n_games):
         move_history = []
         for t in range(60):
             # Compute features for current position
-            features = _compute_move_features(move_history, t - 1 if t > 0 else 0)
             if t == 0:
-                # At t=0, no moves played yet — features are all zeros
                 features = torch.zeros(180, dtype=torch.float32)
+            else:
+                features = _compute_move_features(move_history, t - 1)
 
             features = features.unsqueeze(0).to(device)  # (1, 180)
 
@@ -338,20 +366,25 @@ def generate_games(args):
                 else:
                     board_logits = mlp_odd(features)
 
-                # Get move distribution from policy
+                # Get legal move predictions from policy
                 move_logits = policy(board_logits)  # (1, 60)
 
             # Mask already-played moves
             for prev_move in move_history:
-                move_logits[0, _MOVE_TO_IDX[prev_move]] = float('-inf')
+                move_logits[0, _MOVE_TO_IDX[prev_move]] = -1e9
 
-            # Sample with temperature
-            probs = torch.softmax(move_logits[0] / temperature, dim=0)
+            # Predicted legal moves: sigmoid > 0.5 (i.e. logits > 0)
+            legal_mask = (move_logits[0] > 0)
 
-            # Also mask center squares (never valid)
-            # _VALID_MOVES already excludes them, so move indices map directly
+            # If no moves predicted legal, fall back to highest-scoring unplayed
+            if not legal_mask.any():
+                move_idx = move_logits[0].argmax().item()
+            else:
+                # Sample uniformly from predicted-legal moves
+                legal_indices = legal_mask.nonzero(as_tuple=True)[0]
+                pick = torch.randint(len(legal_indices), (1,)).item()
+                move_idx = legal_indices[pick].item()
 
-            move_idx = torch.multinomial(probs, 1).item()
             move = _VALID_MOVES[move_idx]
             move_history.append(move)
 
