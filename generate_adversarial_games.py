@@ -72,9 +72,7 @@ class PolicyHead(nn.Module):
 
     def forward(self, board_logits):
         """board_logits: (B, 192) raw MLP output."""
-        # Convert to soft board representation
-        probs = board_logits.view(-1, 64, OPTIONS).softmax(-1).view(-1, 64 * OPTIONS)
-        return self.net(probs)
+        return self.net(board_logits)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +226,13 @@ def train_policy(args):
     print(f"  Eval: {len(ev_logits)} samples")
 
     # Train policy head
+    # Compute pos_weight from class balance: legal moves are ~16% of all slots
+    n_pos = tr_targets.sum().item()
+    n_neg = tr_targets.numel() - n_pos
+    pw = n_neg / max(n_pos, 1)
+    print(f"  Class balance: {n_pos/tr_targets.numel():.1%} positive, pos_weight={pw:.1f}")
+    pos_weight = torch.tensor([pw], device=device)
+
     policy = PolicyHead(hidden_dim=256).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -247,7 +252,8 @@ def train_policy(args):
             x = tr_logits[idx].to(device)
             y = tr_targets[idx].to(device)
             logits = policy(x)
-            loss = nn.functional.binary_cross_entropy_with_logits(logits, y)
+            loss = nn.functional.binary_cross_entropy_with_logits(
+                logits, y, pos_weight=pos_weight)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
