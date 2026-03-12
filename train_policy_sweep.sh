@@ -4,7 +4,7 @@
 
 #SBATCH --job-name=pol_sweep
 #SBATCH -c 8
-#SBATCH --time=6:00:00
+#SBATCH --time=2:00:00
 #SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/policy_sweep_%A_%a.out
