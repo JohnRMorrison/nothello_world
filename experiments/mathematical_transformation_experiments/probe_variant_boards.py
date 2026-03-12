@@ -45,11 +45,18 @@ _spec = importlib.util.spec_from_file_location(
 _othello_mod = importlib.util.module_from_spec(_spec)
 # Stub out pgn, seaborn, matplotlib before executing the module
 # (seaborn/matplotlib hang on NFS due to slow directory scans)
+class _Dummy:
+    """Catch-all dummy that returns itself for any attribute/call."""
+    def __getattr__(self, name): return _Dummy()
+    def __call__(self, *a, **kw): return _Dummy()
+
 for _stub in ["pgn", "seaborn", "matplotlib", "matplotlib.pyplot",
               "matplotlib.patches", "matplotlib.collections", "matplotlib.colors",
               "psutil"]:
     if _stub not in sys.modules:
-        sys.modules[_stub] = types.ModuleType(_stub)
+        _mod = types.ModuleType(_stub)
+        _mod.__dict__.setdefault('__getattr__', lambda name: _Dummy())
+        sys.modules[_stub] = _mod
 _spec.loader.exec_module(_othello_mod)
 OthelloBoardState = _othello_mod.OthelloBoardState
 from mingpt.model import GPT, GPTConfig
