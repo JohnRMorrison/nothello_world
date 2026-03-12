@@ -1,0 +1,443 @@
+"""Generate adversarial Othello games using perturbed heuristic MLPs.
+
+Pipeline:
+  1. Load trained MLP (move features → 1024 hidden → board state)
+  2. Add a policy head (board state → next move) and train it on real games
+  3. Perturb the heuristic hidden units by corruption level α
+  4. Generate games by: move history → perturbed MLP → board state → policy → next move
+
+Usage:
+    # Step 1: Train the policy head (run once)
+    python generate_adversarial_games.py --train-policy --max-games 100000
+
+    # Step 2: Generate games at various perturbation levels
+    python generate_adversarial_games.py --generate --alpha 0.0 --n-games 100000
+    python generate_adversarial_games.py --generate --alpha 0.3 --n-games 100000
+    python generate_adversarial_games.py --generate --alpha 1.0 --n-games 100000
+"""
+import sys, os
+sys.path.insert(0, '.')
+
+import argparse
+import pickle
+import numpy as np
+import torch
+import torch.nn as nn
+from copy import deepcopy
+
+from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
+    _build_mlp, N_MOVES, _VALID_MOVES, _MOVE_TO_IDX, POS_START, POS_END, OPTIONS,
+    get_device,
+)
+from experiments.mathematical_transformation_experiments.probe_variant_boards import (
+    load_games, OthelloBoardState, STOI, ITOS,
+)
+
+# ---------------------------------------------------------------------------
+# Feature computation for a single position (used during game generation)
+# ---------------------------------------------------------------------------
+
+def _compute_move_features(move_history, t):
+    """Compute 180-d move features for position t given move history.
+
+    move_history: list of raw moves (0-63, excluding center 4)
+    t: current position index (0-based, i.e. number of moves played so far - 1)
+
+    Returns: (180,) float32 tensor
+    """
+    features = np.zeros(180, dtype=np.float32)
+    for step, move in enumerate(move_history[:t + 1]):
+        idx = _MOVE_TO_IDX[move]
+        features[idx] = 1.0                          # played
+        features[N_MOVES + idx] = (step + 1) / 60.0  # when
+        features[2 * N_MOVES + idx] = float(step % 2 == 0)  # even
+    return torch.tensor(features, dtype=torch.float32)
+
+
+# ---------------------------------------------------------------------------
+# Policy head: board state (64*3 logits) → next move (60 logits)
+# ---------------------------------------------------------------------------
+
+class PolicyHead(nn.Module):
+    """Predicts next move from board state logits."""
+    def __init__(self, hidden_dim=256):
+        super().__init__()
+        # Input: 192 (64 squares × 3 classes) — raw logits from board MLP
+        # We convert to soft probabilities first, then predict
+        self.net = nn.Sequential(
+            nn.Linear(64 * OPTIONS, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, N_MOVES),
+        )
+
+    def forward(self, board_logits):
+        """board_logits: (B, 192) raw MLP output."""
+        # Convert to soft board representation
+        probs = board_logits.view(-1, 64, OPTIONS).softmax(-1).view(-1, 64 * OPTIONS)
+        return self.net(probs)
+
+
+# ---------------------------------------------------------------------------
+# Train policy head
+# ---------------------------------------------------------------------------
+
+def train_policy(args):
+    """Train a policy head on real Othello games.
+
+    For each position t in a game, the input is the board MLP's output (192-d)
+    and the target is the actual next move played at position t+1.
+    """
+    device = get_device()
+    print(f"Device: {device}")
+
+    # Load the trained board-state MLP
+    ckpt = torch.load(args.mlp_checkpoint, map_location='cpu')
+    input_dim = ckpt['input_dim']
+    hidden_dim = ckpt['hidden_dim']
+    num_hidden = ckpt.get('num_hidden_layers', 1)
+
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden).to(device)
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden).to(device)
+    mlp_even.load_state_dict(ckpt['even'])
+    mlp_odd.load_state_dict(ckpt['odd'])
+    mlp_even.eval()
+    mlp_odd.eval()
+    print(f"Loaded board MLP: input={input_dim}, hidden={hidden_dim}")
+
+    # Load games
+    games = load_games(max_files=args.max_files)
+    if args.max_games and len(games) > args.max_games:
+        games = games[:args.max_games]
+    print(f"Loaded {len(games)} games")
+
+    n_eval = max(int(len(games) * 0.1), 500)
+    train_games = games[:len(games) - n_eval]
+    eval_games = games[len(games) - n_eval:]
+
+    # Build training data: for each position t, predict the move at t+1
+    # We use positions POS_START to POS_END-1 (predicting moves POS_START+1 to POS_END)
+    def build_policy_data(game_list):
+        all_features = []
+        all_board_logits = []
+        all_targets = []
+        all_positions = []
+
+        batch_size = 2048
+        # Build move features for all positions
+        from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
+            _build_move_features_batch,
+        )
+        # We need positions [POS_START, POS_END-1] to predict moves at [POS_START+1, POS_END]
+        X, _, pos = _build_move_features_batch(game_list, POS_START, POS_END - 1,
+                                                include_pairwise=False)
+        # Targets: the actual next move at each position
+        n_games = len(game_list)
+        length = (POS_END - 1) - POS_START  # positions we predict FROM
+        targets = np.zeros(n_games * length, dtype=np.int64)
+        for gi, game in enumerate(game_list):
+            for ti, t in enumerate(range(POS_START, POS_END - 1)):
+                targets[gi * length + ti] = _MOVE_TO_IDX[game[t + 1]]
+        targets = torch.tensor(targets, dtype=torch.long)
+
+        # Compute board logits from frozen MLP
+        print("  Computing board logits from frozen MLP...")
+        board_logits = torch.zeros(len(X), 64 * OPTIONS)
+        with torch.no_grad():
+            for i in range(0, len(X), batch_size):
+                x = X[i:i + batch_size].to(device)
+                p = pos[i:i + batch_size]
+                even_mask = (p % 2 == 0)
+                odd_mask = ~even_mask
+                out = torch.zeros(len(x), 64 * OPTIONS, device=device)
+                if even_mask.any():
+                    out[even_mask] = mlp_even(x[even_mask])
+                if odd_mask.any():
+                    out[odd_mask] = mlp_odd(x[odd_mask])
+                board_logits[i:i + batch_size] = out.cpu()
+
+        return board_logits, targets, pos
+
+    print("Building training data...")
+    tr_logits, tr_targets, tr_pos = build_policy_data(train_games)
+    print(f"  Train: {len(tr_logits)} samples")
+    print("Building eval data...")
+    ev_logits, ev_targets, ev_pos = build_policy_data(eval_games)
+    print(f"  Eval: {len(ev_logits)} samples")
+
+    # Train policy head
+    policy = PolicyHead(hidden_dim=256).to(device)
+    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2)
+
+    best_acc = 0.0
+    best_state = None
+    batch_size = 2048
+
+    for epoch in range(1, args.policy_epochs + 1):
+        policy.train()
+        perm = torch.randperm(len(tr_logits))
+        epoch_loss = 0.0
+        n_batches = 0
+        for i in range(0, len(tr_logits), batch_size):
+            idx = perm[i:i + batch_size]
+            x = tr_logits[idx].to(device)
+            y = tr_targets[idx].to(device)
+            logits = policy(x)
+            loss = nn.functional.cross_entropy(logits, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        # Eval
+        policy.eval()
+        correct = 0
+        total = 0
+        eval_loss = 0.0
+        n_eval_batches = 0
+        with torch.no_grad():
+            for i in range(0, len(ev_logits), batch_size):
+                x = ev_logits[i:i + batch_size].to(device)
+                y = ev_targets[i:i + batch_size].to(device)
+                logits = policy(x)
+                eval_loss += nn.functional.cross_entropy(logits, y).item()
+                n_eval_batches += 1
+                correct += (logits.argmax(-1) == y).sum().item()
+                total += len(y)
+        acc = correct / total
+        mean_loss = eval_loss / n_eval_batches
+        scheduler.step(mean_loss)
+        lr = optimizer.param_groups[0]['lr']
+        print(f"  Epoch {epoch}: train_loss={epoch_loss/n_batches:.4f}  "
+              f"eval_acc={acc:.4%}  eval_loss={mean_loss:.4f}  lr={lr:.2e}")
+
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
+
+    # Save
+    save_path = os.path.join(args.output_dir, "policy_head.pt")
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.save({
+        'state_dict': best_state,
+        'hidden_dim': 256,
+        'best_acc': best_acc,
+    }, save_path)
+    print(f"\nBest policy accuracy: {best_acc:.4%}")
+    print(f"Saved to {save_path}")
+
+
+# ---------------------------------------------------------------------------
+# Perturb heuristic MLP hidden units
+# ---------------------------------------------------------------------------
+
+def _perturb_mlp(mlp, alpha, rng):
+    """Perturb the most important hidden units of an MLP.
+
+    Ranks hidden units by L2 norm of their output weights.
+    Replaces the top alpha fraction (most important) with random weights.
+
+    Args:
+        mlp: nn.Sequential (Linear → ReLU → Linear)
+        alpha: float in [0, 1], fraction of units to corrupt
+        rng: numpy random generator for reproducibility
+    Returns:
+        new MLP with perturbed weights (original unchanged)
+    """
+    mlp_new = deepcopy(mlp)
+    # Get output weight matrix: shape (output_dim, hidden_dim)
+    W_out = mlp_new[-1].weight.data  # (192, H)
+    H = W_out.shape[1]
+
+    n_corrupt = int(alpha * H)
+    if n_corrupt == 0:
+        return mlp_new
+
+    # Rank by L2 norm of output weights (importance)
+    importance = W_out.norm(dim=0)  # (H,)
+    _, sorted_idx = importance.sort(descending=True)
+    corrupt_idx = sorted_idx[:n_corrupt]
+
+    # Replace output weights for corrupted units with random weights
+    # (scaled to match original distribution)
+    std = W_out[:, corrupt_idx].std().item()
+    W_out[:, corrupt_idx] = torch.randn_like(W_out[:, corrupt_idx]) * std
+
+    # Also perturb the corresponding input weights and biases
+    W_in = mlp_new[0].weight.data  # (H, input_dim)
+    b_in = mlp_new[0].bias.data    # (H,)
+    in_std = W_in[corrupt_idx].std().item()
+    W_in[corrupt_idx] = torch.randn(n_corrupt, W_in.shape[1]) * in_std
+    b_in[corrupt_idx] = torch.randn(n_corrupt) * b_in.std().item()
+
+    return mlp_new
+
+
+# ---------------------------------------------------------------------------
+# Generate games using perturbed MLP + policy
+# ---------------------------------------------------------------------------
+
+def generate_games(args):
+    """Generate games using perturbed heuristic MLP + trained policy head."""
+    device = get_device()
+    print(f"Device: {device}")
+    print(f"Alpha (perturbation): {args.alpha}")
+    print(f"Temperature: {args.temperature}")
+
+    # Load board MLP
+    ckpt = torch.load(args.mlp_checkpoint, map_location='cpu')
+    input_dim = ckpt['input_dim']
+    hidden_dim = ckpt['hidden_dim']
+    num_hidden = ckpt.get('num_hidden_layers', 1)
+
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden)
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden)
+    mlp_even.load_state_dict(ckpt['even'])
+    mlp_odd.load_state_dict(ckpt['odd'])
+
+    # Perturb
+    rng = np.random.default_rng(args.seed)
+    if args.alpha > 0:
+        print(f"Perturbing {args.alpha:.0%} of hidden units ({int(args.alpha * hidden_dim)}/{hidden_dim})...")
+        mlp_even = _perturb_mlp(mlp_even, args.alpha, rng)
+        mlp_odd = _perturb_mlp(mlp_odd, args.alpha, rng)
+
+    mlp_even = mlp_even.to(device).eval()
+    mlp_odd = mlp_odd.to(device).eval()
+
+    # Load policy head
+    policy_ckpt = torch.load(
+        os.path.join(args.output_dir, "policy_head.pt"), map_location='cpu')
+    policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim']).to(device)
+    policy.load_state_dict(policy_ckpt['state_dict'])
+    policy.eval()
+    print(f"Loaded policy head (acc={policy_ckpt['best_acc']:.4%})")
+
+    # Generate games
+    games = []
+    n_short = 0  # games that ended early (no valid move predicted)
+    temperature = args.temperature
+
+    for gi in range(args.n_games):
+        move_history = []
+        for t in range(60):
+            # Compute features for current position
+            features = _compute_move_features(move_history, t - 1 if t > 0 else 0)
+            if t == 0:
+                # At t=0, no moves played yet — features are all zeros
+                features = torch.zeros(180, dtype=torch.float32)
+
+            features = features.unsqueeze(0).to(device)  # (1, 180)
+
+            with torch.no_grad():
+                # Get board state from heuristic MLP
+                if t % 2 == 0:
+                    board_logits = mlp_even(features)
+                else:
+                    board_logits = mlp_odd(features)
+
+                # Get move distribution from policy
+                move_logits = policy(board_logits)  # (1, 60)
+
+            # Mask already-played moves
+            for prev_move in move_history:
+                move_logits[0, _MOVE_TO_IDX[prev_move]] = float('-inf')
+
+            # Sample with temperature
+            probs = torch.softmax(move_logits[0] / temperature, dim=0)
+
+            # Also mask center squares (never valid)
+            # _VALID_MOVES already excludes them, so move indices map directly
+
+            move_idx = torch.multinomial(probs, 1).item()
+            move = _VALID_MOVES[move_idx]
+            move_history.append(move)
+
+        if len(move_history) == 60:
+            games.append(move_history)
+        else:
+            n_short += 1
+
+        if (gi + 1) % 10000 == 0:
+            print(f"  Generated {gi + 1}/{args.n_games} games", flush=True)
+
+    print(f"\nGenerated {len(games)} complete games ({n_short} short games discarded)")
+
+    # Validate: check what fraction of moves are legal in real Othello
+    n_legal = 0
+    n_total = 0
+    n_games_check = min(1000, len(games))
+    for game in games[:n_games_check]:
+        board = OthelloBoardState()
+        for t, move in enumerate(game):
+            valid = board.get_valid_moves()
+            if move in valid:
+                n_legal += 1
+            n_total += 1
+            # We can't call umpire on an illegal move, so just track stats
+            # For the check, we simulate real Othello to see legality
+            if move in valid:
+                board.umpire(move)
+            else:
+                break  # can't continue real simulation after illegal move
+
+    print(f"Legality check (first {n_games_check} games):")
+    print(f"  Moves that are also legal in real Othello: {n_legal}/{n_total} "
+          f"({n_legal/n_total:.1%})")
+
+    # Save as pickle (same format as training data)
+    alpha_str = f"{args.alpha:.2f}".replace('.', '')
+    out_path = os.path.join(args.output_dir,
+                            f"adversarial_games_alpha{alpha_str}_n{len(games)}.pickle")
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(out_path, 'wb') as f:
+        pickle.dump(games, f, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"Saved to {out_path}")
+
+    return games
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+parser = argparse.ArgumentParser(description="Generate adversarial Othello games")
+parser.add_argument("--train-policy", action="store_true",
+                    help="Train the policy head")
+parser.add_argument("--generate", action="store_true",
+                    help="Generate games with perturbed heuristics")
+
+# Shared
+parser.add_argument("--mlp-checkpoint",
+                    default="experiments/mathematical_transformation_experiments/"
+                            "heuristic_probe_results/mlp_checkpoints/"
+                            "mlp_all_H1024_streaming.pt",
+                    help="Path to trained board-state MLP checkpoint")
+parser.add_argument("--output-dir",
+                    default="experiments/mathematical_transformation_experiments/"
+                            "heuristic_probe_results/adversarial")
+
+# Policy training
+parser.add_argument("--max-games", type=int, default=100000)
+parser.add_argument("--max-files", type=int, default=None)
+parser.add_argument("--policy-epochs", type=int, default=20)
+
+# Generation
+parser.add_argument("--alpha", type=float, default=0.0,
+                    help="Perturbation level [0, 1]")
+parser.add_argument("--n-games", type=int, default=100000,
+                    help="Number of games to generate")
+parser.add_argument("--temperature", type=float, default=1.0,
+                    help="Sampling temperature for move selection")
+parser.add_argument("--seed", type=int, default=42)
+
+args = parser.parse_args()
+
+if args.train_policy:
+    train_policy(args)
+elif args.generate:
+    generate_games(args)
+else:
+    print("Specify --train-policy or --generate")
