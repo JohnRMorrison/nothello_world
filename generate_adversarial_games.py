@@ -129,7 +129,49 @@ def _compute_legal_moves_parallel(game_list, pos_start, pos_end):
     return legal
 
 
-def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
+def _load_precomputed_chunks(chunk_dir, n_games, length, game_offset=0):
+    """Load legal moves from precomputed chunk files (from precompute_legal_moves.py).
+
+    Chunk files have shape (chunk_n, length, 60) in game-major order.
+    We need position-major order: (length * n_games, 60).
+
+    Args:
+        chunk_dir: directory containing legal_moves_chunk_*.npz files
+        n_games: number of games to load
+        length: number of positions per game
+        game_offset: skip this many games from the start (for loading subsets)
+    Returns None if chunks not found or insufficient.
+    """
+    import glob as globmod
+    chunk_files = sorted(globmod.glob(os.path.join(chunk_dir, "legal_moves_chunk_*.npz")))
+    if not chunk_files:
+        return None
+
+    # Load chunks, skipping games before game_offset
+    parts = []
+    total_games = 0
+    games_needed = game_offset + n_games
+    for f in chunk_files:
+        data = np.load(f)['legal']  # (chunk_n, length, 60)
+        parts.append(data)
+        total_games += data.shape[0]
+        if total_games >= games_needed:
+            break
+
+    if total_games < games_needed:
+        print(f"  Warning: only {total_games} games in chunks, need {games_needed}")
+        return None
+
+    # Concatenate, slice to [game_offset : game_offset + n_games]
+    all_legal = np.concatenate(parts, axis=0)[game_offset:game_offset + n_games]
+    # Transpose to position-major: (length, n_games, 60) → (length*n_games, 60)
+    legal = all_legal.transpose(1, 0, 2).reshape(-1, all_legal.shape[2])
+    print(f"  Loaded precomputed legal moves: games [{game_offset}:{game_offset + n_games}]")
+    return legal.astype(np.float32)
+
+
+def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None,
+                     chunk_dir=None, game_offset=0):
     """Compute or load cached legal-move vectors.
 
     Returns: (n_samples, 60) float32 tensor
@@ -138,6 +180,14 @@ def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
         print(f"  Loading cached legal moves from {cache_path}")
         legal = np.load(cache_path)['legal']
         return torch.tensor(legal, dtype=torch.float32)
+
+    # Try precomputed chunks
+    if chunk_dir:
+        length = pos_end - pos_start
+        legal = _load_precomputed_chunks(chunk_dir, len(game_list), length,
+                                          game_offset=game_offset)
+        if legal is not None:
+            return torch.tensor(legal, dtype=torch.float32)
 
     print("  Computing legal moves for each position...")
     legal = _compute_legal_moves_parallel(game_list, pos_start, pos_end)
@@ -150,12 +200,43 @@ def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
     return torch.tensor(legal, dtype=torch.float32)
 
 
+def _build_chunk_logits(game_chunk, mlp_even, mlp_odd, device,
+                        pos_start, pos_end):
+    """Build board logits and position indices for a chunk of games.
+
+    Returns: (board_logits, positions) tensors on CPU.
+    """
+    from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
+        _build_move_features_batch,
+    )
+    X, _, pos = _build_move_features_batch(game_chunk, pos_start, pos_end,
+                                            include_pairwise=False)
+    batch_size = 2048
+    board_logits = torch.zeros(len(X), 64 * OPTIONS)
+    with torch.no_grad():
+        for i in range(0, len(X), batch_size):
+            x = X[i:i + batch_size].to(device)
+            p = pos[i:i + batch_size]
+            even_mask = (p % 2 == 0)
+            odd_mask = ~even_mask
+            out = torch.zeros(len(x), 64 * OPTIONS, device=device)
+            if even_mask.any():
+                out[even_mask] = mlp_even(x[even_mask])
+            if odd_mask.any():
+                out[odd_mask] = mlp_odd(x[odd_mask])
+            board_logits[i:i + batch_size] = out.cpu()
+    del X  # free memory
+    return board_logits, pos
+
+
 def train_policy(args):
     """Train a policy head on real Othello games.
 
     For each position t, the input is the board MLP's output (192-d)
     and the target is a binary vector of all legal moves (not just the one played).
     Trained with binary cross-entropy.
+
+    For large datasets, processes games in chunks to limit memory usage.
     """
     device = get_device()
     print(f"Device: {device}")
@@ -184,89 +265,90 @@ def train_policy(args):
     train_games = games[:len(games) - n_eval]
     eval_games = games[len(games) - n_eval:]
 
-    def build_policy_data(game_list, split_name=""):
-        batch_size = 2048
-        from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
-            _build_move_features_batch,
-        )
-        # Positions [POS_START, POS_END-1]: after move t is played, what's legal next?
-        X, _, pos = _build_move_features_batch(game_list, POS_START, POS_END - 1,
-                                                include_pairwise=False)
+    # Chunk size for streaming (games per chunk)
+    game_chunk_size = min(500000, len(train_games))
+    n_train_chunks = (len(train_games) + game_chunk_size - 1) // game_chunk_size
+    pos_start, pos_end = POS_START, POS_END - 1
+    length = pos_end - pos_start
 
-        # Targets: binary vector of legal moves at each position
-        cache_path = os.path.join(
-            args.output_dir, f"legal_moves_{split_name}_{len(game_list)}.npz"
-        ) if split_name else None
-        legal_targets = _get_legal_moves(game_list, POS_START, POS_END - 1,
-                                          cache_path=cache_path)
+    print(f"Training: {len(train_games)} games in {n_train_chunks} chunks "
+          f"of {game_chunk_size}")
 
-        # Compute board logits from frozen MLP
-        print("  Computing board logits from frozen MLP...")
-        board_logits = torch.zeros(len(X), 64 * OPTIONS)
-        with torch.no_grad():
-            for i in range(0, len(X), batch_size):
-                x = X[i:i + batch_size].to(device)
-                p = pos[i:i + batch_size]
-                even_mask = (p % 2 == 0)
-                odd_mask = ~even_mask
-                out = torch.zeros(len(x), 64 * OPTIONS, device=device)
-                if even_mask.any():
-                    out[even_mask] = mlp_even(x[even_mask])
-                if odd_mask.any():
-                    out[odd_mask] = mlp_odd(x[odd_mask])
-                board_logits[i:i + batch_size] = out.cpu()
+    n_train = len(train_games)  # offset for eval games in original ordering
 
-        return board_logits, legal_targets, pos
-
-    print("Building training data...")
-    tr_logits, tr_targets, tr_pos = build_policy_data(train_games, "train")
-    print(f"  Train: {len(tr_logits)} samples")
+    # --- Precompute eval data (small, fits in memory) ---
     print("Building eval data...")
-    ev_logits, ev_targets, ev_pos = build_policy_data(eval_games, "eval")
+    ev_logits, ev_pos = _build_chunk_logits(
+        eval_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+    ev_targets = _get_legal_moves(eval_games, pos_start, pos_end,
+                                   chunk_dir=args.output_dir,
+                                   game_offset=n_train)
     print(f"  Eval: {len(ev_logits)} samples")
 
-    # Train policy head
-    # Compute pos_weight from class balance: legal moves are ~16% of all slots
-    n_pos = tr_targets.sum().item()
-    n_neg = tr_targets.numel() - n_pos
+    # --- Estimate pos_weight from first chunk ---
+    print("Estimating class balance from first chunk...")
+    first_chunk = train_games[:game_chunk_size]
+    first_legal = _get_legal_moves(first_chunk, pos_start, pos_end,
+                                    chunk_dir=args.output_dir,
+                                    game_offset=0)
+    n_pos = first_legal.sum().item()
+    n_neg = first_legal.numel() - n_pos
     pw = n_neg / max(n_pos, 1)
-    print(f"  Class balance: {n_pos/tr_targets.numel():.1%} positive, pos_weight={pw:.1f}")
+    print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
     pos_weight = torch.tensor([pw], device=device)
+    del first_legal
 
-    policy = PolicyHead(hidden_dim=256).to(device)
+    # --- Train ---
+    policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2)
 
-    best_acc = 0.0
+    best_f1 = 0.0
     best_state = None
     batch_size = 2048
 
     for epoch in range(1, args.policy_epochs + 1):
         policy.train()
-        perm = torch.randperm(len(tr_logits))
         epoch_loss = 0.0
         n_batches = 0
-        for i in range(0, len(tr_logits), batch_size):
-            idx = perm[i:i + batch_size]
-            x = tr_logits[idx].to(device)
-            y = tr_targets[idx].to(device)
-            logits = policy(x)
-            loss = nn.functional.binary_cross_entropy_with_logits(
-                logits, y, pos_weight=pos_weight)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-            n_batches += 1
 
-        # Eval: measure per-move classification accuracy (legal vs illegal)
+        # Shuffle chunk order each epoch
+        chunk_order = torch.randperm(n_train_chunks).tolist()
+        for ci in chunk_order:
+            g_start = ci * game_chunk_size
+            g_end = min(g_start + game_chunk_size, len(train_games))
+            chunk_games = train_games[g_start:g_end]
+
+            # Build board logits for this chunk
+            ch_logits, ch_pos = _build_chunk_logits(
+                chunk_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+
+            # Load legal move targets for this chunk
+            ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
+                                           chunk_dir=args.output_dir,
+                                           game_offset=g_start)
+
+            # Shuffle within chunk
+            perm = torch.randperm(len(ch_logits))
+            for i in range(0, len(ch_logits), batch_size):
+                idx = perm[i:i + batch_size]
+                x = ch_logits[idx].to(device)
+                y = ch_targets[idx].to(device)
+                logits = policy(x)
+                loss = nn.functional.binary_cross_entropy_with_logits(
+                    logits, y, pos_weight=pos_weight)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            del ch_logits, ch_targets  # free memory
+
+        # Eval
         policy.eval()
-        tp = 0  # true positives (predicted legal & actually legal)
-        fp = 0  # false positives
-        fn = 0  # false negatives
-        total_correct = 0
-        total_moves = 0
+        tp = fp = fn = total_correct = total_moves = 0
         eval_loss = 0.0
         n_eval_batches = 0
         with torch.no_grad():
@@ -293,19 +375,19 @@ def train_policy(args):
         print(f"  Epoch {epoch}: loss={mean_loss:.4f}  acc={acc:.4%}  "
               f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}")
 
-        if f1 > best_acc:
-            best_acc = f1
+        if f1 > best_f1:
+            best_f1 = f1
             best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
 
     # Save
-    save_path = os.path.join(args.output_dir, "policy_head.pt")
+    save_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}.pt")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save({
         'state_dict': best_state,
-        'hidden_dim': 256,
-        'best_f1': best_acc,
+        'hidden_dim': args.policy_hidden,
+        'best_f1': best_f1,
     }, save_path)
-    print(f"\nBest policy F1: {best_acc:.4f}")
+    print(f"\nBest policy F1: {best_f1:.4f}")
     print(f"Saved to {save_path}")
 
 
@@ -388,8 +470,11 @@ def generate_games(args):
     mlp_odd = mlp_odd.to(device).eval()
 
     # Load policy head
-    policy_ckpt = torch.load(
-        os.path.join(args.output_dir, "policy_head.pt"), map_location='cpu')
+    policy_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}.pt")
+    if not os.path.exists(policy_path):
+        # Fallback to old naming convention
+        policy_path = os.path.join(args.output_dir, "policy_head.pt")
+    policy_ckpt = torch.load(policy_path, map_location='cpu')
     policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim']).to(device)
     policy.load_state_dict(policy_ckpt['state_dict'])
     policy.eval()
@@ -507,6 +592,8 @@ parser.add_argument("--output-dir",
 parser.add_argument("--max-games", type=int, default=100000)
 parser.add_argument("--max-files", type=int, default=None)
 parser.add_argument("--policy-epochs", type=int, default=20)
+parser.add_argument("--policy-hidden", type=int, default=256,
+                    help="Hidden dim of policy head")
 
 # Generation
 parser.add_argument("--alpha", type=float, default=0.0,
