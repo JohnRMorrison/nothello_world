@@ -171,11 +171,18 @@ def _load_precomputed_chunks(chunk_dir, n_games, length, game_offset=0):
 
 
 def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None,
-                     chunk_dir=None, game_offset=0):
+                     chunk_dir=None, game_offset=0, n_games=None):
     """Compute or load cached legal-move vectors.
+
+    Args:
+        game_list: list of games (can be None if n_games is provided and chunks exist)
+        n_games: number of games (used instead of len(game_list) when game_list is None)
 
     Returns: (n_samples, 60) float32 tensor
     """
+    if n_games is None:
+        n_games = len(game_list)
+
     if cache_path and os.path.exists(cache_path):
         print(f"  Loading cached legal moves from {cache_path}")
         legal = np.load(cache_path)['legal']
@@ -184,11 +191,12 @@ def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None,
     # Try precomputed chunks
     if chunk_dir:
         length = pos_end - pos_start
-        legal = _load_precomputed_chunks(chunk_dir, len(game_list), length,
+        legal = _load_precomputed_chunks(chunk_dir, n_games, length,
                                           game_offset=game_offset)
         if legal is not None:
             return torch.tensor(legal, dtype=torch.float32)
 
+    assert game_list is not None, "game_list required when precomputed chunks unavailable"
     print("  Computing legal moves for each position...")
     legal = _compute_legal_moves_parallel(game_list, pos_start, pos_end)
 
@@ -276,11 +284,30 @@ def train_policy(args):
           f"of {game_chunk_size}")
 
     n_train = len(train_games)  # offset for eval games in original ordering
+    logits_cache_dir = os.path.join(args.output_dir, "logits_cache")
+    os.makedirs(logits_cache_dir, exist_ok=True)
 
-    # --- Precompute eval data (small, fits in memory) ---
-    print("Building eval data...")
-    ev_logits, ev_pos = _build_chunk_logits(
-        eval_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+    def _get_or_build_logits(game_chunk, chunk_id):
+        """Load cached board logits or compute and save them."""
+        cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{chunk_id:04d}.npy")
+        if os.path.exists(cache_path):
+            return torch.tensor(np.load(cache_path), dtype=torch.float32)
+        print(f"  Computing board logits for chunk {chunk_id}...")
+        logits, _ = _build_chunk_logits(
+            game_chunk, mlp_even, mlp_odd, device, pos_start, pos_end)
+        np.save(cache_path, logits.numpy().astype(np.float16))
+        print(f"  Saved to {cache_path}")
+        return logits
+
+    # --- Precompute all board logits (one-time cost) ---
+    print("Precomputing board logits for all chunks...", flush=True)
+    for ci in range(n_train_chunks):
+        g_start = ci * game_chunk_size
+        g_end = min(g_start + game_chunk_size, len(train_games))
+        _get_or_build_logits(train_games[g_start:g_end], ci)
+
+    # Eval logits
+    ev_logits = _get_or_build_logits(eval_games, 9999)
     ev_targets = _get_legal_moves(eval_games, pos_start, pos_end,
                                    chunk_dir=args.output_dir,
                                    game_offset=n_train)
@@ -288,8 +315,7 @@ def train_policy(args):
 
     # --- Estimate pos_weight from first chunk ---
     print("Estimating class balance from first chunk...")
-    first_chunk = train_games[:game_chunk_size]
-    first_legal = _get_legal_moves(first_chunk, pos_start, pos_end,
+    first_legal = _get_legal_moves(train_games[:game_chunk_size], pos_start, pos_end,
                                     chunk_dir=args.output_dir,
                                     game_offset=0)
     n_pos = first_legal.sum().item()
@@ -298,6 +324,10 @@ def train_policy(args):
     print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
     pos_weight = torch.tensor([pw], device=device)
     del first_legal
+
+    # Free games from memory — only need cached logits from here
+    del games, train_games, eval_games
+    import gc; gc.collect()
 
     # --- Train ---
     policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
@@ -309,7 +339,9 @@ def train_policy(args):
     best_state = None
     batch_size = 2048
 
+    import time as _time
     for epoch in range(1, args.policy_epochs + 1):
+        t0 = _time.time()
         policy.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -317,18 +349,15 @@ def train_policy(args):
         # Shuffle chunk order each epoch
         chunk_order = torch.randperm(n_train_chunks).tolist()
         for ci in chunk_order:
+            # Load cached logits and legal moves from disk
+            cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{ci:04d}.npy")
+            ch_logits = torch.tensor(np.load(cache_path), dtype=torch.float32)
             g_start = ci * game_chunk_size
-            g_end = min(g_start + game_chunk_size, len(train_games))
-            chunk_games = train_games[g_start:g_end]
-
-            # Build board logits for this chunk
-            ch_logits, ch_pos = _build_chunk_logits(
-                chunk_games, mlp_even, mlp_odd, device, pos_start, pos_end)
-
-            # Load legal move targets for this chunk
-            ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
+            g_end = min(g_start + game_chunk_size, n_train)
+            ch_targets = _get_legal_moves(None, pos_start, pos_end,
                                            chunk_dir=args.output_dir,
-                                           game_offset=g_start)
+                                           game_offset=g_start,
+                                           n_games=g_end - g_start)
 
             # Shuffle within chunk
             perm = torch.randperm(len(ch_logits))
@@ -373,8 +402,10 @@ def train_policy(args):
         mean_loss = eval_loss / n_eval_batches
         scheduler.step(mean_loss)
         lr = optimizer.param_groups[0]['lr']
+        elapsed = _time.time() - t0
         print(f"  Epoch {epoch}: loss={mean_loss:.4f}  acc={acc:.4%}  "
-              f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}")
+              f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}  "
+              f"({elapsed:.0f}s)", flush=True)
 
         if f1 > best_f1:
             best_f1 = f1
