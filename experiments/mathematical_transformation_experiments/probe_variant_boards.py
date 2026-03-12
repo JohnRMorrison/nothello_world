@@ -43,8 +43,13 @@ _spec = importlib.util.spec_from_file_location(
     submodule_search_locations=[],
 )
 _othello_mod = importlib.util.module_from_spec(_spec)
-# Stub out pgn before executing the module
-sys.modules["pgn"] = types.ModuleType("pgn")
+# Stub out pgn, seaborn, matplotlib before executing the module
+# (seaborn/matplotlib hang on NFS due to slow directory scans)
+for _stub in ["pgn", "seaborn", "matplotlib", "matplotlib.pyplot",
+              "matplotlib.patches", "matplotlib.collections", "matplotlib.colors",
+              "psutil"]:
+    if _stub not in sys.modules:
+        sys.modules[_stub] = types.ModuleType(_stub)
 _spec.loader.exec_module(_othello_mod)
 OthelloBoardState = _othello_mod.OthelloBoardState
 from mingpt.model import GPT, GPTConfig
