@@ -723,7 +723,7 @@ parser.add_argument("--precompute-logits", action="store_true",
 parser.add_argument("--mlp-checkpoint",
                     default="experiments/mathematical_transformation_experiments/"
                             "heuristic_probe_results/mlp_checkpoints/"
-                            "mlp_all_H1024_streaming.pt",
+                            "mlp_180_H1024.pt",
                     help="Path to trained board-state MLP checkpoint")
 parser.add_argument("--output-dir",
                     default="experiments/mathematical_transformation_experiments/"
