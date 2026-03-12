@@ -238,6 +238,129 @@ def _build_chunk_logits(game_chunk, mlp_even, mlp_odd, device,
     return board_logits, pos
 
 
+def _logits_to_board_state(board_logits):
+    """Convert 192-dim logits to uint8 board state (argmax over 3 classes per square).
+
+    Input: (N, 192) tensor of raw logits
+    Returns: (N, 64) uint8 numpy array with values 0, 1, 2
+    """
+    # Reshape to (N, 64, 3) and take argmax
+    return board_logits.reshape(-1, 64, OPTIONS).argmax(dim=-1).byte().numpy()
+
+
+def _board_state_to_onehot(board_state):
+    """Convert uint8 board state back to one-hot 192-dim tensor.
+
+    Input: (N, 64) uint8 numpy array with values 0, 1, 2
+    Returns: (N, 192) float32 tensor
+    """
+    t = torch.from_numpy(board_state.astype(np.int64))
+    return nn.functional.one_hot(t, num_classes=OPTIONS).float().reshape(-1, 64 * OPTIONS)
+
+
+def _load_board_state_chunk(cache_dir, chunk_id, length):
+    """Load a cached board state chunk and convert to one-hot.
+
+    Cache stores game-major (chunk_games, length, 64) uint8.
+    Returns position-major (length * chunk_games, 192) float32 tensor, or None.
+    """
+    path = os.path.join(cache_dir, f"board_state_chunk_{chunk_id:04d}.npz")
+    if not os.path.exists(path):
+        return None
+    bs = np.load(path)['board_state']  # (chunk_games, length, 64)
+    # Transpose to position-major: (length, chunk_games, 64) → (length*chunk_games, 64)
+    bs = bs.transpose(1, 0, 2).reshape(-1, 64)
+    return _board_state_to_onehot(bs)
+
+
+def precompute_board_states(args):
+    """Precompute board states from MLP and save as uint8 chunks.
+
+    Saves ~1.5GB per 500K-game chunk (vs ~8.6GB for float16 logits).
+    All sweep jobs can then load these instead of recomputing.
+    """
+    device = get_device()
+    print(f"Device: {device}")
+
+    # Load MLP
+    ckpt = torch.load(args.mlp_checkpoint, map_location='cpu')
+    input_dim = ckpt['input_dim']
+    hidden_dim = ckpt['hidden_dim']
+    num_hidden = ckpt.get('num_hidden_layers', 1)
+
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden).to(device)
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS, num_hidden).to(device)
+    mlp_even.load_state_dict(ckpt['even'])
+    mlp_odd.load_state_dict(ckpt['odd'])
+    mlp_even.eval()
+    mlp_odd.eval()
+    print(f"Loaded board MLP: input={input_dim}, hidden={hidden_dim}")
+
+    # Load games
+    games = load_games(max_files=args.max_files)
+    if args.max_games and len(games) > args.max_games:
+        games = games[:args.max_games]
+    print(f"Loaded {len(games)} games")
+
+    # Same train/eval split as train_policy
+    n_eval = min(max(int(len(games) * 0.1), 500), 50000)
+    train_games = games[:len(games) - n_eval]
+    eval_games = games[len(games) - n_eval:]
+
+    game_chunk_size = min(500000, len(train_games))
+    n_chunks = (len(train_games) + game_chunk_size - 1) // game_chunk_size
+    pos_start, pos_end = POS_START, POS_END - 1
+    length = pos_end - pos_start
+
+    cache_dir = os.path.join(args.output_dir, "board_state_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    import time as _time
+
+    # Save eval chunk
+    eval_path = os.path.join(cache_dir, "board_state_eval.npz")
+    if os.path.exists(eval_path):
+        print("Eval chunk already exists, skipping", flush=True)
+    else:
+        t0 = _time.time()
+        logits, _ = _build_chunk_logits(
+            eval_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+        bs = _logits_to_board_state(logits).reshape(length, len(eval_games), 64)
+        bs = bs.transpose(1, 0, 2)  # (n_eval, length, 64)
+        np.savez_compressed(eval_path, board_state=bs)
+        size_mb = os.path.getsize(eval_path) / 1e6
+        print(f"Eval: {len(eval_games)} games, {size_mb:.0f}MB, "
+              f"{_time.time() - t0:.0f}s", flush=True)
+        del logits, bs
+
+    # Save train chunks
+    print(f"Precomputing {n_chunks} train chunks of {game_chunk_size} games...")
+    for ci in range(n_chunks):
+        g_start = ci * game_chunk_size
+        g_end = min(g_start + game_chunk_size, len(train_games))
+        out_path = os.path.join(cache_dir, f"board_state_chunk_{ci:04d}.npz")
+        if os.path.exists(out_path):
+            print(f"  Chunk {ci}: already exists, skipping", flush=True)
+            continue
+        t0 = _time.time()
+        chunk_games = train_games[g_start:g_end]
+        n_chunk = g_end - g_start
+        logits, _ = _build_chunk_logits(
+            chunk_games, mlp_even, mlp_odd, device, pos_start, pos_end)
+        # logits are position-major: (length * n_chunk, 192)
+        board_state = _logits_to_board_state(logits)  # (length * n_chunk, 64)
+        # Reshape to position-major (length, n_chunk, 64) then to game-major (n_chunk, length, 64)
+        board_state = board_state.reshape(length, n_chunk, 64).transpose(1, 0, 2)
+        np.savez_compressed(out_path, board_state=board_state)
+        elapsed = _time.time() - t0
+        size_mb = os.path.getsize(out_path) / 1e6
+        print(f"  Chunk {ci}: {g_end - g_start} games, "
+              f"{size_mb:.0f}MB, {elapsed:.0f}s", flush=True)
+        del logits, board_state
+
+    print(f"\nDone. Board state cache saved to {cache_dir}")
+
+
 def train_policy(args):
     """Train a policy head on real Othello games.
 
@@ -284,37 +407,43 @@ def train_policy(args):
           f"of {game_chunk_size}")
 
     n_train = len(train_games)  # offset for eval games in original ordering
-    logits_cache_dir = os.path.join(args.output_dir, "logits_cache")
-    os.makedirs(logits_cache_dir, exist_ok=True)
 
-    def _get_or_build_logits(game_chunk, chunk_id):
-        """Load cached board logits or compute and save them."""
-        cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{chunk_id:04d}.npy")
-        if os.path.exists(cache_path):
-            return torch.tensor(np.load(cache_path), dtype=torch.float32)
-        print(f"  Computing board logits for chunk {chunk_id}...")
+    # Check for precomputed board state cache
+    board_cache_dir = os.path.join(args.output_dir, "board_state_cache")
+    use_cache = os.path.exists(os.path.join(board_cache_dir, "board_state_chunk_0000.npz"))
+    if use_cache:
+        print(f"Using precomputed board states from {board_cache_dir}")
+    else:
+        print("No board state cache found, will compute logits on the fly")
+
+    def _get_chunk_input(chunk_id, game_chunk):
+        """Get policy input (N, 192) for a chunk — from cache or MLP."""
+        if use_cache:
+            onehot = _load_board_state_chunk(board_cache_dir, chunk_id, length)
+            if onehot is not None:
+                return onehot
         logits, _ = _build_chunk_logits(
             game_chunk, mlp_even, mlp_odd, device, pos_start, pos_end)
-        np.save(cache_path, logits.numpy().astype(np.float16))
-        print(f"  Saved to {cache_path}")
         return logits
 
-    # --- Precompute all board logits (one-time cost) ---
-    print("Precomputing board logits for all chunks...", flush=True)
-    for ci in range(n_train_chunks):
-        g_start = ci * game_chunk_size
-        g_end = min(g_start + game_chunk_size, len(train_games))
-        _get_or_build_logits(train_games[g_start:g_end], ci)
-
-    # Eval logits
-    ev_logits = _get_or_build_logits(eval_games, 9999)
+    # --- Precompute eval data (small, fits in memory) ---
+    print("Building eval data...", flush=True)
+    eval_cache_path = os.path.join(board_cache_dir, "board_state_eval.npz")
+    if use_cache and os.path.exists(eval_cache_path):
+        bs = np.load(eval_cache_path)['board_state']  # (n_eval, length, 64)
+        bs = bs.transpose(1, 0, 2).reshape(-1, 64)     # position-major
+        ev_input = _board_state_to_onehot(bs)
+        del bs
+    else:
+        ev_input, _ = _build_chunk_logits(
+            eval_games, mlp_even, mlp_odd, device, pos_start, pos_end)
     ev_targets = _get_legal_moves(eval_games, pos_start, pos_end,
                                    chunk_dir=args.output_dir,
                                    game_offset=n_train)
-    print(f"  Eval: {len(ev_logits)} samples")
+    print(f"  Eval: {len(ev_input)} samples")
 
     # --- Estimate pos_weight from first chunk ---
-    print("Estimating class balance from first chunk...")
+    print("Estimating class balance from first chunk...", flush=True)
     first_legal = _get_legal_moves(train_games[:game_chunk_size], pos_start, pos_end,
                                     chunk_dir=args.output_dir,
                                     game_offset=0)
@@ -324,10 +453,6 @@ def train_policy(args):
     print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
     pos_weight = torch.tensor([pw], device=device)
     del first_legal
-
-    # Free games from memory — only need cached logits from here
-    del games, train_games, eval_games
-    import gc; gc.collect()
 
     # --- Train ---
     policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
@@ -349,21 +474,19 @@ def train_policy(args):
         # Shuffle chunk order each epoch
         chunk_order = torch.randperm(n_train_chunks).tolist()
         for ci in chunk_order:
-            # Load cached logits and legal moves from disk
-            cache_path = os.path.join(logits_cache_dir, f"logits_chunk_{ci:04d}.npy")
-            ch_logits = torch.tensor(np.load(cache_path), dtype=torch.float32)
             g_start = ci * game_chunk_size
             g_end = min(g_start + game_chunk_size, n_train)
-            ch_targets = _get_legal_moves(None, pos_start, pos_end,
+            chunk_games = train_games[g_start:g_end]
+            ch_input = _get_chunk_input(ci, chunk_games)
+            ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
                                            chunk_dir=args.output_dir,
-                                           game_offset=g_start,
-                                           n_games=g_end - g_start)
+                                           game_offset=g_start)
 
             # Shuffle within chunk
-            perm = torch.randperm(len(ch_logits))
-            for i in range(0, len(ch_logits), batch_size):
+            perm = torch.randperm(len(ch_input))
+            for i in range(0, len(ch_input), batch_size):
                 idx = perm[i:i + batch_size]
-                x = ch_logits[idx].to(device)
+                x = ch_input[idx].to(device)
                 y = ch_targets[idx].to(device)
                 logits = policy(x)
                 loss = nn.functional.binary_cross_entropy_with_logits(
@@ -374,7 +497,7 @@ def train_policy(args):
                 epoch_loss += loss.item()
                 n_batches += 1
 
-            del ch_logits, ch_targets  # free memory
+            del ch_input, ch_targets  # free memory
 
         # Eval
         policy.eval()
@@ -382,8 +505,8 @@ def train_policy(args):
         eval_loss = 0.0
         n_eval_batches = 0
         with torch.no_grad():
-            for i in range(0, len(ev_logits), batch_size):
-                x = ev_logits[i:i + batch_size].to(device)
+            for i in range(0, len(ev_input), batch_size):
+                x = ev_input[i:i + batch_size].to(device)
                 y = ev_targets[i:i + batch_size].to(device)
                 logits = policy(x)
                 eval_loss += nn.functional.binary_cross_entropy_with_logits(logits, y).item()
@@ -609,6 +732,8 @@ parser.add_argument("--train-policy", action="store_true",
                     help="Train the policy head")
 parser.add_argument("--generate", action="store_true",
                     help="Generate games with perturbed heuristics")
+parser.add_argument("--precompute-logits", action="store_true",
+                    help="Precompute board states from MLP (run once, shared by sweep jobs)")
 
 # Shared
 parser.add_argument("--mlp-checkpoint",
@@ -638,9 +763,11 @@ parser.add_argument("--seed", type=int, default=42)
 
 args = parser.parse_args()
 
-if args.train_policy:
+if args.precompute_logits:
+    precompute_board_states(args)
+elif args.train_policy:
     train_policy(args)
 elif args.generate:
     generate_games(args)
 else:
-    print("Specify --train-policy or --generate")
+    print("Specify --precompute-logits, --train-policy, or --generate")
