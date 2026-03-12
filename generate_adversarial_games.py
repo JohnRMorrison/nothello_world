@@ -210,7 +210,8 @@ def _build_chunk_logits(game_chunk, mlp_even, mlp_odd, device,
         _build_move_features_batch,
     )
     X, _, pos = _build_move_features_batch(game_chunk, pos_start, pos_end,
-                                            include_pairwise=False)
+                                            include_pairwise=False,
+                                            skip_labels=True)
     batch_size = 2048
     board_logits = torch.zeros(len(X), 64 * OPTIONS)
     with torch.no_grad():
@@ -261,7 +262,7 @@ def train_policy(args):
         games = games[:args.max_games]
     print(f"Loaded {len(games)} games")
 
-    n_eval = max(int(len(games) * 0.1), 500)
+    n_eval = min(max(int(len(games) * 0.1), 500), 50000)
     train_games = games[:len(games) - n_eval]
     eval_games = games[len(games) - n_eval:]
 
