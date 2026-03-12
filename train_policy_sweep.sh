@@ -4,7 +4,7 @@
 
 #SBATCH --job-name=pol_sweep
 #SBATCH -c 8
-#SBATCH --time=4:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/policy_sweep_%A_%a.out
@@ -15,6 +15,7 @@ module load cuda/11.8.0
 source /share/apps/anaconda3-2019.03/etc/profile.d/conda.sh
 conda activate othello
 export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export PYTHONUNBUFFERED=1
 
 mkdir -p logs
 cd $SLURM_SUBMIT_DIR
