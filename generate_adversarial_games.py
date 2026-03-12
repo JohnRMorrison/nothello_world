@@ -129,7 +129,40 @@ def _compute_legal_moves_parallel(game_list, pos_start, pos_end):
     return legal
 
 
-def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
+def _load_precomputed_chunks(chunk_dir, n_games, length):
+    """Load legal moves from precomputed chunk files (from precompute_legal_moves.py).
+
+    Chunk files have shape (chunk_n, length, 60) in game-major order.
+    We need position-major order: (length * n_games, 60).
+    Returns None if chunks not found.
+    """
+    import glob as globmod
+    chunk_files = sorted(globmod.glob(os.path.join(chunk_dir, "legal_moves_chunk_*.npz")))
+    if not chunk_files:
+        return None
+
+    parts = []
+    total_games = 0
+    for f in chunk_files:
+        data = np.load(f)['legal']  # (chunk_n, length, 60)
+        parts.append(data)
+        total_games += data.shape[0]
+        if total_games >= n_games:
+            break
+
+    if total_games < n_games:
+        print(f"  Warning: only {total_games} games in chunks, need {n_games}")
+        return None
+
+    # Concatenate and trim to n_games
+    all_legal = np.concatenate(parts, axis=0)[:n_games]  # (n_games, length, 60)
+    # Transpose to position-major: (length, n_games, 60) → (length*n_games, 60)
+    legal = all_legal.transpose(1, 0, 2).reshape(-1, all_legal.shape[2])
+    print(f"  Loaded precomputed legal moves from {len(chunk_files)} chunk files")
+    return legal.astype(np.float32)
+
+
+def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None, chunk_dir=None):
     """Compute or load cached legal-move vectors.
 
     Returns: (n_samples, 60) float32 tensor
@@ -138,6 +171,13 @@ def _get_legal_moves(game_list, pos_start, pos_end, cache_path=None):
         print(f"  Loading cached legal moves from {cache_path}")
         legal = np.load(cache_path)['legal']
         return torch.tensor(legal, dtype=torch.float32)
+
+    # Try precomputed chunks
+    if chunk_dir:
+        length = pos_end - pos_start
+        legal = _load_precomputed_chunks(chunk_dir, len(game_list), length)
+        if legal is not None:
+            return torch.tensor(legal, dtype=torch.float32)
 
     print("  Computing legal moves for each position...")
     legal = _compute_legal_moves_parallel(game_list, pos_start, pos_end)
@@ -198,7 +238,8 @@ def train_policy(args):
             args.output_dir, f"legal_moves_{split_name}_{len(game_list)}.npz"
         ) if split_name else None
         legal_targets = _get_legal_moves(game_list, POS_START, POS_END - 1,
-                                          cache_path=cache_path)
+                                          cache_path=cache_path,
+                                          chunk_dir=args.output_dir)
 
         # Compute board logits from frozen MLP
         print("  Computing board logits from frozen MLP...")
@@ -233,7 +274,7 @@ def train_policy(args):
     print(f"  Class balance: {n_pos/tr_targets.numel():.1%} positive, pos_weight={pw:.1f}")
     pos_weight = torch.tensor([pw], device=device)
 
-    policy = PolicyHead(hidden_dim=256).to(device)
+    policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2)
@@ -298,11 +339,11 @@ def train_policy(args):
             best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
 
     # Save
-    save_path = os.path.join(args.output_dir, "policy_head.pt")
+    save_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}.pt")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save({
         'state_dict': best_state,
-        'hidden_dim': 256,
+        'hidden_dim': args.policy_hidden,
         'best_f1': best_acc,
     }, save_path)
     print(f"\nBest policy F1: {best_acc:.4f}")
@@ -388,8 +429,11 @@ def generate_games(args):
     mlp_odd = mlp_odd.to(device).eval()
 
     # Load policy head
-    policy_ckpt = torch.load(
-        os.path.join(args.output_dir, "policy_head.pt"), map_location='cpu')
+    policy_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}.pt")
+    if not os.path.exists(policy_path):
+        # Fallback to old naming convention
+        policy_path = os.path.join(args.output_dir, "policy_head.pt")
+    policy_ckpt = torch.load(policy_path, map_location='cpu')
     policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim']).to(device)
     policy.load_state_dict(policy_ckpt['state_dict'])
     policy.eval()
@@ -507,6 +551,8 @@ parser.add_argument("--output-dir",
 parser.add_argument("--max-games", type=int, default=100000)
 parser.add_argument("--max-files", type=int, default=None)
 parser.add_argument("--policy-epochs", type=int, default=20)
+parser.add_argument("--policy-hidden", type=int, default=256,
+                    help="Hidden dim of policy head")
 
 # Generation
 parser.add_argument("--alpha", type=float, default=0.0,
