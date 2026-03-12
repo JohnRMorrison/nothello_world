@@ -551,43 +551,27 @@ def train_policy(args):
 # ---------------------------------------------------------------------------
 
 def _perturb_mlp(mlp, alpha, rng):
-    """Perturb the most important hidden units of an MLP.
+    """Smoothly interpolate MLP weights toward random weights.
 
-    Ranks hidden units by L2 norm of their output weights.
-    Replaces the top alpha fraction (most important) with random weights.
+    W_perturbed = (1 - alpha) * W_original + alpha * W_random
+
+    All weights are perturbed proportionally. At alpha=0 the MLP is unchanged,
+    at alpha=1 all weights are fully random.
 
     Args:
         mlp: nn.Sequential (Linear → ReLU → Linear)
-        alpha: float in [0, 1], fraction of units to corrupt
+        alpha: float in [0, 1], interpolation toward random
         rng: numpy random generator for reproducibility
     Returns:
         new MLP with perturbed weights (original unchanged)
     """
     mlp_new = deepcopy(mlp)
-    # Get output weight matrix: shape (output_dim, hidden_dim)
-    W_out = mlp_new[-1].weight.data  # (192, H)
-    H = W_out.shape[1]
-
-    n_corrupt = int(alpha * H)
-    if n_corrupt == 0:
+    if alpha == 0:
         return mlp_new
 
-    # Rank by L2 norm of output weights (importance)
-    importance = W_out.norm(dim=0)  # (H,)
-    _, sorted_idx = importance.sort(descending=True)
-    corrupt_idx = sorted_idx[:n_corrupt]
-
-    # Replace output weights for corrupted units with random weights
-    # (scaled to match original distribution)
-    std = W_out[:, corrupt_idx].std().item()
-    W_out[:, corrupt_idx] = torch.randn_like(W_out[:, corrupt_idx]) * std
-
-    # Also perturb the corresponding input weights and biases
-    W_in = mlp_new[0].weight.data  # (H, input_dim)
-    b_in = mlp_new[0].bias.data    # (H,)
-    in_std = W_in[corrupt_idx].std().item()
-    W_in[corrupt_idx] = torch.randn(n_corrupt, W_in.shape[1]) * in_std
-    b_in[corrupt_idx] = torch.randn(n_corrupt) * b_in.std().item()
+    for param in mlp_new.parameters():
+        rand_w = torch.randn_like(param.data) * param.data.std().item()
+        param.data = (1 - alpha) * param.data + alpha * rand_w
 
     return mlp_new
 
@@ -617,7 +601,7 @@ def generate_games(args):
     # Perturb
     rng = np.random.default_rng(args.seed)
     if args.alpha > 0:
-        print(f"Perturbing {args.alpha:.0%} of hidden units ({int(args.alpha * hidden_dim)}/{hidden_dim})...")
+        print(f"Interpolating weights toward random (alpha={args.alpha:.2f})...")
         mlp_even = _perturb_mlp(mlp_even, args.alpha, rng)
         mlp_odd = _perturb_mlp(mlp_odd, args.alpha, rng)
 
