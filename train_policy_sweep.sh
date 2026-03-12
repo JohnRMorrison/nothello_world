@@ -34,7 +34,7 @@ echo "============================================"
 python generate_adversarial_games.py \
     --train-policy \
     --max-games 6000000 \
-    --policy-epochs 20 \
+    --policy-epochs 10 \
     --policy-hidden $HIDDEN
 
 echo "Completed at: $(date)"
