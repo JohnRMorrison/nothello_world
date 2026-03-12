@@ -442,17 +442,21 @@ def train_policy(args):
                                    game_offset=n_train)
     print(f"  Eval: {len(ev_input)} samples")
 
-    # --- Estimate pos_weight from first chunk ---
-    print("Estimating class balance from first chunk...", flush=True)
-    first_legal = _get_legal_moves(train_games[:game_chunk_size], pos_start, pos_end,
-                                    chunk_dir=args.output_dir,
-                                    game_offset=0)
-    n_pos = first_legal.sum().item()
-    n_neg = first_legal.numel() - n_pos
-    pw = n_neg / max(n_pos, 1)
-    print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
+    # --- pos_weight ---
+    if args.pos_weight is not None:
+        pw = args.pos_weight
+        print(f"  Using provided pos_weight={pw:.2f}")
+    else:
+        print("Estimating class balance from first chunk...", flush=True)
+        first_legal = _get_legal_moves(train_games[:game_chunk_size], pos_start, pos_end,
+                                        chunk_dir=args.output_dir,
+                                        game_offset=0)
+        n_pos = first_legal.sum().item()
+        n_neg = first_legal.numel() - n_pos
+        pw = n_neg / max(n_pos, 1)
+        print(f"  Class balance: {n_pos/first_legal.numel():.1%} positive, pos_weight={pw:.1f}")
+        del first_legal
     pos_weight = torch.tensor([pw], device=device)
-    del first_legal
 
     # --- Train ---
     policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
@@ -535,7 +539,8 @@ def train_policy(args):
             best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
 
     # Save
-    save_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}.pt")
+    pw_tag = f"_pw{pw:.1f}" if args.pos_weight is not None else ""
+    save_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}{pw_tag}.pt")
     os.makedirs(args.output_dir, exist_ok=True)
     torch.save({
         'state_dict': best_state,
@@ -735,6 +740,8 @@ parser.add_argument("--max-files", type=int, default=None)
 parser.add_argument("--policy-epochs", type=int, default=20)
 parser.add_argument("--policy-hidden", type=int, default=256,
                     help="Hidden dim of policy head")
+parser.add_argument("--pos-weight", type=float, default=None,
+                    help="BCE pos_weight (default: auto from class balance)")
 
 # Generation
 parser.add_argument("--alpha", type=float, default=0.0,
