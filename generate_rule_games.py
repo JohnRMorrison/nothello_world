@@ -140,10 +140,10 @@ def generate_single_game(targets, terminals, opp_cells, opp_mask, rng,
                 legal_per_turn.append(legal_cells.tolist())
             board_pos = int(legal_cells[rng.randint(len(legal_cells))])
 
-        # Try legal move (with flips); if illegal, place without flipping
-        try:
+        # If move is legal in real Othello, apply with flips; otherwise just place
+        if board.tentative_move(board_pos) != 0:
             board.update([board_pos])
-        except:
+        else:
             place_piece_no_flip(board, board_pos)
 
         moves.append(board_pos)
