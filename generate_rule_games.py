@@ -5,6 +5,8 @@ For fraction alpha of the 960 flanking patterns, one cell reference
 (from opponents or terminal) is replaced with a random cell.
 The corrupted rules are consistent — same input always gives same output.
 
+Uses numpy vectorization to evaluate all patterns simultaneously.
+
 Usage:
   python generate_rule_games.py --alpha 0.1 --num-games 2000000 --output-dir experiments/corruption_v2/games/alpha010
 """
@@ -52,27 +54,55 @@ def corrupt_patterns(patterns, alpha, rng):
     return patterns
 
 
-def evaluate_rules(patterns, board_state, is_black_turn):
-    """Return set of cells predicted legal by the (possibly corrupted) rules."""
-    flat = board_state.flatten()
+def precompute_pattern_arrays(patterns):
+    """Precompute numpy arrays for vectorized pattern evaluation."""
+    n = len(patterns)
+    max_opp = max(len(p['opponents']) for p in patterns)
+
+    targets = np.array([p['target'] for p in patterns], dtype=np.int32)
+    terminals = np.array([p['terminal'] for p in patterns], dtype=np.int32)
+    opp_lens = np.array([len(p['opponents']) for p in patterns], dtype=np.int32)
+
+    # Pad opponent arrays — use 0 as filler (masked out later)
+    opp_cells = np.zeros((n, max_opp), dtype=np.int32)
+    for i, p in enumerate(patterns):
+        for j, o in enumerate(p['opponents']):
+            opp_cells[i, j] = o
+
+    # Precompute mask: which opponent slots are real
+    opp_mask = np.arange(max_opp)[None, :] < opp_lens[:, None]  # (n, max_opp)
+
+    return targets, terminals, opp_cells, opp_mask
+
+
+def evaluate_rules_vec(flat, is_black_turn, targets, terminals, opp_cells, opp_mask):
+    """Vectorized: evaluate all patterns at once, return list of legal cells."""
     my_val = 1 if is_black_turn else -1
     opp_val = -my_val
-    legal = set()
 
-    for pat in patterns:
-        target = pat['target']
-        # Target must be empty
-        if flat[target] != 0:
-            continue
-        # All opponent cells must have opponent piece
-        if not all(flat[o] == opp_val for o in pat['opponents']):
-            continue
-        # Terminal must have friendly piece
-        if flat[pat['terminal']] != my_val:
-            continue
-        legal.add(target)
+    # Check target is empty: (n_patterns,)
+    target_empty = (flat[targets] == 0)
 
-    return legal
+    # Check terminal has friendly piece: (n_patterns,)
+    terminal_friendly = (flat[terminals] == my_val)
+
+    # Check opponent cells: (n_patterns, max_opp)
+    opp_vals = flat[opp_cells]
+    opp_match = (opp_vals == opp_val) | ~opp_mask  # masked slots always pass
+    opp_all = opp_match.all(axis=1)  # (n_patterns,)
+
+    # Pattern fires if all conditions met
+    fires = target_empty & opp_all & terminal_friendly
+
+    if not fires.any():
+        return None
+
+    # Unique target cells where at least one pattern fires
+    legal_cells = np.unique(targets[fires])
+    return legal_cells
+
+
+CENTER_SET = np.array(sorted(CENTER_CELLS), dtype=np.int32)
 
 
 def place_piece_no_flip(board, board_pos):
@@ -82,25 +112,27 @@ def place_piece_no_flip(board, board_pos):
     board.next_hand_color *= -1
 
 
-def generate_single_game(patterns, rng):
+def generate_single_game(targets, terminals, opp_cells, opp_mask, rng):
     """Generate a single game using (corrupted) rules on exact board state."""
     board = OthelloBoardState()
     moves = []
 
     for turn in range(60):
+        flat = board.state.flatten()
         is_black_turn = (board.next_hand_color == 1)
-        predicted_legal = evaluate_rules(patterns, board.state, is_black_turn)
 
-        if not predicted_legal:
-            # No moves predicted — sample from empty cells
-            flat = board.state.flatten()
-            empty_cells = [i for i in range(64) if flat[i] == 0 and i not in CENTER_CELLS]
-            if not empty_cells:
+        legal_cells = evaluate_rules_vec(
+            flat, is_black_turn, targets, terminals, opp_cells, opp_mask)
+
+        if legal_cells is None:
+            # No moves predicted — sample from empty non-center cells
+            empty = np.where(flat == 0)[0]
+            empty = np.setdiff1d(empty, CENTER_SET)
+            if len(empty) == 0:
                 break
-            board_pos = empty_cells[rng.randint(len(empty_cells))]
+            board_pos = int(empty[rng.randint(len(empty))])
         else:
-            predicted_legal = sorted(predicted_legal)
-            board_pos = predicted_legal[rng.randint(len(predicted_legal))]
+            board_pos = int(legal_cells[rng.randint(len(legal_cells))])
 
         # Try legal move (with flips); if illegal, place without flipping
         try:
@@ -113,15 +145,17 @@ def generate_single_game(patterns, rng):
     return moves
 
 
-def generate_games(patterns, num_games, rng, chunk_size=100000):
+def generate_games(targets, terminals, opp_cells, opp_mask, num_games, rng,
+                   chunk_size=100000):
     """Generate games using (corrupted) rules."""
     all_games = []
     for chunk_start in range(0, num_games, chunk_size):
         chunk_end = min(chunk_start + chunk_size, num_games)
         for game_idx in range(chunk_start, chunk_end):
-            game = generate_single_game(patterns, rng)
+            game = generate_single_game(
+                targets, terminals, opp_cells, opp_mask, rng)
             all_games.append(game)
-        print(f"  Generated {len(all_games)}/{num_games} games...")
+        print(f"  Generated {len(all_games)}/{num_games} games...", flush=True)
     return all_games
 
 
@@ -149,10 +183,15 @@ def main():
         n_corrupt = int(args.alpha * len(patterns))
         print(f"Corrupted {n_corrupt}/{len(patterns)} patterns")
 
+    # Precompute arrays for vectorized evaluation
+    targets, terminals, opp_cells, opp_mask = precompute_pattern_arrays(patterns)
+    print(f"Pattern arrays: targets={targets.shape}, opp_cells={opp_cells.shape}")
+
     # Generate games
     game_rng = np.random.RandomState(args.seed + 1000)
-    print(f"Generating {args.num_games} games...")
-    games = generate_games(patterns, args.num_games, game_rng)
+    print(f"Generating {args.num_games} games...", flush=True)
+    games = generate_games(targets, terminals, opp_cells, opp_mask,
+                           args.num_games, game_rng)
 
     # Report stats
     lengths = [len(g) for g in games]
