@@ -2,7 +2,7 @@
 #SBATCH --job-name=cor_gen
 #SBATCH --output=logs/corruption_gen_%A_%a.out
 #SBATCH --error=logs/corruption_gen_%A_%a.err
-#SBATCH --time=6:00:00
+#SBATCH --time=1:00:00
 #SBATCH --mem=16G
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=nklab,burst
@@ -45,7 +45,7 @@ conda activate othello
 python generate_corruption_games.py \
     --corruption-type ${TYPE} \
     --alpha ${ALPHA} \
-    --num-games 2000000 \
+    --num-games 100000 \
     --output-dir ${OUTPUT_DIR} \
     --seed 42
 
