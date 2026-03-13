@@ -23,7 +23,7 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-conda activate othello
+source activate othello
 
 python finetune_corruption.py \
     --games-dir ${GAMES_DIR} \

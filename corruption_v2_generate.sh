@@ -22,7 +22,7 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-conda activate othello
+source activate othello
 
 python generate_rule_games.py \
     --alpha ${ALPHA} \
