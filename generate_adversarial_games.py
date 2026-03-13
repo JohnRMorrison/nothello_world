@@ -458,97 +458,150 @@ def train_policy(args):
         del first_legal
     pos_weight = torch.tensor([pw], device=device)
 
+    # --- Build parity masks ---
+    # Data is position-major: all games at pos_start, then pos_start+1, etc.
+    # Each position block has n_games samples.
+    def _build_parity_mask(n_games, pos_start, pos_end):
+        """Return boolean tensor: True for even positions."""
+        masks = []
+        for p in range(pos_start, pos_end):
+            masks.append(torch.full((n_games,), p % 2 == 0))
+        return torch.cat(masks)
+
     # --- Train ---
-    policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
-    optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=2)
-
-    best_f1 = 0.0
-    best_state = None
-    batch_size = 2048
-
     import time as _time
-    for epoch in range(1, args.policy_epochs + 1):
-        t0 = _time.time()
-        policy.train()
-        epoch_loss = 0.0
-        n_batches = 0
 
-        # Shuffle chunk order each epoch
-        chunk_order = torch.randperm(n_train_chunks).tolist()
-        for ci in chunk_order:
-            g_start = ci * game_chunk_size
-            g_end = min(g_start + game_chunk_size, n_train)
-            chunk_games = train_games[g_start:g_end]
-            ch_input = _get_chunk_input(ci, chunk_games)
-            ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
-                                           chunk_dir=args.output_dir,
-                                           game_offset=g_start)
+    if args.even_odd:
+        modes = ['even', 'odd']
+    else:
+        modes = [None]  # single combined model
 
-            # Shuffle within chunk
-            perm = torch.randperm(len(ch_input))
-            for i in range(0, len(ch_input), batch_size):
-                idx = perm[i:i + batch_size]
-                x = ch_input[idx].to(device)
-                y = ch_targets[idx].to(device)
-                logits = policy(x)
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    logits, y, pos_weight=pos_weight)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-                n_batches += 1
+    results_by_mode = {}
+    for mode in modes:
+        if mode is not None:
+            print(f"\n--- Training {mode} policy head ---", flush=True)
 
-            del ch_input, ch_targets  # free memory
+        policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
+        optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=2)
 
-        # Eval
-        policy.eval()
-        tp = fp = fn = total_correct = total_moves = 0
-        eval_loss = 0.0
-        n_eval_batches = 0
-        with torch.no_grad():
-            for i in range(0, len(ev_input), batch_size):
-                x = ev_input[i:i + batch_size].to(device)
-                y = ev_targets[i:i + batch_size].to(device)
-                logits = policy(x)
-                eval_loss += nn.functional.binary_cross_entropy_with_logits(logits, y).item()
-                n_eval_batches += 1
-                preds = (logits > 0).float()
-                total_correct += (preds == y).sum().item()
-                total_moves += y.numel()
-                tp += ((preds == 1) & (y == 1)).sum().item()
-                fp += ((preds == 1) & (y == 0)).sum().item()
-                fn += ((preds == 0) & (y == 1)).sum().item()
+        # Filter eval data by parity
+        if mode is not None:
+            ev_parity = _build_parity_mask(len(eval_games), pos_start, pos_end)
+            ev_mask = ev_parity if mode == 'even' else ~ev_parity
+            ev_input_m = ev_input[ev_mask]
+            ev_targets_m = ev_targets[ev_mask]
+            print(f"  Eval samples ({mode}): {len(ev_input_m)}")
+        else:
+            ev_input_m = ev_input
+            ev_targets_m = ev_targets
 
-        acc = total_correct / total_moves
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-        mean_loss = eval_loss / n_eval_batches
-        scheduler.step(mean_loss)
-        lr = optimizer.param_groups[0]['lr']
-        elapsed = _time.time() - t0
-        print(f"  Epoch {epoch}: loss={mean_loss:.4f}  acc={acc:.4%}  "
-              f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}  "
-              f"({elapsed:.0f}s)", flush=True)
+        best_f1 = 0.0
+        best_state = None
+        batch_size = 2048
 
-        if f1 > best_f1:
-            best_f1 = f1
-            best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
+        for epoch in range(1, args.policy_epochs + 1):
+            t0 = _time.time()
+            policy.train()
+            epoch_loss = 0.0
+            n_batches = 0
 
-    # Save
-    pw_tag = f"_pw{pw:.1f}" if args.pos_weight is not None else ""
-    save_path = os.path.join(args.output_dir, f"policy_head_H{args.policy_hidden}{pw_tag}.pt")
-    os.makedirs(args.output_dir, exist_ok=True)
-    torch.save({
-        'state_dict': best_state,
-        'hidden_dim': args.policy_hidden,
-        'best_f1': best_f1,
-    }, save_path)
-    print(f"\nBest policy F1: {best_f1:.4f}")
-    print(f"Saved to {save_path}")
+            # Shuffle chunk order each epoch
+            chunk_order = torch.randperm(n_train_chunks).tolist()
+            for ci in chunk_order:
+                g_start = ci * game_chunk_size
+                g_end = min(g_start + game_chunk_size, n_train)
+                n_chunk_games = g_end - g_start
+                chunk_games = train_games[g_start:g_end]
+                ch_input = _get_chunk_input(ci, chunk_games)
+                ch_targets = _get_legal_moves(chunk_games, pos_start, pos_end,
+                                               chunk_dir=args.output_dir,
+                                               game_offset=g_start)
+
+                # Filter by parity if even/odd mode
+                if mode is not None:
+                    ch_parity = _build_parity_mask(n_chunk_games, pos_start, pos_end)
+                    ch_mask = ch_parity if mode == 'even' else ~ch_parity
+                    ch_input = ch_input[ch_mask]
+                    ch_targets = ch_targets[ch_mask]
+
+                # Shuffle within chunk
+                perm = torch.randperm(len(ch_input))
+                for i in range(0, len(ch_input), batch_size):
+                    idx = perm[i:i + batch_size]
+                    x = ch_input[idx].to(device)
+                    y = ch_targets[idx].to(device)
+                    logits = policy(x)
+                    loss = nn.functional.binary_cross_entropy_with_logits(
+                        logits, y, pos_weight=pos_weight)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
+                    n_batches += 1
+
+                del ch_input, ch_targets  # free memory
+
+            # Eval
+            policy.eval()
+            tp = fp = fn = total_correct = total_moves = 0
+            eval_loss = 0.0
+            n_eval_batches = 0
+            with torch.no_grad():
+                for i in range(0, len(ev_input_m), batch_size):
+                    x = ev_input_m[i:i + batch_size].to(device)
+                    y = ev_targets_m[i:i + batch_size].to(device)
+                    logits = policy(x)
+                    eval_loss += nn.functional.binary_cross_entropy_with_logits(logits, y).item()
+                    n_eval_batches += 1
+                    preds = (logits > 0).float()
+                    total_correct += (preds == y).sum().item()
+                    total_moves += y.numel()
+                    tp += ((preds == 1) & (y == 1)).sum().item()
+                    fp += ((preds == 1) & (y == 0)).sum().item()
+                    fn += ((preds == 0) & (y == 1)).sum().item()
+
+            acc = total_correct / total_moves
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+            mean_loss = eval_loss / n_eval_batches
+            scheduler.step(mean_loss)
+            lr = optimizer.param_groups[0]['lr']
+            elapsed = _time.time() - t0
+            mode_tag = f" [{mode}]" if mode else ""
+            print(f"  Epoch {epoch}{mode_tag}: loss={mean_loss:.4f}  acc={acc:.4%}  "
+                  f"P={precision:.3f} R={recall:.3f} F1={f1:.3f}  lr={lr:.2e}  "
+                  f"({elapsed:.0f}s)", flush=True)
+
+            if f1 > best_f1:
+                best_f1 = f1
+                best_state = {k: v.cpu().clone() for k, v in policy.state_dict().items()}
+
+        results_by_mode[mode] = best_f1
+
+        # Save
+        pw_tag = f"_pw{pw:.1f}" if args.pos_weight is not None else ""
+        mode_tag = f"_{mode}" if mode else ""
+        save_path = os.path.join(args.output_dir,
+                                 f"policy_head_H{args.policy_hidden}{pw_tag}{mode_tag}.pt")
+        os.makedirs(args.output_dir, exist_ok=True)
+        torch.save({
+            'state_dict': best_state,
+            'hidden_dim': args.policy_hidden,
+            'best_f1': best_f1,
+            'mode': mode,
+        }, save_path)
+        print(f"\nBest policy F1 ({mode or 'combined'}): {best_f1:.4f}")
+        print(f"Saved to {save_path}")
+
+    # If even/odd, also report combined F1
+    if args.even_odd:
+        print(f"\n--- Combined results ---")
+        for m, f in results_by_mode.items():
+            print(f"  {m}: F1={f:.4f}")
+        print(f"  mean: F1={sum(results_by_mode.values()) / len(results_by_mode):.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +795,8 @@ parser.add_argument("--policy-hidden", type=int, default=256,
                     help="Hidden dim of policy head")
 parser.add_argument("--pos-weight", type=float, default=None,
                     help="BCE pos_weight (default: auto from class balance)")
+parser.add_argument("--even-odd", action="store_true",
+                    help="Train separate policy heads for even/odd positions")
 
 # Generation
 parser.add_argument("--alpha", type=float, default=0.0,
