@@ -60,15 +60,14 @@ def _compute_move_features(move_history, t):
 
 class PolicyHead(nn.Module):
     """Predicts next move from board state logits."""
-    def __init__(self, hidden_dim=256):
+    def __init__(self, hidden_dim=256, num_hidden=1):
         super().__init__()
         # Input: 192 (64 squares × 3 classes) — raw logits from board MLP
-        # We convert to soft probabilities first, then predict
-        self.net = nn.Sequential(
-            nn.Linear(64 * OPTIONS, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, N_MOVES),
-        )
+        layers = [nn.Linear(64 * OPTIONS, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden - 1):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        layers.append(nn.Linear(hidden_dim, N_MOVES))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, board_logits):
         """board_logits: (B, 192) raw MLP output."""
@@ -481,7 +480,8 @@ def train_policy(args):
         if mode is not None:
             print(f"\n--- Training {mode} policy head ---", flush=True)
 
-        policy = PolicyHead(hidden_dim=args.policy_hidden).to(device)
+        policy = PolicyHead(hidden_dim=args.policy_hidden,
+                            num_hidden=args.policy_layers).to(device)
         optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=2)
@@ -584,12 +584,14 @@ def train_policy(args):
         # Save
         pw_tag = f"_pw{pw:.1f}" if args.pos_weight is not None else ""
         mode_tag = f"_{mode}" if mode else ""
+        layers_tag = f"_L{args.policy_layers}" if args.policy_layers > 1 else ""
         save_path = os.path.join(args.output_dir,
-                                 f"policy_head_H{args.policy_hidden}{pw_tag}{mode_tag}.pt")
+                                 f"policy_head_H{args.policy_hidden}{layers_tag}{pw_tag}{mode_tag}.pt")
         os.makedirs(args.output_dir, exist_ok=True)
         torch.save({
             'state_dict': best_state,
             'hidden_dim': args.policy_hidden,
+            'num_hidden': args.policy_layers,
             'best_f1': best_f1,
             'mode': mode,
         }, save_path)
@@ -672,7 +674,8 @@ def generate_games(args):
         # Fallback to old naming convention
         policy_path = os.path.join(args.output_dir, "policy_head.pt")
     policy_ckpt = torch.load(policy_path, map_location='cpu')
-    policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim']).to(device)
+    policy = PolicyHead(hidden_dim=policy_ckpt['hidden_dim'],
+                        num_hidden=policy_ckpt.get('num_hidden', 1)).to(device)
     policy.load_state_dict(policy_ckpt['state_dict'])
     policy.eval()
     print(f"Loaded policy head (F1={policy_ckpt.get('best_f1', policy_ckpt.get('best_acc', 0)):.4f})")
@@ -795,6 +798,8 @@ parser.add_argument("--policy-hidden", type=int, default=256,
                     help="Hidden dim of policy head")
 parser.add_argument("--pos-weight", type=float, default=None,
                     help="BCE pos_weight (default: auto from class balance)")
+parser.add_argument("--policy-layers", type=int, default=1,
+                    help="Number of hidden layers in policy head")
 parser.add_argument("--even-odd", action="store_true",
                     help="Train separate policy heads for even/odd positions")
 
