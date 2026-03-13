@@ -112,10 +112,12 @@ def place_piece_no_flip(board, board_pos):
     board.next_hand_color *= -1
 
 
-def generate_single_game(targets, terminals, opp_cells, opp_mask, rng):
+def generate_single_game(targets, terminals, opp_cells, opp_mask, rng,
+                         save_legal=False):
     """Generate a single game using (corrupted) rules on exact board state."""
     board = OthelloBoardState()
     moves = []
+    legal_per_turn = [] if save_legal else None
 
     for turn in range(60):
         flat = board.state.flatten()
@@ -130,8 +132,12 @@ def generate_single_game(targets, terminals, opp_cells, opp_mask, rng):
             empty = np.setdiff1d(empty, CENTER_SET)
             if len(empty) == 0:
                 break
+            if save_legal:
+                legal_per_turn.append(empty.tolist())
             board_pos = int(empty[rng.randint(len(empty))])
         else:
+            if save_legal:
+                legal_per_turn.append(legal_cells.tolist())
             board_pos = int(legal_cells[rng.randint(len(legal_cells))])
 
         # Try legal move (with flips); if illegal, place without flipping
@@ -142,20 +148,31 @@ def generate_single_game(targets, terminals, opp_cells, opp_mask, rng):
 
         moves.append(board_pos)
 
+    if save_legal:
+        return moves, legal_per_turn
     return moves
 
 
 def generate_games(targets, terminals, opp_cells, opp_mask, num_games, rng,
-                   chunk_size=100000):
+                   chunk_size=100000, save_legal=False):
     """Generate games using (corrupted) rules."""
     all_games = []
+    all_legal = [] if save_legal else None
     for chunk_start in range(0, num_games, chunk_size):
         chunk_end = min(chunk_start + chunk_size, num_games)
         for game_idx in range(chunk_start, chunk_end):
-            game = generate_single_game(
-                targets, terminals, opp_cells, opp_mask, rng)
-            all_games.append(game)
+            result = generate_single_game(
+                targets, terminals, opp_cells, opp_mask, rng,
+                save_legal=save_legal)
+            if save_legal:
+                game, legal = result
+                all_games.append(game)
+                all_legal.append(legal)
+            else:
+                all_games.append(result)
         print(f"  Generated {len(all_games)}/{num_games} games...", flush=True)
+    if save_legal:
+        return all_games, all_legal
     return all_games
 
 
@@ -190,8 +207,8 @@ def main():
     # Generate games
     game_rng = np.random.RandomState(args.seed + 1000)
     print(f"Generating {args.num_games} games...", flush=True)
-    games = generate_games(targets, terminals, opp_cells, opp_mask,
-                           args.num_games, game_rng)
+    games, legal_moves = generate_games(targets, terminals, opp_cells, opp_mask,
+                                        args.num_games, game_rng, save_legal=True)
 
     # Report stats
     lengths = [len(g) for g in games]
@@ -207,6 +224,11 @@ def main():
     with open(out_path, 'wb') as f:
         pickle.dump(games, f)
     print(f"Saved to {out_path}")
+
+    legal_path = os.path.join(args.output_dir, "legal_moves.pickle")
+    with open(legal_path, 'wb') as f:
+        pickle.dump(legal_moves, f)
+    print(f"Saved legal moves to {legal_path}")
 
     # Save metadata
     meta_path = os.path.join(args.output_dir, "metadata.txt")
