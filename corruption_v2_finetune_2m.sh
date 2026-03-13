@@ -2,7 +2,7 @@
 #SBATCH --job-name=rule_ft2m
 #SBATCH --output=logs/rule_ft2m_%A_%a.out
 #SBATCH --error=logs/rule_ft2m_%A_%a.err
-#SBATCH --time=8:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
@@ -25,7 +25,7 @@ python finetune_corruption.py \
     --output-dir experiments/corruption_v2/losses_2m \
     --label ${LABEL} \
     --ckpt ckpts/gpt_synthetic.ckpt \
-    --epochs 3 \
+    --epochs 8 \
     --batch-size 64
 
 echo "Finished at: $(date)"
