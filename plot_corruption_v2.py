@@ -13,6 +13,20 @@ OUT_DIR = "experiments/corruption_v2/figures"
 
 ALPHAS = [0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
 
+# Distinct colors for each alpha
+COLORS = [
+    '#000000',  # 0.00 - black
+    '#1f77b4',  # 0.01 - blue
+    '#ff7f0e',  # 0.02 - orange
+    '#2ca02c',  # 0.05 - green
+    '#d62728',  # 0.10 - red
+    '#9467bd',  # 0.20 - purple
+    '#8c564b',  # 0.30 - brown
+    '#e377c2',  # 0.50 - pink
+    '#17becf',  # 0.70 - cyan
+    '#bcbd22',  # 1.00 - olive
+]
+
 def load_all():
     results = {}
     for f in sorted(glob.glob(os.path.join(LOSS_DIR, "*.json"))):
@@ -29,18 +43,15 @@ def plot_loss_curves(results):
     os.makedirs(OUT_DIR, exist_ok=True)
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    norm = Normalize(vmin=0, vmax=1)
-    cmap = plt.cm.viridis
 
-    for alpha in ALPHAS:
+    for i, alpha in enumerate(ALPHAS):
         alpha_str = f"{int(alpha * 100):03d}"
         label = f"alpha{alpha_str}"
         if label not in results:
             continue
         losses = results[label]['losses']
         smoothed = smooth(losses)
-        color = cmap(norm(alpha))
-        ax.plot(smoothed, color=color, linewidth=1.2, alpha=0.9,
+        ax.plot(smoothed, color=COLORS[i], linewidth=1.5,
                 label=f"α={alpha}")
 
     ax.set_xlabel("Batch")
@@ -49,9 +60,6 @@ def plot_loss_curves(results):
     ax.set_ylim(1.5, 3.5)
     ax.legend(fontsize=8, loc='upper right')
     ax.grid(True, alpha=0.3)
-
-    sm = ScalarMappable(cmap=cmap, norm=norm)
-    fig.colorbar(sm, ax=ax, shrink=0.8, pad=0.02, label="Alpha (corruption level)")
 
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "v2_loss_curves.png"), dpi=150, bbox_inches='tight')
