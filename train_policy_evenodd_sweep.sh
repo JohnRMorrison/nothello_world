@@ -1,8 +1,8 @@
 #!/bin/bash
-# Sweep even/odd policy heads: H={1024,2048} x pos_weight={1.0,1.5,2.0}
+# Sweep even/odd policy heads: H={1024,2048} x pos_weight={1.0,1.5,2.0} + 2-layer H=1024
 # Each job trains BOTH even and odd heads sequentially
-# Tasks 0-2: H=1024, Tasks 3-5: H=2048
-# Usage: sbatch --array=0-5 train_policy_evenodd_sweep.sh
+# Tasks 0-2:  H=1024 L=1, Tasks 3-5: H=2048 L=1, Tasks 6-8: H=1024 L=2
+# Usage: sbatch --array=0-8 train_policy_evenodd_sweep.sh
 
 #SBATCH --job-name=eo_sweep
 #SBATCH -c 8
@@ -25,18 +25,24 @@ cd $SLURM_SUBMIT_DIR
 PW_ARRAY=(1.0 1.5 2.0)
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
 
-# Tasks 0-2: H=1024, Tasks 3-5: H=2048
+# Tasks 0-2: H=1024 L=1, Tasks 3-5: H=2048 L=1, Tasks 6-8: H=1024 L=2
 if [ $TASK_ID -lt 3 ]; then
     HIDDEN=1024
+    LAYERS=1
     PW_IDX=$TASK_ID
-else
+elif [ $TASK_ID -lt 6 ]; then
     HIDDEN=2048
+    LAYERS=1
     PW_IDX=$((TASK_ID - 3))
+else
+    HIDDEN=1024
+    LAYERS=2
+    PW_IDX=$((TASK_ID - 6))
 fi
 PW=${PW_ARRAY[$PW_IDX]}
 
 echo "============================================"
-echo "Even/odd policy head sweep: H=$HIDDEN, pos_weight=$PW, 6M games"
+echo "Even/odd policy head sweep: H=$HIDDEN, L=$LAYERS, pos_weight=$PW, 6M games"
 echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: $TASK_ID"
 echo "Node: $(hostname)"
 echo "Started at: $(date)"
@@ -47,6 +53,7 @@ python generate_adversarial_games.py \
     --max-games 6000000 \
     --policy-epochs 10 \
     --policy-hidden $HIDDEN \
+    --policy-layers $LAYERS \
     --pos-weight $PW \
     --even-odd
 
