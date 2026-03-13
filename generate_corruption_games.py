@@ -86,11 +86,21 @@ def generate_games(even_net, odd_net, num_games, rng, chunk_size=100000):
     return all_games
 
 
+def place_piece_no_flip(board, board_pos):
+    """Place a piece on the board without flipping. Used for illegal moves."""
+    r, c = board_pos // 8, board_pos % 8
+    board.state[r, c] = board.next_hand_color
+    board.next_hand_color *= -1
+
+
 def generate_single_game(even_net, odd_net, rng):
-    """Generate a single game using corrupted networks on exact board state."""
+    """Generate a single game using corrupted networks on exact board state.
+
+    Move selection is purely from the network. If a move is illegal,
+    the piece is still placed (without flipping) and recorded.
+    """
     board = OthelloBoardState()
     moves = []
-    consecutive_passes = 0
 
     for turn in range(60):
         is_black_turn = (board.next_hand_color == 1)
@@ -109,34 +119,18 @@ def generate_single_game(even_net, odd_net, rng):
             empty_cells = [i for i in range(64) if flat[i] == 0 and i not in CENTER_CELLS]
             if not empty_cells:
                 break
-            # Try each empty cell, pick one that's actually playable
-            # If none works, pass
             board_pos = empty_cells[rng.randint(len(empty_cells))]
-            try:
-                board.update([board_pos])
-                moves.append(board_pos)
-                consecutive_passes = 0
-            except:
-                # Invalid move — pass
-                consecutive_passes += 1
-                if consecutive_passes >= 2:
-                    break
-                board.update([])
         else:
-            # Sample from predicted legal moves
             move_idx = predicted_legal[rng.randint(len(predicted_legal))]
             board_pos = VALID_MOVES[move_idx]
 
-            try:
-                board.update([board_pos])
-                moves.append(board_pos)
-                consecutive_passes = 0
-            except:
-                # Predicted move was actually illegal — pass
-                consecutive_passes += 1
-                if consecutive_passes >= 2:
-                    break
-                board.update([])
+        # Try legal move first (with flips); if illegal, place without flipping
+        try:
+            board.update([board_pos])
+        except:
+            place_piece_no_flip(board, board_pos)
+
+        moves.append(board_pos)
 
     return moves
 
