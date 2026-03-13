@@ -1,7 +1,8 @@
 #!/bin/bash
-# Sweep even/odd policy heads: H=1024, pos_weight={1.0,1.5,2.0}
+# Sweep even/odd policy heads: H={1024,2048} x pos_weight={1.0,1.5,2.0}
 # Each job trains BOTH even and odd heads sequentially
-# Usage: sbatch --array=0-2 train_policy_evenodd_sweep.sh
+# Tasks 0-2: H=1024, Tasks 3-5: H=2048
+# Usage: sbatch --array=0-5 train_policy_evenodd_sweep.sh
 
 #SBATCH --job-name=eo_sweep
 #SBATCH -c 8
@@ -23,10 +24,19 @@ cd $SLURM_SUBMIT_DIR
 
 PW_ARRAY=(1.0 1.5 2.0)
 TASK_ID=${SLURM_ARRAY_TASK_ID:-0}
-PW=${PW_ARRAY[$TASK_ID]}
+
+# Tasks 0-2: H=1024, Tasks 3-5: H=2048
+if [ $TASK_ID -lt 3 ]; then
+    HIDDEN=1024
+    PW_IDX=$TASK_ID
+else
+    HIDDEN=2048
+    PW_IDX=$((TASK_ID - 3))
+fi
+PW=${PW_ARRAY[$PW_IDX]}
 
 echo "============================================"
-echo "Even/odd policy head sweep: H=1024, pos_weight=$PW, 6M games"
+echo "Even/odd policy head sweep: H=$HIDDEN, pos_weight=$PW, 6M games"
 echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: $TASK_ID"
 echo "Node: $(hostname)"
 echo "Started at: $(date)"
@@ -36,7 +46,7 @@ python generate_adversarial_games.py \
     --train-policy \
     --max-games 6000000 \
     --policy-epochs 10 \
-    --policy-hidden 1024 \
+    --policy-hidden $HIDDEN \
     --pos-weight $PW \
     --even-odd
 
