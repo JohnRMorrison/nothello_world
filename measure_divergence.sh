@@ -6,7 +6,7 @@
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=nklab,burst
-#SBATCH --exclude=ax01,ax00
+#SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
 # Tasks 0-9:   Direction 1 (on experimental) — corruption alphas
 # Tasks 10-16: Direction 1 (on experimental) — variants
