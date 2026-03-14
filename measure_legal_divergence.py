@@ -251,15 +251,19 @@ def measure_on_standard(std_games, variant_name, max_games=100000, seed=42):
             count += 1
 
             # Track flips for locked_flips before advancing
-            if flip_counts is not None:
-                # Count which pieces will flip during this standard move
-                pre_state = board.state.flatten().copy()
-                board.update([move])
-                post_state = board.state.flatten()
-                flipped = (pre_state != 0) & (post_state != 0) & (pre_state != post_state)
-                flip_counts[flipped] += 1
-            else:
-                board.update([move])
+            try:
+                if flip_counts is not None:
+                    # Count which pieces will flip during this standard move
+                    pre_state = board.state.flatten().copy()
+                    board.update([move])
+                    post_state = board.state.flatten()
+                    flipped = (pre_state != 0) & (post_state != 0) & (pre_state != post_state)
+                    flip_counts[flipped] += 1
+                else:
+                    board.update([move])
+            except AssertionError:
+                # Game ended (no legal moves for either player)
+                break
 
         if (idx_i + 1) % 10000 == 0:
             elapsed = time.time() - t0
