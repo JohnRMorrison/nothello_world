@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--save-ckpt", action="store_true")
+    parser.add_argument("--random-init", action="store_true",
+                        help="Skip loading checkpoint; train from random init")
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -182,10 +184,13 @@ def main():
     )
     model = GPT(mconf)
 
-    # Load pre-trained weights
-    print(f"Loading checkpoint: {args.ckpt}")
-    state_dict = torch.load(args.ckpt, map_location='cpu')
-    model.load_state_dict(state_dict)
+    # Load pre-trained weights (or skip for random init)
+    if args.random_init:
+        print("Using random initialization (no checkpoint)")
+    else:
+        print(f"Loading checkpoint: {args.ckpt}")
+        state_dict = torch.load(args.ckpt, map_location='cpu')
+        model.load_state_dict(state_dict)
     model = model.to(device)
 
     # Optimizer
