@@ -9,6 +9,10 @@ Variants:
   5. max_three_flips    - A move is only legal if it flips at most 3 pieces
   6. self_flanking      - Flanking your OWN pieces flips them to opponent's color
   7. delayed_flips      - Flips happen one turn later (at the start of your next move)
+  8. adjacent_legal     - Any empty square adjacent to any piece is legal (flips if bracket)
+  9. skip_empty_flips   - Rays skip empty squares when checking for flanking
+ 10. capture_any        - Adjacent to any opponent piece is legal (flips if bracket)
+ 11. wrap_flips         - Flanking rays wrap around board edges (torus topology)
 
 Usage:
   python generate_variant_games.py --variant no_diagonal_flips --num-games 100000 \
@@ -70,6 +74,49 @@ QUADRANTS = np.array([((sq // 8) >= 4) * 2 + ((sq % 8) >= 4) for sq in range(64)
 DIR_MASK_ALL = np.ones(8, dtype=bool)
 DIR_MASK_NO_DIAG = np.array([True, False, True, False, True, False, True, False])
 DIR_MASK_NO_ROW = np.array([True, True, False, True, True, True, False, True])
+
+# Adjacency table for each square (for adjacent_legal / capture_any)
+def _precompute_adjacency():
+    """Precompute adjacent squares for each cell."""
+    adj = []
+    for sq in range(64):
+        r, c = sq // 8, sq % 8
+        nbrs = []
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr <= 7 and 0 <= nc <= 7:
+                    nbrs.append(nr * 8 + nc)
+        adj.append(np.array(nbrs, dtype=np.int32))
+    return adj
+
+ADJACENCY = _precompute_adjacency()
+
+# Precomputed wrap-around rays (torus topology)
+def _precompute_wrap_rays():
+    """Precompute rays that wrap around board edges."""
+    rays = np.full((64, 8, 7), 64, dtype=np.int32)
+    ray_lens = np.zeros((64, 8), dtype=np.int32)
+    for sq in range(64):
+        r, c = sq // 8, sq % 8
+        for di, (dr, dc) in enumerate(EIGHTS):
+            cur_r, cur_c = r + dr, c + dc
+            idx = 0
+            while idx < 7:
+                wr, wc = cur_r % 8, cur_c % 8
+                cell = wr * 8 + wc
+                if cell == sq:  # wrapped all the way around
+                    break
+                rays[sq, di, idx] = cell
+                idx += 1
+                cur_r += dr
+                cur_c += dc
+            ray_lens[sq, di] = idx
+    return rays, ray_lens
+
+WRAP_RAYS, WRAP_RAY_LENS = _precompute_wrap_rays()
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +218,72 @@ def _flips_locked_vec(flat, color, dir_mask, fc_flat):
     return n_unlocked.sum(axis=1)  # (64,)
 
 
+def _flips_skip_empty_vec(flat, color, dir_mask):
+    """Vectorized flips that skip empty squares in rays.
+
+    A ray like B-W-_-W-B would flip both W's (the empty is ignored).
+    Only counts flips; returns (n_flips, None).
+    """
+    flat_pad = np.empty(65, dtype=np.int8)
+    flat_pad[:64] = flat
+    flat_pad[64] = 0
+
+    vals = flat_pad[RAYS]  # (64, 8, 7)
+
+    # Mask empty cells in rays — treat as "transparent"
+    # For skip-empty: we need to find opponent run (ignoring empties) terminated by own color
+    # Strategy: replace empty cells with a special marker, then process
+
+    n_flips_total = np.zeros(64, dtype=np.int32)
+    empty_sq = np.where(flat == 0)[0]
+
+    for sq in empty_sq:
+        for di in range(8):
+            if not dir_mask[di]:
+                continue
+            ray_len = RAY_LENS[sq, di]
+            if ray_len == 0:
+                continue
+            # Walk along the ray, skipping empties
+            opp_count = 0
+            for k in range(ray_len):
+                v = vals[sq, di, k]
+                if v == 0:
+                    continue  # skip empty
+                elif v == -color:
+                    opp_count += 1
+                elif v == color:
+                    n_flips_total[sq] += opp_count
+                    break
+                else:
+                    break
+
+    return n_flips_total, None
+
+
+def _flips_wrap_vec(flat, color, dir_mask):
+    """Vectorized flips using wrap-around (torus) rays."""
+    flat_pad = np.empty(65, dtype=np.int8)
+    flat_pad[:64] = flat
+    flat_pad[64] = 0
+
+    vals = flat_pad[WRAP_RAYS]  # (64, 8, 7)
+    is_opp = (vals == -color) & dir_mask[None, :, None]
+
+    not_opp = ~is_opp
+    first_break = not_opp.argmax(axis=2)
+    has_break = not_opp.any(axis=2)
+
+    gather = np.take_along_axis(WRAP_RAYS, first_break[:, :, None], axis=2).squeeze(2)
+    terminator = flat_pad[gather]
+
+    valid_dir = (first_break > 0) & (terminator == color) & has_break
+    n_flips_per_dir = np.where(valid_dir, first_break, 0)
+    n_flips = n_flips_per_dir.sum(axis=1)
+
+    return n_flips, valid_dir
+
+
 # ---------------------------------------------------------------------------
 # Scalar find_flips (used only in make_move — called once per turn)
 # ---------------------------------------------------------------------------
@@ -196,6 +309,61 @@ def find_flips(state, move, color, directions=None):
                 buffer.append((cur_r, cur_c))
             cur_r += dr
             cur_c += dc
+    return tbf
+
+
+def find_flips_skip_empty(state, move, color, directions=None):
+    """Find flips skipping over empty squares in rays."""
+    if directions is None:
+        directions = range(8)
+    r, c = move // 8, move % 8
+    tbf = []
+    for di in directions:
+        dr, dc = EIGHTS[di]
+        buffer = []
+        cur_r, cur_c = r + dr, c + dc
+        while 0 <= cur_r <= 7 and 0 <= cur_c <= 7:
+            val = state[cur_r, cur_c]
+            if val == 0:
+                # Skip empty squares
+                cur_r += dr
+                cur_c += dc
+                continue
+            elif val == color:
+                tbf.extend(buffer)
+                break
+            else:
+                buffer.append((cur_r, cur_c))
+            cur_r += dr
+            cur_c += dc
+    return tbf
+
+
+def find_flips_wrap(state, move, color, directions=None):
+    """Find flips using wrap-around (torus) rays."""
+    if directions is None:
+        directions = range(8)
+    r, c = move // 8, move % 8
+    tbf = []
+    for di in directions:
+        dr, dc = EIGHTS[di]
+        buffer = []
+        cur_r, cur_c = (r + dr) % 8, (c + dc) % 8
+        steps = 0
+        while steps < 7:
+            if cur_r == r and cur_c == c:
+                break
+            val = state[cur_r, cur_c]
+            if val == 0:
+                break
+            elif val == color:
+                tbf.extend(buffer)
+                break
+            else:
+                buffer.append((cur_r, cur_c))
+            cur_r = (cur_r + dr) % 8
+            cur_c = (cur_c + dc) % 8
+            steps += 1
     return tbf
 
 
@@ -243,6 +411,52 @@ class VariantBoard:
         color = self.next_hand_color
         flat = self.state.ravel()
         empty = (flat == 0)
+
+        # --- adjacent_legal: any empty square adjacent to any piece ---
+        if self.variant == "adjacent_legal":
+            occupied = (flat != 0)
+            adj_mask = np.zeros(64, dtype=bool)
+            for sq in np.where(occupied)[0]:
+                for nbr in ADJACENCY[sq]:
+                    if flat[nbr] == 0:
+                        adj_mask[nbr] = True
+            regular = np.where(adj_mask)[0].tolist()
+            return regular if regular else []
+
+        # --- capture_any: any empty square adjacent to opponent piece ---
+        if self.variant == "capture_any":
+            opp_occupied = (flat == -color)
+            adj_mask = np.zeros(64, dtype=bool)
+            for sq in np.where(opp_occupied)[0]:
+                for nbr in ADJACENCY[sq]:
+                    if flat[nbr] == 0:
+                        adj_mask[nbr] = True
+            regular = np.where(adj_mask)[0].tolist()
+            return regular if regular else []
+
+        # --- skip_empty_flips: uses skip-empty vectorized flip counts ---
+        if self.variant == "skip_empty_flips":
+            n_flips, _ = _flips_skip_empty_vec(flat, color, self._dir_mask)
+            valid_mask = empty & (n_flips > 0)
+            regular = np.where(valid_mask)[0].tolist()
+            if regular:
+                return regular
+            # Forfeit
+            opp_flips, _ = _flips_skip_empty_vec(flat, -color, self._dir_mask)
+            forfeit_mask = empty & (opp_flips > 0)
+            return np.where(forfeit_mask)[0].tolist()
+
+        # --- wrap_flips: uses wrap-around rays ---
+        if self.variant == "wrap_flips":
+            n_flips, _ = _flips_wrap_vec(flat, color, self._dir_mask)
+            valid_mask = empty & (n_flips > 0)
+            regular = np.where(valid_mask)[0].tolist()
+            if regular:
+                return regular
+            # Forfeit
+            opp_flips, _ = _flips_wrap_vec(flat, -color, self._dir_mask)
+            forfeit_mask = empty & (opp_flips > 0)
+            return np.where(forfeit_mask)[0].tolist()
 
         # --- Compute flip counts for all squares at once ---
         if self.variant == "locked_flips":
@@ -294,14 +508,27 @@ class VariantBoard:
                     self.state[fr, fc] *= -1
             self.pending_flips = []
 
-        # Find flips for current move
-        flips = find_flips(self.state, move, color, self._dirs)
+        # Find flips for current move (variant-specific)
+        if self.variant == "skip_empty_flips":
+            flips = find_flips_skip_empty(self.state, move, color, self._dirs)
+        elif self.variant == "wrap_flips":
+            flips = find_flips_wrap(self.state, move, color, self._dirs)
+        elif self.variant in ("adjacent_legal", "capture_any"):
+            # Normal flanking flips — if no bracket, piece is just placed
+            flips = find_flips(self.state, move, color, self._dirs)
+        else:
+            flips = find_flips(self.state, move, color, self._dirs)
 
-        if len(flips) == 0:
+        if len(flips) == 0 and self.variant not in ("adjacent_legal", "capture_any"):
             # Forfeit — switch color and retry
             color *= -1
             self.next_hand_color *= -1
-            flips = find_flips(self.state, move, color, self._dirs)
+            if self.variant == "skip_empty_flips":
+                flips = find_flips_skip_empty(self.state, move, color, self._dirs)
+            elif self.variant == "wrap_flips":
+                flips = find_flips_wrap(self.state, move, color, self._dirs)
+            else:
+                flips = find_flips(self.state, move, color, self._dirs)
 
         # Variant 4: locked_flips — filter out pieces flipped twice already
         if self.variant == "locked_flips":
@@ -349,7 +576,9 @@ def main():
                         choices=["no_same_quadrant", "no_diagonal_flips",
                                  "no_row_flips", "locked_flips",
                                  "max_three_flips", "self_flanking",
-                                 "delayed_flips"])
+                                 "delayed_flips", "adjacent_legal",
+                                 "skip_empty_flips", "capture_any",
+                                 "wrap_flips"])
     parser.add_argument("--num-games", type=int, default=100000)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
