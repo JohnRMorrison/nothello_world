@@ -54,9 +54,7 @@ alpha = "ABCDEFGH"
 def to_board_label(i):
     return f"{alpha[i//8]}{i%8}"
 
-import transformer_lens
-import transformer_lens.utils as tl_utils
-from transformer_lens import HookedTransformer, HookedTransformerConfig
+from mingpt.model import GPT, GPTConfig
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -85,28 +83,32 @@ def board_val_to_probe_class(val):
 # ---------------------------------------------------------------------------
 # Model and data loading
 # ---------------------------------------------------------------------------
-def load_model_and_data(probe_path, device="cuda"):
-    """Load TransformerLens OthelloGPT model, linear probe, and game data."""
-    cfg = HookedTransformerConfig(
-        n_layers=8, d_model=512, d_head=64, n_heads=8,
-        d_mlp=2048, d_vocab=61, n_ctx=59,
-        act_fn="gelu", normalization_type="LNPre",
+def load_model_and_data(probe_path, ckpt_path, device="cuda"):
+    """Load mingpt OthelloGPT model, linear probe, and game data."""
+    mconf = GPTConfig(
+        vocab_size=61, block_size=59,
+        n_layer=8, n_head=8, n_embd=512,
     )
-    model = HookedTransformer(cfg)
-    sd = tl_utils.download_file_from_hf(
-        "NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth"
-    )
-    model.load_state_dict(sd)
+    model = GPT(mconf)
+
+    script_dir = os.path.dirname(__file__)
+    parent_dir = os.path.join(script_dir, "..")
+
+    ckpt_full = os.path.join(parent_dir, ckpt_path)
+    model.load_state_dict(torch.load(ckpt_full, map_location=device))
     model.to(device)
     model.eval()
 
-    probe_full_path = os.path.join(os.path.dirname(__file__), probe_path)
+    probe_full_path = os.path.join(script_dir, probe_path)
     linear_probe = torch.load(probe_full_path, map_location=device)
     # Shape: (3, 512, 8, 8, 3) — modes x d_model x rows x cols x options
 
-    data_dir = os.path.dirname(__file__)
-    board_seqs_int = torch.load(os.path.join(data_dir, "board_seqs_int.pth"))
-    board_seqs_string = torch.load(os.path.join(data_dir, "board_seqs_string.pth"))
+    board_seqs_int = torch.load(
+        os.path.join(script_dir, "board_seqs_int.pth"), map_location="cpu"
+    )
+    board_seqs_string = torch.load(
+        os.path.join(script_dir, "board_seqs_string.pth"), map_location="cpu"
+    )
 
     return model, linear_probe, board_seqs_int, board_seqs_string
 
@@ -297,11 +299,8 @@ def select_mixed(board_state, n, rng):
 # ---------------------------------------------------------------------------
 # Intervention hooks
 # ---------------------------------------------------------------------------
-def make_intervention_hook(linear_probe, modifications, pos, scale, mode=PROBE_MODE):
-    """Create hook that applies all N interventions to residual stream.
-
-    modifications: list of (r, c, orig_val, target_val)
-    """
+def compute_flip_dirs(linear_probe, modifications, mode=PROBE_MODE):
+    """Compute probe-direction vectors for each modification."""
     flip_dirs = []
     for (r, c, orig_val, target_val) in modifications:
         current_class = board_val_to_probe_class(orig_val)
@@ -309,13 +308,18 @@ def make_intervention_hook(linear_probe, modifications, pos, scale, mode=PROBE_M
         flip_dir = linear_probe[mode, :, r, c, target_class] - \
                    linear_probe[mode, :, r, c, current_class]
         flip_dirs.append(flip_dir)
+    return flip_dirs
 
-    def hook_fn(resid, hook):
-        for flip_dir in flip_dirs:
-            coeff = resid[0, pos] @ flip_dir / flip_dir.norm()
-            resid[0, pos] -= scale * coeff * flip_dir / flip_dir.norm()
 
-    return hook_fn
+def apply_intervention(x, flip_dirs, pos, scale):
+    """Apply probe-direction subtraction to activation tensor x in-place.
+
+    x: (batch, seq, d_model)
+    """
+    for flip_dir in flip_dirs:
+        coeff = x[0, pos] @ flip_dir / flip_dir.norm()
+        x[0, pos] -= scale * coeff * flip_dir / flip_dir.norm()
+    return x
 
 
 def run_with_intervention(model, input_tokens, modifications, linear_probe,
@@ -323,22 +327,65 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
                           mode=PROBE_MODE, device="cuda"):
     """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
 
-    Intervenes at layer_intervene, captures residual at layer_probe.
+    Uses mingpt: manually split forward pass at layer_intervene,
+    apply intervention, continue forward, capture activations at layer_probe.
     """
-    hook_fn = make_intervention_hook(linear_probe, modifications, pos, scale, mode)
-    captured = {}
+    flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
 
-    def capture_hook(resid, hook):
-        captured["resid"] = resid[0, pos].detach().clone()
+    # Forward through embedding + layers 0..layer_intervene-1
+    b, t = input_tokens.size()
+    token_emb = model.tok_emb(input_tokens)
+    pos_emb = model.pos_emb[:, :t, :]
+    x = model.drop(token_emb + pos_emb)
 
-    logits = model.run_with_hooks(
-        input_tokens,
-        fwd_hooks=[
-            (f"blocks.{layer_intervene}.hook_resid_post", hook_fn),
-            (f"blocks.{layer_probe}.hook_resid_post", capture_hook),
-        ]
-    )
-    return logits[0, pos], captured["resid"]
+    for block in model.blocks[:layer_intervene]:
+        x = block(x)
+
+    # Apply intervention at layer_intervene output
+    x = apply_intervention(x, flip_dirs, pos, scale)
+
+    # Continue through remaining layers, capture at layer_probe
+    resid_at_probe = None
+    for i, block in enumerate(model.blocks[layer_intervene:], start=layer_intervene):
+        x = block(x)
+        if i == layer_probe - 1:
+            # Capture after this block (= resid_post for layer_probe)
+            # layer_probe is 0-indexed: block i produces resid_post layer i
+            resid_at_probe = x[0, pos].detach().clone()
+
+    # If layer_probe is the last layer or beyond what we captured
+    if resid_at_probe is None:
+        resid_at_probe = x[0, pos].detach().clone()
+
+    # Final layernorm + head
+    x = model.ln_f(x)
+    logits = model.head(x)  # (B, T, vocab)
+
+    return logits[0, pos], resid_at_probe
+
+
+def _forward_with_resid(model, input_tokens, pos, layer_probe):
+    """Forward pass through mingpt, returning logits and residual at layer_probe.
+
+    Returns (logits_at_pos, resid_at_probe_layer).
+    """
+    b, t = input_tokens.size()
+    token_emb = model.tok_emb(input_tokens)
+    pos_emb = model.pos_emb[:, :t, :]
+    x = model.drop(token_emb + pos_emb)
+
+    resid_at_probe = None
+    for i, block in enumerate(model.blocks):
+        x = block(x)
+        if i == layer_probe - 1:
+            resid_at_probe = x[0, pos].detach().clone()
+
+    if resid_at_probe is None:
+        resid_at_probe = x[0, pos].detach().clone()
+
+    x = model.ln_f(x)
+    logits = model.head(x)
+    return logits[0, pos], resid_at_probe
 
 
 # ---------------------------------------------------------------------------
@@ -492,7 +539,7 @@ def calibrate_scale(model, linear_probe, board_seqs_int, board_seqs_string,
                 # Run intervention
                 input_tokens = game_int[:pos + 1].unsqueeze(0).to(device)
                 with torch.no_grad():
-                    orig_logits = model(input_tokens)[0, pos]
+                    orig_logits = model(input_tokens)[0][0, pos]
                     intv_logits, _ = run_with_intervention(
                         model, input_tokens, mods, linear_probe,
                         pos, scale, layer, 6, device=device
@@ -553,15 +600,12 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
         board_state, color = replay_to_position(game_str, pos)
         original_legal = compute_legal_moves(board_state, color)
 
-        # Get original model output
+        # Get original model output + residual at probe layer
         input_tokens = game_int[:pos + 1].unsqueeze(0).to(device)
         with torch.no_grad():
-            orig_logits, orig_cache = model.run_with_cache(
-                input_tokens, return_type="logits"
+            orig_logits_at_pos, orig_resid = _forward_with_resid(
+                model, input_tokens, pos, layer_probe
             )
-        orig_logits_at_pos = orig_logits[0, pos]
-        orig_resid = orig_cache["resid_post", layer_probe][0, pos].detach()
-        del orig_cache  # free memory
 
         for n in n_values:
             # Standard conditions
@@ -786,6 +830,8 @@ def main():
     )
     parser.add_argument("--probe-path", default="main_linear_probe.pth",
                         help="Path to linear probe (relative to script dir)")
+    parser.add_argument("--ckpt", default="ckpts/gpt_synthetic.ckpt",
+                        help="Path to model checkpoint (relative to repo root)")
     parser.add_argument("--n-games", type=int, default=200)
     parser.add_argument("--layer-intervene", type=int, default=None,
                         help="Intervention layer (default: calibrate)")
@@ -815,7 +861,7 @@ def main():
     # Load model and data
     print("Loading model, probe, and game data...")
     model, linear_probe, board_seqs_int, board_seqs_string = \
-        load_model_and_data(args.probe_path, device=args.device)
+        load_model_and_data(args.probe_path, args.ckpt, device=args.device)
 
     # Scale calibration
     layer_intervene = args.layer_intervene
