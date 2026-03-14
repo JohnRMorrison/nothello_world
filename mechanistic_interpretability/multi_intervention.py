@@ -44,8 +44,15 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from mech_interp_othello_utils import OthelloBoardState, stoi_indices, to_board_label
+from data.othello import OthelloBoardState
 from generate_variant_games import _flips_vec, DIR_MASK_ALL
+
+# stoi_indices and to_board_label defined inline to avoid importing
+# mech_interp_othello_utils (which requires neel_plotly)
+stoi_indices = list(range(27)) + list(range(29, 35)) + list(range(37, 64))
+alpha = "ABCDEFGH"
+def to_board_label(i):
+    return f"{alpha[i//8]}{i%8}"
 
 import transformer_lens
 import transformer_lens.utils as tl_utils
