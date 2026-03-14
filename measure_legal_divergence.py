@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from data.othello import OthelloBoardState
 from generate_variant_games import (
     VariantBoard, _flips_vec, _self_flank_vec, _flips_locked_vec,
+    _flips_skip_empty_vec, _flips_wrap_vec, ADJACENCY,
     DIR_MASK_ALL, DIR_MASK_NO_DIAG, DIR_MASK_NO_ROW, QUADRANTS,
 )
 
@@ -73,6 +74,46 @@ def compute_variant_legal(flat, color, variant_name, last_move=None,
     flat = flat.astype(np.int8)
     empty = (flat == 0)
 
+    # --- New variants with fundamentally different legality ---
+    if variant_name == "adjacent_legal":
+        occupied = (flat != 0)
+        adj_mask = np.zeros(64, dtype=bool)
+        for sq in np.where(occupied)[0]:
+            for nbr in ADJACENCY[sq]:
+                if flat[nbr] == 0:
+                    adj_mask[nbr] = True
+        return np.where(adj_mask)[0].tolist()
+
+    if variant_name == "capture_any":
+        opp_occupied = (flat == -color)
+        adj_mask = np.zeros(64, dtype=bool)
+        for sq in np.where(opp_occupied)[0]:
+            for nbr in ADJACENCY[sq]:
+                if flat[nbr] == 0:
+                    adj_mask[nbr] = True
+        return np.where(adj_mask)[0].tolist()
+
+    if variant_name == "skip_empty_flips":
+        n_flips, _ = _flips_skip_empty_vec(flat, color, DIR_MASK_ALL)
+        valid_mask = empty & (n_flips > 0)
+        regular = np.where(valid_mask)[0].tolist()
+        if regular:
+            return regular
+        opp_flips, _ = _flips_skip_empty_vec(flat, -color, DIR_MASK_ALL)
+        forfeit_mask = empty & (opp_flips > 0)
+        return np.where(forfeit_mask)[0].tolist()
+
+    if variant_name == "wrap_flips":
+        n_flips, _ = _flips_wrap_vec(flat, color, DIR_MASK_ALL)
+        valid_mask = empty & (n_flips > 0)
+        regular = np.where(valid_mask)[0].tolist()
+        if regular:
+            return regular
+        opp_flips, _ = _flips_wrap_vec(flat, -color, DIR_MASK_ALL)
+        forfeit_mask = empty & (opp_flips > 0)
+        return np.where(forfeit_mask)[0].tolist()
+
+    # --- Original variants ---
     # Direction mask
     if variant_name == "no_diagonal_flips":
         dir_mask = DIR_MASK_NO_DIAG
