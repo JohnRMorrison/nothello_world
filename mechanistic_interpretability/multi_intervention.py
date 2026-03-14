@@ -55,6 +55,7 @@ def to_board_label(i):
     return f"{alpha[i//8]}{i%8}"
 
 from mingpt.model import GPT, GPTConfig
+import torch.nn as nn
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -386,6 +387,369 @@ def _forward_with_resid(model, input_tokens, pos, layer_probe):
     x = model.ln_f(x)
     logits = model.head(x)
     return logits[0, pos], resid_at_probe
+
+
+# ---------------------------------------------------------------------------
+# MLP baseline
+# ---------------------------------------------------------------------------
+_VALID_MOVES = sorted(set(range(64)) - {27, 28, 35, 36})
+_MOVE_TO_IDX = {m: i for i, m in enumerate(_VALID_MOVES)}
+N_MOVES = 60
+
+
+def _build_mlp(input_dim, hidden_dim, output_dim, num_hidden_layers=1):
+    layers = [nn.Linear(input_dim, hidden_dim), nn.ReLU()]
+    for _ in range(num_hidden_layers - 1):
+        layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+    layers.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
+def load_mlp(mlp_ckpt_path, device="cuda"):
+    """Load MLP checkpoint (even/odd models).
+
+    Returns (mlp_even, mlp_odd, mlp_probe) where mlp_probe has shape
+    (1024, 8, 8, 3) — analogous to linear_probe[mode, :, r, c, class].
+    """
+    ckpt = torch.load(mlp_ckpt_path, map_location=device)
+    hidden_dim = ckpt["hidden_dim"]
+    input_dim = ckpt["input_dim"]
+    num_hidden = ckpt.get("num_hidden_layers", 1)
+
+    mlp_even = _build_mlp(input_dim, hidden_dim, 64 * 3, num_hidden)
+    mlp_even.load_state_dict(ckpt["even"])
+    mlp_even.to(device).eval()
+
+    mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * 3, num_hidden)
+    mlp_odd.load_state_dict(ckpt["odd"])
+    mlp_odd.to(device).eval()
+
+    # Extract output layer weights as "probe": (192, H) -> (H, 8, 8, 3)
+    def _extract_probe(mlp):
+        W2 = mlp[-1].weight.detach()  # (192, H)
+        p = W2.reshape(64, 3, hidden_dim).reshape(8, 8, 3, hidden_dim)
+        return p.permute(3, 0, 1, 2)  # (H, 8, 8, 3)
+
+    mlp_probe_even = _extract_probe(mlp_even)
+    mlp_probe_odd = _extract_probe(mlp_odd)
+
+    return mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd, hidden_dim
+
+
+def build_180d_features(game_str, pos):
+    """Build 180-d move-history features at position pos.
+
+    game_str: sequence of flat board indices (0-63).
+    Returns numpy array of shape (180,).
+    """
+    played = np.zeros(N_MOVES, dtype=np.float32)
+    when = np.zeros(N_MOVES, dtype=np.float32)
+    even = np.zeros(N_MOVES, dtype=np.float32)
+
+    for s in range(pos + 1):
+        move = game_str[s].item() if hasattr(game_str[s], 'item') else int(game_str[s])
+        if move not in _MOVE_TO_IDX:
+            continue
+        idx = _MOVE_TO_IDX[move]
+        played[idx] = 1.0
+        when[idx] = (s + 1) / 60.0
+        even[idx] = 1.0 if (s % 2 == 0) else 0.0
+
+    return np.concatenate([played, when, even])
+
+
+def mlp_forward_with_intervention(mlp, features, modifications, mlp_probe,
+                                   scale, device="cuda"):
+    """Forward MLP with intervention on hidden activations.
+
+    mlp: nn.Sequential (Linear, ReLU, Linear)
+    features: (180,) numpy array
+    modifications: list of (r, c, orig_val, target_val)
+    mlp_probe: (H, 8, 8, 3) tensor — output layer weights reshaped
+    scale: intervention scale
+
+    Returns (output_logits_64x3, hidden_original, hidden_intervened).
+    """
+    x = torch.tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
+
+    # Forward through hidden layer(s) — everything except last Linear
+    h = x
+    for layer in mlp[:-1]:
+        h = layer(h)
+    h_orig = h[0].detach().clone()
+
+    # Compute intervention directions from mlp_probe
+    h_mod = h.clone()
+    for (r, c, orig_val, target_val) in modifications:
+        current_class = board_val_to_probe_class(orig_val)
+        target_class = board_val_to_probe_class(target_val)
+        flip_dir = mlp_probe[:, r, c, target_class] - mlp_probe[:, r, c, current_class]
+        coeff = h_mod[0] @ flip_dir / flip_dir.norm()
+        h_mod[0] = h_mod[0] - scale * coeff * flip_dir / flip_dir.norm()
+
+    h_intv = h_mod[0].detach().clone()
+
+    # Forward through output layer
+    output = mlp[-1](h_mod)  # (1, 192)
+    output = output.view(64, 3)  # (64, 3) — per-cell class logits
+
+    return output, h_orig, h_intv
+
+
+def mlp_forward_clean(mlp, features, device="cuda"):
+    """Clean forward pass through MLP. Returns (output_64x3, hidden)."""
+    x = torch.tensor(features, dtype=torch.float32, device=device).unsqueeze(0)
+    h = x
+    for layer in mlp[:-1]:
+        h = layer(h)
+    h_out = h[0].detach().clone()
+    output = mlp[-1](h).view(64, 3)
+    return output, h_out
+
+
+def measure_mlp_probe_metrics(orig_output, intv_output, modifications):
+    """Measure probe-based metrics for MLP baseline.
+
+    orig_output, intv_output: (64, 3) tensors — per-cell class logits.
+
+    Returns dict with: probe_acc, crosstalk, direction_acc_probe.
+    """
+    result = {}
+    modified_set = {(m[0], m[1]) for m in modifications}
+
+    # Probe accuracy on modified cells
+    correct = 0
+    dir_correct = 0
+    for (r, c, orig_val, target_val) in modifications:
+        cell = r * 8 + c
+        target_class = board_val_to_probe_class(target_val)
+        current_class = board_val_to_probe_class(orig_val)
+        pred = intv_output[cell].argmax().item()
+        if pred == target_class:
+            correct += 1
+        # Direction: did target class logit increase relative to current?
+        orig_diff = orig_output[cell, target_class] - orig_output[cell, current_class]
+        intv_diff = intv_output[cell, target_class] - intv_output[cell, current_class]
+        if intv_diff > orig_diff:
+            dir_correct += 1
+
+    result["probe_acc"] = correct / len(modifications)
+    result["direction_acc_probe"] = dir_correct / len(modifications)
+
+    # Cross-talk: mean absolute change in logits for non-modified cells
+    diff = (intv_output - orig_output).abs()  # (64, 3)
+    mask = torch.ones(64, dtype=torch.bool, device=diff.device)
+    for (r, c, _, _) in modifications:
+        mask[r * 8 + c] = False
+    if mask.sum() > 0:
+        result["crosstalk"] = diff[mask].mean().item()
+    else:
+        result["crosstalk"] = 0.0
+
+    return result
+
+
+def calibrate_mlp_scale(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
+                         board_seqs_string, scales=(0.5, 1, 2, 3, 4, 6, 8),
+                         n_games=50, device="cuda"):
+    """Find optimal scale for MLP baseline via N=1 flip interventions."""
+    print("=== MLP Scale Calibration ===")
+    rng = random.Random(42)
+    results = {}
+
+    for scale in scales:
+        probe_accs = []
+        for gi in tqdm(range(n_games), desc=f"s{scale}", leave=False):
+            game_str = board_seqs_string[gi]
+            pos = rng.randint(POS_RANGE[0], POS_RANGE[1])
+            board_state, color = replay_to_position(game_str, pos)
+
+            mods = select_flip_noninteracting(board_state, 1, rng)
+            if mods is None:
+                continue
+
+            features = build_180d_features(game_str, pos)
+            is_even = (pos % 2 == 0)
+            mlp = mlp_even if is_even else mlp_odd
+            mlp_probe = mlp_probe_even if is_even else mlp_probe_odd
+
+            with torch.no_grad():
+                orig_out, _ = mlp_forward_clean(mlp, features, device)
+                intv_out, _, _ = mlp_forward_with_intervention(
+                    mlp, features, mods, mlp_probe, scale, device
+                )
+                metrics = measure_mlp_probe_metrics(orig_out, intv_out, mods)
+                probe_accs.append(metrics["probe_acc"])
+
+        mean_acc = np.mean(probe_accs) if probe_accs else 0.0
+        results[scale] = mean_acc
+        print(f"  scale {scale}: probe_acc = {mean_acc:.3f} (n={len(probe_accs)})")
+
+    best_scale = max(results, key=results.get)
+    print(f"\nBest MLP scale: {best_scale}, probe_acc={results[best_scale]:.3f}")
+    return best_scale, results
+
+
+def run_mlp_experiment(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
+                        board_seqs_string, scale,
+                        n_games=200, n_values=None, seed=42, device="cuda"):
+    """Run multi-intervention experiment on MLP baseline."""
+    if n_values is None:
+        n_values = N_VALUES
+
+    rng = random.Random(seed)
+
+    results = {cond: {str(n): [] for n in n_values}
+               for cond, _ in CONDITIONS}
+    results["mixed"] = {str(n): [] for n in n_values}
+
+    print(f"\n=== MLP Baseline Experiment ===")
+    print(f"Scale: {scale}")
+    print(f"Games: {n_games}, N values: {n_values}")
+
+    for gi in tqdm(range(n_games), desc="MLP Games"):
+        game_str = board_seqs_string[gi]
+        pos = rng.randint(POS_RANGE[0], min(POS_RANGE[1], 58))
+        board_state, color = replay_to_position(game_str, pos)
+
+        features = build_180d_features(game_str, pos)
+        is_even = (pos % 2 == 0)
+        mlp = mlp_even if is_even else mlp_odd
+        mlp_probe = mlp_probe_even if is_even else mlp_probe_odd
+
+        with torch.no_grad():
+            orig_out, orig_h = mlp_forward_clean(mlp, features, device)
+
+        for n in n_values:
+            for cond_name, select_fn in CONDITIONS:
+                mods = select_fn(board_state, n, rng)
+                if mods is None:
+                    continue
+
+                with torch.no_grad():
+                    intv_out, _, intv_h = mlp_forward_with_intervention(
+                        mlp, features, mods, mlp_probe, scale, device
+                    )
+
+                metrics = measure_mlp_probe_metrics(orig_out, intv_out, mods)
+
+                # Hidden-layer cross-talk using mlp_probe
+                orig_probe = torch.einsum("d, d r c o -> r c o", orig_h, mlp_probe)
+                intv_probe = torch.einsum("d, d r c o -> r c o", intv_h, mlp_probe)
+                diff = (intv_probe - orig_probe).abs()
+                mask = torch.ones(8, 8, dtype=torch.bool, device=diff.device)
+                for (r, c, _, _) in mods:
+                    mask[r, c] = False
+                if mask.sum() > 0:
+                    metrics["hidden_crosstalk"] = diff[mask].mean().item()
+                else:
+                    metrics["hidden_crosstalk"] = 0.0
+
+                results[cond_name][str(n)].append(metrics)
+
+            # Mixed condition
+            mods, (n_flips, n_adds) = select_mixed(board_state, n, rng)
+            if mods is not None:
+                with torch.no_grad():
+                    intv_out, _, intv_h = mlp_forward_with_intervention(
+                        mlp, features, mods, mlp_probe, scale, device
+                    )
+                metrics = measure_mlp_probe_metrics(orig_out, intv_out, mods)
+
+                orig_probe = torch.einsum("d, d r c o -> r c o", orig_h, mlp_probe)
+                intv_probe = torch.einsum("d, d r c o -> r c o", intv_h, mlp_probe)
+                diff = (intv_probe - orig_probe).abs()
+                mask = torch.ones(8, 8, dtype=torch.bool, device=diff.device)
+                for (r, c, _, _) in mods:
+                    mask[r, c] = False
+                if mask.sum() > 0:
+                    metrics["hidden_crosstalk"] = diff[mask].mean().item()
+                else:
+                    metrics["hidden_crosstalk"] = 0.0
+
+                metrics["n_flips"] = n_flips
+                metrics["n_adds"] = n_adds
+                results["mixed"][str(n)].append(metrics)
+
+    return results
+
+
+def aggregate_mlp_results(results):
+    """Aggregate MLP per-sample results into means and stds."""
+    aggregated = {}
+    for cond in results:
+        aggregated[cond] = {}
+        for n_str, samples in results[cond].items():
+            if not samples:
+                aggregated[cond][n_str] = {"n_samples": 0}
+                continue
+
+            agg = {"n_samples": len(samples)}
+            for key in ["probe_acc", "direction_acc_probe", "crosstalk",
+                         "hidden_crosstalk"]:
+                vals = [s[key] for s in samples if s.get(key) is not None]
+                if vals:
+                    agg[key] = float(np.mean(vals))
+                    agg[key + "_std"] = float(np.std(vals))
+                else:
+                    agg[key] = None
+
+            if cond == "mixed" and "n_flips" in samples[0]:
+                compositions = defaultdict(list)
+                for s in samples:
+                    comp_key = f"{s['n_flips']}f_{s['n_adds']}a"
+                    compositions[comp_key].append(s)
+                agg["compositions"] = {}
+                for comp_key, comp_samples in compositions.items():
+                    comp_agg = {"n_samples": len(comp_samples)}
+                    for key in ["probe_acc", "direction_acc_probe", "crosstalk"]:
+                        vals = [s[key] for s in comp_samples if s.get(key) is not None]
+                        if vals:
+                            comp_agg[key] = float(np.mean(vals))
+                    agg["compositions"][comp_key] = comp_agg
+
+            aggregated[cond][n_str] = agg
+
+    return aggregated
+
+
+def plot_mlp_results(aggregated, n_values, output_dir):
+    """Generate plots for MLP baseline results."""
+    metrics_to_plot = [
+        ("probe_acc", "MLP Probe Accuracy (Modified Cells)", "Fraction correct"),
+        ("direction_acc_probe", "MLP Direction Accuracy (Modified Cells)",
+         "Fraction correct direction"),
+        ("crosstalk", "MLP Output Cross-talk (Non-modified Cells)",
+         "Mean |change| in output logits"),
+        ("hidden_crosstalk", "MLP Hidden Cross-talk via Probe",
+         "Mean |change| in probe logits"),
+    ]
+
+    for metric_key, title, ylabel in metrics_to_plot:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for cond in COND_COLORS:
+            xs, ys, errs = [], [], []
+            for n in n_values:
+                data = aggregated.get(cond, {}).get(str(n), {})
+                val = data.get(metric_key)
+                if val is not None:
+                    xs.append(n)
+                    ys.append(val)
+                    errs.append(data.get(metric_key + "_std", 0))
+            if xs:
+                ax.errorbar(xs, ys, yerr=errs, marker='o',
+                            label=COND_LABELS[cond],
+                            color=COND_COLORS[cond], capsize=3)
+        ax.set_xlabel("Number of interventions (N)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=9)
+        ax.set_xticks(n_values)
+        plt.tight_layout()
+        fname = os.path.join(output_dir, f"mlp_{metric_key}.png")
+        plt.savefig(fname, dpi=150)
+        plt.close()
+        print(f"  Saved {fname}")
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +1212,11 @@ def main():
     parser.add_argument("--output-dir", default="multi_intervention_results")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    # MLP baseline
+    parser.add_argument("--mlp-baseline", action="store_true",
+                        help="Run MLP baseline instead of OthelloGPT")
+    parser.add_argument("--mlp-ckpt", type=str, default=None,
+                        help="Path to MLP checkpoint (e.g. mlp_180_H1024.pt)")
     args = parser.parse_args()
 
     n_values = [int(x) for x in args.n_values.split(",")]
@@ -858,6 +1227,97 @@ def main():
         print("CUDA not available, falling back to CPU")
         args.device = "cpu"
 
+    if args.mlp_baseline:
+        # ---- MLP baseline mode ----
+        if args.mlp_ckpt is None:
+            parser.error("--mlp-ckpt is required when using --mlp-baseline")
+
+        print("Loading MLP and game data...")
+        mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd, hidden_dim = load_mlp(
+            args.mlp_ckpt, device=args.device
+        )
+        # Load game data (still needed for board replay)
+        script_dir = os.path.dirname(__file__)
+        board_seqs_string = torch.load(
+            os.path.join(script_dir, "board_seqs_string.pth"), map_location="cpu"
+        )
+        print(f"MLP loaded: hidden_dim={hidden_dim}")
+
+        # MLP scale calibration
+        scale = args.scale
+        if scale is None or args.calibrate:
+            scale, cal_results = calibrate_mlp_scale(
+                mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
+                board_seqs_string,
+                n_games=min(args.n_games, 50), device=args.device
+            )
+            cal_path = os.path.join(args.output_dir, "mlp_calibration.json")
+            with open(cal_path, "w") as f:
+                json.dump({"best_scale": scale,
+                           "results": {str(k): v for k, v in cal_results.items()}},
+                          f, indent=2)
+            print(f"MLP calibration saved to {cal_path}")
+
+            if args.calibrate_only:
+                return
+
+        if args.scale is not None:
+            scale = args.scale
+
+        # Run MLP experiment
+        raw_results = run_mlp_experiment(
+            mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
+            board_seqs_string, scale,
+            n_games=args.n_games, n_values=n_values,
+            seed=args.seed, device=args.device
+        )
+
+        aggregated = aggregate_mlp_results(raw_results)
+
+        output = {
+            "config": {
+                "mode": "mlp_baseline",
+                "mlp_ckpt": args.mlp_ckpt,
+                "n_games": args.n_games,
+                "scale": scale,
+                "n_values": n_values,
+                "seed": args.seed,
+            },
+            "results": aggregated,
+        }
+
+        results_path = os.path.join(args.output_dir, "mlp_results.json")
+        with open(results_path, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"\nMLP results saved to {results_path}")
+
+        # Print summary
+        print("\n=== MLP Baseline Summary ===")
+        for cond in list(COND_LABELS.keys()):
+            print(f"\n{COND_LABELS[cond]}:")
+            for n in n_values:
+                data = aggregated.get(cond, {}).get(str(n), {})
+                if data.get("n_samples", 0) == 0:
+                    print(f"  N={n}: no samples")
+                    continue
+                pa = data.get("probe_acc")
+                da = data.get("direction_acc_probe")
+                ct = data.get("crosstalk")
+                hc = data.get("hidden_crosstalk")
+                ns = data.get("n_samples", 0)
+                pa_s = f"{pa:.3f}" if pa is not None else "N/A"
+                da_s = f"{da:.3f}" if da is not None else "N/A"
+                ct_s = f"{ct:.4f}" if ct is not None else "N/A"
+                hc_s = f"{hc:.4f}" if hc is not None else "N/A"
+                print(f"  N={n}: probe={pa_s}  dir={da_s}  "
+                      f"xtalk={ct_s}  h_xtalk={hc_s}  (n={ns})")
+
+        print("\nGenerating MLP plots...")
+        plot_mlp_results(aggregated, n_values, args.output_dir)
+        print("Done.")
+        return
+
+    # ---- OthelloGPT mode (original) ----
     # Load model and data
     print("Loading model, probe, and game data...")
     model, linear_probe, board_seqs_int, board_seqs_string = \
