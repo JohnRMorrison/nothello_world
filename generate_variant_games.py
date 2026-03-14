@@ -18,6 +18,7 @@ Usage:
 import argparse
 import os
 import pickle
+import sys
 import time
 
 import numpy as np
@@ -34,27 +35,148 @@ EIGHTS = [
     [-1, -1],  # up-left
 ]
 
-# Indices into EIGHTS
-ROWS_ONLY = [2, 6]           # right, left
-COLS_ONLY = [0, 4]           # up, down
-DIAG_ONLY = [1, 3, 5, 7]    # diagonals
-NON_DIAG  = [0, 2, 4, 6]    # rows + cols
-NON_ROW   = [0, 1, 3, 4, 5, 7]  # cols + diags
+# ---------------------------------------------------------------------------
+# Precomputed ray tables for vectorized move-legality checks
+# ---------------------------------------------------------------------------
 
-CENTER = {27, 28, 35, 36}
+def _precompute_rays():
+    """Precompute ray indices for all (square, direction) pairs.
+
+    RAYS[sq, di, k] = flat board index of the k-th cell along the ray,
+    or 64 (sentinel) if the ray is shorter than k+1.
+    RAY_LENS[sq, di] = actual length of the ray.
+    """
+    rays = np.full((64, 8, 7), 64, dtype=np.int32)
+    ray_lens = np.zeros((64, 8), dtype=np.int32)
+    for sq in range(64):
+        r, c = sq // 8, sq % 8
+        for di, (dr, dc) in enumerate(EIGHTS):
+            cur_r, cur_c = r + dr, c + dc
+            idx = 0
+            while 0 <= cur_r <= 7 and 0 <= cur_c <= 7:
+                rays[sq, di, idx] = cur_r * 8 + cur_c
+                idx += 1
+                cur_r += dr
+                cur_c += dc
+            ray_lens[sq, di] = idx
+    return rays, ray_lens
+
+RAYS, RAY_LENS = _precompute_rays()
+
+# Quadrant for each square (0-3)
+QUADRANTS = np.array([((sq // 8) >= 4) * 2 + ((sq % 8) >= 4) for sq in range(64)])
+
+# Direction masks for variants
+DIR_MASK_ALL = np.ones(8, dtype=bool)
+DIR_MASK_NO_DIAG = np.array([True, False, True, False, True, False, True, False])
+DIR_MASK_NO_ROW = np.array([True, True, False, True, True, True, False, True])
 
 
-def quadrant_of(move):
-    """Return quadrant index 0-3 for a board position 0-63."""
-    r, c = move // 8, move % 8
-    return (0 if r < 4 else 2) + (0 if c < 4 else 1)
+# ---------------------------------------------------------------------------
+# Vectorized helpers — process all 64 squares at once
+# ---------------------------------------------------------------------------
 
+def _flips_vec(flat, color, dir_mask):
+    """Vectorized: for each square, count flips and check validity.
+
+    Args:
+        flat: int8 array (64,) — board state
+        color: +1 or -1
+        dir_mask: bool array (8,) — which directions to consider
+
+    Returns:
+        (n_flips, valid_dir) where:
+            n_flips: int array (64,) — total flip count per square
+            valid_dir: bool array (64, 8) — which directions have valid flips
+    """
+    # Pad with sentinel at index 64 (reads as 0 = empty)
+    flat_pad = np.empty(65, dtype=np.int8)
+    flat_pad[:64] = flat
+    flat_pad[64] = 0
+
+    vals = flat_pad[RAYS]  # (64, 8, 7)
+    is_opp = (vals == -color) & dir_mask[None, :, None]  # (64, 8, 7)
+
+    # First non-opponent position in each ray
+    not_opp = ~is_opp
+    first_break = not_opp.argmax(axis=2)  # (64, 8)
+    has_break = not_opp.any(axis=2)       # (64, 8)
+
+    # Value at the first break position
+    gather = np.take_along_axis(RAYS, first_break[:, :, None], axis=2).squeeze(2)
+    terminator = flat_pad[gather]  # (64, 8)
+
+    # Valid flip: >=1 opponent then own color
+    valid_dir = (first_break > 0) & (terminator == color) & has_break
+    n_flips_per_dir = np.where(valid_dir, first_break, 0)
+    n_flips = n_flips_per_dir.sum(axis=1)  # (64,)
+
+    return n_flips, valid_dir
+
+
+def _self_flank_vec(flat, color, dir_mask):
+    """Check which squares would self-flank (own run terminated by opponent).
+
+    Returns bool array (64,) — True if placing here causes a self-flank.
+    """
+    flat_pad = np.empty(65, dtype=np.int8)
+    flat_pad[:64] = flat
+    flat_pad[64] = 0
+
+    vals = flat_pad[RAYS]
+    is_own = (vals == color) & dir_mask[None, :, None]
+
+    not_own = ~is_own
+    first_break = not_own.argmax(axis=2)
+    has_break = not_own.any(axis=2)
+
+    gather = np.take_along_axis(RAYS, first_break[:, :, None], axis=2).squeeze(2)
+    terminator = flat_pad[gather]
+
+    self_flank_dir = (first_break > 0) & (terminator == -color) & has_break
+    return self_flank_dir.any(axis=1)  # (64,)
+
+
+def _flips_locked_vec(flat, color, dir_mask, fc_flat):
+    """Like _flips_vec but only counts unlocked pieces (flip_count < 2).
+
+    Returns n_unlocked_flips: int array (64,).
+    """
+    flat_pad = np.empty(65, dtype=np.int8)
+    flat_pad[:64] = flat
+    flat_pad[64] = 0
+
+    fc_pad = np.empty(65, dtype=np.int8)
+    fc_pad[:64] = fc_flat
+    fc_pad[64] = 99  # sentinel: always "locked"
+
+    vals = flat_pad[RAYS]
+    is_opp = (vals == -color) & dir_mask[None, :, None]
+
+    not_opp = ~is_opp
+    first_break = not_opp.argmax(axis=2)
+    has_break = not_opp.any(axis=2)
+
+    gather = np.take_along_axis(RAYS, first_break[:, :, None], axis=2).squeeze(2)
+    terminator = flat_pad[gather]
+    valid_dir = (first_break > 0) & (terminator == color) & has_break  # (64, 8)
+
+    # Check which ray positions are in the flanked region AND unlocked
+    fc_vals = fc_pad[RAYS]  # (64, 8, 7)
+    positions = np.arange(7)[None, None, :]  # (1, 1, 7)
+    in_flank = positions < first_break[:, :, None]  # (64, 8, 7)
+    is_unlocked = (fc_vals < 2)
+
+    n_unlocked = (is_opp & in_flank & is_unlocked & valid_dir[:, :, None]).sum(axis=2)
+    return n_unlocked.sum(axis=1)  # (64,)
+
+
+# ---------------------------------------------------------------------------
+# Scalar find_flips (used only in make_move — called once per turn)
+# ---------------------------------------------------------------------------
 
 def find_flips(state, move, color, directions=None):
-    """Find all pieces that would be flipped by placing `color` at `move`.
-
-    Returns list of (r, c) pairs to flip.
-    """
+    """Find all pieces that would be flipped by placing `color` at `move`."""
     if directions is None:
         directions = range(8)
     r, c = move // 8, move % 8
@@ -77,37 +199,9 @@ def find_flips(state, move, color, directions=None):
     return tbf
 
 
-def find_self_flips(state, move, color, directions=None):
-    """Find own pieces flanked by placing `color` at `move`.
-
-    Flanking own pieces means: color ... color ... -color (or edge).
-    Actually: we look for lines where we place `color`, then see a run
-    of `color` (own pieces) terminated by `-color` (opponent).
-    Those own pieces get flipped to opponent.
-    """
-    if directions is None:
-        directions = range(8)
-    r, c = move // 8, move % 8
-    tbf = []
-    for di in directions:
-        dr, dc = EIGHTS[di]
-        buffer = []
-        cur_r, cur_c = r + dr, c + dc
-        while 0 <= cur_r <= 7 and 0 <= cur_c <= 7:
-            val = state[cur_r, cur_c]
-            if val == 0:
-                break
-            elif val == color:
-                # own piece — add to buffer (these might get flipped)
-                buffer.append((cur_r, cur_c))
-            else:
-                # opponent piece terminates the line — flip the buffer
-                tbf.extend(buffer)
-                break
-            cur_r += dr
-            cur_c += dc
-    return tbf
-
+# ---------------------------------------------------------------------------
+# Board class
+# ---------------------------------------------------------------------------
 
 class VariantBoard:
     """Othello board that supports variant rules."""
@@ -128,92 +222,86 @@ class VariantBoard:
         # For delayed_flips: pending flips to apply at start of next move
         self.pending_flips = []  # list of (r, c) to flip
 
-    def _get_flip_directions(self):
-        """Return which direction indices to use for flipping."""
-        if self.variant == "no_diagonal_flips":
-            return NON_DIAG
-        elif self.variant == "no_row_flips":
-            return NON_ROW
+        # Direction mask for this variant
+        if variant == "no_diagonal_flips":
+            self._dir_mask = DIR_MASK_NO_DIAG
+        elif variant == "no_row_flips":
+            self._dir_mask = DIR_MASK_NO_ROW
         else:
-            return range(8)
+            self._dir_mask = DIR_MASK_ALL
+
+        # Direction list for scalar find_flips (used in make_move)
+        if variant == "no_diagonal_flips":
+            self._dirs = [0, 2, 4, 6]
+        elif variant == "no_row_flips":
+            self._dirs = [0, 1, 3, 4, 5, 7]
+        else:
+            self._dirs = list(range(8))
 
     def get_valid_moves(self):
-        """Return list of legal moves for current player."""
+        """Return list of legal moves for current player (vectorized)."""
         color = self.next_hand_color
-        dirs = self._get_flip_directions()
-        regular = []
-        forfeit = []
+        flat = self.state.ravel()
+        empty = (flat == 0)
 
-        for move in range(64):
-            r, c = move // 8, move % 8
-            if self.state[r, c] != 0:
-                continue
+        # --- Compute flip counts for all squares at once ---
+        if self.variant == "locked_flips":
+            n_flips = _flips_locked_vec(flat, color, self._dir_mask,
+                                        self.flip_count.ravel())
+        else:
+            n_flips, _ = _flips_vec(flat, color, self._dir_mask)
 
-            # Variant 1: no_same_quadrant
-            if self.variant == "no_same_quadrant" and len(self.history) > 0:
-                if quadrant_of(move) == quadrant_of(self.history[-1]):
-                    continue
+        # --- Apply variant-specific filters ---
+        if self.variant == "no_same_quadrant" and self.history:
+            last_q = QUADRANTS[self.history[-1]]
+            empty = empty & (QUADRANTS != last_q)
 
-            # Variant 6: self_flanking — must avoid flanking own pieces
-            if self.variant == "self_flanking":
-                own_flips = find_self_flips(self.state, move, color)
-                if len(own_flips) > 0:
-                    continue  # illegal — would flank own pieces
+        if self.variant == "self_flanking":
+            has_sf = _self_flank_vec(flat, color, self._dir_mask)
+            empty = empty & ~has_sf
 
-            # Find flips
-            flips = find_flips(self.state, move, color, dirs)
+        if self.variant == "max_three_flips":
+            valid_mask = empty & (n_flips >= 1) & (n_flips <= 3)
+            regular = np.where(valid_mask)[0].tolist()
+            # No forfeit for this variant
+            return regular if regular else []
 
-            # Variant 4: locked_flips — remove flips on pieces flipped twice already
-            if self.variant == "locked_flips":
-                flips = [(r2, c2) for r2, c2 in flips if self.flip_count[r2, c2] < 2]
-
-            # Variant 5: max_three_flips — only legal if flips <= 3 pieces
-            if self.variant == "max_three_flips":
-                if 1 <= len(flips) <= 3:
-                    regular.append(move)
-                # Don't add forfeit moves with wrong flip count
-                continue
-
-            if len(flips) > 0:
-                regular.append(move)
-            else:
-                # Check if opponent could use this square (forfeit)
-                opp_flips = find_flips(self.state, move, -color, dirs)
-                if self.variant == "locked_flips":
-                    opp_flips = [(r2, c2) for r2, c2 in opp_flips
-                                 if self.flip_count[r2, c2] < 2]
-                if len(opp_flips) > 0:
-                    forfeit.append(move)
-
+        # Regular moves: empty squares with flips
+        valid_mask = empty & (n_flips > 0)
+        regular = np.where(valid_mask)[0].tolist()
         if regular:
             return regular
-        elif forfeit:
-            return forfeit
-        return []
+
+        # Forfeit: squares where opponent could flip
+        if self.variant == "locked_flips":
+            opp_flips = _flips_locked_vec(flat, -color, self._dir_mask,
+                                          self.flip_count.ravel())
+        else:
+            opp_flips, _ = _flips_vec(flat, -color, self._dir_mask)
+
+        forfeit_mask = empty & (opp_flips > 0)
+        return np.where(forfeit_mask)[0].tolist()
 
     def make_move(self, move):
         """Execute a move, updating board state."""
         r, c = move // 8, move % 8
         color = self.next_hand_color
-        dirs = self._get_flip_directions()
 
         # Variant 7: apply pending flips from last turn
         if self.variant == "delayed_flips" and self.pending_flips:
             for fr, fc in self.pending_flips:
-                # Only flip if the piece is still the same color it was when captured
-                # (it might have been overwritten by a new placement)
                 if self.state[fr, fc] != 0:
                     self.state[fr, fc] *= -1
             self.pending_flips = []
 
         # Find flips for current move
-        flips = find_flips(self.state, move, color, dirs)
+        flips = find_flips(self.state, move, color, self._dirs)
 
         if len(flips) == 0:
             # Forfeit — switch color and retry
             color *= -1
             self.next_hand_color *= -1
-            flips = find_flips(self.state, move, color, dirs)
+            flips = find_flips(self.state, move, color, self._dirs)
 
         # Variant 4: locked_flips — filter out pieces flipped twice already
         if self.variant == "locked_flips":
@@ -221,7 +309,6 @@ class VariantBoard:
 
         # Apply flips
         if self.variant == "delayed_flips":
-            # Don't flip now — queue them for next turn
             self.pending_flips = list(flips)
         else:
             for fr, fc in flips:
@@ -271,8 +358,8 @@ def main():
     rng = np.random.RandomState(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    print(f"Variant: {args.variant}")
-    print(f"Generating {args.num_games} games...")
+    print(f"Variant: {args.variant}", flush=True)
+    print(f"Generating {args.num_games} games...", flush=True)
     t0 = time.time()
 
     all_games = []
@@ -289,7 +376,7 @@ def main():
             elapsed = time.time() - t0
             avg_len = np.mean(lengths[-10000:])
             print(f"  {i+1}/{args.num_games} games, avg_len={avg_len:.1f}, "
-                  f"elapsed={elapsed:.0f}s")
+                  f"elapsed={elapsed:.0f}s", flush=True)
 
     elapsed = time.time() - t0
     print(f"\nDone: {args.num_games} games in {elapsed:.0f}s")
