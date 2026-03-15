@@ -805,6 +805,16 @@ def measure_logit_metrics(original_logits, intervened_logits,
     top5_legal = sum(1 for c in top_cells if c in cf_legal_stoi)
     result["top5_legal_frac"] = top5_legal / 5.0
 
+    # Stricter top-1: only count when top move actually changed
+    orig_valid_logits = original_logits[1:61]
+    orig_top_idx = orig_valid_logits.argmax().item()
+    orig_top_cell = stoi_indices[orig_top_idx]
+    intv_top_cell = top_cells[0]
+    if orig_top_cell != intv_top_cell:
+        result["top1_legal_strict"] = 1.0 if intv_top_cell in cf_legal_stoi else 0.0
+    else:
+        result["top1_legal_strict"] = None  # top move didn't change
+
     # 4. Legal probability mass
     probs = torch.softmax(intervened_logits[1:61], dim=0)  # over 60 valid cells
     legal_mask = torch.zeros(60, device=probs.device)
@@ -1062,7 +1072,8 @@ def aggregate_results(results):
             agg = {"n_samples": len(samples)}
 
             # Scalar metrics
-            for key in ["direction_acc", "top1_legal", "top5_legal_frac",
+            for key in ["direction_acc", "top1_legal", "top1_legal_strict",
+                         "top5_legal_frac",
                          "legal_prob_mass", "mean_shift_newly_illegal",
                          "mean_shift_newly_legal", "crosstalk", "probe_acc"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
@@ -1083,8 +1094,8 @@ def aggregate_results(results):
                 agg["compositions"] = {}
                 for comp_key, comp_samples in compositions.items():
                     comp_agg = {"n_samples": len(comp_samples)}
-                    for key in ["direction_acc", "top1_legal", "legal_prob_mass",
-                                 "crosstalk", "probe_acc"]:
+                    for key in ["direction_acc", "top1_legal", "top1_legal_strict",
+                                 "legal_prob_mass", "crosstalk", "probe_acc"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
                             comp_agg[key] = float(np.mean(vals))
@@ -1120,6 +1131,7 @@ def plot_results(aggregated, n_values, output_dir):
         ("direction_acc", "Direction Accuracy", "Fraction correct"),
         ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("top1_legal", "Top-1 Legal Accuracy", "Fraction legal"),
+        ("top1_legal_strict", "Top-1 Legal (Strict: top move changed)", "Fraction legal"),
         ("crosstalk", "Probe Cross-talk", "Mean |change| (non-modified cells)"),
         ("probe_acc", "Probe Accuracy (Modified Cells)", "Fraction correct"),
     ]
@@ -1399,16 +1411,18 @@ def main():
                 continue
             da = data.get("direction_acc")
             t1 = data.get("top1_legal")
+            t1s = data.get("top1_legal_strict")
             lpm = data.get("legal_prob_mass")
             ct = data.get("crosstalk")
             pa = data.get("probe_acc")
             ns = data.get("n_samples", 0)
             da_s = f"{da:.3f}" if da is not None else "N/A"
             t1_s = f"{t1:.3f}" if t1 is not None else "N/A"
+            t1s_s = f"{t1s:.3f}" if t1s is not None else "N/A"
             lpm_s = f"{lpm:.3f}" if lpm is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
-            print(f"  N={n}: dir_acc={da_s}  top1={t1_s}  "
+            print(f"  N={n}: dir_acc={da_s}  top1={t1_s}  top1_strict={t1s_s}  "
                   f"legal_mass={lpm_s}  xtalk={ct_s}  "
                   f"probe={pa_s}  (n={ns})")
 
