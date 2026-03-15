@@ -110,7 +110,7 @@ class Othello:
                     seq.sort()
                     self.sequences = [k for k, _ in itertools.groupby(seq)]
                     for t in trash:
-                        os.remove(os.path.join(f"./data/{wanna_use}", f))
+                        os.remove(os.path.join(f"./data/{wanna_use}", t))
                     print(f"Deduplicating finished with {len(self.sequences)} games left")
                     self.val = self.sequences[20000000:]
                     self.sequences = self.sequences[:20000000]
