@@ -373,21 +373,12 @@ def compute_per_cell_scales(h, linear_probe, modifications, mode=PROBE_MODE):
     return scales
 
 
-def run_with_intervention(model, input_tokens, modifications, linear_probe,
-                          pos, scale, layer_intervene, layer_probe,
-                          mode=PROBE_MODE, device="cuda",
-                          per_cell_calibrate=False):
-    """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
+def compute_prefix_activations(model, input_tokens, layer_intervene):
+    """Forward through embedding + layers 0..layer_intervene-1.
 
-    Uses mingpt: manually split forward pass at layer_intervene,
-    apply intervention, continue forward, capture activations at layer_probe.
-
-    If per_cell_calibrate=True, compute per-cell scales analytically
-    instead of using the global `scale`.
+    Returns the activation tensor at the intervention point. This can be
+    cached and reused across multiple interventions on the same input.
     """
-    flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
-
-    # Forward through embedding + layers 0..layer_intervene-1
     b, t = input_tokens.size()
     token_emb = model.tok_emb(input_tokens)
     pos_emb = model.pos_emb[:, :t, :]
@@ -395,6 +386,33 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
 
     for block in model.blocks[:layer_intervene]:
         x = block(x)
+
+    return x
+
+
+def run_with_intervention(model, input_tokens, modifications, linear_probe,
+                          pos, scale, layer_intervene, layer_probe,
+                          mode=PROBE_MODE, device="cuda",
+                          per_cell_calibrate=False,
+                          prefix_acts=None):
+    """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
+
+    Uses mingpt: manually split forward pass at layer_intervene,
+    apply intervention, continue forward, capture activations at layer_probe.
+
+    If per_cell_calibrate=True, compute per-cell scales analytically
+    instead of using the global `scale`.
+
+    If prefix_acts is provided, skip the prefix computation (layers
+    0..layer_intervene-1) and use the cached activations instead.
+    """
+    flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
+
+    # Use cached prefix or compute from scratch
+    if prefix_acts is not None:
+        x = prefix_acts.clone()
+    else:
+        x = compute_prefix_activations(model, input_tokens, layer_intervene)
 
     # Compute per-cell scales if requested
     per_cell_scales = None
@@ -1149,6 +1167,10 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
             orig_logits_at_pos, orig_resid = _forward_with_resid(
                 model, input_tokens, pos, layer_probe
             )
+            # Cache prefix activations (layers 0..layer_intervene-1)
+            prefix_acts = compute_prefix_activations(
+                model, input_tokens, layer_intervene
+            )
 
         for n in n_values:
             # Standard conditions
@@ -1167,7 +1189,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         model, input_tokens, mods, linear_probe,
                         pos, scale, layer_intervene, layer_probe,
                         device=device,
-                        per_cell_calibrate=per_cell_calibrate
+                        per_cell_calibrate=per_cell_calibrate,
+                        prefix_acts=prefix_acts
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1201,7 +1224,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         model, input_tokens, mods, linear_probe,
                         pos, scale, layer_intervene, layer_probe,
                         device=device,
-                        per_cell_calibrate=per_cell_calibrate
+                        per_cell_calibrate=per_cell_calibrate,
+                        prefix_acts=prefix_acts
                     )
 
                 logit_metrics = measure_logit_metrics(
