@@ -18,8 +18,9 @@ cd mechanistic_interpretability
 python multi_intervention.py \
     --mlp-baseline \
     --mlp-ckpt ../experiments/mathematical_transformation_experiments/heuristic_probe_results/mlp_checkpoints/mlp_180_H1024.pt \
-    --n-games 10 \
+    --n-games 200 \
     --calibrate \
+    --per-cell-scale \
     --output-dir ../experiments/multi_intervention_mlp \
     --seed 42
 
