@@ -1022,17 +1022,17 @@ def calibrate_scale(model, linear_probe, board_seqs_int, board_seqs_string,
 
                 metrics = measure_logit_metrics(orig_logits, intv_logits,
                                                 original_legal, cf_legal)
-                if metrics["direction_acc"] is not None:
-                    direction_accs.append(metrics["direction_acc"])
+                if metrics["boundary_margin"] is not None:
+                    direction_accs.append(metrics["boundary_margin"])
 
-            mean_acc = np.mean(direction_accs) if direction_accs else 0.0
-            results[(layer, scale)] = mean_acc
-            print(f"  Layer {layer}, scale {scale}: direction_acc = {mean_acc:.3f} "
+            mean_val = np.mean(direction_accs) if direction_accs else 0.0
+            results[(layer, scale)] = mean_val
+            print(f"  Layer {layer}, scale {scale}: boundary_margin = {mean_val:.3f} "
                   f"(n={len(direction_accs)})")
 
     best = max(results, key=results.get)
     print(f"\nBest: layer={best[0]}, scale={best[1]}, "
-          f"direction_acc={results[best]:.3f}")
+          f"boundary_margin={results[best]:.3f}")
     return best[0], best[1], results
 
 
