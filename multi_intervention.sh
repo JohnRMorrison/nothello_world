@@ -2,7 +2,7 @@
 #SBATCH --job-name=multi_intv
 #SBATCH --output=logs/multi_intv_%j.out
 #SBATCH --error=logs/multi_intv_%j.err
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
@@ -17,8 +17,9 @@ cd mechanistic_interpretability
 
 python multi_intervention.py \
     --probe-path main_linear_probe.pth \
-    --n-games 10 \
+    --n-games 200 \
     --calibrate \
+    --per-cell-scale \
     --output-dir ../experiments/multi_intervention \
     --seed 42
 

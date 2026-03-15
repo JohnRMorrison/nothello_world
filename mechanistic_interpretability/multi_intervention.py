@@ -899,6 +899,63 @@ def measure_logit_metrics(original_logits, intervened_logits,
     result["mean_shift_newly_illegal"] = np.mean(shifts_illegal) if shifts_illegal else None
     result["mean_shift_newly_legal"] = np.mean(shifts_legal) if shifts_legal else None
 
+    # 7b. Log-probability shift (natural unit of cross-entropy)
+    orig_logprobs = torch.log_softmax(original_logits[1:61], dim=0)
+    intv_logprobs = torch.log_softmax(intervened_logits[1:61], dim=0)
+    # Map to 64-cell arrays
+    orig_lp = torch.full((64,), float('-inf'), device=original_logits.device)
+    intv_lp = torch.full((64,), float('-inf'), device=intervened_logits.device)
+    orig_lp[stoi_indices] = orig_logprobs
+    intv_lp[stoi_indices] = intv_logprobs
+
+    lp_shifts_illegal = []
+    lp_shifts_legal = []
+    for cell in newly_illegal:
+        if cell in STOI_SET:
+            lp_shifts_illegal.append((intv_lp[cell] - orig_lp[cell]).item())
+    for cell in newly_legal:
+        if cell in STOI_SET:
+            lp_shifts_legal.append((intv_lp[cell] - orig_lp[cell]).item())
+
+    result["mean_logprob_shift_illegal"] = np.mean(lp_shifts_illegal) if lp_shifts_illegal else None
+    result["mean_logprob_shift_legal"] = np.mean(lp_shifts_legal) if lp_shifts_legal else None
+
+    # 7c. Rank shift
+    # Rank 0 = highest logit. Compute ranks for all 60 valid cells.
+    orig_ranks = torch.zeros(64, dtype=torch.long, device=original_logits.device)
+    intv_ranks = torch.zeros(64, dtype=torch.long, device=intervened_logits.device)
+    orig_order = orig_valid_logits.argsort(descending=True)
+    intv_order = valid_logits.argsort(descending=True)
+    for rank, idx in enumerate(orig_order.tolist()):
+        orig_ranks[stoi_indices[idx]] = rank
+    for rank, idx in enumerate(intv_order.tolist()):
+        intv_ranks[stoi_indices[idx]] = rank
+
+    rank_shifts_illegal = []
+    rank_shifts_legal = []
+    for cell in newly_illegal:
+        if cell in STOI_SET:
+            # positive = rank got worse (higher number)
+            rank_shifts_illegal.append((intv_ranks[cell] - orig_ranks[cell]).item())
+    for cell in newly_legal:
+        if cell in STOI_SET:
+            # negative = rank got better (lower number)
+            rank_shifts_legal.append((intv_ranks[cell] - orig_ranks[cell]).item())
+
+    result["mean_rank_shift_illegal"] = np.mean(rank_shifts_illegal) if rank_shifts_illegal else None
+    result["mean_rank_shift_legal"] = np.mean(rank_shifts_legal) if rank_shifts_legal else None
+
+    # 7d. Min-legal-rank: rank of least-probable legal move (before & after)
+    orig_legal_stoi = original_legal & STOI_SET
+    if orig_legal_stoi:
+        result["min_legal_rank_before"] = max(orig_ranks[cell].item() for cell in orig_legal_stoi)
+    else:
+        result["min_legal_rank_before"] = None
+    if cf_legal_stoi:
+        result["min_legal_rank_after"] = max(intv_ranks[cell].item() for cell in cf_legal_stoi)
+    else:
+        result["min_legal_rank_after"] = None
+
     # 7. Classification accuracy on changed cells
     # Model's "legal set" after intervention = top-K cells (K = |cf_legal|)
     k = len(cf_legal_stoi)
@@ -1166,7 +1223,11 @@ def aggregate_results(results):
             for key in ["direction_acc", "top1_legal", "top1_legal_strict",
                          "top5_legal_frac", "classification_acc",
                          "legal_prob_mass", "mean_shift_newly_illegal",
-                         "mean_shift_newly_legal", "crosstalk", "probe_acc"]:
+                         "mean_shift_newly_legal",
+                         "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
+                         "mean_rank_shift_illegal", "mean_rank_shift_legal",
+                         "min_legal_rank_before", "min_legal_rank_after",
+                         "crosstalk", "probe_acc"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
                 if vals:
                     agg[key] = float(np.mean(vals))
@@ -1187,7 +1248,11 @@ def aggregate_results(results):
                     comp_agg = {"n_samples": len(comp_samples)}
                     for key in ["direction_acc", "top1_legal", "top1_legal_strict",
                                  "classification_acc",
-                                 "legal_prob_mass", "crosstalk", "probe_acc"]:
+                                 "legal_prob_mass",
+                                 "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
+                                 "mean_rank_shift_illegal", "mean_rank_shift_legal",
+                                 "min_legal_rank_before", "min_legal_rank_after",
+                                 "crosstalk", "probe_acc"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
                             comp_agg[key] = float(np.mean(vals))
@@ -1221,10 +1286,10 @@ def plot_results(aggregated, n_values, output_dir):
     """Generate 6 summary plots."""
     metrics_to_plot = [
         ("classification_acc", "Classification Accuracy", "Fraction correct"),
-        ("direction_acc", "Direction Accuracy", "Fraction correct"),
         ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("top1_legal", "Top-1 Legal Accuracy", "Fraction legal"),
         ("top1_legal_strict", "Top-1 Legal (Strict: top move changed)", "Fraction legal"),
+        ("min_legal_rank_after", "Worst-Case Legal Move Rank (After Intervention)", "Rank (0=best)"),
         ("crosstalk", "Probe Cross-talk", "Mean |change| (non-modified cells)"),
         ("probe_acc", "Probe Accuracy (Modified Cells)", "Fraction correct"),
     ]
@@ -1285,6 +1350,76 @@ def plot_results(aggregated, n_values, output_dir):
     ax.set_xticks(n_values)
     plt.tight_layout()
     fname = os.path.join(output_dir, "logit_shifts.png")
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  Saved {fname}")
+
+    # Special plot: log-probability shifts (two lines per condition)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for cond in COND_COLORS:
+        xs_il, ys_il = [], []
+        xs_le, ys_le = [], []
+        for n in n_values:
+            data = aggregated.get(cond, {}).get(str(n), {})
+            val_il = data.get("mean_logprob_shift_illegal")
+            val_le = data.get("mean_logprob_shift_legal")
+            if val_il is not None:
+                xs_il.append(n)
+                ys_il.append(val_il)
+            if val_le is not None:
+                xs_le.append(n)
+                ys_le.append(val_le)
+        if xs_il:
+            ax.plot(xs_il, ys_il, marker='v', linestyle='--',
+                    color=COND_COLORS[cond], alpha=0.7,
+                    label=f"{COND_LABELS[cond]} (illegal)")
+        if xs_le:
+            ax.plot(xs_le, ys_le, marker='^', linestyle='-',
+                    color=COND_COLORS[cond], alpha=0.7,
+                    label=f"{COND_LABELS[cond]} (legal)")
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel("Number of interventions (N)")
+    ax.set_ylabel("Mean log-probability shift (nats)")
+    ax.set_title("Log-Probability Shift (Newly Legal vs Newly Illegal)")
+    ax.legend(fontsize=7, ncol=2)
+    ax.set_xticks(n_values)
+    plt.tight_layout()
+    fname = os.path.join(output_dir, "logprob_shifts.png")
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  Saved {fname}")
+
+    # Special plot: rank shifts (two lines per condition)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for cond in COND_COLORS:
+        xs_il, ys_il = [], []
+        xs_le, ys_le = [], []
+        for n in n_values:
+            data = aggregated.get(cond, {}).get(str(n), {})
+            val_il = data.get("mean_rank_shift_illegal")
+            val_le = data.get("mean_rank_shift_legal")
+            if val_il is not None:
+                xs_il.append(n)
+                ys_il.append(val_il)
+            if val_le is not None:
+                xs_le.append(n)
+                ys_le.append(val_le)
+        if xs_il:
+            ax.plot(xs_il, ys_il, marker='v', linestyle='--',
+                    color=COND_COLORS[cond], alpha=0.7,
+                    label=f"{COND_LABELS[cond]} (illegal)")
+        if xs_le:
+            ax.plot(xs_le, ys_le, marker='^', linestyle='-',
+                    color=COND_COLORS[cond], alpha=0.7,
+                    label=f"{COND_LABELS[cond]} (legal)")
+    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
+    ax.set_xlabel("Number of interventions (N)")
+    ax.set_ylabel("Mean rank shift (+ = worse rank)")
+    ax.set_title("Rank Shift (Newly Legal vs Newly Illegal)")
+    ax.legend(fontsize=7, ncol=2)
+    ax.set_xticks(n_values)
+    plt.tight_layout()
+    fname = os.path.join(output_dir, "rank_shifts.png")
     plt.savefig(fname, dpi=150)
     plt.close()
     print(f"  Saved {fname}")
@@ -1507,24 +1642,31 @@ def main():
             if data.get("n_samples", 0) == 0:
                 print(f"  N={n}: no samples")
                 continue
-            da = data.get("direction_acc")
             ca = data.get("classification_acc")
-            t1 = data.get("top1_legal")
             t1s = data.get("top1_legal_strict")
             lpm = data.get("legal_prob_mass")
+            lp_il = data.get("mean_logprob_shift_illegal")
+            lp_le = data.get("mean_logprob_shift_legal")
+            rk_il = data.get("mean_rank_shift_illegal")
+            rk_le = data.get("mean_rank_shift_legal")
+            mlr = data.get("min_legal_rank_after")
             ct = data.get("crosstalk")
             pa = data.get("probe_acc")
             ns = data.get("n_samples", 0)
-            da_s = f"{da:.3f}" if da is not None else "N/A"
             ca_s = f"{ca:.3f}" if ca is not None else "N/A"
-            t1_s = f"{t1:.3f}" if t1 is not None else "N/A"
             t1s_s = f"{t1s:.3f}" if t1s is not None else "N/A"
             lpm_s = f"{lpm:.3f}" if lpm is not None else "N/A"
+            lp_il_s = f"{lp_il:+.2f}" if lp_il is not None else "N/A"
+            lp_le_s = f"{lp_le:+.2f}" if lp_le is not None else "N/A"
+            rk_il_s = f"{rk_il:+.1f}" if rk_il is not None else "N/A"
+            rk_le_s = f"{rk_le:+.1f}" if rk_le is not None else "N/A"
+            mlr_s = f"{mlr:.1f}" if mlr is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
-            print(f"  N={n}: dir={da_s}  classif={ca_s}  top1={t1_s}  "
-                  f"top1_strict={t1s_s}  legal_mass={lpm_s}  "
-                  f"xtalk={ct_s}  probe={pa_s}  (n={ns})")
+            print(f"  N={n}: classif={ca_s}  top1s={t1s_s}  mass={lpm_s}  "
+                  f"lp_il/le={lp_il_s}/{lp_le_s}  "
+                  f"rank_il/le={rk_il_s}/{rk_le_s}  "
+                  f"worst_rank={mlr_s}  xtalk={ct_s}  probe={pa_s}  (n={ns})")
 
     # Plot
     print("\nGenerating plots...")
