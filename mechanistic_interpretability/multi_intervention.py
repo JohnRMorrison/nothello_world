@@ -60,7 +60,7 @@ import torch.nn as nn
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-N_VALUES = [1, 2, 3, 5, 8]
+N_VALUES = [1, 2, 3]
 POS_RANGE = (10, 50)
 PROBE_MODE = 2  # mode 2 = all positions (no parity concern)
 CENTER_CELLS = {27, 28, 35, 36}  # not in model vocabulary
