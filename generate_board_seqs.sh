@@ -12,8 +12,6 @@ echo "Started at: $(date)"
 
 source activate othello
 
-cd mechanistic_interpretability
-
-python generate_board_seqs.py
+python mechanistic_interpretability/generate_board_seqs.py
 
 echo "Finished at: $(date)"

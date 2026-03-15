@@ -1,13 +1,18 @@
 """Generate board_seqs_string.pth and board_seqs_int.pth from game data.
 
-Run from mechanistic_interpretability/ directory:
-    python generate_board_seqs.py
+Run from the repo root:
+    python mechanistic_interpretability/generate_board_seqs.py
 """
 import os
 import sys
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+repo_root = os.path.join(os.path.dirname(__file__), "..")
+repo_root = os.path.abspath(repo_root)
+sys.path.insert(0, repo_root)
+
+# get_othello() looks for ./data/ relative to CWD, so chdir to repo root
+os.chdir(repo_root)
 
 from mingpt.dataset import CharDataset
 from data import get_othello
@@ -32,6 +37,7 @@ indices = torch.randperm(len(board_seqs_int))
 board_seqs_int = board_seqs_int[indices]
 board_seqs_string = board_seqs_string[indices]
 
-torch.save(board_seqs_int, "board_seqs_int.pth")
-torch.save(board_seqs_string, "board_seqs_string.pth")
+out_dir = os.path.join(repo_root, "mechanistic_interpretability")
+torch.save(board_seqs_int, os.path.join(out_dir, "board_seqs_int.pth"))
+torch.save(board_seqs_string, os.path.join(out_dir, "board_seqs_string.pth"))
 print(f"Saved board_seqs_int.pth and board_seqs_string.pth ({board_seqs_string.shape})")
