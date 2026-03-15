@@ -312,24 +312,78 @@ def compute_flip_dirs(linear_probe, modifications, mode=PROBE_MODE):
     return flip_dirs
 
 
-def apply_intervention(x, flip_dirs, pos, scale):
+def apply_intervention(x, flip_dirs, pos, scale, per_cell_scales=None):
     """Apply probe-direction subtraction to activation tensor x in-place.
 
     x: (batch, seq, d_model)
+    per_cell_scales: if provided, list of per-cell scales (one per flip_dir).
+                     Overrides `scale` for each cell.
     """
-    for flip_dir in flip_dirs:
+    for i, flip_dir in enumerate(flip_dirs):
+        s = per_cell_scales[i] if per_cell_scales is not None else scale
         coeff = x[0, pos] @ flip_dir / flip_dir.norm()
-        x[0, pos] -= scale * coeff * flip_dir / flip_dir.norm()
+        x[0, pos] -= s * coeff * flip_dir / flip_dir.norm()
     return x
+
+
+def compute_per_cell_scales(h, linear_probe, modifications, mode=PROBE_MODE):
+    """Compute the minimal scale per cell that flips the probe's argmax.
+
+    Uses binary search: for each modification, find the smallest s in [0, 10]
+    such that after h' = h - s * (h . d_hat) * d_hat, the probe predicts
+    target_class for that cell.
+
+    Returns list of scales (one per modification).
+    """
+    scales = []
+    for (r, c, orig_val, target_val) in modifications:
+        current_class = board_val_to_probe_class(orig_val)
+        target_class = board_val_to_probe_class(target_val)
+
+        W = linear_probe[mode, :, r, c, :]  # (d_model, 3)
+        flip_dir = W[:, target_class] - W[:, current_class]
+        d_hat = flip_dir / flip_dir.norm()
+        coeff = h @ d_hat
+
+        def probe_pred_at_scale(s):
+            h_mod = h - s * coeff * d_hat
+            logits = W.T @ h_mod  # (3,)
+            return logits.argmax().item()
+
+        # Binary search for minimal s that flips to target_class
+        lo, hi = 0.0, 10.0
+        # First check if any scale works
+        if probe_pred_at_scale(hi) != target_class:
+            scales.append(hi)  # can't flip — use max
+            continue
+        if probe_pred_at_scale(0.0) == target_class:
+            scales.append(0.5)  # already correct — use small nudge
+            continue
+
+        for _ in range(30):  # ~30 iterations gives precision < 1e-8
+            mid = (lo + hi) / 2
+            if probe_pred_at_scale(mid) == target_class:
+                hi = mid
+            else:
+                lo = mid
+
+        # Use the found scale + 10% margin to ensure clean flip
+        scales.append(min(hi * 1.1, 10.0))
+
+    return scales
 
 
 def run_with_intervention(model, input_tokens, modifications, linear_probe,
                           pos, scale, layer_intervene, layer_probe,
-                          mode=PROBE_MODE, device="cuda"):
+                          mode=PROBE_MODE, device="cuda",
+                          per_cell_calibrate=False):
     """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
 
     Uses mingpt: manually split forward pass at layer_intervene,
     apply intervention, continue forward, capture activations at layer_probe.
+
+    If per_cell_calibrate=True, compute per-cell scales analytically
+    instead of using the global `scale`.
     """
     flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
 
@@ -342,8 +396,17 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     for block in model.blocks[:layer_intervene]:
         x = block(x)
 
+    # Compute per-cell scales if requested
+    per_cell_scales = None
+    if per_cell_calibrate:
+        h = x[0, pos].detach().clone()
+        per_cell_scales = compute_per_cell_scales(
+            h, linear_probe, modifications, mode
+        )
+
     # Apply intervention at layer_intervene output
-    x = apply_intervention(x, flip_dirs, pos, scale)
+    x = apply_intervention(x, flip_dirs, pos, scale,
+                           per_cell_scales=per_cell_scales)
 
     # Continue through remaining layers, capture at layer_probe
     resid_at_probe = None
@@ -948,7 +1011,8 @@ CONDITIONS = [
 
 def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                    layer_intervene, layer_probe, scale,
-                   n_games=200, n_values=None, seed=42, device="cuda"):
+                   n_games=200, n_values=None, seed=42, device="cuda",
+                   per_cell_calibrate=False):
     """Run the full multi-intervention experiment."""
     if n_values is None:
         n_values = N_VALUES
@@ -997,7 +1061,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     intv_logits, intv_resid = run_with_intervention(
                         model, input_tokens, mods, linear_probe,
                         pos, scale, layer_intervene, layer_probe,
-                        device=device
+                        device=device,
+                        per_cell_calibrate=per_cell_calibrate
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1030,7 +1095,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     intv_logits, intv_resid = run_with_intervention(
                         model, input_tokens, mods, linear_probe,
                         pos, scale, layer_intervene, layer_probe,
-                        device=device
+                        device=device,
+                        per_cell_calibrate=per_cell_calibrate
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1225,6 +1291,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
     # MLP baseline
+    parser.add_argument("--per-cell-scale", action="store_true",
+                        help="Use per-cell analytically calibrated scales "
+                             "(ensures probe flips for each cell)")
+    # MLP baseline
     parser.add_argument("--mlp-baseline", action="store_true",
                         help="Run MLP baseline instead of OthelloGPT")
     parser.add_argument("--mlp-ckpt", type=str, default=None,
@@ -1371,7 +1441,8 @@ def main():
         model, linear_probe, board_seqs_int, board_seqs_string,
         layer_intervene, args.layer_probe, scale,
         n_games=args.n_games, n_values=n_values,
-        seed=args.seed, device=args.device
+        seed=args.seed, device=args.device,
+        per_cell_calibrate=args.per_cell_scale
     )
 
     # Aggregate
