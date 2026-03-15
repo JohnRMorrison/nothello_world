@@ -27,6 +27,16 @@ import time
 
 import numpy as np
 
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def njit(f=None, **kwargs):
+        if f is not None:
+            return f
+        return lambda fn: fn
+
 # Direction vectors: [row_delta, col_delta]
 EIGHTS = [
     [-1,  0],  # up
@@ -218,36 +228,23 @@ def _flips_locked_vec(flat, color, dir_mask, fc_flat):
     return n_unlocked.sum(axis=1)  # (64,)
 
 
-def _flips_skip_empty_vec(flat, color, dir_mask):
-    """Vectorized flips that skip empty squares in rays.
-
-    A ray like B-W-_-W-B would flip both W's (the empty is ignored).
-    Only counts flips; returns (n_flips, None).
-    """
-    flat_pad = np.empty(65, dtype=np.int8)
-    flat_pad[:64] = flat
-    flat_pad[64] = 0
-
-    vals = flat_pad[RAYS]  # (64, 8, 7)
-
-    # Mask empty cells in rays — treat as "transparent"
-    # For skip-empty: we need to find opponent run (ignoring empties) terminated by own color
-    # Strategy: replace empty cells with a special marker, then process
-
+@njit(cache=True)
+def _flips_skip_empty_inner(flat, color, dir_mask, rays, ray_lens):
+    """Numba-accelerated inner loop for skip-empty flips."""
     n_flips_total = np.zeros(64, dtype=np.int32)
-    empty_sq = np.where(flat == 0)[0]
-
-    for sq in empty_sq:
+    for sq in range(64):
+        if flat[sq] != 0:
+            continue
         for di in range(8):
             if not dir_mask[di]:
                 continue
-            ray_len = RAY_LENS[sq, di]
+            ray_len = ray_lens[sq, di]
             if ray_len == 0:
                 continue
-            # Walk along the ray, skipping empties
             opp_count = 0
             for k in range(ray_len):
-                v = vals[sq, di, k]
+                idx = rays[sq, di, k]
+                v = flat[idx] if idx < 64 else 0
                 if v == 0:
                     continue  # skip empty
                 elif v == -color:
@@ -257,8 +254,17 @@ def _flips_skip_empty_vec(flat, color, dir_mask):
                     break
                 else:
                     break
+    return n_flips_total
 
-    return n_flips_total, None
+
+def _flips_skip_empty_vec(flat, color, dir_mask):
+    """Flips that skip empty squares in rays (numba-accelerated).
+
+    A ray like B-W-_-W-B would flip both W's (the empty is ignored).
+    Only counts flips; returns (n_flips, None).
+    """
+    n_flips = _flips_skip_empty_inner(flat, color, dir_mask, RAYS, RAY_LENS)
+    return n_flips, None
 
 
 def _flips_wrap_vec(flat, color, dir_mask):
@@ -312,31 +318,56 @@ def find_flips(state, move, color, directions=None):
     return tbf
 
 
+@njit(cache=True)
+def _find_flips_skip_empty_inner(flat, move, color, dir_mask, rays, ray_lens):
+    """Numba-accelerated flip finding for skip-empty variant.
+
+    Returns flat indices of pieces to flip (max 6*8=48 possible).
+    Uses a fixed-size array; count indicates how many are valid.
+    """
+    result = np.empty(48, dtype=np.int32)
+    count = 0
+    for di in range(8):
+        if not dir_mask[di]:
+            continue
+        ray_len = ray_lens[move, di]
+        if ray_len == 0:
+            continue
+        buf_start = count
+        buf_count = 0
+        for k in range(ray_len):
+            idx = rays[move, di, k]
+            v = flat[idx] if idx < 64 else 0
+            if v == 0:
+                continue
+            elif v == -color:
+                result[count] = idx
+                count += 1
+                buf_count += 1
+            elif v == color:
+                break  # keep the buffer entries
+            else:
+                # shouldn't happen, but safety
+                count -= buf_count  # discard buffer
+                break
+        else:
+            # ray ended without finding own color — discard buffer
+            count -= buf_count
+    return result, count
+
+
 def find_flips_skip_empty(state, move, color, directions=None):
     """Find flips skipping over empty squares in rays."""
+    flat = state.flatten().astype(np.int8)
     if directions is None:
-        directions = range(8)
-    r, c = move // 8, move % 8
-    tbf = []
-    for di in directions:
-        dr, dc = EIGHTS[di]
-        buffer = []
-        cur_r, cur_c = r + dr, c + dc
-        while 0 <= cur_r <= 7 and 0 <= cur_c <= 7:
-            val = state[cur_r, cur_c]
-            if val == 0:
-                # Skip empty squares
-                cur_r += dr
-                cur_c += dc
-                continue
-            elif val == color:
-                tbf.extend(buffer)
-                break
-            else:
-                buffer.append((cur_r, cur_c))
-            cur_r += dr
-            cur_c += dc
-    return tbf
+        dir_mask = DIR_MASK_ALL
+    else:
+        dir_mask = np.zeros(8, dtype=np.bool_)
+        for d in directions:
+            dir_mask[d] = True
+    result, count = _find_flips_skip_empty_inner(flat, move, color, dir_mask, RAYS, RAY_LENS)
+    # Convert flat indices back to (r, c) tuples
+    return [(int(idx) // 8, int(idx) % 8) for idx in result[:count]]
 
 
 def find_flips_wrap(state, move, color, directions=None):
