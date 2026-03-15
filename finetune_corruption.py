@@ -36,10 +36,15 @@ def build_legal_mask(games, legal_moves, stoi, block_size, vocab_size):
 
     Returns np.ndarray of shape (total_non_padding_positions, vocab_size).
     """
-    # Count total positions first
-    total = sum(min(len(g) - 1, block_size) for g in games)
-    mask = np.zeros((total, vocab_size), dtype=np.bool_)
+    # Pre-map stoi for fast lookup
+    max_key = max(stoi.keys())
+    stoi_map = np.full(max_key + 1, -1, dtype=np.int32)
+    for k, v in stoi.items():
+        stoi_map[k] = v
 
+    # Collect (row, col) indices for vectorized assignment
+    rows = []
+    cols = []
     pos = 0
     for gi, game in enumerate(games):
         T = min(len(game) - 1, block_size)
@@ -47,9 +52,14 @@ def build_legal_mask(games, legal_moves, stoi, block_size, vocab_size):
             move_idx = t + 1
             if move_idx < len(legal_moves[gi]):
                 for p in legal_moves[gi][move_idx]:
-                    if p in stoi:
-                        mask[pos, stoi[p]] = True
+                    if p <= max_key and stoi_map[p] >= 0:
+                        rows.append(pos)
+                        cols.append(stoi_map[p])
             pos += 1
+
+    total = pos
+    mask = np.zeros((total, vocab_size), dtype=np.bool_)
+    mask[np.array(rows, dtype=np.int64), np.array(cols, dtype=np.int64)] = True
     return mask
 
 
