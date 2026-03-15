@@ -1120,6 +1120,12 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 )
 
                 sample = {
+                    "game_idx": gi,
+                    "pos": pos,
+                    "color": color,
+                    "modifications": [(r, c, int(o), int(t)) for r, c, o, t in mods],
+                    "n_original_legal": len(original_legal),
+                    "n_cf_legal": len(cf_legal),
                     **logit_metrics,
                     "crosstalk": crosstalk,
                     "probe_acc": probe_acc,
@@ -1155,6 +1161,12 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 )
 
                 sample = {
+                    "game_idx": gi,
+                    "pos": pos,
+                    "color": color,
+                    "modifications": [(r, c, int(o), int(t)) for r, c, o, t in mods],
+                    "n_original_legal": len(original_legal),
+                    "n_cf_legal": len(cf_legal),
                     **logit_metrics,
                     "crosstalk": crosstalk,
                     "probe_acc": probe_acc,
@@ -1553,6 +1565,12 @@ def main():
     with open(results_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"\nResults saved to {results_path}")
+
+    # Save raw per-sample data for downstream analysis
+    raw_path = os.path.join(args.output_dir, "raw_samples.json")
+    with open(raw_path, "w") as f:
+        json.dump(raw_results, f, indent=1)
+    print(f"Raw per-sample data saved to {raw_path}")
 
     # Print summary table
     print("\n=== Summary ===")
