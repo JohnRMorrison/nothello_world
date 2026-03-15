@@ -899,6 +899,31 @@ def measure_logit_metrics(original_logits, intervened_logits,
     result["mean_shift_newly_illegal"] = np.mean(shifts_illegal) if shifts_illegal else None
     result["mean_shift_newly_legal"] = np.mean(shifts_legal) if shifts_legal else None
 
+    # 7. Classification accuracy on changed cells
+    # Model's "legal set" after intervention = top-K cells (K = |cf_legal|)
+    k = len(cf_legal_stoi)
+    if k > 0:
+        model_legal_after = set(stoi_indices[idx] for idx in sorted_indices[:k].tolist())
+    else:
+        model_legal_after = set()
+
+    # For newly legal cells: should be in model_legal_after
+    # For newly illegal cells: should NOT be in model_legal_after
+    n_classif = 0
+    n_classif_correct = 0
+    for cell in newly_legal:
+        if cell in STOI_SET:
+            n_classif += 1
+            if cell in model_legal_after:
+                n_classif_correct += 1
+    for cell in newly_illegal:
+        if cell in STOI_SET:
+            n_classif += 1
+            if cell not in model_legal_after:
+                n_classif_correct += 1
+    result["classification_acc"] = n_classif_correct / n_classif if n_classif > 0 else None
+    result["n_classif"] = n_classif
+
     return result
 
 
@@ -1139,7 +1164,7 @@ def aggregate_results(results):
 
             # Scalar metrics
             for key in ["direction_acc", "top1_legal", "top1_legal_strict",
-                         "top5_legal_frac",
+                         "top5_legal_frac", "classification_acc",
                          "legal_prob_mass", "mean_shift_newly_illegal",
                          "mean_shift_newly_legal", "crosstalk", "probe_acc"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
@@ -1161,6 +1186,7 @@ def aggregate_results(results):
                 for comp_key, comp_samples in compositions.items():
                     comp_agg = {"n_samples": len(comp_samples)}
                     for key in ["direction_acc", "top1_legal", "top1_legal_strict",
+                                 "classification_acc",
                                  "legal_prob_mass", "crosstalk", "probe_acc"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
@@ -1194,6 +1220,7 @@ COND_LABELS = {
 def plot_results(aggregated, n_values, output_dir):
     """Generate 6 summary plots."""
     metrics_to_plot = [
+        ("classification_acc", "Classification Accuracy", "Fraction correct"),
         ("direction_acc", "Direction Accuracy", "Fraction correct"),
         ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("top1_legal", "Top-1 Legal Accuracy", "Fraction legal"),
@@ -1481,6 +1508,7 @@ def main():
                 print(f"  N={n}: no samples")
                 continue
             da = data.get("direction_acc")
+            ca = data.get("classification_acc")
             t1 = data.get("top1_legal")
             t1s = data.get("top1_legal_strict")
             lpm = data.get("legal_prob_mass")
@@ -1488,14 +1516,15 @@ def main():
             pa = data.get("probe_acc")
             ns = data.get("n_samples", 0)
             da_s = f"{da:.3f}" if da is not None else "N/A"
+            ca_s = f"{ca:.3f}" if ca is not None else "N/A"
             t1_s = f"{t1:.3f}" if t1 is not None else "N/A"
             t1s_s = f"{t1s:.3f}" if t1s is not None else "N/A"
             lpm_s = f"{lpm:.3f}" if lpm is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
-            print(f"  N={n}: dir_acc={da_s}  top1={t1_s}  top1_strict={t1s_s}  "
-                  f"legal_mass={lpm_s}  xtalk={ct_s}  "
-                  f"probe={pa_s}  (n={ns})")
+            print(f"  N={n}: dir={da_s}  classif={ca_s}  top1={t1_s}  "
+                  f"top1_strict={t1s_s}  legal_mass={lpm_s}  "
+                  f"xtalk={ct_s}  probe={pa_s}  (n={ns})")
 
     # Plot
     print("\nGenerating plots...")
