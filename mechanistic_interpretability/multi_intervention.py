@@ -838,89 +838,45 @@ def plot_mlp_results(aggregated, n_values, output_dir):
 # ---------------------------------------------------------------------------
 def measure_logit_metrics(original_logits, intervened_logits,
                           original_legal, counterfactual_legal):
-    """Compute all logit-based metrics.
+    """Compute logit-based metrics for an intervention.
 
-    Returns dict with: direction_acc, top1_legal, top5_legal_frac,
-    legal_prob_mass, mean_shift_newly_illegal, mean_shift_newly_legal.
+    Returns dict with: boundary_margin, boundary_margin_frac_positive,
+    top1_legal_strict, legal_prob_mass, mean_logprob_shift_illegal,
+    mean_logprob_shift_legal, mean_rank_shift_illegal, mean_rank_shift_legal.
     """
     newly_legal = counterfactual_legal - original_legal
     newly_illegal = original_legal - counterfactual_legal
+    cf_legal_stoi = counterfactual_legal & STOI_SET
 
     # Map model logits to per-cell values (60 valid cells)
     # Model output: index 0 = pass, indices 1-60 = stoi_indices
-    orig_cell = torch.full((64,), float('-inf'), device=original_logits.device)
-    orig_cell[stoi_indices] = original_logits[1:61]
-
     intv_cell = torch.full((64,), float('-inf'), device=intervened_logits.device)
     intv_cell[stoi_indices] = intervened_logits[1:61]
 
     result = {}
+    result["n_changed"] = len(newly_legal) + len(newly_illegal)
 
-    # 1. Direction accuracy
-    n_changed = len(newly_legal) + len(newly_illegal)
-    if n_changed > 0:
-        correct = 0
-        for cell in newly_legal:
-            if cell in STOI_SET and intv_cell[cell] > orig_cell[cell]:
-                correct += 1
-            elif cell not in STOI_SET:
-                n_changed -= 1  # exclude center cells
-        for cell in newly_illegal:
-            if cell in STOI_SET and intv_cell[cell] < orig_cell[cell]:
-                correct += 1
-            elif cell not in STOI_SET:
-                n_changed -= 1
-        result["direction_acc"] = correct / n_changed if n_changed > 0 else None
-    else:
-        result["direction_acc"] = None
-    result["n_changed"] = n_changed
-
-    # 2-3. Top-1 and top-5 legal accuracy
-    # Use only valid board positions (exclude pass token)
-    valid_logits = intervened_logits[1:61]  # 60 values for stoi_indices
-    sorted_indices = valid_logits.argsort(descending=True)
-    top_cells = [stoi_indices[idx] for idx in sorted_indices[:5].tolist()]
-
-    cf_legal_stoi = counterfactual_legal & STOI_SET
-    result["top1_legal"] = 1.0 if top_cells[0] in cf_legal_stoi else 0.0
-    top5_legal = sum(1 for c in top_cells if c in cf_legal_stoi)
-    result["top5_legal_frac"] = top5_legal / 5.0
-
-    # Stricter top-1: only count when top move actually changed
+    # 1. Top-1 legal (strict): only when top move changed
+    valid_logits = intervened_logits[1:61]
     orig_valid_logits = original_logits[1:61]
-    orig_top_idx = orig_valid_logits.argmax().item()
-    orig_top_cell = stoi_indices[orig_top_idx]
-    intv_top_cell = top_cells[0]
+    orig_top_cell = stoi_indices[orig_valid_logits.argmax().item()]
+    intv_top_cell = stoi_indices[valid_logits.argmax().item()]
     if orig_top_cell != intv_top_cell:
         result["top1_legal_strict"] = 1.0 if intv_top_cell in cf_legal_stoi else 0.0
     else:
-        result["top1_legal_strict"] = None  # top move didn't change
+        result["top1_legal_strict"] = None
 
-    # 4. Legal probability mass
-    probs = torch.softmax(intervened_logits[1:61], dim=0)  # over 60 valid cells
+    # 2. Legal probability mass
+    probs = torch.softmax(valid_logits, dim=0)
     legal_mask = torch.zeros(60, device=probs.device)
     for i, cell in enumerate(stoi_indices):
         if cell in counterfactual_legal:
             legal_mask[i] = 1.0
     result["legal_prob_mass"] = (probs * legal_mask).sum().item()
 
-    # 5-6. Mean logit shifts
-    shifts_illegal = []
-    shifts_legal = []
-    for cell in newly_illegal:
-        if cell in STOI_SET:
-            shifts_illegal.append((intv_cell[cell] - orig_cell[cell]).item())
-    for cell in newly_legal:
-        if cell in STOI_SET:
-            shifts_legal.append((intv_cell[cell] - orig_cell[cell]).item())
-
-    result["mean_shift_newly_illegal"] = np.mean(shifts_illegal) if shifts_illegal else None
-    result["mean_shift_newly_legal"] = np.mean(shifts_legal) if shifts_legal else None
-
-    # 7b. Log-probability shift (natural unit of cross-entropy)
-    orig_logprobs = torch.log_softmax(original_logits[1:61], dim=0)
-    intv_logprobs = torch.log_softmax(intervened_logits[1:61], dim=0)
-    # Map to 64-cell arrays
+    # 3. Log-probability shift (natural unit of cross-entropy)
+    orig_logprobs = torch.log_softmax(orig_valid_logits, dim=0)
+    intv_logprobs = torch.log_softmax(valid_logits, dim=0)
     orig_lp = torch.full((64,), float('-inf'), device=original_logits.device)
     intv_lp = torch.full((64,), float('-inf'), device=intervened_logits.device)
     orig_lp[stoi_indices] = orig_logprobs
@@ -938,43 +894,27 @@ def measure_logit_metrics(original_logits, intervened_logits,
     result["mean_logprob_shift_illegal"] = np.mean(lp_shifts_illegal) if lp_shifts_illegal else None
     result["mean_logprob_shift_legal"] = np.mean(lp_shifts_legal) if lp_shifts_legal else None
 
-    # 7c. Rank shift
-    # Rank 0 = highest logit. Compute ranks for all 60 valid cells.
+    # 4. Rank shift
     orig_ranks = torch.zeros(64, dtype=torch.long, device=original_logits.device)
     intv_ranks = torch.zeros(64, dtype=torch.long, device=intervened_logits.device)
-    orig_order = orig_valid_logits.argsort(descending=True)
-    intv_order = valid_logits.argsort(descending=True)
-    for rank, idx in enumerate(orig_order.tolist()):
+    for rank, idx in enumerate(orig_valid_logits.argsort(descending=True).tolist()):
         orig_ranks[stoi_indices[idx]] = rank
-    for rank, idx in enumerate(intv_order.tolist()):
+    for rank, idx in enumerate(valid_logits.argsort(descending=True).tolist()):
         intv_ranks[stoi_indices[idx]] = rank
 
     rank_shifts_illegal = []
     rank_shifts_legal = []
     for cell in newly_illegal:
         if cell in STOI_SET:
-            # positive = rank got worse (higher number)
             rank_shifts_illegal.append((intv_ranks[cell] - orig_ranks[cell]).item())
     for cell in newly_legal:
         if cell in STOI_SET:
-            # negative = rank got better (lower number)
             rank_shifts_legal.append((intv_ranks[cell] - orig_ranks[cell]).item())
 
     result["mean_rank_shift_illegal"] = np.mean(rank_shifts_illegal) if rank_shifts_illegal else None
     result["mean_rank_shift_legal"] = np.mean(rank_shifts_legal) if rank_shifts_legal else None
 
-    # 7d. Min-legal-rank: rank of least-probable legal move (before & after)
-    orig_legal_stoi = original_legal & STOI_SET
-    if orig_legal_stoi:
-        result["min_legal_rank_before"] = max(orig_ranks[cell].item() for cell in orig_legal_stoi)
-    else:
-        result["min_legal_rank_before"] = None
-    if cf_legal_stoi:
-        result["min_legal_rank_after"] = max(intv_ranks[cell].item() for cell in cf_legal_stoi)
-    else:
-        result["min_legal_rank_after"] = None
-
-    # 7e. Boundary margin: distance from the legal/illegal boundary
+    # 5. Boundary margin: distance from the legal/illegal boundary
     # Boundary = logit of the worst counterfactual-legal move after intervention
     # Newly illegal: margin = boundary - cell_logit (positive = correct side)
     # Newly legal:   margin = cell_logit - boundary (positive = correct side)
@@ -996,31 +936,6 @@ def measure_logit_metrics(original_logits, intervened_logits,
     result["boundary_margin_frac_positive"] = (
         np.mean([m > 0 for m in margins]) if margins else None
     )
-
-    # 7. Classification accuracy on changed cells
-    # Model's "legal set" after intervention = top-K cells (K = |cf_legal|)
-    k = len(cf_legal_stoi)
-    if k > 0:
-        model_legal_after = set(stoi_indices[idx] for idx in sorted_indices[:k].tolist())
-    else:
-        model_legal_after = set()
-
-    # For newly legal cells: should be in model_legal_after
-    # For newly illegal cells: should NOT be in model_legal_after
-    n_classif = 0
-    n_classif_correct = 0
-    for cell in newly_legal:
-        if cell in STOI_SET:
-            n_classif += 1
-            if cell in model_legal_after:
-                n_classif_correct += 1
-    for cell in newly_illegal:
-        if cell in STOI_SET:
-            n_classif += 1
-            if cell not in model_legal_after:
-                n_classif_correct += 1
-    result["classification_acc"] = n_classif_correct / n_classif if n_classif > 0 else None
-    result["n_classif"] = n_classif
 
     return result
 
@@ -1267,14 +1182,10 @@ def aggregate_results(results):
             agg = {"n_samples": len(samples)}
 
             # Scalar metrics
-            for key in ["direction_acc", "top1_legal", "top1_legal_strict",
-                         "top5_legal_frac", "classification_acc",
-                         "legal_prob_mass", "mean_shift_newly_illegal",
-                         "mean_shift_newly_legal",
+            for key in ["boundary_margin", "boundary_margin_frac_positive",
+                         "top1_legal_strict", "legal_prob_mass",
                          "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                          "mean_rank_shift_illegal", "mean_rank_shift_legal",
-                         "min_legal_rank_before", "min_legal_rank_after",
-                         "boundary_margin", "boundary_margin_frac_positive",
                          "crosstalk", "probe_acc"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
                 if vals:
@@ -1294,13 +1205,10 @@ def aggregate_results(results):
                 agg["compositions"] = {}
                 for comp_key, comp_samples in compositions.items():
                     comp_agg = {"n_samples": len(comp_samples)}
-                    for key in ["direction_acc", "top1_legal", "top1_legal_strict",
-                                 "classification_acc",
-                                 "legal_prob_mass",
+                    for key in ["boundary_margin", "boundary_margin_frac_positive",
+                                 "top1_legal_strict", "legal_prob_mass",
                                  "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                                  "mean_rank_shift_illegal", "mean_rank_shift_legal",
-                                 "min_legal_rank_before", "min_legal_rank_after",
-                                 "boundary_margin", "boundary_margin_frac_positive",
                                  "crosstalk", "probe_acc"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
@@ -1336,11 +1244,8 @@ def plot_results(aggregated, n_values, output_dir):
     metrics_to_plot = [
         ("boundary_margin", "Boundary Margin (mean)", "Logit margin (+ = correct side)"),
         ("boundary_margin_frac_positive", "Boundary Margin (fraction correct)", "Fraction on correct side"),
-        ("classification_acc", "Classification Accuracy (top-K)", "Fraction correct"),
-        ("legal_prob_mass", "Legal Probability Mass", "Probability"),
-        ("top1_legal", "Top-1 Legal Accuracy", "Fraction legal"),
         ("top1_legal_strict", "Top-1 Legal (Strict: top move changed)", "Fraction legal"),
-        ("min_legal_rank_after", "Worst-Case Legal Move Rank (After Intervention)", "Rank (0=best)"),
+        ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("crosstalk", "Probe Cross-talk", "Mean |change| (non-modified cells)"),
         ("probe_acc", "Probe Accuracy (Modified Cells)", "Fraction correct"),
     ]
@@ -1369,41 +1274,6 @@ def plot_results(aggregated, n_values, output_dir):
         plt.savefig(fname, dpi=150)
         plt.close()
         print(f"  Saved {fname}")
-
-    # Special plot: mean logit shifts (two lines per condition)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    for cond in COND_COLORS:
-        xs_il, ys_il = [], []
-        xs_le, ys_le = [], []
-        for n in n_values:
-            data = aggregated.get(cond, {}).get(str(n), {})
-            val_il = data.get("mean_shift_newly_illegal")
-            val_le = data.get("mean_shift_newly_legal")
-            if val_il is not None:
-                xs_il.append(n)
-                ys_il.append(val_il)
-            if val_le is not None:
-                xs_le.append(n)
-                ys_le.append(val_le)
-        if xs_il:
-            ax.plot(xs_il, ys_il, marker='v', linestyle='--',
-                    color=COND_COLORS[cond], alpha=0.7,
-                    label=f"{COND_LABELS[cond]} (illegal)")
-        if xs_le:
-            ax.plot(xs_le, ys_le, marker='^', linestyle='-',
-                    color=COND_COLORS[cond], alpha=0.7,
-                    label=f"{COND_LABELS[cond]} (legal)")
-    ax.axhline(0, color='gray', linestyle=':', alpha=0.5)
-    ax.set_xlabel("Number of interventions (N)")
-    ax.set_ylabel("Mean logit shift")
-    ax.set_title("Mean Logit Shift (Newly Legal vs Newly Illegal)")
-    ax.legend(fontsize=7, ncol=2)
-    ax.set_xticks(n_values)
-    plt.tight_layout()
-    fname = os.path.join(output_dir, "logit_shifts.png")
-    plt.savefig(fname, dpi=150)
-    plt.close()
-    print(f"  Saved {fname}")
 
     # Special plot: log-probability shifts (two lines per condition)
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -1695,7 +1565,6 @@ def main():
                 continue
             bm = data.get("boundary_margin")
             bmf = data.get("boundary_margin_frac_positive")
-            ca = data.get("classification_acc")
             t1s = data.get("top1_legal_strict")
             lpm = data.get("legal_prob_mass")
             lp_il = data.get("mean_logprob_shift_illegal")
@@ -1707,7 +1576,6 @@ def main():
             ns = data.get("n_samples", 0)
             bm_s = f"{bm:+.2f}" if bm is not None else "N/A"
             bmf_s = f"{bmf:.3f}" if bmf is not None else "N/A"
-            ca_s = f"{ca:.3f}" if ca is not None else "N/A"
             t1s_s = f"{t1s:.3f}" if t1s is not None else "N/A"
             lpm_s = f"{lpm:.3f}" if lpm is not None else "N/A"
             lp_il_s = f"{lp_il:+.2f}" if lp_il is not None else "N/A"
@@ -1716,7 +1584,7 @@ def main():
             rk_le_s = f"{rk_le:+.1f}" if rk_le is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
-            print(f"  N={n}: margin={bm_s}  margin_frac={bmf_s}  classif={ca_s}  "
+            print(f"  N={n}: margin={bm_s}  margin_frac={bmf_s}  "
                   f"top1s={t1s_s}  mass={lpm_s}  "
                   f"lp_il/le={lp_il_s}/{lp_le_s}  "
                   f"rank_il/le={rk_il_s}/{rk_le_s}  "
