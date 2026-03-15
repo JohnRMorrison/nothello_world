@@ -956,6 +956,29 @@ def measure_logit_metrics(original_logits, intervened_logits,
     else:
         result["min_legal_rank_after"] = None
 
+    # 7e. Boundary margin: distance from the legal/illegal boundary
+    # Boundary = logit of the worst counterfactual-legal move after intervention
+    # Newly illegal: margin = boundary - cell_logit (positive = correct side)
+    # Newly legal:   margin = cell_logit - boundary (positive = correct side)
+    if cf_legal_stoi:
+        boundary = min(intv_cell[cell].item() for cell in cf_legal_stoi)
+    else:
+        boundary = None
+
+    margins = []
+    if boundary is not None:
+        for cell in newly_illegal:
+            if cell in STOI_SET:
+                margins.append(boundary - intv_cell[cell].item())
+        for cell in newly_legal:
+            if cell in STOI_SET:
+                margins.append(intv_cell[cell].item() - boundary)
+
+    result["boundary_margin"] = np.mean(margins) if margins else None
+    result["boundary_margin_frac_positive"] = (
+        np.mean([m > 0 for m in margins]) if margins else None
+    )
+
     # 7. Classification accuracy on changed cells
     # Model's "legal set" after intervention = top-K cells (K = |cf_legal|)
     k = len(cf_legal_stoi)
@@ -1227,6 +1250,7 @@ def aggregate_results(results):
                          "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                          "mean_rank_shift_illegal", "mean_rank_shift_legal",
                          "min_legal_rank_before", "min_legal_rank_after",
+                         "boundary_margin", "boundary_margin_frac_positive",
                          "crosstalk", "probe_acc"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
                 if vals:
@@ -1252,6 +1276,7 @@ def aggregate_results(results):
                                  "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                                  "mean_rank_shift_illegal", "mean_rank_shift_legal",
                                  "min_legal_rank_before", "min_legal_rank_after",
+                                 "boundary_margin", "boundary_margin_frac_positive",
                                  "crosstalk", "probe_acc"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
@@ -1285,7 +1310,9 @@ COND_LABELS = {
 def plot_results(aggregated, n_values, output_dir):
     """Generate 6 summary plots."""
     metrics_to_plot = [
-        ("classification_acc", "Classification Accuracy", "Fraction correct"),
+        ("boundary_margin", "Boundary Margin (mean)", "Logit margin (+ = correct side)"),
+        ("boundary_margin_frac_positive", "Boundary Margin (fraction correct)", "Fraction on correct side"),
+        ("classification_acc", "Classification Accuracy (top-K)", "Fraction correct"),
         ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("top1_legal", "Top-1 Legal Accuracy", "Fraction legal"),
         ("top1_legal_strict", "Top-1 Legal (Strict: top move changed)", "Fraction legal"),
@@ -1642,6 +1669,8 @@ def main():
             if data.get("n_samples", 0) == 0:
                 print(f"  N={n}: no samples")
                 continue
+            bm = data.get("boundary_margin")
+            bmf = data.get("boundary_margin_frac_positive")
             ca = data.get("classification_acc")
             t1s = data.get("top1_legal_strict")
             lpm = data.get("legal_prob_mass")
@@ -1649,10 +1678,11 @@ def main():
             lp_le = data.get("mean_logprob_shift_legal")
             rk_il = data.get("mean_rank_shift_illegal")
             rk_le = data.get("mean_rank_shift_legal")
-            mlr = data.get("min_legal_rank_after")
             ct = data.get("crosstalk")
             pa = data.get("probe_acc")
             ns = data.get("n_samples", 0)
+            bm_s = f"{bm:+.2f}" if bm is not None else "N/A"
+            bmf_s = f"{bmf:.3f}" if bmf is not None else "N/A"
             ca_s = f"{ca:.3f}" if ca is not None else "N/A"
             t1s_s = f"{t1s:.3f}" if t1s is not None else "N/A"
             lpm_s = f"{lpm:.3f}" if lpm is not None else "N/A"
@@ -1660,13 +1690,13 @@ def main():
             lp_le_s = f"{lp_le:+.2f}" if lp_le is not None else "N/A"
             rk_il_s = f"{rk_il:+.1f}" if rk_il is not None else "N/A"
             rk_le_s = f"{rk_le:+.1f}" if rk_le is not None else "N/A"
-            mlr_s = f"{mlr:.1f}" if mlr is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
-            print(f"  N={n}: classif={ca_s}  top1s={t1s_s}  mass={lpm_s}  "
+            print(f"  N={n}: margin={bm_s}  margin_frac={bmf_s}  classif={ca_s}  "
+                  f"top1s={t1s_s}  mass={lpm_s}  "
                   f"lp_il/le={lp_il_s}/{lp_le_s}  "
                   f"rank_il/le={rk_il_s}/{rk_le_s}  "
-                  f"worst_rank={mlr_s}  xtalk={ct_s}  probe={pa_s}  (n={ns})")
+                  f"xtalk={ct_s}  probe={pa_s}  (n={ns})")
 
     # Plot
     print("\nGenerating plots...")
