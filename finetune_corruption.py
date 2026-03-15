@@ -36,11 +36,12 @@ def build_legal_mask(games, legal_moves, stoi, block_size, vocab_size):
 
     Returns np.ndarray of shape (total_non_padding_positions, vocab_size).
     """
-    # Pre-map stoi for fast lookup
-    max_key = max(stoi.keys())
+    # Pre-map stoi for fast lookup (skip negative keys like -100 padding)
+    max_key = max(k for k in stoi.keys() if k >= 0)
     stoi_map = np.full(max_key + 1, -1, dtype=np.int32)
     for k, v in stoi.items():
-        stoi_map[k] = v
+        if k >= 0:
+            stoi_map[k] = v
 
     # Collect (row, col) indices for vectorized assignment
     rows = []
