@@ -387,9 +387,9 @@ def main():
     print("Model loaded")
 
     # Load data
-    data_path = os.path.join(script_dir, "board_seqs_int.pt")
+    data_path = os.path.join(script_dir, "board_seqs_int.pth")
     board_seqs_int = torch.load(data_path, map_location="cpu")
-    str_path = os.path.join(script_dir, "board_seqs_string.pt")
+    str_path = os.path.join(script_dir, "board_seqs_string.pth")
     board_seqs_string = torch.load(str_path, map_location="cpu")
     print(f"Data loaded: {board_seqs_int.shape[0]} games")
 
