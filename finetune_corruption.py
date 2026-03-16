@@ -83,12 +83,12 @@ def evaluate(model, loader, device, legal_mask=None):
         logits, loss = model(x, y)
         B, T, V = logits.shape
 
-        # Loss
-        n_valid = (y != -100).sum().item()
+        # Loss — token 0 is the padding token (stoi[-100] = 0)
+        mask = (y != 0)  # (B, T)
+        n_valid = mask.sum().item()
         total_loss += loss.mean().item() * n_valid
 
         # Flatten non-padding positions
-        mask = (y != -100)  # (B, T)
         preds_flat = logits.argmax(dim=-1)[mask].cpu().numpy()  # (n_valid,)
         y_flat = y[mask].cpu().numpy()
 
