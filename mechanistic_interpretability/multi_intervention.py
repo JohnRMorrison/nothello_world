@@ -925,12 +925,17 @@ def plot_mlp_results(aggregated, n_values, output_dir):
 # Measurement functions
 # ---------------------------------------------------------------------------
 def measure_logit_metrics(original_logits, intervened_logits,
-                          original_legal, counterfactual_legal):
+                          original_legal, counterfactual_legal,
+                          save_probs=False):
     """Compute logit-based metrics for an intervention.
 
     Returns dict with: boundary_margin, boundary_margin_frac_positive,
     top1_legal_strict, legal_prob_mass, mean_logprob_shift_illegal,
     mean_logprob_shift_legal, mean_rank_shift_illegal, mean_rank_shift_legal.
+
+    If save_probs=True, also includes orig_probs and intv_probs (64-element
+    lists, indexed by board cell, -1 for non-valid cells), plus
+    original_legal and counterfactual_legal as sorted lists.
     """
     newly_legal = counterfactual_legal - original_legal
     newly_illegal = original_legal - counterfactual_legal
@@ -1040,6 +1045,20 @@ def measure_logit_metrics(original_logits, intervened_logits,
     else:
         result["li_topn_errors"] = None
         result["li_topn_accuracy"] = None
+
+    if save_probs:
+        # Full probability vectors indexed by board cell (0-63)
+        orig_probs_64 = [-1.0] * 64
+        intv_probs_64 = [-1.0] * 64
+        orig_probs_valid = torch.softmax(orig_valid_logits, dim=0)
+        intv_probs_valid = torch.softmax(valid_logits, dim=0)
+        for i, cell in enumerate(stoi_indices):
+            orig_probs_64[cell] = orig_probs_valid[i].item()
+            intv_probs_64[cell] = intv_probs_valid[i].item()
+        result["orig_probs"] = orig_probs_64
+        result["intv_probs"] = intv_probs_64
+        result["original_legal"] = sorted(original_legal)
+        result["counterfactual_legal"] = sorted(counterfactual_legal)
 
     return result
 
@@ -1173,7 +1192,7 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                    n_games=200, n_values=None, seed=42, device="cuda",
                    per_cell_calibrate=False,
                    direction_probe=None, downstream_probes=None,
-                   cal_depth=0):
+                   cal_depth=0, save_probs=False):
     """Run the full multi-intervention experiment."""
     if n_values is None:
         n_values = N_VALUES
@@ -1236,7 +1255,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
 
                 logit_metrics = measure_logit_metrics(
                     orig_logits_at_pos, intv_logits,
-                    original_legal, cf_legal
+                    original_legal, cf_legal,
+                    save_probs=save_probs,
                 )
                 # Use per-layer probe if available for crosstalk + accuracy
                 if downstream_probes is not None:
@@ -1265,6 +1285,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     "crosstalk": crosstalk,
                     "probe_acc": probe_acc,
                 }
+                if save_probs:
+                    sample["board_state"] = board_state.flatten().tolist()
                 results[cond_name][str(n)].append(sample)
 
             # Mixed condition
@@ -1289,7 +1311,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
 
                 logit_metrics = measure_logit_metrics(
                     orig_logits_at_pos, intv_logits,
-                    original_legal, cf_legal
+                    original_legal, cf_legal,
+                    save_probs=save_probs,
                 )
                 if downstream_probes is not None:
                     parity_str = "even" if pos % 2 == 0 else "odd"
@@ -1319,6 +1342,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     "n_flips": n_flips,
                     "n_adds": n_adds,
                 }
+                if save_probs:
+                    sample["board_state"] = board_state.flatten().tolist()
                 results["mixed"][str(n)].append(sample)
 
     return results
@@ -1546,6 +1571,8 @@ def main():
     parser.add_argument("--probe-dir", type=str, default=None,
                         help="Directory with per-layer probe checkpoints "
                              "(required for --per-cell-scale)")
+    parser.add_argument("--save-probs", action="store_true",
+                        help="Save full 64-cell probability vectors per sample")
     # MLP baseline
     parser.add_argument("--mlp-baseline", action="store_true",
                         help="Run MLP baseline instead of OthelloGPT")
@@ -1714,6 +1741,7 @@ def main():
         direction_probe=direction_probe_tensor,
         downstream_probes=downstream_probes,
         cal_depth=cal_depth,
+        save_probs=args.save_probs,
     )
 
     # Aggregate
