@@ -20,10 +20,10 @@ python multi_intervention.py \
     --n-games 200 \
     --calibrate \
     --per-cell-scale \
-    --cal-depth 2 \
+    --cal-depth ${CAL_DEPTH:-2} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
     --n-values 1,2,3 \
-    --output-dir ../experiments/multi_intervention_probs \
+    --output-dir ../experiments/multi_intervention_probs_cd${CAL_DEPTH:-2} \
     --save-probs \
     --seed 42
 
