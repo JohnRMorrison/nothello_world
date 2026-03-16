@@ -57,6 +57,13 @@ def to_board_label(i):
 from mingpt.model import GPT, GPTConfig
 import torch.nn as nn
 
+from layer_propagation import (
+    load_probes,
+    build_direction_probe,
+    compute_per_cell_scales_downstream,
+    compute_flip_dirs_from_direction_probe,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -394,20 +401,20 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
                           pos, scale, layer_intervene, layer_probe,
                           mode=PROBE_MODE, device="cuda",
                           per_cell_calibrate=False,
-                          prefix_acts=None):
+                          prefix_acts=None,
+                          direction_probe=None, downstream_probes=None):
     """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
 
     Uses mingpt: manually split forward pass at layer_intervene,
     apply intervention, continue forward, capture activations at layer_probe.
 
-    If per_cell_calibrate=True, compute per-cell scales analytically
-    instead of using the global `scale`.
+    If per_cell_calibrate=True and direction_probe/downstream_probes are
+    provided, use downstream calibration (binary search through forward pass
+    to probe layer). Otherwise fall back to local calibration.
 
-    If prefix_acts is provided, skip the prefix computation (layers
-    0..layer_intervene-1) and use the cached activations instead.
+    direction_probe: (2, 512, 8, 8, 3) tensor for even/odd flip directions
+    downstream_probes: dict mapping (layer, parity_str) -> nn.Linear
     """
-    flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
-
     # Use cached prefix or compute from scratch
     if prefix_acts is not None:
         x = prefix_acts.clone()
@@ -417,10 +424,28 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     # Compute per-cell scales if requested
     per_cell_scales = None
     if per_cell_calibrate:
-        h = x[0, pos].detach().clone()
-        per_cell_scales = compute_per_cell_scales(
-            h, linear_probe, modifications, mode
-        )
+        if direction_probe is not None and downstream_probes is not None:
+            # Downstream calibration: binary search through forward pass
+            pm = 0 if pos % 2 == 0 else 1
+            parity_str = "even" if pm == 0 else "odd"
+            target_probe = downstream_probes[(layer_probe, parity_str)]
+            per_cell_scales = compute_per_cell_scales_downstream(
+                model, x, direction_probe, target_probe,
+                modifications, pos, layer_intervene, layer_probe, pm
+            )
+            # Use direction probe for flip dirs (parity-aware)
+            flip_dirs = compute_flip_dirs_from_direction_probe(
+                direction_probe, modifications, pm
+            )
+        else:
+            # Legacy: local calibration at intervention layer
+            h = x[0, pos].detach().clone()
+            per_cell_scales = compute_per_cell_scales(
+                h, linear_probe, modifications, mode
+            )
+            flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
+    else:
+        flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
 
     # Apply intervention at layer_intervene output
     x = apply_intervention(x, flip_dirs, pos, scale,
@@ -539,15 +564,55 @@ def build_180d_features(game_str, pos):
     return np.concatenate([played, when, even])
 
 
+def mlp_per_cell_scales(h, mlp_probe, mlp_output_layer, modifications):
+    """Binary search for per-cell scale that flips MLP output argmax.
+
+    h: (H,) hidden activation
+    mlp_probe: (H, 8, 8, 3) for computing flip directions
+    mlp_output_layer: nn.Linear — last layer of MLP
+    """
+    scales = []
+    for (r, c, orig_val, target_val) in modifications:
+        current_class = board_val_to_probe_class(orig_val)
+        target_class = board_val_to_probe_class(target_val)
+        flip_dir = mlp_probe[:, r, c, target_class] - mlp_probe[:, r, c, current_class]
+        d_hat = flip_dir / flip_dir.norm()
+        coeff = (h @ d_hat).item()
+        cell = r * 8 + c
+
+        def pred_at_scale(s):
+            h_mod = h - s * coeff * d_hat
+            out = mlp_output_layer(h_mod.unsqueeze(0)).view(64, 3)
+            return out[cell].argmax().item()
+
+        lo, hi = 0.0, 10.0
+        if pred_at_scale(hi) != target_class:
+            scales.append(hi)
+            continue
+        if pred_at_scale(0.0) == target_class:
+            scales.append(0.5)
+            continue
+
+        for _ in range(30):
+            mid = (lo + hi) / 2
+            if pred_at_scale(mid) == target_class:
+                hi = mid
+            else:
+                lo = mid
+        scales.append(min(hi * 1.1, 10.0))
+    return scales
+
+
 def mlp_forward_with_intervention(mlp, features, modifications, mlp_probe,
-                                   scale, device="cuda"):
+                                   scale, device="cuda", per_cell_calibrate=False):
     """Forward MLP with intervention on hidden activations.
 
     mlp: nn.Sequential (Linear, ReLU, Linear)
     features: (180,) numpy array
     modifications: list of (r, c, orig_val, target_val)
     mlp_probe: (H, 8, 8, 3) tensor — output layer weights reshaped
-    scale: intervention scale
+    scale: intervention scale (used as fallback if not per_cell_calibrate)
+    per_cell_calibrate: if True, binary search for per-cell scale
 
     Returns (output_logits_64x3, hidden_original, hidden_intervened).
     """
@@ -559,14 +624,20 @@ def mlp_forward_with_intervention(mlp, features, modifications, mlp_probe,
         h = layer(h)
     h_orig = h[0].detach().clone()
 
+    # Per-cell calibration if requested
+    if per_cell_calibrate:
+        scales = mlp_per_cell_scales(h[0], mlp_probe, mlp[-1], modifications)
+    else:
+        scales = [scale] * len(modifications)
+
     # Compute intervention directions from mlp_probe
     h_mod = h.clone()
-    for (r, c, orig_val, target_val) in modifications:
+    for i, (r, c, orig_val, target_val) in enumerate(modifications):
         current_class = board_val_to_probe_class(orig_val)
         target_class = board_val_to_probe_class(target_val)
         flip_dir = mlp_probe[:, r, c, target_class] - mlp_probe[:, r, c, current_class]
         coeff = h_mod[0] @ flip_dir / flip_dir.norm()
-        h_mod[0] = h_mod[0] - scale * coeff * flip_dir / flip_dir.norm()
+        h_mod[0] = h_mod[0] - scales[i] * coeff * flip_dir / flip_dir.norm()
 
     h_intv = h_mod[0].detach().clone()
 
@@ -673,7 +744,8 @@ def calibrate_mlp_scale(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
 
 def run_mlp_experiment(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
                         board_seqs_string, scale,
-                        n_games=200, n_values=None, seed=42, device="cuda"):
+                        n_games=200, n_values=None, seed=42, device="cuda",
+                        per_cell_calibrate=False):
     """Run multi-intervention experiment on MLP baseline."""
     if n_values is None:
         n_values = N_VALUES
@@ -709,7 +781,8 @@ def run_mlp_experiment(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
 
                 with torch.no_grad():
                     intv_out, _, intv_h = mlp_forward_with_intervention(
-                        mlp, features, mods, mlp_probe, scale, device
+                        mlp, features, mods, mlp_probe, scale, device,
+                        per_cell_calibrate=per_cell_calibrate
                     )
 
                 metrics = measure_mlp_probe_metrics(orig_out, intv_out, mods)
@@ -733,7 +806,8 @@ def run_mlp_experiment(mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
             if mods is not None:
                 with torch.no_grad():
                     intv_out, _, intv_h = mlp_forward_with_intervention(
-                        mlp, features, mods, mlp_probe, scale, device
+                        mlp, features, mods, mlp_probe, scale, device,
+                        per_cell_calibrate=per_cell_calibrate
                     )
                 metrics = measure_mlp_probe_metrics(orig_out, intv_out, mods)
 
@@ -1050,7 +1124,8 @@ CONDITIONS = [
 def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                    layer_intervene, layer_probe, scale,
                    n_games=200, n_values=None, seed=42, device="cuda",
-                   per_cell_calibrate=False):
+                   per_cell_calibrate=False,
+                   direction_probe=None, downstream_probes=None):
     """Run the full multi-intervention experiment."""
     if n_values is None:
         n_values = N_VALUES
@@ -1105,7 +1180,9 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         pos, scale, layer_intervene, layer_probe,
                         device=device,
                         per_cell_calibrate=per_cell_calibrate,
-                        prefix_acts=prefix_acts
+                        prefix_acts=prefix_acts,
+                        direction_probe=direction_probe,
+                        downstream_probes=downstream_probes,
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1146,7 +1223,9 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         pos, scale, layer_intervene, layer_probe,
                         device=device,
                         per_cell_calibrate=per_cell_calibrate,
-                        prefix_acts=prefix_acts
+                        prefix_acts=prefix_acts,
+                        direction_probe=direction_probe,
+                        downstream_probes=downstream_probes,
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1387,8 +1466,11 @@ def main():
     parser.add_argument("--device", default="cuda")
     # MLP baseline
     parser.add_argument("--per-cell-scale", action="store_true",
-                        help="Use per-cell analytically calibrated scales "
-                             "(ensures probe flips for each cell)")
+                        help="Use per-cell calibrated scales via downstream "
+                             "binary search (ensures probe flips at probe layer)")
+    parser.add_argument("--probe-dir", type=str, default=None,
+                        help="Directory with per-layer probe checkpoints "
+                             "(required for --per-cell-scale)")
     # MLP baseline
     parser.add_argument("--mlp-baseline", action="store_true",
                         help="Run MLP baseline instead of OthelloGPT")
@@ -1446,7 +1528,8 @@ def main():
             mlp_even, mlp_odd, mlp_probe_even, mlp_probe_odd,
             board_seqs_string, scale,
             n_games=args.n_games, n_values=n_values,
-            seed=args.seed, device=args.device
+            seed=args.seed, device=args.device,
+            per_cell_calibrate=args.per_cell_scale
         )
 
         aggregated = aggregate_mlp_results(raw_results)
@@ -1531,13 +1614,27 @@ def main():
     if args.scale is not None:
         scale = args.scale
 
+    # Load per-layer probes for downstream calibration
+    direction_probe_tensor = None
+    downstream_probes = None
+    if args.per_cell_scale:
+        if args.probe_dir is None:
+            parser.error("--probe-dir is required when using --per-cell-scale")
+        downstream_probes = load_probes(args.probe_dir, args.device)
+        direction_probe_tensor = build_direction_probe(
+            downstream_probes, layer=args.layer_probe, device=args.device)
+        print(f"Loaded per-layer probes for downstream calibration "
+              f"(direction + target: L{args.layer_probe})")
+
     # Run experiment
     raw_results = run_experiment(
         model, linear_probe, board_seqs_int, board_seqs_string,
         layer_intervene, args.layer_probe, scale,
         n_games=args.n_games, n_values=n_values,
         seed=args.seed, device=args.device,
-        per_cell_calibrate=args.per_cell_scale
+        per_cell_calibrate=args.per_cell_scale,
+        direction_probe=direction_probe_tensor,
+        downstream_probes=downstream_probes,
     )
 
     # Aggregate
