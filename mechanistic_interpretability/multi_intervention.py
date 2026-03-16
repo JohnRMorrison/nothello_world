@@ -57,12 +57,8 @@ def to_board_label(i):
 from mingpt.model import GPT, GPTConfig
 import torch.nn as nn
 
-from layer_propagation import (
-    load_probes,
-    build_direction_probe,
-    compute_per_cell_scales_downstream,
-    compute_flip_dirs_from_direction_probe,
-)
+# NOTE: layer_propagation imports are done lazily to avoid circular import
+# (layer_propagation.py imports from this module)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -429,6 +425,7 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
             pm = 0 if pos % 2 == 0 else 1
             parity_str = "even" if pm == 0 else "odd"
             target_probe = downstream_probes[(layer_probe, parity_str)]
+            from layer_propagation import compute_per_cell_scales_downstream, compute_flip_dirs_from_direction_probe
             per_cell_scales = compute_per_cell_scales_downstream(
                 model, x, direction_probe, target_probe,
                 modifications, pos, layer_intervene, layer_probe, pm
@@ -1620,6 +1617,7 @@ def main():
     if args.per_cell_scale:
         if args.probe_dir is None:
             parser.error("--probe-dir is required when using --per-cell-scale")
+        from layer_propagation import load_probes, build_direction_probe
         downstream_probes = load_probes(args.probe_dir, args.device)
         direction_probe_tensor = build_direction_probe(
             downstream_probes, layer=args.layer_probe, device=args.device)
