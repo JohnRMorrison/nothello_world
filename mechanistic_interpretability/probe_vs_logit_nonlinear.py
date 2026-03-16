@@ -218,6 +218,80 @@ def optimize_direction(model, prefix_acts, pos, layer_intervene,
     return best_delta, best_change
 
 
+def optimize_direction_selective(model, prefix_acts, pos, layer_intervene,
+                                  logit_idx, perturb_norm, n_steps=100,
+                                  lr=0.05, maximize=True, lam=1.0):
+    """Find direction that changes logit[logit_idx] WITHOUT changing others.
+
+    Objective: maximize |logit_change(target)| - lam * mean(|logit_change(other)|)
+
+    This finds a "surgical" direction that selectively targets one move's logit,
+    analogous to how the probe targets one board cell. If this selective optimal
+    direction is closer to the probe than the unconstrained one, it suggests
+    the probe's selectivity is the key shared property.
+
+    Args:
+        lam: penalty weight on non-target logit changes. Higher = more selective.
+    """
+    device = prefix_acts.device
+    x_base = prefix_acts.detach().clone()
+    h_clean = x_base[0, pos].detach().clone()
+
+    # Clean logits
+    with torch.no_grad():
+        logits_clean = forward_from_layer(model, x_base, layer_intervene)
+        logits_clean_pos = logits_clean[0, pos].detach().clone()  # (61,)
+
+    # Initialize delta as unit random vector
+    delta = torch.randn(512, device=device)
+    delta = delta / delta.norm()
+    delta = delta.requires_grad_(True)
+
+    optimizer = torch.optim.Adam([delta], lr=lr)
+
+    best_obj = float("-inf")
+    best_delta = delta.detach().clone()
+
+    # Mask for "other" logits (all except target and pass token 0)
+    other_mask = torch.ones(61, dtype=torch.bool, device=device)
+    other_mask[logit_idx] = False
+    other_mask[0] = False  # ignore pass token
+
+    for step in range(n_steps):
+        optimizer.zero_grad()
+
+        h_perturbed = h_clean + perturb_norm * delta
+        seq = x_base[0].detach().clone()
+        x_mod = torch.cat([seq[:pos], h_perturbed.unsqueeze(0), seq[pos+1:]], dim=0).unsqueeze(0)
+
+        logits = forward_from_layer(model, x_mod, layer_intervene)
+        logits_pos = logits[0, pos]  # (61,)
+
+        target_change = logits_pos[logit_idx] - logits_clean_pos[logit_idx]
+        other_changes = (logits_pos[other_mask] - logits_clean_pos[other_mask]).abs().mean()
+
+        if maximize:
+            obj = target_change - lam * other_changes
+        else:
+            obj = -target_change - lam * other_changes
+
+        loss = -obj  # minimize negative objective
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            delta.div_(delta.norm().clamp(min=1e-8))
+
+        obj_val = obj.item()
+        if obj_val > best_obj:
+            best_obj = obj_val
+            best_delta = delta.detach().clone()
+            best_target_change = target_change.item()
+            best_other_change = other_changes.item()
+
+    return best_delta, best_target_change, best_other_change
+
+
 def run_experiment(model, probes, direction_probe, board_seqs_int,
                    board_seqs_string, n_games=200, seed=42, device="cuda",
                    opt_steps=100):
@@ -295,7 +369,7 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
                 grad = grads[move]
                 cos_probe_grad = cosine_sim(probe_dir, grad)
 
-                # === Analysis B: Optimized direction ===
+                # === Analysis B: Optimized direction (unconstrained) ===
                 lidx = _cell_to_logit_idx[move]
                 # Optimize to maximize logit change (same sign as actual)
                 do_maximize = (actual >= 0)
@@ -307,6 +381,18 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
                 cos_probe_opt = cosine_sim(probe_dir, opt_dir)
                 cos_grad_opt = cosine_sim(grad, opt_dir)
 
+                # === Analysis B2: Selective optimization ===
+                # Maximize target logit change while minimizing other logit changes
+                sel_dir, sel_target_change, sel_other_change = \
+                    optimize_direction_selective(
+                        model, prefix_acts, pos, LAYER_INTERVENE,
+                        lidx, perturb_norm, n_steps=opt_steps,
+                        maximize=do_maximize, lam=1.0)
+
+                cos_probe_sel = cosine_sim(probe_dir, sel_dir)
+                cos_grad_sel = cosine_sim(grad, sel_dir)
+                cos_opt_sel = cosine_sim(opt_dir, sel_dir)
+
                 move_results.append({
                     "move": int(move),
                     "legality": legality,
@@ -317,6 +403,11 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
                     "cos_probe_optimized": cos_probe_opt,
                     "cos_grad_optimized": cos_grad_opt,
                     "opt_logit_change": opt_change,
+                    "cos_probe_selective": cos_probe_sel,
+                    "cos_grad_selective": cos_grad_sel,
+                    "cos_opt_selective": cos_opt_sel,
+                    "sel_target_change": sel_target_change,
+                    "sel_other_change": sel_other_change,
                     "grad_norm": grad.norm().item(),
                 })
 
@@ -345,9 +436,10 @@ def plot_results(samples, output_dir):
 
     # Collect per-move data
     actual_all, predicted_all = [], []
-    cos_probe_grad_legal, cos_probe_opt_legal = [], []
-    cos_probe_grad_illegal, cos_probe_opt_illegal = [], []
+    cos_probe_grad_legal, cos_probe_opt_legal, cos_probe_sel_legal = [], [], []
+    cos_probe_grad_illegal, cos_probe_opt_illegal, cos_probe_sel_illegal = [], [], []
     opt_changes, actual_from_probe = [], []
+    sel_target_changes, sel_other_changes = [], []
     nonlin_ratios = []
 
     for s in samples:
@@ -359,13 +451,19 @@ def plot_results(samples, output_dir):
             if m["legality"] == "newly_legal":
                 cos_probe_grad_legal.append(m["cos_probe_grad"])
                 cos_probe_opt_legal.append(m["cos_probe_optimized"])
+                cos_probe_sel_legal.append(m["cos_probe_selective"])
             else:
                 cos_probe_grad_illegal.append(m["cos_probe_grad"])
                 cos_probe_opt_illegal.append(m["cos_probe_optimized"])
+                cos_probe_sel_illegal.append(m["cos_probe_selective"])
             opt_changes.append(m["opt_logit_change"])
             actual_from_probe.append(m["actual_logit_change"])
+            sel_target_changes.append(m["sel_target_change"])
+            sel_other_changes.append(m["sel_other_change"])
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    random_baseline = np.sqrt(2 / np.pi) / np.sqrt(512)  # E[|cos|] for random
+
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
 
     # Panel 1: Actual vs predicted logit change (scatter)
     ax = axes[0, 0]
@@ -388,9 +486,8 @@ def plot_results(samples, output_dir):
     ax.set_title(f"A: Nonlinearity ratio (median={np.median(nonlin_ratios):.2f})")
     ax.legend(fontsize=9)
 
-    # Panel 3: Cosine sim comparison — gradient vs optimized (newly legal)
+    # Panel 3: cos(probe, gradient) vs cos(probe, optimized)
     ax = axes[0, 2]
-    random_baseline = np.sqrt(2 / np.pi) / np.sqrt(512)  # E[|cos|] for random
     if cos_probe_grad_legal and cos_probe_opt_legal:
         ax.scatter(cos_probe_grad_legal, cos_probe_opt_legal,
                    alpha=0.4, s=15, color="tab:green", label="Newly legal")
@@ -401,24 +498,22 @@ def plot_results(samples, output_dir):
     ax.axvline(random_baseline, color="gray", linestyle=":", alpha=0.5)
     ax.plot([-1, 1], [-1, 1], "k--", alpha=0.3)
     ax.set_xlabel("cos(probe, gradient)")
-    ax.set_ylabel("cos(probe, optimized)")
+    ax.set_ylabel("cos(probe, unconstrained opt)")
     ax.set_title("B: Probe alignment — gradient vs optimized")
     ax.legend(fontsize=9)
 
     # Panel 4: Optimized logit change vs probe logit change
     ax = axes[1, 0]
     ax.scatter(actual_from_probe, opt_changes, alpha=0.4, s=15, color="tab:orange")
-    ax.plot([min(actual_from_probe + opt_changes),
-             max(actual_from_probe + opt_changes)],
-            [min(actual_from_probe + opt_changes),
-             max(actual_from_probe + opt_changes)],
-            "k--", alpha=0.5, label="y=x")
+    lims2 = [min(actual_from_probe + opt_changes),
+             max(actual_from_probe + opt_changes)]
+    ax.plot(lims2, lims2, "k--", alpha=0.5, label="y=x")
     ax.set_xlabel("Logit change from probe direction")
     ax.set_ylabel("Logit change from optimized direction")
     ax.set_title("B: Optimized vs probe logit change (same norm)")
     ax.legend(fontsize=9)
 
-    # Panel 5: cos(probe, optimized) histogram by legality
+    # Panel 5: cos(probe, optimized) histogram — unconstrained
     ax = axes[1, 1]
     bins = np.linspace(-1, 1, 50)
     if cos_probe_opt_legal:
@@ -429,13 +524,56 @@ def plot_results(samples, output_dir):
                 label=f"Newly illegal (n={len(cos_probe_opt_illegal)})", color="tab:red")
     ax.axvline(random_baseline, color="gray", linestyle=":", alpha=0.5, label=f"Random ±{random_baseline:.3f}")
     ax.axvline(-random_baseline, color="gray", linestyle=":", alpha=0.5)
-    ax.set_xlabel("cos(probe direction, optimized direction)")
+    ax.set_xlabel("cos(probe, unconstrained optimized)")
     ax.set_ylabel("Count")
-    ax.set_title("B: Probe vs optimized direction alignment")
+    ax.set_title("B: Probe vs unconstrained optimized")
     ax.legend(fontsize=9)
 
-    # Panel 6: Summary stats text
+    # Panel 6: cos(probe, selective) histogram
     ax = axes[1, 2]
+    if cos_probe_sel_legal:
+        ax.hist(cos_probe_sel_legal, bins=bins, alpha=0.6,
+                label=f"Newly legal (n={len(cos_probe_sel_legal)})", color="tab:green")
+    if cos_probe_sel_illegal:
+        ax.hist(cos_probe_sel_illegal, bins=bins, alpha=0.6,
+                label=f"Newly illegal (n={len(cos_probe_sel_illegal)})", color="tab:red")
+    ax.axvline(random_baseline, color="gray", linestyle=":", alpha=0.5, label=f"Random ±{random_baseline:.3f}")
+    ax.axvline(-random_baseline, color="gray", linestyle=":", alpha=0.5)
+    ax.set_xlabel("cos(probe, selective optimized)")
+    ax.set_ylabel("Count")
+    ax.set_title("B2: Probe vs selective optimized (penalize other logits)")
+    ax.legend(fontsize=9)
+
+    # Panel 7: cos(probe, gradient) vs cos(probe, selective)
+    ax = axes[2, 0]
+    if cos_probe_grad_legal and cos_probe_sel_legal:
+        ax.scatter(cos_probe_grad_legal, cos_probe_sel_legal,
+                   alpha=0.4, s=15, color="tab:green", label="Newly legal")
+    if cos_probe_grad_illegal and cos_probe_sel_illegal:
+        ax.scatter(cos_probe_grad_illegal, cos_probe_sel_illegal,
+                   alpha=0.4, s=15, color="tab:red", label="Newly illegal")
+    ax.axhline(random_baseline, color="gray", linestyle=":", alpha=0.5)
+    ax.axvline(random_baseline, color="gray", linestyle=":", alpha=0.5)
+    ax.plot([-1, 1], [-1, 1], "k--", alpha=0.3)
+    ax.set_xlabel("cos(probe, gradient)")
+    ax.set_ylabel("cos(probe, selective opt)")
+    ax.set_title("B2: Probe alignment — gradient vs selective")
+    ax.legend(fontsize=9)
+
+    # Panel 8: Selective optimization — target vs other logit changes
+    ax = axes[2, 1]
+    ax.scatter(np.abs(sel_target_changes), sel_other_changes,
+               alpha=0.4, s=15, color="tab:blue")
+    ax.set_xlabel("|Target logit change| (selective opt)")
+    ax.set_ylabel("Mean |other logit changes| (selective opt)")
+    ax.set_title("B2: Selectivity of optimized direction")
+    ax.plot([0, max(np.abs(sel_target_changes))],
+            [0, max(np.abs(sel_target_changes))],
+            "k--", alpha=0.3, label="y=x (non-selective)")
+    ax.legend(fontsize=9)
+
+    # Panel 9: Summary stats
+    ax = axes[2, 2]
     ax.axis("off")
     stats = []
     stats.append(f"N samples: {len(samples)}")
@@ -443,26 +581,27 @@ def plot_results(samples, output_dir):
     stats.append(f"N move comparisons: {n_moves}")
     stats.append("")
     stats.append("=== A: Nonlinearity ===")
-    stats.append(f"Median ratio (actual/predicted): {np.median(nonlin_ratios):.3f}")
-    stats.append(f"Mean ratio: {np.mean(nonlin_ratios):.3f}")
-    stats.append(f"Frac |ratio| > 2: {np.mean([abs(r) > 2 for r in nonlin_ratios]):.2%}")
+    stats.append(f"Median ratio: {np.median(nonlin_ratios):.3f}")
+    stats.append(f"Frac |ratio| > 2: {np.mean([abs(r) > 2 for r in nonlin_ratios]):.1%}")
     stats.append("")
-    stats.append("=== B: Optimized alignment ===")
+    stats.append("=== B: Unconstrained opt ===")
     if cos_probe_opt_legal:
-        stats.append(f"cos(probe, opt) newly legal:")
-        stats.append(f"  mean |cos| = {np.mean(np.abs(cos_probe_opt_legal)):.4f}")
-        stats.append(f"  (vs gradient: {np.mean(np.abs(cos_probe_grad_legal)):.4f})")
+        stats.append(f"Legal: |cos(probe,opt)|={np.mean(np.abs(cos_probe_opt_legal)):.4f}")
+        stats.append(f"  (vs grad: {np.mean(np.abs(cos_probe_grad_legal)):.4f})")
     if cos_probe_opt_illegal:
-        stats.append(f"cos(probe, opt) newly illegal:")
-        stats.append(f"  mean |cos| = {np.mean(np.abs(cos_probe_opt_illegal)):.4f}")
-        stats.append(f"  (vs gradient: {np.mean(np.abs(cos_probe_grad_illegal)):.4f})")
+        stats.append(f"Illegal: |cos(probe,opt)|={np.mean(np.abs(cos_probe_opt_illegal)):.4f}")
+        stats.append(f"  (vs grad: {np.mean(np.abs(cos_probe_grad_illegal)):.4f})")
+    stats.append("")
+    stats.append("=== B2: Selective opt ===")
+    if cos_probe_sel_legal:
+        stats.append(f"Legal: |cos(probe,sel)|={np.mean(np.abs(cos_probe_sel_legal)):.4f}")
+    if cos_probe_sel_illegal:
+        stats.append(f"Illegal: |cos(probe,sel)|={np.mean(np.abs(cos_probe_sel_illegal)):.4f}")
     stats.append(f"\nRandom baseline: {random_baseline:.4f}")
     if opt_changes and actual_from_probe:
-        stats.append(f"\nOpt/probe logit change ratio:")
         ratios = [o / a for o, a in zip(opt_changes, actual_from_probe) if abs(a) > 0.01]
         if ratios:
-            stats.append(f"  median: {np.median(ratios):.2f}x")
-            stats.append(f"  mean: {np.mean(ratios):.2f}x")
+            stats.append(f"Opt/probe logit ratio: {np.median(ratios):.2f}x")
 
     ax.text(0.05, 0.95, "\n".join(stats), transform=ax.transAxes,
             fontsize=9, verticalalignment="top", fontfamily="monospace",
@@ -545,8 +684,10 @@ def main():
         "nonlinearity_ratio_mean": float(np.mean(nonlin)) if nonlin else None,
         "cos_probe_grad_legal": float(np.mean(np.abs([m["cos_probe_grad"] for m in legal_moves]))) if legal_moves else None,
         "cos_probe_opt_legal": float(np.mean(np.abs([m["cos_probe_optimized"] for m in legal_moves]))) if legal_moves else None,
+        "cos_probe_sel_legal": float(np.mean(np.abs([m["cos_probe_selective"] for m in legal_moves]))) if legal_moves else None,
         "cos_probe_grad_illegal": float(np.mean(np.abs([m["cos_probe_grad"] for m in illegal_moves]))) if illegal_moves else None,
         "cos_probe_opt_illegal": float(np.mean(np.abs([m["cos_probe_optimized"] for m in illegal_moves]))) if illegal_moves else None,
+        "cos_probe_sel_illegal": float(np.mean(np.abs([m["cos_probe_selective"] for m in illegal_moves]))) if illegal_moves else None,
         "cos_grad_opt_legal": float(np.mean(np.abs([m["cos_grad_optimized"] for m in legal_moves]))) if legal_moves else None,
         "cos_grad_opt_illegal": float(np.mean(np.abs([m["cos_grad_optimized"] for m in illegal_moves]))) if illegal_moves else None,
         "opt_steps": args.opt_steps,
@@ -566,10 +707,12 @@ def main():
         print(f"Nonlinearity ratio: median={np.median(nonlin):.3f}, mean={np.mean(nonlin):.3f}")
     if legal_moves:
         print(f"Newly legal — cos(probe,grad): {results['cos_probe_grad_legal']:.4f}, "
-              f"cos(probe,opt): {results['cos_probe_opt_legal']:.4f}")
+              f"cos(probe,opt): {results['cos_probe_opt_legal']:.4f}, "
+              f"cos(probe,sel): {results['cos_probe_sel_legal']:.4f}")
     if illegal_moves:
         print(f"Newly illegal — cos(probe,grad): {results['cos_probe_grad_illegal']:.4f}, "
-              f"cos(probe,opt): {results['cos_probe_opt_illegal']:.4f}")
+              f"cos(probe,opt): {results['cos_probe_opt_illegal']:.4f}, "
+              f"cos(probe,sel): {results['cos_probe_sel_illegal']:.4f}")
 
 
 if __name__ == "__main__":
