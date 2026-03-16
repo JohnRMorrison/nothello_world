@@ -342,18 +342,22 @@ def clean_forward_multi_capture(model, input_tokens, pos,
 # Main experiment
 # ---------------------------------------------------------------------------
 def run_experiment(model, probes, direction_probe, board_seqs_int,
-                   board_seqs_string, layer, n_games=200,
+                   board_seqs_string, layer, cal_depths=None, n_games=200,
                    seed=42, device="cuda"):
     """Run layer propagation experiment.
 
     Intervenes at resid_post of block `layer` using layer `layer` probe.
-    Calibrates locally, measures at all downstream layers.
+    For each cal_depth, calibrates at layer + cal_depth (0 = local).
+    Measures at all downstream layers.
 
     layer: the block/probe layer (0-indexed). Intervention modifies resid_post
            of this block. compute_prefix_activations is called with layer+1.
+    cal_depths: list of calibration depths (0 = local, 1 = +1 layer, etc.)
 
     Returns list of per-sample dicts.
     """
+    if cal_depths is None:
+        cal_depths = [0]
     layer_intervene = layer + 1  # compute_prefix_activations convention
     # Downstream layers captured by forward pass through remaining blocks
     downstream_layers = list(range(layer + 1, 8))
@@ -361,6 +365,13 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
     measurement_layers = [layer] + downstream_layers
     rng = random.Random(seed)
     samples = []
+
+    # Validate cal_depths: can't calibrate beyond layer 7
+    valid_cal_depths = [d for d in cal_depths if layer + d <= 7]
+    if len(valid_cal_depths) < len(cal_depths):
+        skipped = [d for d in cal_depths if layer + d > 7]
+        print(f"  Skipping cal_depth {skipped} (would exceed layer 7)")
+    cal_depths = valid_cal_depths
 
     for gi in tqdm(range(n_games), desc="Games"):
         game_str = board_seqs_string[gi]
@@ -401,7 +412,7 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
                 "game_idx": gi, "pos": pos, "color": int(color),
                 "board_state": board_flat,
                 "modifications": [(r, c, int(o), int(t)) for r, c, o, t in mods],
-                "condition": "none", "scale": 0.0,
+                "condition": "none", "cal_depth": -1, "scale": 0.0,
                 "n_original_legal": len(original_legal),
                 "n_cf_legal": len(cf_legal),
             }
@@ -415,44 +426,58 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
             sample_base.update(logit_m)
             samples.append(sample_base)
 
-            # --- Intervention with local calibration ---
-            native_probe = probes[(layer, parity)]
-            h = prefix_acts[0, pos].detach()
-
-            per_cell_scales = compute_per_cell_scales_local(
-                h, native_probe, direction_probe, mods, mode
-            )
-
+            # --- Intervention at each cal_depth ---
             flip_dirs = compute_flip_dirs_from_direction_probe(
                 direction_probe, mods, mode)
-            intv_logits, intv_resids = forward_multi_capture(
-                model, prefix_acts, flip_dirs, per_cell_scales,
-                pos, layer_intervene, downstream_layers,
-                native_layer=layer
-            )
 
-            sample = {
-                "game_idx": gi, "pos": pos, "color": int(color),
-                "board_state": board_flat,
-                "modifications": [(r, c, int(o), int(t))
-                                  for r, c, o, t in mods],
-                "condition": "intervention",
-                "scale": per_cell_scales[0],  # N=1
-                "n_original_legal": len(original_legal),
-                "n_cf_legal": len(cf_legal),
-            }
+            for cal_depth in cal_depths:
+                cal_layer = layer + cal_depth
 
-            for ml in measurement_layers:
-                probe = probes[(ml, parity)]
-                sample[f"probe_acc_L{ml}"] = measure_probe_acc(
-                    intv_resids[ml], probe, mods)
-                sample[f"crosstalk_L{ml}"] = measure_crosstalk(
-                    clean_resids[ml], intv_resids[ml], probe, mods)
+                if cal_depth == 0:
+                    # Local calibration
+                    native_probe = probes[(layer, parity)]
+                    h = prefix_acts[0, pos].detach()
+                    per_cell_scales = compute_per_cell_scales_local(
+                        h, native_probe, direction_probe, mods, mode
+                    )
+                else:
+                    # Downstream calibration
+                    target_probe = probes[(cal_layer, parity)]
+                    per_cell_scales = compute_per_cell_scales_downstream(
+                        model, prefix_acts, direction_probe, target_probe,
+                        mods, pos, layer_intervene, cal_layer, mode
+                    )
 
-            logit_m = measure_logit_metrics(clean_logits, intv_logits,
-                                            original_legal, cf_legal)
-            sample.update(logit_m)
-            samples.append(sample)
+                intv_logits, intv_resids = forward_multi_capture(
+                    model, prefix_acts, flip_dirs, per_cell_scales,
+                    pos, layer_intervene, downstream_layers,
+                    native_layer=layer
+                )
+
+                cond_name = f"cal_depth_{cal_depth}"
+                sample = {
+                    "game_idx": gi, "pos": pos, "color": int(color),
+                    "board_state": board_flat,
+                    "modifications": [(r, c, int(o), int(t))
+                                      for r, c, o, t in mods],
+                    "condition": cond_name,
+                    "cal_depth": cal_depth,
+                    "scale": per_cell_scales[0],  # N=1
+                    "n_original_legal": len(original_legal),
+                    "n_cf_legal": len(cf_legal),
+                }
+
+                for ml in measurement_layers:
+                    probe = probes[(ml, parity)]
+                    sample[f"probe_acc_L{ml}"] = measure_probe_acc(
+                        intv_resids[ml], probe, mods)
+                    sample[f"crosstalk_L{ml}"] = measure_crosstalk(
+                        clean_resids[ml], intv_resids[ml], probe, mods)
+
+                logit_m = measure_logit_metrics(clean_logits, intv_logits,
+                                                original_legal, cf_legal)
+                sample.update(logit_m)
+                samples.append(sample)
 
     return samples
 
@@ -462,8 +487,9 @@ def run_experiment(model, probes, direction_probe, board_seqs_int,
 # ---------------------------------------------------------------------------
 def aggregate_results(samples, measurement_layers):
     """Aggregate per-sample results by condition."""
+    conditions = sorted(set(s["condition"] for s in samples))
     agg = {}
-    for cond in ["none", "intervention"]:
+    for cond in conditions:
         subset = [s for s in samples if s["condition"] == cond]
         if not subset:
             continue
@@ -484,13 +510,18 @@ def aggregate_results(samples, measurement_layers):
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
-def plot_results(agg, layer, measurement_layers, output_dir):
+def plot_results(agg, layer, measurement_layers, cal_depths, output_dir):
     """Generate plots for the layer propagation experiment."""
     os.makedirs(output_dir, exist_ok=True)
 
-    conditions = ["none", "intervention"]
-    cond_labels = ["No intervention", f"Intervene @ L{layer}"]
-    colors = ["gray", "#1f77b4"]
+    # Build condition list: none + each cal_depth
+    plot_colors = ["gray", "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+    conditions = ["none"]
+    cond_labels = ["No intervention"]
+    for d in sorted(cal_depths):
+        conditions.append(f"cal_depth_{d}")
+        cal_layer = layer + d
+        cond_labels.append(f"Cal depth {d} (→L{cal_layer})")
 
     # 1. Probe accuracy across layers
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -500,7 +531,8 @@ def plot_results(agg, layer, measurement_layers, output_dir):
         vals = [agg[ct].get(f"probe_acc_L{l}", 0) for l in measurement_layers]
         stds = [agg[ct].get(f"probe_acc_L{l}_std", 0) for l in measurement_layers]
         ax.errorbar(measurement_layers, vals, yerr=stds, fmt="o-",
-                    color=colors[i], label=label, capsize=4, linewidth=2)
+                    color=plot_colors[i % len(plot_colors)],
+                    label=label, capsize=4, linewidth=2)
     ax.set_xlabel("Measurement Layer")
     ax.set_ylabel("Probe Accuracy (modified cell)")
     ax.set_title(f"Probe Accuracy: Intervene at Layer {layer}")
@@ -515,14 +547,14 @@ def plot_results(agg, layer, measurement_layers, output_dir):
 
     # 2. Crosstalk across layers
     fig, ax = plt.subplots(figsize=(8, 5))
-    if "intervention" in agg:
-        vals = [agg["intervention"].get(f"crosstalk_L{l}", 0)
-                for l in measurement_layers]
-        stds = [agg["intervention"].get(f"crosstalk_L{l}_std", 0)
-                for l in measurement_layers]
+    for i, (ct, label) in enumerate(zip(conditions, cond_labels)):
+        if ct == "none" or ct not in agg:
+            continue
+        vals = [agg[ct].get(f"crosstalk_L{l}", 0) for l in measurement_layers]
+        stds = [agg[ct].get(f"crosstalk_L{l}_std", 0) for l in measurement_layers]
         ax.errorbar(measurement_layers, vals, yerr=stds, fmt="o-",
-                    color="#1f77b4", label=f"Intervene @ L{layer}",
-                    capsize=4, linewidth=2)
+                    color=plot_colors[i % len(plot_colors)],
+                    label=label, capsize=4, linewidth=2)
     ax.set_xlabel("Measurement Layer")
     ax.set_ylabel("Crosstalk (mean abs logit change, non-modified cells)")
     ax.set_title(f"Crosstalk: Intervene at Layer {layer}")
@@ -534,18 +566,20 @@ def plot_results(agg, layer, measurement_layers, output_dir):
     print(f"  Saved crosstalk.png")
     plt.close()
 
-    # 3. Scale distribution (histogram)
-    intv_samples = [s for s in agg.get("intervention", {}).items()
-                    if s[0] == "scale"]
-    if "intervention" in agg:
+    # 3. Scale comparison across cal_depths
+    intv_conds = [c for c in conditions if c != "none" and c in agg]
+    if intv_conds:
         fig, ax = plt.subplots(figsize=(6, 4))
-        scale_mean = agg["intervention"].get("scale", 0)
-        scale_std = agg["intervention"].get("scale_std", 0)
-        ax.bar(0, scale_mean, yerr=scale_std, color="#1f77b4",
+        x_pos = range(len(intv_conds))
+        means = [agg[c].get("scale", 0) for c in intv_conds]
+        stds = [agg[c].get("scale_std", 0) for c in intv_conds]
+        labels = [f"depth {c.split('_')[-1]}" for c in intv_conds]
+        ax.bar(x_pos, means, yerr=stds, color=plot_colors[1:len(intv_conds)+1],
                capsize=4, width=0.5)
         ax.set_ylabel("Per-Cell Scale")
-        ax.set_title(f"Intervention Scale (Layer {layer})")
-        ax.set_xticks([])
+        ax.set_title(f"Intervention Scale by Cal Depth (Layer {layer})")
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(labels)
         ax.grid(True, alpha=0.3, axis="y")
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, "scale_distribution.png"), dpi=150)
@@ -565,6 +599,9 @@ def main():
     parser.add_argument("--ckpt", default="ckpts/gpt_synthetic.ckpt")
     parser.add_argument("--probe-dir", required=True,
                         help="Directory with othello_layer{0-8}.pt files")
+    parser.add_argument("--cal-depths", type=str, default="0",
+                        help="Comma-separated calibration depths "
+                             "(0=local, 1=+1 layer downstream, etc.)")
     parser.add_argument("--n-games", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="layer_propagation_results")
@@ -572,6 +609,7 @@ def main():
     args = parser.parse_args()
 
     layer = args.layer
+    cal_depths = [int(x) for x in args.cal_depths.split(",")]
     measurement_layers = list(range(layer, 8))
     device = args.device
 
@@ -604,6 +642,7 @@ def main():
     direction_probe = build_direction_probe(probes, layer=layer, device=device)
     print(f"  Direction probe from layer {layer}, shape: {direction_probe.shape}")
     print(f"  Measurement layers: {measurement_layers}")
+    print(f"  Calibration depths: {cal_depths}")
 
     # Run experiment
     print(f"\nRunning experiment: {args.n_games} games, "
@@ -611,12 +650,12 @@ def main():
     samples = run_experiment(
         model, probes, direction_probe,
         board_seqs_int, board_seqs_string,
-        layer=layer,
+        layer=layer, cal_depths=cal_depths,
         n_games=args.n_games, seed=args.seed, device=device,
     )
 
     # Save raw samples
-    output_dir = os.path.join(parent_dir, args.output_dir)
+    output_dir = args.output_dir
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\nSaving {len(samples)} samples to {output_dir}/")
@@ -628,6 +667,7 @@ def main():
     agg = aggregate_results(samples, measurement_layers)
     config = {
         "layer": layer,
+        "cal_depths": cal_depths,
         "measurement_layers": measurement_layers,
         "n_games": args.n_games,
         "seed": args.seed,
@@ -639,11 +679,14 @@ def main():
 
     # Print summary
     print("\n=== Summary ===")
-    for cond in ["none", "intervention"]:
-        if cond not in agg:
-            continue
+    for cond in sorted(agg.keys()):
         entry = agg[cond]
-        label = "No intervention" if cond == "none" else f"Intervene @ L{layer}"
+        if cond == "none":
+            label = "No intervention"
+        else:
+            d = cond.split("_")[-1]
+            cal_layer = layer + int(d)
+            label = f"Cal depth {d} (→L{cal_layer})"
         accs = "  ".join(f"L{l}={entry.get(f'probe_acc_L{l}', 0):.3f}"
                          for l in measurement_layers)
         xtalks = "  ".join(f"L{l}={entry.get(f'crosstalk_L{l}', 0):.3f}"
@@ -664,7 +707,7 @@ def main():
 
     # Plot
     print("\nGenerating plots...")
-    plot_results(agg, layer, measurement_layers, output_dir)
+    plot_results(agg, layer, measurement_layers, cal_depths, output_dir)
     print("Done.")
 
 
