@@ -19,7 +19,7 @@ CAL_DEPTH=${CAL_DEPTH:-0}
 
 python multi_intervention.py \
     --probe-path main_linear_probe.pth \
-    --n-games 200 \
+    --n-games 1000 \
     --calibrate \
     --per-cell-scale \
     --cal-depth ${CAL_DEPTH} \
