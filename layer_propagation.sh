@@ -8,17 +8,20 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=nklab,burst
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
+#SBATCH --array=4-6
 
 echo "Started at: $(date)"
+echo "Layer: ${SLURM_ARRAY_TASK_ID}"
 
 source activate othello
 
 cd mechanistic_interpretability
 
 python layer_propagation.py \
+    --layer ${SLURM_ARRAY_TASK_ID} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
     --n-games 200 \
-    --output-dir ../experiments/layer_propagation \
+    --output-dir ../experiments/layer_propagation/L${SLURM_ARRAY_TASK_ID} \
     --seed 42
 
 echo "Finished at: $(date)"

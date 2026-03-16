@@ -404,9 +404,10 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     Uses mingpt: manually split forward pass at layer_intervene,
     apply intervention, continue forward, capture activations at layer_probe.
 
-    If per_cell_calibrate=True and direction_probe/downstream_probes are
-    provided, use downstream calibration (binary search through forward pass
-    to probe layer). Otherwise fall back to local calibration.
+    When per_cell_calibrate=True with direction_probe and downstream_probes:
+      - Uses LOCAL calibration at the intervention layer (layer_intervene - 1)
+      - Direction probe should be built from the native layer's probe
+      - downstream_probes provides the nn.Linear probe for calibration
 
     direction_probe: (2, 512, 8, 8, 3) tensor for even/odd flip directions
     downstream_probes: dict mapping (layer, parity_str) -> nn.Linear
@@ -421,21 +422,23 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     per_cell_scales = None
     if per_cell_calibrate:
         if direction_probe is not None and downstream_probes is not None:
-            # Downstream calibration: binary search through forward pass
+            # Local calibration at the intervention layer using native probe
             pm = 0 if pos % 2 == 0 else 1
             parity_str = "even" if pm == 0 else "odd"
-            target_probe = downstream_probes[(layer_probe, parity_str)]
-            from layer_propagation import compute_per_cell_scales_downstream, compute_flip_dirs_from_direction_probe
-            per_cell_scales = compute_per_cell_scales_downstream(
-                model, x, direction_probe, target_probe,
-                modifications, pos, layer_intervene, layer_probe, pm
+            native_layer = layer_intervene - 1  # resid_post of this block
+            native_probe = downstream_probes[(native_layer, parity_str)]
+            from layer_propagation import compute_per_cell_scales_local, compute_flip_dirs_from_direction_probe
+            h = x[0, pos].detach()
+            per_cell_scales = compute_per_cell_scales_local(
+                h, native_probe, direction_probe,
+                modifications, pm
             )
             # Use direction probe for flip dirs (parity-aware)
             flip_dirs = compute_flip_dirs_from_direction_probe(
                 direction_probe, modifications, pm
             )
         else:
-            # Legacy: local calibration at intervention layer
+            # Legacy: local calibration at intervention layer using Nanda probe
             h = x[0, pos].detach().clone()
             per_cell_scales = compute_per_cell_scales(
                 h, linear_probe, modifications, mode
@@ -448,48 +451,45 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     x = apply_intervention(x, flip_dirs, pos, scale,
                            per_cell_scales=per_cell_scales)
 
-    # Continue through remaining layers, capture at layer_probe
-    resid_at_probe = None
-    for i, block in enumerate(model.blocks[layer_intervene:], start=layer_intervene):
-        x = block(x)
-        if i == layer_probe - 1:
-            # Capture after this block (= resid_post for layer_probe)
-            # layer_probe is 0-indexed: block i produces resid_post layer i
-            resid_at_probe = x[0, pos].detach().clone()
+    # Capture resid at the intervention point (before any blocks run)
+    # This is where the native probe should read ~100%
+    resid_at_native = x[0, pos].detach().clone()
 
-    # If layer_probe is the last layer or beyond what we captured
-    if resid_at_probe is None:
-        resid_at_probe = x[0, pos].detach().clone()
+    # Continue through remaining layers to get logits
+    for block in model.blocks[layer_intervene:]:
+        x = block(x)
 
     # Final layernorm + head
     x = model.ln_f(x)
     logits = model.head(x)  # (B, T, vocab)
 
-    return logits[0, pos], resid_at_probe
+    return logits[0, pos], resid_at_native
 
 
-def _forward_with_resid(model, input_tokens, pos, layer_probe):
-    """Forward pass through mingpt, returning logits and residual at layer_probe.
+def _forward_with_resid(model, input_tokens, pos, native_layer):
+    """Forward pass through mingpt, returning logits and residual.
 
-    Returns (logits_at_pos, resid_at_probe_layer).
+    Captures resid_post of block native_layer (= the activation at the
+    intervention point). The "layer N probe" is trained on resid_post of
+    block N, so native_layer = layer_intervene - 1.
+
+    Returns (logits_at_pos, resid_at_native_layer).
     """
     b, t = input_tokens.size()
     token_emb = model.tok_emb(input_tokens)
     pos_emb = model.pos_emb[:, :t, :]
     x = model.drop(token_emb + pos_emb)
 
-    resid_at_probe = None
+    resid = None
     for i, block in enumerate(model.blocks):
         x = block(x)
-        if i == layer_probe - 1:
-            resid_at_probe = x[0, pos].detach().clone()
-
-    if resid_at_probe is None:
-        resid_at_probe = x[0, pos].detach().clone()
+        if i == native_layer:
+            # resid_post of block native_layer
+            resid = x[0, pos].detach().clone()
 
     x = model.ln_f(x)
     logits = model.head(x)
-    return logits[0, pos], resid_at_probe
+    return logits[0, pos], resid
 
 
 # ---------------------------------------------------------------------------
@@ -1008,6 +1008,22 @@ def measure_logit_metrics(original_logits, intervened_logits,
         np.mean([m > 0 for m in margins]) if margins else None
     )
 
+    # 6. Li et al. metric: top-N accuracy
+    # N = number of legal moves in counterfactual board
+    # Compare model's top-N predictions against ground truth legal moves
+    # Error = |false positives| + |false negatives|
+    n_cf_legal = len(cf_legal_stoi)
+    if n_cf_legal > 0:
+        topn_indices = valid_logits.argsort(descending=True)[:n_cf_legal]
+        topn_cells = set(stoi_indices[i] for i in topn_indices.tolist())
+        false_positives = topn_cells - cf_legal_stoi
+        false_negatives = cf_legal_stoi - topn_cells
+        result["li_topn_errors"] = len(false_positives) + len(false_negatives)
+        result["li_topn_accuracy"] = 1.0 - result["li_topn_errors"] / (2 * n_cf_legal)
+    else:
+        result["li_topn_errors"] = None
+        result["li_topn_accuracy"] = None
+
     return result
 
 
@@ -1152,7 +1168,7 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
     results["mixed"] = {str(n): [] for n in n_values}
 
     print(f"\n=== Multi-Intervention Experiment ===")
-    print(f"Layer intervene: {layer_intervene}, Layer probe: {layer_probe}, "
+    print(f"Layer intervene: {layer_intervene}, Native layer: {layer_probe}, "
           f"Scale: {scale}")
     print(f"Games: {n_games}, N values: {n_values}")
 
@@ -1203,14 +1219,17 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     orig_logits_at_pos, intv_logits,
                     original_legal, cf_legal
                 )
-                crosstalk = measure_probe_crosstalk(
-                    orig_resid, intv_resid, linear_probe, mods
-                )
-                # Use per-layer probe if available, else Nanda probe
-                ds_probe = None
+                # Use per-layer probe if available for crosstalk + accuracy
                 if downstream_probes is not None:
                     parity_str = "even" if pos % 2 == 0 else "odd"
                     ds_probe = downstream_probes.get((layer_probe, parity_str))
+                    from layer_propagation import measure_crosstalk as measure_crosstalk_nn
+                    crosstalk = measure_crosstalk_nn(
+                        orig_resid, intv_resid, ds_probe, mods)
+                else:
+                    ds_probe = None
+                    crosstalk = measure_probe_crosstalk(
+                        orig_resid, intv_resid, linear_probe, mods)
                 probe_acc = measure_probe_accuracy(
                     intv_resid, linear_probe, mods,
                     downstream_probe=ds_probe
@@ -1252,13 +1271,16 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                     orig_logits_at_pos, intv_logits,
                     original_legal, cf_legal
                 )
-                crosstalk = measure_probe_crosstalk(
-                    orig_resid, intv_resid, linear_probe, mods
-                )
-                ds_probe = None
                 if downstream_probes is not None:
                     parity_str = "even" if pos % 2 == 0 else "odd"
                     ds_probe = downstream_probes.get((layer_probe, parity_str))
+                    from layer_propagation import measure_crosstalk as measure_crosstalk_nn
+                    crosstalk = measure_crosstalk_nn(
+                        orig_resid, intv_resid, ds_probe, mods)
+                else:
+                    ds_probe = None
+                    crosstalk = measure_probe_crosstalk(
+                        orig_resid, intv_resid, linear_probe, mods)
                 probe_acc = measure_probe_accuracy(
                     intv_resid, linear_probe, mods,
                     downstream_probe=ds_probe
@@ -1302,7 +1324,8 @@ def aggregate_results(results):
                          "top1_legal_strict", "legal_prob_mass",
                          "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                          "mean_rank_shift_illegal", "mean_rank_shift_legal",
-                         "crosstalk", "probe_acc"]:
+                         "crosstalk", "probe_acc",
+                         "li_topn_errors", "li_topn_accuracy"]:
                 vals = [s[key] for s in samples if s.get(key) is not None]
                 if vals:
                     agg[key] = float(np.mean(vals))
@@ -1325,7 +1348,8 @@ def aggregate_results(results):
                                  "top1_legal_strict", "legal_prob_mass",
                                  "mean_logprob_shift_illegal", "mean_logprob_shift_legal",
                                  "mean_rank_shift_illegal", "mean_rank_shift_legal",
-                                 "crosstalk", "probe_acc"]:
+                                 "crosstalk", "probe_acc",
+                                 "li_topn_errors", "li_topn_accuracy"]:
                         vals = [s[key] for s in comp_samples if s.get(key) is not None]
                         if vals:
                             comp_agg[key] = float(np.mean(vals))
@@ -1364,6 +1388,8 @@ def plot_results(aggregated, n_values, output_dir):
         ("legal_prob_mass", "Legal Probability Mass", "Probability"),
         ("crosstalk", "Probe Cross-talk", "Mean |change| (non-modified cells)"),
         ("probe_acc", "Probe Accuracy (Modified Cells)", "Fraction correct"),
+        ("li_topn_accuracy", "Li et al. Top-N Accuracy", "Accuracy (1 - errors/2N)"),
+        ("li_topn_errors", "Li et al. Top-N Errors (FP+FN)", "Mean errors"),
     ]
 
     for metric_key, title, ylabel in metrics_to_plot:
@@ -1476,8 +1502,9 @@ def main():
     parser.add_argument("--n-games", type=int, default=200)
     parser.add_argument("--layer-intervene", type=int, default=None,
                         help="Intervention layer (default: calibrate)")
-    parser.add_argument("--layer-probe", type=int, default=6,
-                        help="Probe layer (default: 6)")
+    parser.add_argument("--layer-probe", type=int, default=None,
+                        help="Probe layer (default: layer-intervene - 1, i.e. native). "
+                             "Deprecated: now auto-derived from --layer-intervene.")
     parser.add_argument("--scale", type=float, default=None,
                         help="Intervention scale (default: calibrate)")
     parser.add_argument("--calibrate", action="store_true",
@@ -1491,8 +1518,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     # MLP baseline
     parser.add_argument("--per-cell-scale", action="store_true",
-                        help="Use per-cell calibrated scales via downstream "
-                             "binary search (ensures probe flips at probe layer)")
+                        help="Use per-cell calibrated scales via local "
+                             "binary search (ensures native probe flips at intervention point)")
     parser.add_argument("--probe-dir", type=str, default=None,
                         help="Directory with per-layer probe checkpoints "
                              "(required for --per-cell-scale)")
@@ -1639,23 +1666,24 @@ def main():
     if args.scale is not None:
         scale = args.scale
 
-    # Load per-layer probes for downstream calibration
+    # Load per-layer probes for local calibration using native probe
     direction_probe_tensor = None
     downstream_probes = None
+    native_layer = layer_intervene - 1  # resid_post of this block
     if args.per_cell_scale:
         if args.probe_dir is None:
             parser.error("--probe-dir is required when using --per-cell-scale")
         from layer_propagation import load_probes, build_direction_probe
         downstream_probes = load_probes(args.probe_dir, args.device)
         direction_probe_tensor = build_direction_probe(
-            downstream_probes, layer=args.layer_probe, device=args.device)
-        print(f"Loaded per-layer probes for downstream calibration "
-              f"(direction + target: L{args.layer_probe})")
+            downstream_probes, layer=native_layer, device=args.device)
+        print(f"Loaded per-layer probes for local calibration "
+              f"(native layer: L{native_layer})")
 
     # Run experiment
     raw_results = run_experiment(
         model, linear_probe, board_seqs_int, board_seqs_string,
-        layer_intervene, args.layer_probe, scale,
+        layer_intervene, native_layer, scale,
         n_games=args.n_games, n_values=n_values,
         seed=args.seed, device=args.device,
         per_cell_calibrate=args.per_cell_scale,
@@ -1671,7 +1699,7 @@ def main():
         "config": {
             "n_games": args.n_games,
             "layer_intervene": layer_intervene,
-            "layer_probe": args.layer_probe,
+            "native_layer": native_layer,
             "scale": scale,
             "n_values": n_values,
             "seed": args.seed,
@@ -1725,11 +1753,16 @@ def main():
             rk_le_s = f"{rk_le:+.1f}" if rk_le is not None else "N/A"
             ct_s = f"{ct:.4f}" if ct is not None else "N/A"
             pa_s = f"{pa:.3f}" if pa is not None else "N/A"
+            li_acc = data.get("li_topn_accuracy")
+            li_err = data.get("li_topn_errors")
+            li_acc_s = f"{li_acc:.3f}" if li_acc is not None else "N/A"
+            li_err_s = f"{li_err:.2f}" if li_err is not None else "N/A"
             print(f"  N={n}: margin={bm_s}  margin_frac={bmf_s}  "
                   f"top1s={t1s_s}  mass={lpm_s}  "
                   f"lp_il/le={lp_il_s}/{lp_le_s}  "
                   f"rank_il/le={rk_il_s}/{rk_le_s}  "
-                  f"xtalk={ct_s}  probe={pa_s}  (n={ns})")
+                  f"xtalk={ct_s}  probe={pa_s}  "
+                  f"li_acc={li_acc_s}  li_err={li_err_s}  (n={ns})")
 
     # Plot
     print("\nGenerating plots...")
