@@ -20,6 +20,8 @@ python multi_intervention.py \
     --n-games 200 \
     --calibrate \
     --per-cell-scale \
+    --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
+    --n-values 1,2,3 \
     --output-dir ../experiments/multi_intervention \
     --seed 42
 

@@ -21,6 +21,7 @@ python multi_intervention.py \
     --n-games 200 \
     --calibrate \
     --per-cell-scale \
+    --n-values 1,2,3 \
     --output-dir ../experiments/multi_intervention_mlp \
     --seed 42
 
