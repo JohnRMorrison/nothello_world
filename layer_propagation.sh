@@ -21,7 +21,7 @@ python layer_propagation.py \
     --layer ${SLURM_ARRAY_TASK_ID} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
     --cal-depths 0,1,2 \
-    --n-games 200 \
+    --n-games 1000 \
     --output-dir ../experiments/layer_propagation/L${SLURM_ARRAY_TASK_ID} \
     --seed 42
 
