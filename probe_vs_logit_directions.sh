@@ -11,7 +11,7 @@
 
 echo "Started at: $(date)"
 
-source activate othello
+source activate othello 2>/dev/null || conda activate othello
 
 cd mechanistic_interpretability
 
