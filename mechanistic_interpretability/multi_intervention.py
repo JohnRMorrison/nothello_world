@@ -1033,8 +1033,25 @@ def measure_probe_crosstalk(original_resid, intervened_resid, linear_probe,
 
 
 def measure_probe_accuracy(intervened_resid, linear_probe, modifications,
-                           mode=PROBE_MODE):
-    """Fraction of modified cells whose probe argmax matches target state."""
+                           mode=PROBE_MODE, downstream_probe=None):
+    """Fraction of modified cells whose probe argmax matches target state.
+
+    If downstream_probe (nn.Linear) is provided, use it instead of the
+    Nanda probe (linear_probe). This ensures we measure with the same
+    probe used for calibration.
+    """
+    if downstream_probe is not None:
+        with torch.no_grad():
+            logits = downstream_probe(intervened_resid).view(64, 3)
+        correct = 0
+        for (r, c, orig_val, target_val) in modifications:
+            cell = r * 8 + c
+            target_class = board_val_to_probe_class(target_val)
+            predicted_class = logits[cell].argmax().item()
+            if predicted_class == target_class:
+                correct += 1
+        return correct / len(modifications)
+
     probe_out = torch.einsum("d, d r c o -> r c o", intervened_resid,
                              linear_probe[mode])
 
@@ -1189,8 +1206,14 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 crosstalk = measure_probe_crosstalk(
                     orig_resid, intv_resid, linear_probe, mods
                 )
+                # Use per-layer probe if available, else Nanda probe
+                ds_probe = None
+                if downstream_probes is not None:
+                    parity_str = "even" if pos % 2 == 0 else "odd"
+                    ds_probe = downstream_probes.get((layer_probe, parity_str))
                 probe_acc = measure_probe_accuracy(
-                    intv_resid, linear_probe, mods
+                    intv_resid, linear_probe, mods,
+                    downstream_probe=ds_probe
                 )
 
                 sample = {
@@ -1232,8 +1255,13 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 crosstalk = measure_probe_crosstalk(
                     orig_resid, intv_resid, linear_probe, mods
                 )
+                ds_probe = None
+                if downstream_probes is not None:
+                    parity_str = "even" if pos % 2 == 0 else "odd"
+                    ds_probe = downstream_probes.get((layer_probe, parity_str))
                 probe_acc = measure_probe_accuracy(
-                    intv_resid, linear_probe, mods
+                    intv_resid, linear_probe, mods,
+                    downstream_probe=ds_probe
                 )
 
                 sample = {
