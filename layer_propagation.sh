@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=layer_prop
-#SBATCH --output=logs/layer_prop_%j.out
-#SBATCH --error=logs/layer_prop_%j.err
-#SBATCH --time=2:00:00
+#SBATCH --output=logs/layer_prop_%A_%a.out
+#SBATCH --error=logs/layer_prop_%A_%a.err
+#SBATCH --time=6:00:00
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
@@ -20,6 +20,7 @@ cd mechanistic_interpretability
 python layer_propagation.py \
     --layer ${SLURM_ARRAY_TASK_ID} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
+    --cal-depths 0,1,2 \
     --n-games 200 \
     --output-dir ../experiments/layer_propagation/L${SLURM_ARRAY_TASK_ID} \
     --seed 42
