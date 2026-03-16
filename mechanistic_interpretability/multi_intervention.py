@@ -398,19 +398,22 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
                           mode=PROBE_MODE, device="cuda",
                           per_cell_calibrate=False,
                           prefix_acts=None,
-                          direction_probe=None, downstream_probes=None):
+                          direction_probe=None, downstream_probes=None,
+                          cal_depth=0):
     """Run model with intervention, return (logits_at_pos, resid_at_probe_layer).
 
     Uses mingpt: manually split forward pass at layer_intervene,
     apply intervention, continue forward, capture activations at layer_probe.
 
     When per_cell_calibrate=True with direction_probe and downstream_probes:
-      - Uses LOCAL calibration at the intervention layer (layer_intervene - 1)
+      - cal_depth=0: LOCAL calibration at the intervention layer
+      - cal_depth>0: calibrate at intervention_layer + cal_depth downstream
       - Direction probe should be built from the native layer's probe
-      - downstream_probes provides the nn.Linear probe for calibration
+      - downstream_probes provides nn.Linear probes for calibration
 
     direction_probe: (2, 512, 8, 8, 3) tensor for even/odd flip directions
     downstream_probes: dict mapping (layer, parity_str) -> nn.Linear
+    cal_depth: 0 = local, 1 = +1 layer downstream, 2 = +2 layers, etc.
     """
     # Use cached prefix or compute from scratch
     if prefix_acts is not None:
@@ -422,17 +425,31 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
     per_cell_scales = None
     if per_cell_calibrate:
         if direction_probe is not None and downstream_probes is not None:
-            # Local calibration at the intervention layer using native probe
             pm = 0 if pos % 2 == 0 else 1
             parity_str = "even" if pm == 0 else "odd"
             native_layer = layer_intervene - 1  # resid_post of this block
-            native_probe = downstream_probes[(native_layer, parity_str)]
-            from layer_propagation import compute_per_cell_scales_local, compute_flip_dirs_from_direction_probe
-            h = x[0, pos].detach()
-            per_cell_scales = compute_per_cell_scales_local(
-                h, native_probe, direction_probe,
-                modifications, pm
-            )
+            from layer_propagation import (compute_per_cell_scales_local,
+                                           compute_per_cell_scales_downstream,
+                                           compute_flip_dirs_from_direction_probe)
+
+            if cal_depth == 0:
+                # Local calibration at the intervention layer using native probe
+                native_probe = downstream_probes[(native_layer, parity_str)]
+                h = x[0, pos].detach()
+                per_cell_scales = compute_per_cell_scales_local(
+                    h, native_probe, direction_probe,
+                    modifications, pm
+                )
+            else:
+                # Downstream calibration
+                cal_layer = native_layer + cal_depth
+                cal_layer = min(cal_layer, 7)  # clamp to max layer
+                target_probe = downstream_probes[(cal_layer, parity_str)]
+                per_cell_scales = compute_per_cell_scales_downstream(
+                    model, x, direction_probe, target_probe,
+                    modifications, pos, layer_intervene, cal_layer, pm
+                )
+
             # Use direction probe for flip dirs (parity-aware)
             flip_dirs = compute_flip_dirs_from_direction_probe(
                 direction_probe, modifications, pm
@@ -1155,7 +1172,8 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                    layer_intervene, layer_probe, scale,
                    n_games=200, n_values=None, seed=42, device="cuda",
                    per_cell_calibrate=False,
-                   direction_probe=None, downstream_probes=None):
+                   direction_probe=None, downstream_probes=None,
+                   cal_depth=0):
     """Run the full multi-intervention experiment."""
     if n_values is None:
         n_values = N_VALUES
@@ -1213,6 +1231,7 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         prefix_acts=prefix_acts,
                         direction_probe=direction_probe,
                         downstream_probes=downstream_probes,
+                        cal_depth=cal_depth,
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1265,6 +1284,7 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                         prefix_acts=prefix_acts,
                         direction_probe=direction_probe,
                         downstream_probes=downstream_probes,
+                        cal_depth=cal_depth,
                     )
 
                 logit_metrics = measure_logit_metrics(
@@ -1520,6 +1540,9 @@ def main():
     parser.add_argument("--per-cell-scale", action="store_true",
                         help="Use per-cell calibrated scales via local "
                              "binary search (ensures native probe flips at intervention point)")
+    parser.add_argument("--cal-depth", type=int, default=0,
+                        help="Calibration depth: 0=local (native probe), "
+                             "1=+1 layer downstream, 2=+2 layers, etc.")
     parser.add_argument("--probe-dir", type=str, default=None,
                         help="Directory with per-layer probe checkpoints "
                              "(required for --per-cell-scale)")
@@ -1681,6 +1704,7 @@ def main():
               f"(native layer: L{native_layer})")
 
     # Run experiment
+    cal_depth = args.cal_depth
     raw_results = run_experiment(
         model, linear_probe, board_seqs_int, board_seqs_string,
         layer_intervene, native_layer, scale,
@@ -1689,6 +1713,7 @@ def main():
         per_cell_calibrate=args.per_cell_scale,
         direction_probe=direction_probe_tensor,
         downstream_probes=downstream_probes,
+        cal_depth=cal_depth,
     )
 
     # Aggregate
@@ -1701,6 +1726,7 @@ def main():
             "layer_intervene": layer_intervene,
             "native_layer": native_layer,
             "scale": scale,
+            "cal_depth": cal_depth,
             "n_values": n_values,
             "seed": args.seed,
         },

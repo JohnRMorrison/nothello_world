@@ -15,14 +15,17 @@ source activate othello
 
 cd mechanistic_interpretability
 
+CAL_DEPTH=${CAL_DEPTH:-0}
+
 python multi_intervention.py \
     --probe-path main_linear_probe.pth \
     --n-games 200 \
     --calibrate \
     --per-cell-scale \
+    --cal-depth ${CAL_DEPTH} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
     --n-values 1,2,3 \
-    --output-dir ../experiments/multi_intervention \
+    --output-dir ../experiments/multi_intervention_cd${CAL_DEPTH} \
     --seed 42
 
 echo "Finished at: $(date)"
