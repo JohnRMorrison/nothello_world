@@ -468,13 +468,6 @@ class VariantBoard:
 
     def get_valid_moves(self):
         """Return list of legal moves for current player (vectorized)."""
-        # delayed_flips: apply pending flips so legality is computed on correct state
-        if self.variant == "delayed_flips" and self.pending_flips:
-            for fr, fc in self.pending_flips:
-                if self.state[fr, fc] != 0:
-                    self.state[fr, fc] *= -1
-            self.pending_flips = []
-
         color = self.next_hand_color
         flat = self.state.ravel()
         empty = (flat == 0)
@@ -570,7 +563,12 @@ class VariantBoard:
         r, c = move // 8, move % 8
         color = self.next_hand_color
 
-        # delayed_flips: pending flips already applied in get_valid_moves()
+        # delayed_flips: apply pending flips from opponent's last move
+        if self.variant == "delayed_flips" and self.pending_flips:
+            for fr, fc in self.pending_flips:
+                if self.state[fr, fc] != 0:
+                    self.state[fr, fc] *= -1
+            self.pending_flips = []
 
         # Find flips for current move (variant-specific)
         if self.variant == "skip_empty_flips":
