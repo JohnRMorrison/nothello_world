@@ -13,6 +13,7 @@ Variants:
   9. skip_empty_flips   - Rays skip empty squares when checking for flanking
  10. capture_any        - Adjacent to any opponent piece is legal (flips if bracket)
  11. wrap_flips         - Flanking rays wrap around board edges (torus topology)
+ 12. swapped_colors     - Starting pieces have swapped colors (control variant)
 
 Usage:
   python generate_variant_games.py --variant no_diagonal_flips --num-games 100000 \
@@ -436,10 +437,16 @@ class VariantBoard:
 
     def __init__(self, variant="normal"):
         self.state = np.zeros((8, 8), dtype=np.int8)
-        self.state[3, 4] = 1    # black
-        self.state[3, 3] = -1   # white
-        self.state[4, 3] = 1    # black
-        self.state[4, 4] = -1   # white
+        if variant == "swapped_colors":
+            self.state[3, 4] = -1   # white (swapped)
+            self.state[3, 3] = 1    # black (swapped)
+            self.state[4, 3] = -1   # white (swapped)
+            self.state[4, 4] = 1    # black (swapped)
+        else:
+            self.state[3, 4] = 1    # black
+            self.state[3, 3] = -1   # white
+            self.state[4, 3] = 1    # black
+            self.state[4, 4] = -1   # white
         self.next_hand_color = 1  # black first
         self.history = []
         self.variant = variant
@@ -649,7 +656,7 @@ def main():
                                  "max_three_flips", "self_flanking",
                                  "delayed_flips", "adjacent_legal",
                                  "skip_empty_flips", "capture_any",
-                                 "wrap_flips"])
+                                 "wrap_flips", "swapped_colors"])
     parser.add_argument("--num-games", type=int, default=100000)
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--seed", type=int, default=42)
