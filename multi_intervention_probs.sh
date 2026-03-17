@@ -15,15 +15,19 @@ source activate othello
 
 cd mechanistic_interpretability
 
+LAYER=${LAYER:-5}
+CAL_DEPTH=${CAL_DEPTH:-2}
+
 python multi_intervention.py \
     --probe-path main_linear_probe.pth \
     --n-games 200 \
     --calibrate \
     --per-cell-scale \
-    --cal-depth 2 \
+    --layer-intervene ${LAYER} \
+    --cal-depth ${CAL_DEPTH} \
     --probe-dir ../experiments/mathematical_transformation_experiments/heuristic_probe_results/probe_directions/probe_checkpoints \
     --n-values 1,2,3 \
-    --output-dir ../experiments/multi_intervention_probs \
+    --output-dir ../experiments/multi_intervention_probs_L${LAYER}_cd${CAL_DEPTH} \
     --save-probs \
     --seed 42
 
