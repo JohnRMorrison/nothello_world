@@ -393,6 +393,87 @@ def compute_prefix_activations(model, input_tokens, layer_intervene):
     return x
 
 
+def run_with_cascade_intervention(model, input_tokens, modifications,
+                                  pos, start_layer, downstream_probes,
+                                  device="cuda", prefix_acts=None):
+    """Run model with cascading interventions at every layer from start_layer.
+
+    At each layer L (from start_layer to 7):
+      1. Build direction tensor from layer L's probe
+      2. Calibrate per-cell scales locally (layer L's probe)
+      3. Apply intervention to residual stream
+      4. Pass through block L
+
+    This follows Li et al.'s approach of intervening at every layer.
+
+    Returns (logits_at_pos, resid_at_start_layer).
+    """
+    from layer_propagation import (convert_probe_to_direction_tensor,
+                                   compute_per_cell_scales_local,
+                                   compute_flip_dirs_from_direction_probe)
+
+    pm = 0 if pos % 2 == 0 else 1
+    parity_str = "even" if pm == 0 else "odd"
+
+    # Use cached prefix or compute from scratch
+    if prefix_acts is not None:
+        x = prefix_acts.clone()
+    else:
+        x = compute_prefix_activations(model, input_tokens, start_layer)
+
+    resid_at_start = None
+
+    # Cascade: intervene at each layer from start_layer to 7
+    for layer_idx in range(start_layer, len(model.blocks)):
+        native_layer = layer_idx  # resid_post of previous block = input to this block
+        # layer_idx is the block index; native_layer for probe = layer_idx
+        # But the probe at "layer L" reads resid_post of block L-1,
+        # which is the current x before passing through block layer_idx.
+        # The probe naming: layer 4 probe reads resid_post of block 3.
+        # So when we're about to run block layer_idx, x is resid_post of
+        # block (layer_idx - 1), which is what layer layer_idx probe reads.
+
+        probe_key = (layer_idx, parity_str)
+        if probe_key not in downstream_probes:
+            # No probe for this layer, just run the block
+            x = model.blocks[layer_idx](x)
+            continue
+
+        probe = downstream_probes[probe_key]
+        direction_tensor = convert_probe_to_direction_tensor(probe, device)
+        # Stack into (2, 512, 8, 8, 3) with same tensor for both parities
+        # (we only use the correct parity via pm)
+        dir_probe = torch.zeros(2, 512, 8, 8, 3, device=device)
+        dir_probe[pm] = direction_tensor
+
+        # Local calibration at this layer
+        h = x[0, pos].detach()
+        per_cell_scales = compute_per_cell_scales_local(
+            h, probe, dir_probe, modifications, pm
+        )
+
+        # Compute flip directions from this layer's probe
+        flip_dirs = compute_flip_dirs_from_direction_probe(
+            dir_probe, modifications, pm
+        )
+
+        # Apply intervention
+        x = apply_intervention(x, flip_dirs, pos, scale=1.0,
+                               per_cell_scales=per_cell_scales)
+
+        if resid_at_start is None:
+            resid_at_start = x[0, pos].detach().clone()
+
+        # Pass through this block
+        x = model.blocks[layer_idx](x)
+
+    # Final layernorm + head
+    x = model.ln_f(x)
+    logits = model.head(x)
+
+    return logits[0, pos], resid_at_start
+
+
 def run_with_intervention(model, input_tokens, modifications, linear_probe,
                           pos, scale, layer_intervene, layer_probe,
                           mode=PROBE_MODE, device="cuda",
@@ -1192,7 +1273,7 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                    n_games=200, n_values=None, seed=42, device="cuda",
                    per_cell_calibrate=False,
                    direction_probe=None, downstream_probes=None,
-                   cal_depth=0, save_probs=False):
+                   cal_depth=0, save_probs=False, cascade=False):
     """Run the full multi-intervention experiment."""
     if n_values is None:
         n_values = N_VALUES
@@ -1205,8 +1286,11 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
     results["mixed"] = {str(n): [] for n in n_values}
 
     print(f"\n=== Multi-Intervention Experiment ===")
-    print(f"Layer intervene: {layer_intervene}, Native layer: {layer_probe}, "
-          f"Scale: {scale}")
+    if cascade:
+        print(f"CASCADE mode: intervene at every layer from {layer_intervene} to 7")
+    else:
+        print(f"Layer intervene: {layer_intervene}, Native layer: {layer_probe}, "
+              f"Scale: {scale}")
     print(f"Games: {n_games}, N values: {n_values}")
 
     for gi in tqdm(range(n_games), desc="Games"):
@@ -1242,16 +1326,23 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 )
 
                 with torch.no_grad():
-                    intv_logits, intv_resid = run_with_intervention(
-                        model, input_tokens, mods, linear_probe,
-                        pos, scale, layer_intervene, layer_probe,
-                        device=device,
-                        per_cell_calibrate=per_cell_calibrate,
-                        prefix_acts=prefix_acts,
-                        direction_probe=direction_probe,
-                        downstream_probes=downstream_probes,
-                        cal_depth=cal_depth,
-                    )
+                    if cascade:
+                        intv_logits, intv_resid = run_with_cascade_intervention(
+                            model, input_tokens, mods,
+                            pos, layer_intervene, downstream_probes,
+                            device=device, prefix_acts=prefix_acts,
+                        )
+                    else:
+                        intv_logits, intv_resid = run_with_intervention(
+                            model, input_tokens, mods, linear_probe,
+                            pos, scale, layer_intervene, layer_probe,
+                            device=device,
+                            per_cell_calibrate=per_cell_calibrate,
+                            prefix_acts=prefix_acts,
+                            direction_probe=direction_probe,
+                            downstream_probes=downstream_probes,
+                            cal_depth=cal_depth,
+                        )
 
                 logit_metrics = measure_logit_metrics(
                     orig_logits_at_pos, intv_logits,
@@ -1298,16 +1389,23 @@ def run_experiment(model, linear_probe, board_seqs_int, board_seqs_string,
                 )
 
                 with torch.no_grad():
-                    intv_logits, intv_resid = run_with_intervention(
-                        model, input_tokens, mods, linear_probe,
-                        pos, scale, layer_intervene, layer_probe,
-                        device=device,
-                        per_cell_calibrate=per_cell_calibrate,
-                        prefix_acts=prefix_acts,
-                        direction_probe=direction_probe,
-                        downstream_probes=downstream_probes,
-                        cal_depth=cal_depth,
-                    )
+                    if cascade:
+                        intv_logits, intv_resid = run_with_cascade_intervention(
+                            model, input_tokens, mods,
+                            pos, layer_intervene, downstream_probes,
+                            device=device, prefix_acts=prefix_acts,
+                        )
+                    else:
+                        intv_logits, intv_resid = run_with_intervention(
+                            model, input_tokens, mods, linear_probe,
+                            pos, scale, layer_intervene, layer_probe,
+                            device=device,
+                            per_cell_calibrate=per_cell_calibrate,
+                            prefix_acts=prefix_acts,
+                            direction_probe=direction_probe,
+                            downstream_probes=downstream_probes,
+                            cal_depth=cal_depth,
+                        )
 
                 logit_metrics = measure_logit_metrics(
                     orig_logits_at_pos, intv_logits,
@@ -1573,6 +1671,9 @@ def main():
                              "(required for --per-cell-scale)")
     parser.add_argument("--save-probs", action="store_true",
                         help="Save full 64-cell probability vectors per sample")
+    parser.add_argument("--cascade", action="store_true",
+                        help="Cascade intervention: apply at every layer from "
+                             "layer-intervene to 7, each using its native probe")
     # MLP baseline
     parser.add_argument("--mlp-baseline", action="store_true",
                         help="Run MLP baseline instead of OthelloGPT")
@@ -1720,14 +1821,15 @@ def main():
     direction_probe_tensor = None
     downstream_probes = None
     native_layer = layer_intervene - 1  # resid_post of this block
-    if args.per_cell_scale:
+    if args.per_cell_scale or args.cascade:
         if args.probe_dir is None:
-            parser.error("--probe-dir is required when using --per-cell-scale")
+            parser.error("--probe-dir is required when using --per-cell-scale or --cascade")
         from layer_propagation import load_probes, build_direction_probe
         downstream_probes = load_probes(args.probe_dir, args.device)
         direction_probe_tensor = build_direction_probe(
             downstream_probes, layer=native_layer, device=args.device)
-        print(f"Loaded per-layer probes for local calibration "
+        print(f"Loaded per-layer probes for "
+              f"{'cascade' if args.cascade else 'local calibration'} "
               f"(native layer: L{native_layer})")
 
     # Run experiment
@@ -1742,6 +1844,7 @@ def main():
         downstream_probes=downstream_probes,
         cal_depth=cal_depth,
         save_probs=args.save_probs,
+        cascade=args.cascade,
     )
 
     # Aggregate
@@ -1755,6 +1858,7 @@ def main():
             "native_layer": native_layer,
             "scale": scale,
             "cal_depth": cal_depth,
+            "cascade": args.cascade,
             "n_values": n_values,
             "seed": args.seed,
         },
