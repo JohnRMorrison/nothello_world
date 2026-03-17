@@ -139,6 +139,11 @@ def main():
             print(f"Skipping {label}: data not found at {games_dir}")
             continue
 
+        # Truncate to max_games early to save memory
+        if len(games) > args.max_games:
+            games = games[:args.max_games]
+            legal_moves = legal_moves[:args.max_games]
+
         print(f"{label}...", flush=True, end=" ")
         stats = compute_stats(games, legal_moves, max_games=args.max_games)
         stats['label'] = label
@@ -151,6 +156,7 @@ def main():
         out_path = os.path.join(args.output_dir, f"{label}.json")
         with open(out_path, 'w') as f:
             json.dump(stats, f, indent=2)
+        del games, legal_moves
 
     # Summary table
     print(f"\n{'='*80}")

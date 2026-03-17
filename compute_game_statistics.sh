@@ -3,7 +3,7 @@
 #SBATCH --output=logs/game_stats_%j.out
 #SBATCH --error=logs/game_stats_%j.err
 #SBATCH --time=2:00:00
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=nklab,burst
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09

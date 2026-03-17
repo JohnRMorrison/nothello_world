@@ -393,6 +393,9 @@ def run_batch(corruption_base, variant_base, std_games_dir, output_dir,
 
         print(f"\nCorruption: {label} (alpha={alpha})", flush=True)
         games, legal_moves = load_condition(games_dir)
+        if len(games) > max_games:
+            games = games[:max_games]
+            legal_moves = legal_moves[:max_games]
         metrics = measure_on_experimental(games, legal_moves, "corruption",
                                           max_games=max_games)
         metrics['alpha'] = alpha
@@ -403,6 +406,7 @@ def run_batch(corruption_base, variant_base, std_games_dir, output_dir,
         print(f"  newly_illegal={metrics['newly_illegal']:.4f}, "
               f"newly_legal={metrics['newly_legal']:.4f}, "
               f"jaccard={metrics['jaccard_dist']:.4f}")
+        del games, legal_moves
 
     # Variant conditions
     for variant in VARIANTS:
@@ -413,6 +417,9 @@ def run_batch(corruption_base, variant_base, std_games_dir, output_dir,
 
         print(f"\nVariant: {variant}", flush=True)
         games, legal_moves = load_condition(games_dir)
+        if len(games) > max_games:
+            games = games[:max_games]
+            legal_moves = legal_moves[:max_games]
         metrics = measure_on_experimental(games, legal_moves, "variant",
                                           variant_name=variant,
                                           max_games=max_games)
@@ -423,6 +430,7 @@ def run_batch(corruption_base, variant_base, std_games_dir, output_dir,
         print(f"  newly_illegal={metrics['newly_illegal']:.4f}, "
               f"newly_legal={metrics['newly_legal']:.4f}, "
               f"jaccard={metrics['jaccard_dist']:.4f}")
+        del games, legal_moves
 
     # --- Direction 2: On standard Othello games ---
     print("\n" + "=" * 70)
@@ -433,6 +441,8 @@ def run_batch(corruption_base, variant_base, std_games_dir, output_dir,
     if os.path.isdir(std_games_dir):
         print(f"\nLoading standard games from {std_games_dir}...", flush=True)
         std_games = load_standard_games(std_games_dir)
+        if len(std_games) > max_games:
+            std_games = std_games[:max_games]
         print(f"Loaded {len(std_games)} standard games")
 
         # Corruption: on standard boards, corrupted rules define different
@@ -540,6 +550,9 @@ def main():
         # Direction 1
         if args.direction in ("both", "on_experimental"):
             games, legal_moves = load_condition(args.games_dir)
+            if len(games) > args.max_games:
+                games = games[:args.max_games]
+                legal_moves = legal_moves[:args.max_games]
             metrics = measure_on_experimental(
                 games, legal_moves, args.condition_type,
                 variant_name=variant_name, max_games=args.max_games)
