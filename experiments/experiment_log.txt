@@ -1,419 +1,476 @@
 ================================================================================
 EXPERIMENT LOG — OthelloGPT World Model Analysis
 ================================================================================
-Last updated: 2026-03-15
+Last updated: 2026-03-17 (afternoon)
+
+See abandoned_experiments.txt for superseded/dead-end experiments.
 
 OVERVIEW
 --------
-We investigate whether OthelloGPT learns a genuine world model or relies on
-heuristics. Three lines of evidence:
+Three lines of evidence for whether OthelloGPT has a world model:
+  A. Transfer learning (fine-tune on corrupted/variant-rule games)
+  B. Causal interventions (modify board cells, check prediction updates)
+  C. Probing (linear probes on internal activations)
 
-  A. Transfer learning: Fine-tune OthelloGPT on corrupted or alternative-rule
-     games. If it has a world model, it should adapt faster than a random
-     network — but only if the rules are learnable from the new data.
+Key scripts:
+  mechanistic_interpretability/multi_intervention.py   — B1 experiment
+  mechanistic_interpretability/layer_propagation.py    — B2 experiment
+  mechanistic_interpretability/probe_vs_logit_directions.py    — B3
+  mechanistic_interpretability/probe_vs_logit_nonlinear.py     — B3b
+  mechanistic_interpretability/probe_vs_logit_constrained.py   — B3c
+  finetune_corruption.py                               — A1/A2 training
+  generate_variant_games.py                            — game generation
+  measure_legal_divergence.py                          — divergence
 
-  B. Causal interventions: Modify the model's internal representation of
-     specific board cells and measure whether its predictions update correctly.
-
-  C. Probing: Train linear probes on internal activations to measure how
-     board state information is encoded across layers.
+SLURM scripts (repo root):
+  multi_intervention.sh, multi_intervention_mlp.sh     — B1
+  multi_intervention_probs.sh                          — B1 (with full probs)
+  multi_intervention_cascade.sh                        — B1c (cascade, Li et al.)
+  layer_propagation.sh                                 — B2 (array job L4-L6)
+  probe_vs_logit_directions.sh                         — B3
+  probe_vs_logit_nonlinear.sh                          — B3b
+  probe_vs_logit_constrained.sh                        — B3c
+  train_state.sh, train_bracket.sh, etc.               — A1/A2
 
 
 ================================================================================
 A. TRANSFER LEARNING EXPERIMENTS
 ================================================================================
 
-Goal: Compare fine-tuning loss curves of pre-trained OthelloGPT vs random-init
-networks on games with modified rules. If OthelloGPT's representations transfer,
-it should learn faster.
-
-Setup:
-  - Pre-trained model: ckpts/gpt_synthetic.ckpt (standard Othello, 8L/512d)
-  - 2M training games per condition, 8 epochs, batch size 64
-  - Eval metric: legal-move accuracy (is the model's top prediction legal?)
-  - Divergence: fraction of moves that change legality vs standard Othello
-
 --------------------------------------------------------------------------------
 A1. Corruption experiments (alpha)
 --------------------------------------------------------------------------------
-At each move, with probability alpha, a random legal move is substituted for
-the actual move played. Tests tolerance to noisy training data.
+With probability alpha, substitute a random legal move. Results in
+experiments/corruption_v2/losses_2m/, losses_2m_random/.
 
-Condition       | Fine-tune  | Random-init | Divergence  | Status
-----------------|------------|-------------|-------------|--------
-alpha000 (0%)   | Done       | Done        | Done        | Transferred
-alpha001 (0.1%) | Done       | Done        | Done        | Transferred
-alpha002 (0.2%) | Done       | Done        | Done        | Transferred
-alpha005 (0.5%) | Done       | Done        | Done        | Transferred
-alpha010 (1%)   | Done       | Done        | Done        | Transferred
-alpha020 (2%)   | Done       | Done        | Done        | Transferred
-alpha030 (3%)   | Done       | Done        | Done        | Transferred
-alpha050 (5%)   | Done       | Done        | Done        | Transferred
-alpha070 (7%)   | Done       | Done        | Done        | Transferred
-alpha100 (10%)  | Done       | Done        | Done        | Transferred
+Fine-tuned and random-init reach similar final accuracy. Limited transfer.
+  alpha000: FT=99.1%, RND=98.9%  |  alpha050: FT=92.0%, RND=91.4%
+  alpha010: FT=97.2%, RND=96.6%  |  alpha100: FT=89.3%, RND=88.8%
 
-Losses: experiments/corruption_v2/losses_2m/, losses_2m_random/
-Divergence: experiments/divergence/alpha*_on_exp.json
-
-Preliminary results:
-  - Fine-tuned and random-init reach similar final accuracy at each alpha,
-    suggesting limited transfer advantage for pure corruption.
-  - Final legal-move accuracy degrades smoothly with alpha:
-      alpha000: FT=99.1%, RND=98.9%
-      alpha010: FT=97.2%, RND=96.6%
-      alpha050: FT=92.0%, RND=91.4%
-      alpha100: FT=89.3%, RND=88.8%
-  - Higher corruption = harder to learn, likely because corrupted games are
-    harder to compress (less predictable structure).
-  - Divergence (Jaccard distance) scales monotonically with alpha:
-      alpha001: 0.008, alpha010: 0.12, alpha050: 0.34, alpha100: 0.64
+Status: COMPLETE. All 10 alphas trained and transferred.
 
 --------------------------------------------------------------------------------
 A2. Variant rule experiments
 --------------------------------------------------------------------------------
-Games played under alternative rules. Tests whether transfer depends on
-structural similarity to standard Othello.
+Games under alternative rules. Divergence from standard Othello measured.
 
-Condition            | Fine-tune      | Random-init    | Divergence | Status
----------------------|----------------|----------------|------------|--------
-no_same_quadrant     | Done           | 5752195 (run)  | Done       | FT transferred
-no_diagonal_flips    | 5752213_1 (run)| 5752214_1 (run)| Done       | Retraining w/ legal mask
-no_row_flips         | 5752213_2 (run)| 5752214_2 (run)| Done       | Retraining w/ legal mask
-locked_flips         | 5752213_3 (run)| 5752214_3 (run)| Done       | Retraining w/ legal mask
-max_three_flips      | 5752213_4 (run)| 5752214_4 (run)| Done       | Retraining w/ legal mask
-self_flanking        | 5752213_5 (run)| 5752214_5 (run)| Done       | Retraining w/ legal mask
-delayed_flips        | 5752213_6 (run)| 5752214_6 (run)| Done       | Retraining w/ legal mask
-adjacent_legal       | 5752236 (dep)  | 5752237 (dep)  | Not done   | Blocked on pickle regen (5752235)
-skip_empty_flips     | 5752215_1 (run)| 5752216_1 (run)| Not done   | Running
-capture_any          | 5752215_2 (run)| 5752216_2 (run)| Not done   | Running
-wrap_flips           | 5752215_3 (run)| 5752216_3 (run)| Not done   | Running
+Condition            | FT legal_acc | FT rank | RND legal_acc | RND rank | Divergence | Status
+---------------------|-------------|---------|---------------|----------|------------|--------
+no_same_quadrant     | —           | —       | —             | —        | 0.289      | Retraining: 5752426_6 / 5752433_6
+no_diagonal_flips    | —           | —       | —             | —        | 0.540      | Retraining: 5752426_0 / 5752433_0
+no_row_flips         | —           | —       | —             | —        | 0.315      | Retraining: 5752426_1 / 5752433_1
+locked_flips         | —           | —       | —             | —        | 0.335      | Retraining: 5752426_2 / 5752433_2
+max_three_flips      | —           | —       | —             | —        | 0.172      | REGEN: 5753941_1 (bug fix: added forfeit)
+self_flanking        | —           | —       | —             | —        | *          | REGEN: 5753941_0 (bug fix: now flips own pieces)
+delayed_flips        | —           | —       | —             | —        | *          | Retraining: 5752426_5 / 5752433_5
+skip_empty_flips     | 98.74%      | 7.86    | 98.22%        | 8.00     | 0.419      | COMPLETE
+capture_any          | 99.65%      | 8.09    | 99.62%        | 8.11     | 0.389      | COMPLETE
+adjacent_legal       | FAILED      | —       | FAILED        | —        | FAILED     | Regen pickle: 5752359
+wrap_flips           | dropped     | —       | dropped       | —        | 0.149      | DROPPED (too similar to standard)
 
-Note: First 7 variants were originally trained without legal-move accuracy
-(used exact-match instead, giving ~6% accuracy). All are being retrained with
-correct eval metric (legal-move accuracy).
+  * = divergence metric (Jaccard on legal move sets) reads ~0 for self_flanking
+      and delayed_flips because the legality RULE is identical to standard Othello.
+      The variants change flip mechanics (not move legality), causing board states
+      to diverge. Playing the same moves in both games produces different legal
+      moves at 57% (self_flanking) and 72% (delayed_flips) of positions.
 
-Losses: experiments/variants/losses_2m/, losses_2m_random/
-Divergence: experiments/divergence/*_on_exp.json, *_on_std.json
+  Bug fixes applied (2026-03-17):
+    - self_flanking: was BLOCKING self-flanking moves; now FLIPS own pieces
+      (own-color run terminated by opponent → those own pieces flip).
+      ~42 self-flank flips per game. Needs game regen + retrain.
+    - max_three_flips: had no forfeit/pass; game ended when no ≤3-flip moves.
+      Now passes to opponent. Needs game regen + retrain.
+    - delayed_flips: original code was CORRECT (player sees board without
+      opponent's pending flips). No regen needed.
 
-Preliminary divergence (Jaccard distance, measured on variant games):
-  delayed_flips:      0.000  (identical legal moves to standard!)
-  max_three_flips:    0.172
-  no_same_quadrant:   0.289
-  no_row_flips:       0.315
-  self_flanking:      0.318
-  locked_flips:       0.335
-  no_diagonal_flips:  0.540
+  Retraining (2026-03-17): Old 7 variants lacked legal_mask during training,
+    so eval_accs stored exact-match accuracy (~7-14%) instead of legal accuracy.
+    Resubmitted with current code: 5752426 (FT, array 0-6), 5752433 (RND, 0-6).
+    Cancelled indices 3,4 (max_three_flips, self_flanking) — need regen first.
+    Variants: variant_retrain_7.sh, variant_retrain_7_random.sh
+    Array mapping: 0=no_diagonal_flips 1=no_row_flips 2=locked_flips
+      3=max_three_flips 4=self_flanking 5=delayed_flips 6=no_same_quadrant
 
-Note: delayed_flips has zero divergence — it changes only flip timing, not
-which moves are legal. This is a control: transfer should be near-perfect.
+  Notes on new variants (jobs 5752288_1-3 FT, 5752291_1-3 RND — all COMPLETE):
+    - skip_empty_flips: FT and RND nearly identical accuracy — no transfer advantage
+    - capture_any: highest accuracy (~99.6%), both FT and RND — easy variant
 
-Most variant rules primarily remove legal moves (newly_illegal >> newly_legal),
-unlike corruption which symmetrically shuffles.
+  adjacent_legal: legal_moves.pickle corrupt (regen job 5752276 timed out at 8h).
+    Training jobs 5752294/5752295 hit EOFError loading pickle.
+    Resubmitted regen: job 5752359 (24h limit, 4 workers, 64G mem).
 
---------------------------------------------------------------------------------
-A3. Divergence measurement
---------------------------------------------------------------------------------
-For each condition, measure how many legal moves change vs standard Othello.
-Used to match variant rules to corruption levels at equal "entropy."
+Divergence for new variants (job 5752320, measure_divergence_v2.sh):
+  skip_empty_flips:  on_exp=0.419, on_std=0.396
+  capture_any:       on_exp=0.389, on_std=0.384
+  wrap_flips:        on_exp=0.149, on_std=0.168
+  adjacent_legal:    FAILED (corrupted pickle, blocked on regen job 5752276)
 
-Status: Done for all alphas + first 7 variants. Not yet run for 4 new variants
-(adjacent_legal, skip_empty_flips, capture_any, wrap_flips).
-Need to submit divergence jobs after new variant training completes.
+Variant descriptions:
+  Each variant modifies one aspect of standard Othello rules. Games are generated
+  by generate_variant_games.py. 2M games per variant.
+
+  Legality-changing variants (different legal move set from standard Othello):
+    no_diagonal_flips  — Diagonal directions don't produce flips. Only horizontal
+                         and vertical flanking counts. Rule div = 0.540.
+    no_row_flips       — Horizontal (row) flips disabled. Only vertical and
+                         diagonal flanking counts. Rule div = 0.315.
+    no_same_quadrant   — A move cannot flip pieces in the same board quadrant as
+                         the placed piece. Rule div = 0.289.
+    locked_flips       — Pieces flipped on the previous turn cannot be re-flipped.
+                         They are "locked" for one turn. Rule div = 0.335.
+    max_three_flips    — A move can flip at most 3 pieces. If no ≤3-flip moves
+                         exist, the player forfeits. Rule div = 0.172.
+    skip_empty_flips   — Empty squares between flanking pieces don't block flips —
+                         the flip "skips" gaps. Rule div = 0.419.
+    capture_any        — Legal if adjacent to any opponent piece (no flanking
+                         required). Normal flips still apply. Rule div = 0.389.
+    adjacent_legal     — Legal if adjacent to ANY occupied square (own or
+                         opponent). Normal flips still apply. Rule div = TBD.
+
+  Flip-mechanic variants (same legality rule, different board-state evolution):
+    self_flanking      — Own pieces bracketed between new piece and opponent piece
+                         flip to opponent's color. ~42 self-flank flips per game.
+                         Rule div ≈ 0, trajectory div = 0.57.
+    delayed_flips      — Flips are "pending" and applied at the start of the NEXT
+                         player's move. Players see a stale board.
+                         Rule div ≈ 0, trajectory div = 0.72.
+
+  Control:
+    swapped_colors     — Starting pieces have B/W swapped. Rules identical.
+                         Tests whether difficulty is rule complexity vs representation.
+
+  Dropped:
+    wrap_flips         — Flips wrap around board edges. div = 0.149. Too similar.
+
+Comparison metrics:
+  Rule divergence (measure_legal_divergence.py):
+    For the same board state, compare legal move sets under standard vs variant
+    rules. Jaccard distance: 1 - |intersection| / |union|. LIMITATION: reads 0
+    for variants that change flip mechanics without changing legality.
+
+  Trajectory divergence (measure_trajectory_divergence.py):
+    Play the SAME moves on both standard and variant boards. Compare legal move
+    sets at each turn. Captures divergence from different flip mechanics that
+    accumulate over turns. Critical complement to rule divergence.
+
+  Game statistics (compute_game_statistics.py):
+    - avg_branching_factor: mean legal moves per position (determines random
+      baseline accuracy = 1/BF)
+    - avg_game_length: mean moves per game
+    - move_entropy: entropy of move frequency distribution (bits)
+    - random_top1_acc: expected accuracy of random predictor
+
+  Embedding-based divergence (TODO):
+    Run variant games through pretrained OthelloGPT, collect residual stream
+    activations at layer 4 or 5, compare distributions via MMD or Fréchet
+    distance. Directly measures "how different do these games look to the model."
 
 
 ================================================================================
 B. CAUSAL INTERVENTION EXPERIMENTS
 ================================================================================
 
---------------------------------------------------------------------------------
-B1. Multi-intervention experiment
---------------------------------------------------------------------------------
-Goal: Modify N board cells simultaneously in the residual stream and test
-whether the model's legal-move predictions update correctly.
+Methodology (current, as of v5):
+  - Intervene at resid_post of block N using layer N's NATIVE probe for both
+    direction computation and local calibration
+  - Per-cell binary search for minimal scale that flips probe at target layer
+  - Calibration depth: 0 (local), 1 (+1 downstream), 2 (+2 downstream)
+  - Measure probe accuracy at all downstream layers (each using its own probe)
+  - Measure logit-level metrics: boundary margin, frac_positive, Li et al.
+    top-N accuracy, legal probability mass
+  - Per-move binary metrics: newly-legal enters top-N, above min-legal,
+    newly-illegal dropped from top-N, below min-legal
 
-Setup:
-  - Intervene at layer 5 (resid_post block 4)
-  - Read probe at layer 6
-  - Fixed scale = 3 (NOT per-cell calibrated to downstream probe accuracy)
-  - N = 1, 2, 3, 5, 8 simultaneous interventions
+Previous versions used layer 6 probe directions at layer 5 (cross-layer
+mismatch). See abandoned_experiments.txt for v1-v3 details.
+
+--------------------------------------------------------------------------------
+B1. Multi-intervention experiment (1000 games, cal_depth sweep)
+--------------------------------------------------------------------------------
+Modify N board cells simultaneously, test whether predictions update.
+  - N = 1, 2, 3 simultaneous interventions
   - 5 conditions: flip_noninteracting, flip_interacting,
     add_noninteracting, add_interacting, mixed
-  - 200 games
+  - Intervene at L5, native probe at L4
 
-Key metrics: boundary_margin, legal_prob_mass, probe_acc, crosstalk
+Results (jobs 5752331/5752332/5752333, COMPLETE):
 
-Results (OthelloGPT):
+Cal Depth 0 (local calibration — all boundary margins negative):
 
-  Condition             | N | Bndry Margin | Probe Acc | Crosstalk | Legal Prob
-  ----------------------|---|-------------|-----------|-----------|----------
-  flip_noninteracting   | 1 |  -0.88      |  0.28     |  0.51     |  0.95
-  flip_noninteracting   | 3 |  -1.56      |  0.31     |  1.55     |  0.86
-  flip_noninteracting   | 8 |  +1.24      |  0.38     |  3.45     |  0.37
-  flip_interacting      | 1 |  -0.76      |  0.26     |  0.53     |  0.96
-  flip_interacting      | 5 |  -1.93      |  0.38     |  4.93     |  0.70
-  flip_interacting      | 8 |  -1.49      |  0.36     | 19.96     |  0.59
-  add_noninteracting    | 1 |  +2.93      |  0.21     |  0.80     |  0.97
-  add_noninteracting    | 5 |  +1.44      |  0.23     |  3.47     |  0.88
-  add_interacting       | 1 |  +2.97      |  0.24     |  1.00     |  0.96
-  add_interacting       | 8 |  +0.73      |  0.29     |  3.08     |  0.75
-  mixed                 | 1 |  +1.51      |  0.21     |  0.75     |  0.97
-  mixed                 | 8 |  -0.43      |  0.35     |  4.43     |  0.73
+  Condition         | N | BM     | Frac+ | TopN Acc | TopN Err | Crosstalk
+  ------------------|---|--------|-------|----------|----------|----------
+  flip_nonint       | 1 | -0.58  | 21%   | 95.3%    | 0.92     | 0.090
+  flip_nonint       | 2 | -1.21  | 25%   | 91.2%    | 1.73     | 0.138
+  flip_nonint       | 3 | -1.39  | 29%   | 88.6%    | 2.35     | 0.178
+  flip_int          | 1 | -0.51  | 24%   | 95.6%    | 0.87     | 0.091
+  add_nonint        | 1 | -0.44  | 30%   | 96.1%    | 0.70     | 0.126
+  add_int           | 1 | -0.28  | 36%   | 96.3%    | 0.67     | 0.129
+  mixed             | 1 | -0.44  | 27%   | 96.3%    | 0.73     | 0.107
+
+Cal Depth 1 (+1 downstream — all boundary margins positive):
+
+  Condition         | N | BM     | Frac+ | TopN Acc | TopN Err | Crosstalk
+  ------------------|---|--------|-------|----------|----------|----------
+  flip_nonint       | 1 | +0.44  | 40%   | 98.0%    | 0.38     | 0.139
+  flip_nonint       | 2 | +0.16  | 40%   | 95.3%    | 0.93     | 0.212
+  flip_nonint       | 3 | +0.04  | 40%   | 92.9%    | 1.48     | 0.268
+  flip_int          | 1 | +0.50  | 41%   | 98.1%    | 0.38     | 0.141
+  add_nonint        | 1 | +1.09  | 49%   | 97.6%    | 0.42     | 0.196
+  add_int           | 1 | +1.43  | 58%   | 98.1%    | 0.35     | 0.198
+  mixed             | 1 | +0.77  | 45%   | 98.2%    | 0.36     | 0.161
+
+Cal Depth 2 (+2 downstream — strongest positive margins):
+
+  Condition         | N | BM     | Frac+ | TopN Acc | TopN Err | Crosstalk
+  ------------------|---|--------|-------|----------|----------|----------
+  flip_nonint       | 1 | +1.16  | 48%   | 98.8%    | 0.23     | 0.171
+  flip_nonint       | 2 | +1.01  | 50%   | 96.7%    | 0.64     | 0.260
+  flip_nonint       | 3 | +0.92  | 51%   | 95.2%    | 0.99     | 0.331
+  flip_int          | 1 | +1.25  | 50%   | 99.0%    | 0.21     | 0.173
+  add_nonint        | 1 | +2.70  | 64%   | 98.7%    | 0.23     | 0.245
+  add_int           | 1 | +2.91  | 70%   | 98.8%    | 0.20     | 0.249
+  mixed             | 1 | +1.82  | 54%   | 98.9%    | 0.23     | 0.202
+
+Per-move binary metrics (200 games with saved probs):
+  Jobs: 5752339 (cd0), 5752340 (cd1), 5752337 (cd2), 5752341 (L4 cd2)
+
+  Metric definitions:
+    In Top-N:        newly-legal move appears in model's top-N predictions
+                     (N = number of counterfactual-legal moves)
+    Above Min-Legal: newly-legal move's prob >= weakest still-legal move's prob
+    Dropped Top-N:   newly-illegal move falls out of model's top-N
+    Below Min-Legal: newly-illegal move's prob drops below weakest still-legal
+
+  Aggregate results (all conditions, N=1 flips/adds/mixed):
+
+  Setting   | NL In Top-N | NL Above Min-Legal | NI Dropped Top-N | NI Below Min-Legal
+  ----------|-------------|---------------------|------------------|-----------
+  L5 cd0    |    51%      |         0%          |       31%        |     46%
+  L5 cd1    |    69%      |         1%          |       64%        |     86%
+  L5 cd2    |    82%      |         5%          |       84%        |     94%
+  L4 cd2    |    81%      |         7%          |       79%        |     91%
+
+  Fall-off with N (L5 cd2):
+    Newly-legal  In Top-N:        82% (N=1) → 70% (N=2) → 69% (N=3)
+    Newly-legal  Above Min-Legal:  5% (N=1) →  8% (N=2) → 12% (N=3)
+    Newly-illegal Dropped Top-N:  84% (N=1) → 75% (N=2) → 69% (N=3)
+    Newly-illegal Below Min-Legal: 94% (N=1) → 91% (N=2) → 89% (N=3)
+
+  Key findings:
+  1. Strong asymmetry: 94% of newly-illegal moves lose "legal" probability
+     status, but only 5% of newly-legal moves gain it. Suppression >> promotion.
+  2. "In Top-N" is misleadingly high because illegal moves have near-zero
+     probability (~0.01%), so a tiny boost suffices to outrank them. "Above
+     Min-Legal" is the honest test — newly-legal moves reach ~1-3% probability
+     but legal moves sit at ~8-16%.
+  3. For add conditions, 100% of newly-illegal moves are on the added cell
+     (trivial: occupied square). For flip conditions, 0% are on modified cells
+     (genuine flanking logic update).
+  4. L4 cd2 ≈ L5 cd2: intervening one layer earlier gives similar results.
+     The real lever is calibration depth, not intervention layer.
+  5. Calibration depth is the dominant factor: cd0→cd2 at L5 is a much larger
+     improvement than L5→L4 at cd2.
+
+Results in experiments/multi_intervention_cd{0,1,2}/ and
+experiments/multi_intervention_probs{,_cd0,_cd1}/
+
+--------------------------------------------------------------------------------
+B1c. Cascade intervention (Li et al. approach)
+--------------------------------------------------------------------------------
+Intervene at every layer from start_layer to 7, each using that layer's
+native probe for direction and local per-cell scale calibration. This follows
+Li et al.'s approach of reinforcing the intervention at each layer rather than
+relying on a single-layer intervention to propagate through the network.
+
+  - N = 1, 2, 3, 8 simultaneous interventions
+  - 5 conditions: flip_noninteracting, flip_interacting,
+    add_noninteracting, add_interacting, mixed
+  - Two runs: start at L4 (layers 4-7) and start at L5 (layers 5-7)
+  - Saves full probability vectors (--save-probs)
+
+Code: multi_intervention.py --cascade, multi_intervention_cascade.sh
+Jobs: 5752355 (L4, cascade layers 4-7), 5752356 (L5, cascade layers 5-7)
+Status: COMPLETE
+
+Aggregate metrics (N=1, mixed condition):
+
+  Setting       | BM     | Frac+ | TopN Acc | Crosstalk
+  --------------|--------|-------|----------|----------
+  Cascade L4→7  | -0.17  | 28%   | 96.0%    | 0.084
+  Cascade L5→7  | -0.27  | 28%   | 95.9%    | 0.099
+
+Per-move binary metrics (N=1, all conditions aggregated):
+
+  Setting       | NL In Top-N | NL Above Min | NI Dropped Top-N | NI Below Min
+  --------------|-------------|--------------|------------------|-------------
+  L5 cd0        |    51%      |      0%      |       31%        |     46%
+  L5 cd2        |    82%      |      5%      |       84%        |     94%
+  Cascade L4→7  |    54%      |      0%      |       44%        |     65%
+  Cascade L5→7  |    49%      |      0%      |       44%        |     67%
+
+Cascade L4→7 aggregate metrics by N (mixed condition):
+
+  N | BM     | Frac+ | TopN Acc | Legal Prob Mass | Crosstalk
+  --|--------|-------|----------|-----------------|----------
+  1 | -0.17  | 28%   | 96.0%    | 96.7%           | 0.084
+  2 | -0.32  | 32%   | 93.5%    | 94.5%           | 0.149
+  3 | -0.97  | 29%   | 90.4%    | 90.9%           | 0.184
+  8 | -1.40  | 39%   | 62.8%    | 69.9%           | 0.351
+
+Fall-off with N — cascade L4→7 vs single-layer L5 cd2:
+
+  Metric              | Method     | N=1  | N=2  | N=3  | N=8
+  --------------------|------------|------|------|------|-----
+  NL In Top-N         | Cascade    |  54% |  44% |  36% |  24%
+  NL In Top-N         | L5 cd2     |  82% |  70% |  69% |   —
+  NL Above Min-Legal  | Cascade    |   0% |   1% |   0% |   7%
+  NL Above Min-Legal  | L5 cd2     |   5% |   8% |  12% |   —
+  NI Dropped Top-N    | Cascade    |  44% |  31% |  27% |  32%
+  NI Dropped Top-N    | L5 cd2     |  84% |  75% |  69% |   —
+  NI Below Min-Legal  | Cascade    |  65% |  60% |  59% |  49%
+  NI Below Min-Legal  | L5 cd2     |  94% |  91% |  89% |   —
 
 Key findings:
-  1. Boundary margin: Negative for flips (model doesn't fully update which
-     moves should become legal), positive for adds (easier to add a piece
-     to an empty cell). Asymmetry suggests flips require more complex
-     downstream recomputation.
+  1. Cascade performs WORSE than single-layer cd2 on all per-move metrics,
+     and is roughly comparable to single-layer cd0. The cascade applies
+     locally-calibrated interventions at each layer, but the aggregate
+     effect is much weaker than a single intervention calibrated to
+     propagate 2 layers downstream.
+  2. Likely explanation: each transformer block partially undoes the previous
+     layer's intervention before the next cascade step is applied. The
+     interventions don't stack constructively.
+  3. NL Above Min-Legal remains at 0% — newly-legal moves never reach
+     the probability floor of existing legal moves under cascade.
+  4. Cascade does show slightly lower crosstalk (0.084 vs 0.107 for cd0),
+     suggesting the per-layer local calibration is gentler but less effective.
 
-  2. Probe accuracy is only 20-35%: The fixed scale=3 was NOT calibrated to
-     actually flip the downstream probe. This motivated experiment B2.
-
-  3. Crosstalk scales linearly with N for non-interacting cells, but explodes
-     for interacting cells (flip_interacting N=8: crosstalk=19.96). Cells
-     that share flip chains interfere massively.
-
-  4. Legal prob mass degrades gracefully (95% → 73% at N=8 mixed), except
-     for flip_noninteracting N=8 which collapses to 37% — suggests the
-     model recognizes something is deeply wrong when many non-interacting
-     cells flip simultaneously.
-
-Results (MLP baseline): Completed, similar patterns.
-
-Job 5752152 (OthelloGPT): COMPLETED — experiments/multi_intervention/
-Job 5752153 (MLP):        COMPLETED — experiments/multi_intervention_mlp/
-Both transferred locally.
+Results in experiments/multi_intervention_cascade_L{4,5}/
 
 --------------------------------------------------------------------------------
-B2. Layer propagation experiment
+B2. Layer propagation experiment (1000 games, cal_depth sweep)
 --------------------------------------------------------------------------------
-Goal: Understand why probe accuracy is low (~25%) after intervention. Calibrate
-intervention scale to achieve 100% probe accuracy at specific downstream layers,
-then measure how accuracy and interference propagate across all layers.
+How interventions propagate across layers. Intervene at one layer using native
+probe, measure at all downstream layers. Sweeps calibration depth: 0 (local),
+1 (+1 layer downstream), 2 (+2 layers downstream).
 
-Setup:
-  - Intervene at layer 5 (resid_post block 4)
-  - Direction probe: layer 6 probe weights (defines intervention direction)
-  - Calibration: binary search for minimal scale to flip target probe
-  - Calibration targets: layer 6, layer 7
-  - Measurement layers: 5, 6, 7
-  - N=1 flip, 200 games
-  - Per-sample data saved (game_idx, board_state, modifications) for
-    board reconstruction
+Three runs: layer 4, layer 5, layer 6. Each uses its own native probe.
 
-Job 5752241: COMPLETED — experiments/layer_propagation/
-Transferred locally.
+Code: layer_propagation.py, layer_propagation.sh (array job 4-6)
 
-Results:
+Results (job 5752334, 1000 games, COMPLETE):
 
-  Condition  | Scale | L5 Acc | L6 Acc | L7 Acc | L5 Xtalk | L6 Xtalk | L7 Xtalk
-  -----------|-------|--------|--------|--------|----------|----------|----------
-  No interv. | 0.00  |  1%    |  2%    |  2%    |  0.00    |  0.00    |  0.00
-  Cal → L6   | 2.31  | 79%    | 98%    | 80%    |  0.13    |  0.17    |  0.17
-  Cal → L7   | 2.34  | 75%    | 82%    | 97%    |  0.14    |  0.17    |  0.17
+Intervene at Layer 4:
 
-  Boundary margin: +0.75 (cal→L6), +0.84 (cal→L7) — both positive, meaning
-  the model's legal-move predictions partially respect the counterfactual.
+  Condition | Scale | Probe L4 | Probe L5 | Probe L6 | Probe L7 | BM    | Frac+
+  ----------|-------|----------|----------|----------|----------|-------|------
+  No intv   | 0.0   | 1.0%     | 0.9%     | 1.2%     | 1.1%     | -0.89 | 15%
+  Depth 0   | 1.20  | 99.0%*   | 9.6%     | 8.9%     | 9.0%     | -0.54 | 21%
+  Depth 1   | 1.93  | 94.8%    | 98.5%*   | 37.3%    | 41.0%    | +0.41 | 37%
+  Depth 2   | 2.40  | 93.6%    | 88.7%    | 97.8%*   | 81.5%    | +1.13 | 45%
+
+Intervene at Layer 5:
+
+  Condition | Scale | Probe L5 | Probe L6 | Probe L7 | BM    | Frac+
+  ----------|-------|----------|----------|----------|-------|------
+  No intv   | 0.0   | 0.9%     | 1.2%     | 1.1%     | -0.89 | 15%
+  Depth 0   | 1.23  | 98.8%*   | 39.1%    | 39.5%    | -0.54 | 23%
+  Depth 1   | 1.54  | 84.9%    | 98.6%*   | 74.2%    | -0.40 | 27%
+  Depth 2   | 1.57  | 81.3%    | 77.1%    | 98.6%*   | -0.36 | 28%
+
+Intervene at Layer 6:
+
+  Condition | Scale | Probe L6 | Probe L7 | BM    | Frac+
+  ----------|-------|----------|----------|-------|------
+  No intv   | 0.0   | 1.2%     | 1.1%     | -0.89 | 15%
+  Depth 0   | 1.34  | 98.4%*   | 74.0%    | -0.87 | 15%
+  Depth 1   | 1.37  | 73.7%    | 98.5%*   | -0.87 | 15%
+
+  (* = calibration target layer)
 
 Key findings:
+  1. L4 is the only layer where interventions causally affect output.
+     Depth-2 yields BM=+1.13 (45% positive).
+  2. L5 shows marginal improvement (BM: -0.54 → -0.36) but never crosses zero.
+  3. L6 has zero causal effect regardless of calibration depth (BM ≈ baseline).
+  4. Local calibration is underpowered: depth-0 scales (~1.2) too small to
+     survive transformer blocks; probe accuracy drops to ~10% one layer down.
 
-  1. Calibration succeeds: 97-98% probe accuracy at the targeted layer
-     (up from ~25% in B1 with fixed scale). Binary search finds appropriate
-     per-cell scales.
-
-  2. Scales are nearly identical between cal→L6 (2.31) and cal→L7 (2.34).
-     The L6 probe direction is already mostly aligned with what L7 needs.
-
-  3. Cross-layer accuracy is ~80%, not ~100%: Calibrating to L6 gives 80%
-     at L7 and 79% at L5. Calibrating to L7 gives 82% at L6 and 75% at L5.
-     The representation is partially but not fully preserved across layers.
-
-  4. The ~20% failure rate is SYSTEMATIC, not driven by outliers:
-     - Failures are binary (per-sample, N=1) and spread across many games
-     - 128/193 games pass at all 3 layers (cal→L6), 26 fail L7 only,
-       31 fail L5 only, 8 fail both
-     - Failure does NOT correlate with scale, position, or color
-
-  5. L5 failures are game-specific: 34/39 games that fail at L5 under
-     cal→L6 also fail at L5 under cal→L7. These cells have L6 probe
-     directions that don't align with L5's probe — a property of the
-     game/cell, not the intervention.
-
-  6. Non-calibrated layer failures are NOT game-specific: 0 games fail at
-     both L7-under-cal→L6 and L6-under-cal→L7. Every game CAN have every
-     layer's probe flipped — it just requires calibrating to THAT layer.
-
-  7. Crosstalk is moderate (~0.13-0.17) and similar across conditions.
-     The intervention doesn't catastrophically interfere with other cells.
-
-  Interpretation: Each transformer block reshapes the representation enough
-  that ~20% of cells need a different direction to flip the probe at a
-  different layer. The probes at L5, L6, L7 share a common direction for
-  ~80% of cells but have partially independent subspaces for the rest.
-  The representation is not layer-invariant.
+Results in experiments/layer_propagation_1k/L{4,5,6}/
 
 --------------------------------------------------------------------------------
-B3. Probe vs logit direction comparison
+B3. Probe vs logit direction comparison (COMPLETE, mostly dead end)
 --------------------------------------------------------------------------------
-Goal: Test whether probe-based interventions (change a board cell) are
-geometrically similar to logit-gradient interventions (change a move's logit).
-If cosine similarity is high, it's ambiguous whether the probe captures "board
-state" or just "move legality" — the two representations would be confounded.
+Tested whether probe directions align with logit gradients. Answer: no
+(cosine sim ~0.17-0.24). But this doesn't distinguish world model from
+heuristic — low alignment is expected under both hypotheses.
 
-Setup:
-  - Intervene at layer 5 using layer 6 probe directions
-  - For each game: apply probe intervention (flip or add a cell)
-  - Identify moves that change legality (newly legal / newly illegal)
-  - For each affected move m: compute gradient of logit(m) w.r.t. layer 5
-    activation at the current position (clean, no intervention)
-  - Compare probe direction and logit gradient via cosine similarity
-  - Also measure subspace similarity: how much of the probe direction lies
-    in the span of all affected-move gradients
+B3: Job 5752250, experiments/probe_vs_logit/
+B3b: Job 5752275, experiments/probe_vs_logit_nonlinear/
+B3c: Job 5752285, experiments/probe_vs_logit_constrained/
 
-  Both flip and add conditions are tested per game.
-  200 games, per-cell scale calibration to layer 6.
-
-Key metrics:
-  - Per-move cosine similarity (probe dir vs individual logit gradient)
-  - Cosine similarity with mean gradient across all affected moves
-  - Subspace similarity (fraction of probe dir in gradient span)
-
-Interpretation:
-  - High cosine sim → probe direction ≈ logit gradient → ambiguous whether
-    we're intervening on board state or on move predictions
-  - Low cosine sim → board state representation is geometrically distinct
-    from move-legality computation → genuine world model evidence
-
-Script: mechanistic_interpretability/probe_vs_logit_directions.py
-SLURM: probe_vs_logit_directions.sh
-Status: NOT YET SUBMITTED
+See abandoned_experiments.txt for full results.
 
 
 ================================================================================
 C. PROBING EXPERIMENTS
 ================================================================================
 
---------------------------------------------------------------------------------
-C1. Linear probes (per-layer)
---------------------------------------------------------------------------------
-Trained nn.Linear(512, 192) probes at each layer (0-8) on standard OthelloGPT.
-192 = 64 cells × 3 classes (empty/white/black). Even/odd parity split.
+C1. Per-layer probes: nn.Linear(512, 192) at layers 0-8, even/odd split.
+    Accuracy peaks at layer 4 (99.1%).
+    Checkpoints: experiments/.../probe_checkpoints/othello_layer{0-8}.pt
 
-Accuracy peaks at layers 5-7 (~97-98%).
-
-Checkpoints: experiments/.../heuristic_probe_results/probe_directions/probe_checkpoints/
-             othello_layer{0-8}.pt
-
---------------------------------------------------------------------------------
-C2. Nanda probe (layer 6)
---------------------------------------------------------------------------------
-Original probe from Nanda's repo, shape (3, 512, 8, 8, 3).
-Achieves 95.88% accuracy on layer 6.
-
-File: mechanistic_interpretability/main_linear_probe.pth
-
---------------------------------------------------------------------------------
-C3. Heuristic probe experiments
---------------------------------------------------------------------------------
-Extensive analysis of what information probes capture. Includes MLP probes,
-ablation studies, SVD analysis of probe weights.
-
-Results: experiments/mathematical_transformation_experiments/heuristic_probe_results/
-
---------------------------------------------------------------------------------
-C4. Variant board probing
---------------------------------------------------------------------------------
-Probes trained on activations from games played under variant rules.
-Tests whether the model's representations generalize across rule sets.
-
-Results: experiments/mathematical_transformation_experiments/variant_probe_results/
+C2. Nanda probe: shape (3, 512, 8, 8, 3), 95.88% at layer 6.
+    File: mechanistic_interpretability/main_linear_probe.pth
 
 
 ================================================================================
-SUPPORTING INFRASTRUCTURE
+ACTIVE CLUSTER JOBS (as of 2026-03-17)
 ================================================================================
 
-Game generation:
-  - generate_variant_games.py: generates games under any variant rule
-  - 2M games per condition, stored as games.pickle + legal_moves.pickle
-  - Alpha games: experiments/corruption_v2/games_2m/
-  - Variant games: experiments/variants/games_2m/
+Job ID      | Name       | Description                              | Status
+------------|------------|------------------------------------------|--------
+5752359     | regen_adj  | Regen adjacent_legal legal_moves.pickle   | Running (24h, 4 workers)
+5752426_0-2,6 | retrain7 FT  | Retrain 4 old variants (with legal_mask) | Running
+5752433_0-2,6 | retrain7 RND | Retrain 4 old variants (random init)    | Running
+5753941_0   | regen3     | Regen self_flanking 2M games (bug fix)    | Running
+5753941_1   | regen3     | Regen max_three_flips 2M games (bug fix)  | Running
+5756032     | traj_div   | Trajectory divergence (100k games, batch)  | Running
+5758006     | swapped    | swapped_colors: generate 2M + FT + RND    | Running
+5759238     | game_stats | Game statistics (BF, length, entropy)      | Running
 
-Fine-tuning:
-  - finetune_corruption.py: trains model on new games, tracks loss + legal acc
-  - build_legal_mask(): vectorized legal-move mask for eval (fixed OOM issue)
+COMPLETED:
+  5752331     | multi_intv cd0 (1000 games) → experiments/multi_intervention_cd0/
+  5752332     | multi_intv cd1 (1000 games) → experiments/multi_intervention_cd1/
+  5752333     | multi_intv cd2 (1000 games) → experiments/multi_intervention_cd2/
+  5752334     | layer_prop L4-L6 (1000 games, cd sweep) → experiments/layer_propagation_1k/
+  5752337     | multi_intv probs cd2 (200 games) → experiments/multi_intervention_probs/
+  5752339     | multi_intv probs cd0 (200 games) → experiments/multi_intervention_probs_cd0/
+  5752340     | multi_intv probs cd1 (200 games) → experiments/multi_intervention_probs_cd1/
+  5752341     | multi_intv probs L4 cd2 (200 games) → experiments/multi_intervention_probs_L4_cd2/
+  5752355     | cascade L4→7 (200 games, N=1,2,3,8) → experiments/multi_intervention_cascade_L4/
+  5752356     | cascade L5→7 (200 games, N=1,2,3,8) → experiments/multi_intervention_cascade_L5/
+  5752288_1-3 | variant FT: skip_empty_flips, capture_any, wrap_flips
+  5752291_1-3 | variant RND: skip_empty_flips, capture_any, wrap_flips
+  5752320     | divergence for 4 new variants (7/8 tasks OK, adj_legal failed)
 
-Divergence:
-  - measure_legal_divergence.py: measures fraction of moves that change legality
+CANCELLED:
+  5752426_3,4 | retrain7 FT: max_three_flips, self_flanking (need regen first)
+  5752433_3,4 | retrain7 RND: max_three_flips, self_flanking (need regen first)
+  5752426_5, 5752433_5 | retrain7 delayed_flips: completed or cancelled (not in queue)
 
-Cluster: ssh -p 55 jrm2182@axon-remote.rc.zi.columbia.edu
-Repo on cluster: /engram/nklab/jrm2182/nothello_world
-
-
-================================================================================
-ACTIVE JOBS (as of 2026-03-15 20:00 EDT)
-================================================================================
-
-Job ID    | Name      | Description                              | Status
-----------|-----------|------------------------------------------|--------
-5752213   | var_ft2m  | Variant fine-tune (7 variants), array 0-6 | Running
-5752214   | var_rnd   | Variant random-init (7 variants), arr 0-6 | Running
-5752195   | var_rnd   | no_same_quadrant random-init (task 0)     | Running
-5752215   | v2_ft2m   | New variant fine-tune (tasks 1-3)         | Running
-5752216   | v2_rnd    | New variant random-init (tasks 1-3)       | Running
-5752235   | regen_adj | Regen adjacent_legal legal_moves.pickle   | Running (~2h in)
-5752236   | v2_ft2m   | adjacent_legal fine-tune (dep on 5752235) | Pending
-5752237   | v2_rnd    | adjacent_legal random-init (dep on 5752235)| Pending
-
-
-================================================================================
-PLANNED FIGURES
-================================================================================
-
-Fig 1: Loss/accuracy curves — corruption alphas, fine-tuned OthelloGPT  [READY]
-Fig 2: Loss/accuracy curves — corruption alphas, random network         [READY]
-Fig 3: Loss/accuracy curves — all variant rules, fine-tuned OthelloGPT  [WAITING on retraining]
-Fig 4: Loss/accuracy curves — all variant rules, random network         [WAITING on retraining]
-Fig 5: Divergence — newly legal/illegal moves per condition             [PARTIAL — need new variants]
-Fig 6: Matched comparison — variant vs corruption at equal divergence   [WAITING on Fig 3-5]
-Fig 7: Multi-intervention — boundary margin & crosstalk vs N            [READY]
-Fig 8: Layer propagation — probe accuracy across layers per condition   [READY]
-Fig 9: Layer propagation — failure analysis (cross-layer, cross-cond)   [READY]
+TODO:
+  - When 5752359 completes: resubmit adjacent_legal FT+RND training
+  - Rerun adjacent_legal divergence after regen completes
+  - When 5753941 completes: resubmit max_three_flips + self_flanking FT+RND training
+  - Rerun divergence for self_flanking, max_three_flips after regen
+  - Submit game statistics on cluster: sbatch compute_game_statistics.sh
+  - Trajectory divergence already running: job 5756032
+  - Transfer results for all 10 completed variants to local machine
+  - Generate summary table with all variant FT vs RND results
+  - Embedding-based divergence: Run variant games through pretrained OthelloGPT,
+    collect residual stream activations (layer 4 or 5 recommended — where probes
+    peak and interventions are most effective), compare distributions via MMD or
+    Fréchet distance. This directly measures "how different do these games look
+    to the model" and may be the most relevant metric for transfer learning.
 
 
-================================================================================
-EMERGING NARRATIVE
-================================================================================
-
-The evidence so far paints a nuanced picture:
-
-1. Transfer learning (A): Pre-trained OthelloGPT shows minimal transfer
-   advantage over random-init on corruption experiments — both converge to
-   similar final accuracy. This suggests the model's knowledge doesn't
-   provide a strong head start when the game rules are simply noisier.
-   Variant results (pending retraining with correct metric) will test
-   whether structured rule changes produce different transfer behavior.
-
-2. Causal interventions (B): The model partially respects counterfactual
-   board modifications. When we intervene to flip a cell's color:
-   - The intervention CAN flip probes at each individual layer (~97-98%
-     when calibrated per-layer)
-   - But each layer uses a partially different direction to represent the
-     same cell (~80% cross-layer accuracy)
-   - Adding pieces to empty cells works better than flipping existing
-     pieces (positive vs negative boundary margin)
-   - Crosstalk between cells is moderate for non-interacting cells but
-     explodes when cells share flip chains
-
-3. Probing (C): Linear probes achieve 97-98% accuracy at layers 5-7,
-   showing the model clearly encodes board state. The layer propagation
-   experiment reveals this encoding is not identical across layers —
-   each transformer block reshapes the representation, maintaining ~80%
-   alignment with adjacent layers' probe directions.
-
-Open questions:
-  - Do variant rules with different divergence levels produce different
-    transfer advantages? (Waiting on retraining)
-  - Can we find a single intervention direction that works across all
-    layers simultaneously? Or does each layer fundamentally need its own?
-  - Why do adds succeed (positive boundary margin) while flips fail
-    (negative)? Is it because flips require recomputing flip chains?
