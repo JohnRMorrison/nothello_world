@@ -12,10 +12,13 @@ echo "Started at: $(date)"
 
 source activate othello
 
-python measure_trajectory_divergence.py \
-    --variant adjacent_legal \
+python measure_legal_divergence.py \
+    --games-dir experiments/variants/games_2m/adjacent_legal \
+    --condition-type variant \
+    --condition-label adjacent_legal \
+    --variant-name adjacent_legal \
     --std-games-dir experiments/corruption_v2/games_2m/alpha000 \
-    --output-dir experiments/divergence/trajectory \
+    --output-dir experiments/divergence \
     --max-games 100000
 
 echo "Finished at: $(date)"
