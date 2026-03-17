@@ -318,6 +318,35 @@ def find_flips(state, move, color, directions=None):
     return tbf
 
 
+def find_self_flank_flips(state, move, color, directions=None):
+    """Find own pieces that would be self-flanked by placing `color` at `move`.
+
+    Self-flanking: a run of own-color pieces terminated by an opponent piece.
+    These own pieces get flipped to the opponent's color.
+    """
+    if directions is None:
+        directions = range(8)
+    r, c = move // 8, move % 8
+    tbf = []
+    for di in directions:
+        dr, dc = EIGHTS[di]
+        buffer = []
+        cur_r, cur_c = r + dr, c + dc
+        while 0 <= cur_r <= 7 and 0 <= cur_c <= 7:
+            val = state[cur_r, cur_c]
+            if val == 0:
+                break
+            elif val == color:
+                buffer.append((cur_r, cur_c))
+            elif val == -color:
+                # Opponent terminates a run of own pieces → self-flank
+                tbf.extend(buffer)
+                break
+            cur_r += dr
+            cur_c += dc
+    return tbf
+
+
 @njit(cache=True)
 def _find_flips_skip_empty_inner(flat, move, color, dir_mask, rays, ray_lens):
     """Numba-accelerated flip finding for skip-empty variant.
@@ -439,6 +468,13 @@ class VariantBoard:
 
     def get_valid_moves(self):
         """Return list of legal moves for current player (vectorized)."""
+        # delayed_flips: apply pending flips so legality is computed on correct state
+        if self.variant == "delayed_flips" and self.pending_flips:
+            for fr, fc in self.pending_flips:
+                if self.state[fr, fc] != 0:
+                    self.state[fr, fc] *= -1
+            self.pending_flips = []
+
         color = self.next_hand_color
         flat = self.state.ravel()
         empty = (flat == 0)
@@ -501,15 +537,17 @@ class VariantBoard:
             last_q = QUADRANTS[self.history[-1]]
             empty = empty & (QUADRANTS != last_q)
 
-        if self.variant == "self_flanking":
-            has_sf = _self_flank_vec(flat, color, self._dir_mask)
-            empty = empty & ~has_sf
+        # self_flanking: no move restriction — flips happen in make_move
 
         if self.variant == "max_three_flips":
             valid_mask = empty & (n_flips >= 1) & (n_flips <= 3)
             regular = np.where(valid_mask)[0].tolist()
-            # No forfeit for this variant
-            return regular if regular else []
+            if regular:
+                return regular
+            # Forfeit: opponent's moves with ≤3 flips
+            opp_flips, _ = _flips_vec(flat, -color, self._dir_mask)
+            forfeit_mask = empty & (opp_flips >= 1) & (opp_flips <= 3)
+            return np.where(forfeit_mask)[0].tolist()
 
         # Regular moves: empty squares with flips
         valid_mask = empty & (n_flips > 0)
@@ -532,12 +570,7 @@ class VariantBoard:
         r, c = move // 8, move % 8
         color = self.next_hand_color
 
-        # Variant 7: apply pending flips from last turn
-        if self.variant == "delayed_flips" and self.pending_flips:
-            for fr, fc in self.pending_flips:
-                if self.state[fr, fc] != 0:
-                    self.state[fr, fc] *= -1
-            self.pending_flips = []
+        # delayed_flips: pending flips already applied in get_valid_moves()
 
         # Find flips for current move (variant-specific)
         if self.variant == "skip_empty_flips":
@@ -565,6 +598,11 @@ class VariantBoard:
         if self.variant == "locked_flips":
             flips = [(r2, c2) for r2, c2 in flips if self.flip_count[r2, c2] < 2]
 
+        # Variant: self_flanking — find own pieces to flip BEFORE applying normal flips
+        sf_flips = []
+        if self.variant == "self_flanking":
+            sf_flips = find_self_flank_flips(self.state, move, color, self._dirs)
+
         # Apply flips
         if self.variant == "delayed_flips":
             self.pending_flips = list(flips)
@@ -573,6 +611,10 @@ class VariantBoard:
                 self.state[fr, fc] *= -1
                 if self.variant == "locked_flips":
                     self.flip_count[fr, fc] += 1
+
+        # Apply self-flank flips (own pieces flipped to opponent's color)
+        for fr, fc in sf_flips:
+            self.state[fr, fc] *= -1
 
         # Place piece
         self.state[r, c] = color
