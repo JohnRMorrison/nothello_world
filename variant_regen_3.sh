@@ -8,7 +8,7 @@
 #SBATCH --partition=nklab,burst
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
-VARIANTS=(self_flanking delayed_flips max_three_flips)
+VARIANTS=(self_flanking max_three_flips)
 
 VARIANT=${VARIANTS[$SLURM_ARRAY_TASK_ID]}
 
