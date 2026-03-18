@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=swapped
-#SBATCH --output=logs/swapped_%j.out
-#SBATCH --error=logs/swapped_%j.err
+#SBATCH --job-name=swap_train
+#SBATCH --output=logs/swap_train_%j.out
+#SBATCH --error=logs/swap_train_%j.err
 #SBATCH --time=24:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
@@ -12,15 +12,6 @@
 echo "Started at: $(date)"
 
 source activate othello
-
-# Generate games
-python generate_variant_games.py \
-    --variant swapped_colors \
-    --num-games 2000000 \
-    --output-dir experiments/variants/games_2m/swapped_colors \
-    --seed 42
-
-echo "Generation done at: $(date)"
 
 # Fine-tune
 python finetune_corruption.py \
