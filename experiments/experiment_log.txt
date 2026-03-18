@@ -429,16 +429,15 @@ ACTIVE CLUSTER JOBS (as of 2026-03-17)
 
 Job ID      | Name       | Description                              | Status
 ------------|------------|------------------------------------------|--------
-5752359     | regen_adj  | Regen adjacent_legal legal_moves.pickle   | Running (24h, 4 workers)
-5752426_0-2,6 | retrain7 FT  | Retrain 4 old variants (with legal_mask) | Running
-5752433_0-2,6 | retrain7 RND | Retrain 4 old variants (random init)    | Running
-5753941_0   | regen3     | Regen self_flanking 2M games (bug fix)    | Running
-5753941_1   | regen3     | Regen max_three_flips 2M games (bug fix)  | Running
-5756032     | traj_div   | Trajectory divergence (100k games, batch)  | Running
-5758006     | swapped    | swapped_colors: generate 2M + FT + RND    | Running
-5759238     | game_stats | Game statistics (BF, length, entropy)      | Running
+5761473     | delay_all  | delayed_flips: generate 2M + FT + RND       | Running
+5761475_3   | retrain7 RND | max_three_flips RND                      | Running
+5761476_4   | retrain7 FT  | self_flanking FT                         | Running
+5761477_4   | retrain7 RND | self_flanking RND                        | Running
+5767324     | swap_ft    | swapped_colors FT (GPU)                     | Running
+5767325     | swap_rnd   | swapped_colors RND (GPU)                    | Running
 
 COMPLETED:
+  5752359     | regen adjacent_legal legal_moves.pickle (24h, 4 workers)
   5752331     | multi_intv cd0 (1000 games) → experiments/multi_intervention_cd0/
   5752332     | multi_intv cd1 (1000 games) → experiments/multi_intervention_cd1/
   5752333     | multi_intv cd2 (1000 games) → experiments/multi_intervention_cd2/
@@ -452,25 +451,110 @@ COMPLETED:
   5752288_1-3 | variant FT: skip_empty_flips, capture_any, wrap_flips
   5752291_1-3 | variant RND: skip_empty_flips, capture_any, wrap_flips
   5752320     | divergence for 4 new variants (7/8 tasks OK, adj_legal failed)
+  5753941_1   | regen max_three_flips 2M games
+  5761478     | game_stats (64G, early truncation fix) → experiments/divergence/game_stats/
+  5761479     | adj_div: adjacent_legal legal divergence → experiments/divergence/
+  5752426_0-2,6 | retrain7 FT: no_diagonal_flips, no_row_flips, locked_flips, no_same_quadrant
+  5752433_0-2,6 | retrain7 RND: no_diagonal_flips, no_row_flips, locked_flips, no_same_quadrant
+  5753941_0   | regen self_flanking 2M games
+  5761467     | adj_ft: adjacent_legal FT training
+  5761468     | adj_rnd: adjacent_legal RND training
+  5761474_3   | retrain7 FT: max_three_flips
+  5762754     | traj_adj: trajectory divergence adjacent_legal
+  5767733_0-4 | lpm_ft: 5 variants FT bs=16 1ep → experiments/variants/losses_lpm/
+              |   (locked_flips, no_diagonal_flips, no_row_flips, no_same_quadrant, skip_empty_flips)
+  5767738_0-4 | lpm_rnd: 5 variants RND bs=16 1ep → experiments/variants/losses_lpm_random/
+              |   (locked_flips, no_diagonal_flips, no_row_flips, no_same_quadrant, skip_empty_flips)
 
 CANCELLED:
   5752426_3,4 | retrain7 FT: max_three_flips, self_flanking (need regen first)
   5752433_3,4 | retrain7 RND: max_three_flips, self_flanking (need regen first)
-  5752426_5, 5752433_5 | retrain7 delayed_flips: completed or cancelled (not in queue)
+  5752426_5, 5752433_5 | retrain7 delayed_flips: CANCELLED (games missing, resubmitted as 5761473)
+  5761469     | adj_div: FAILED (ambiguous --variant flag, resubmitted as 5761472)
+  5761470     | delay_ft: FAILED (games missing, folded into 5761473)
+  5761471     | delay_rnd: FAILED (games missing, folded into 5761473)
+  5759238     | game_stats: OUT_OF_MEMORY at 32G (resubmitted as 5761466 at 64G)
+  5761466     | game_stats: OUT_OF_MEMORY at 64G (bumped to 128G)
+  5761472     | adj_div: OUT_OF_MEMORY at 32G (bumped to 128G)
+  5756032     | traj_div: TIMEOUT at 4h (9/11 variants already had results, resubmitted as 5762754/5762755)
+  5758006     | swapped: TIMEOUT at 8h (no GPU, CPU training too slow, resubmitted as 5767324/5767325)
+  5762755     | traj_swap: exited immediately (swapped games not ready)
+  5767323     | swap_train: CANCELLED (split into parallel 5767324/5767325)
+
+--------------------------------------------------------------------------------
+A3. Spatially impossible board experiments (GER)
+--------------------------------------------------------------------------------
+Cross-wire Othello flanking patterns to create rule sets that are structured
+and compressible but cannot be embedded in any consistent 8x8 grid.
+
+Method: For each pattern, with probability beta, swap its ray body (opponents +
+terminal) with another pattern of the same direction and length whose target is
+in the opposite board half (rows 0-3 vs 4-7). Swaps at the individual pattern
+level create intra-cell contradictions: cell 16's right-length-1 pattern still
+points to neighbor 17, but its right-length-2 pattern now points to cells from
+row 5. No grid can satisfy both.
+
+Spatial properties violated by cross-wiring:
+  - Embeddability: no consistent 8x8 grid satisfies all constraints
+  - Reflexivity: A→C flanks B, but C→A may not flank B
+  - Transitivity: "right from A" → B, "right from B" → C, but C ≠ A+2
+  - Collinearity: length-2 and length-3 patterns from same cell disagree on ray
+  - Commutativity: right-then-down ≠ down-then-right
+  - Distance symmetry: A references B at distance 2, B may never reference A
+  - Neighborhood consistency: two directions from A may point to same cell
+  - Betweenness: intermediate cells in long patterns absent from shorter patterns
+
+Measured by Grid Embedding Residual (GER): extract all consecutive-pair
+constraints from patterns with direction labels, solve least-squares for (x,y)
+coordinates of each cell. GER = mean squared residual. Standard Othello → 0.
+
+GER range achievable via cross-wiring: 0.0 to ~0.51. Compare: alpha corruption
+has no spatial structure at all but is less compressible.
+
+Beta sweep results (10 seeds each):
+  beta | GER (mean±std) | Gzip (mean±std) | Dead patterns
+  0.0  | 0.000 ± 0.000  | 2381 ± 0        | 0.0
+  0.1  | 0.079 ± 0.012  | 2438 ± 6        | 0.2
+  0.2  | 0.171 ± 0.007  | 2525 ± 5        | 0.6
+  0.3  | 0.229 ± 0.008  | 2583 ± 6        | 0.6
+  0.4  | 0.273 ± 0.010  | 2654 ± 8        | 2.1
+  0.5  | 0.330 ± 0.009  | 2714 ± 8        | 1.5
+  0.6  | 0.347 ± 0.008  | 2746 ± 9        | 2.2
+  0.7  | 0.366 ± 0.010  | 2798 ± 6        | 2.5
+  0.8  | 0.386 ± 0.006  | 2822 ± 7        | 2.8
+  0.9  | 0.406 ± 0.005  | 2860 ± 9        | 3.7
+  1.0  | 0.425 ± 0.007  | 2882 ± 13       | 3.9
+
+  Compare alpha corruption: alpha=1.0 → gzip=3602. Cross-wiring stays much
+  more compressible because it preserves pattern structure (just rewires it).
+
+GER targets for experiments: 0.0, 0.1, 0.2, 0.3, 0.4, 0.5 (via hill-climbing)
+
+Scripts:
+  generate_impossible_patterns.py  — cross-wiring, GER computation, target search
+  generate_impossible_games.py     — game generation from impossible patterns
+  impossible_generate.sh           — SLURM: generate 2M games per GER target
+  impossible_lpm_ft.sh             — SLURM: FT bs=16 1 epoch
+  impossible_lpm_rnd.sh            — SLURM: RND bs=16 1 epoch
+
+Hypothesis: if OthelloGPT relies on spatial structure, higher GER should slow
+LPM convergence during fine-tuning, even though compressibility is similar.
+
+Status: READY TO SUBMIT. Scripts created, not yet run.
+
 
 TODO:
-  - When 5752359 completes: resubmit adjacent_legal FT+RND training
-  - Rerun adjacent_legal divergence after regen completes
-  - When 5753941 completes: resubmit max_three_flips + self_flanking FT+RND training
-  - Rerun divergence for self_flanking, max_three_flips after regen
-  - Submit game statistics on cluster: sbatch compute_game_statistics.sh
-  - Trajectory divergence already running: job 5756032
-  - Transfer results for all 10 completed variants to local machine
+  - Transfer remaining results (swapped_colors, delayed_flips, self_flanking) when jobs complete
+  - Rerun traj divergence for swapped_colors after training completes
   - Generate summary table with all variant FT vs RND results
-  - Embedding-based divergence: Run variant games through pretrained OthelloGPT,
-    collect residual stream activations (layer 4 or 5 recommended — where probes
-    peak and interventions are most effective), compare distributions via MMD or
-    Fréchet distance. This directly measures "how different do these games look
-    to the model" and may be the most relevant metric for transfer learning.
+  - Submit impossible board experiments (GER 0.0-0.5)
+  - Non-8x8 spatially coherent boards (spatially possible but wrong shape)
+  - Beta corruption idea: Instead of substituting random moves (alpha), randomly
+    drop legal moves from the legal set — make some normally-legal moves illegal.
+    With probability beta, each legal move is removed from the legal set before
+    choosing. This tests selective unlearning: variant results (e.g. no_diagonal_flips)
+    show the model can quickly forget specific heuristics, so beta corruption would
+    parameterize this. Hypothesis: forgetting (beta) may be easier than relearning
+    from noise (alpha), since it only requires suppressing existing knowledge.
 
 
