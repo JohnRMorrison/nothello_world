@@ -68,14 +68,16 @@ def build_legal_mask(games, legal_moves, stoi, block_size, vocab_size):
 def evaluate(model, loader, device, legal_mask=None):
     """Evaluate on test set.
 
-    Returns (loss, legal_acc, mean_rank).
+    Returns (loss, legal_acc, mean_rank, legal_prob_mass).
     legal_mask: np.ndarray (N, V) boolean mask from build_legal_mask().
-    If None, legal_acc falls back to exact-match accuracy.
+    If None, legal_acc falls back to exact-match accuracy and
+    legal_prob_mass is returned as 0.0.
     """
     model.eval()
     total_loss = 0.0
     total_legal = 0
     total_rank = 0.0
+    total_legal_prob = 0.0
     n_tokens = 0
 
     for x, y in loader:
@@ -92,17 +94,23 @@ def evaluate(model, loader, device, legal_mask=None):
         preds_flat = logits.argmax(dim=-1)[mask].cpu().numpy()  # (n_valid,)
         y_flat = y[mask].cpu().numpy()
 
-        # Legal-move accuracy
+        # Softmax probabilities for legal prob mass
+        logits_flat = logits[mask]  # (n_valid, V)
+        probs_flat = torch.softmax(logits_flat, dim=-1)  # (n_valid, V)
+
+        # Legal-move accuracy and legal probability mass
         if legal_mask is not None:
             end = n_tokens + len(preds_flat)
             if end <= len(legal_mask):
                 legal_slice = legal_mask[n_tokens:end]
                 total_legal += legal_slice[np.arange(len(preds_flat)), preds_flat].sum()
+                # Sum softmax probs over legal moves for each position
+                legal_torch = torch.from_numpy(legal_slice).to(probs_flat.device)
+                total_legal_prob += (probs_flat * legal_torch).sum().item()
         else:
             total_legal += (preds_flat == y_flat).sum()
 
         # Mean rank of the played move (vectorized)
-        logits_flat = logits[mask]  # (n_valid, V)
         y_tok = y[mask]  # (n_valid,)
         correct_logit = logits_flat[torch.arange(len(y_tok)), y_tok].unsqueeze(-1)
         ranks = (logits_flat > correct_logit).sum(dim=-1) + 1  # 1-indexed
@@ -113,7 +121,8 @@ def evaluate(model, loader, device, legal_mask=None):
     model.train()
     return (total_loss / n_tokens,
             total_legal / n_tokens,
-            total_rank / n_tokens)
+            total_rank / n_tokens,
+            total_legal_prob / n_tokens if legal_mask is not None else 0.0)
 
 
 def main():
@@ -225,14 +234,16 @@ def main():
 
     # Eval before any training
     print("Evaluating before training...", flush=True)
-    eval_loss, eval_acc, eval_rank = evaluate(
+    eval_loss, eval_acc, eval_rank, eval_lpm = evaluate(
         model, test_loader, device, test_legal_mask)
-    print(f"  Initial: loss={eval_loss:.4f}, legal_acc={eval_acc:.4f}, mean_rank={eval_rank:.2f}")
+    print(f"  Initial: loss={eval_loss:.4f}, legal_acc={eval_acc:.4f}, "
+          f"mean_rank={eval_rank:.2f}, legal_prob_mass={eval_lpm:.4f}")
 
     eval_steps = [0]
     eval_losses = [eval_loss]
     eval_accs = [eval_acc]
     eval_ranks = [eval_rank]
+    eval_lpms = [eval_lpm]
 
     # Training loop
     batch_count = 0
@@ -253,34 +264,37 @@ def main():
             batch_count += 1
 
             if batch_count % args.eval_every == 0:
-                eval_loss, eval_acc, eval_rank = evaluate(
+                eval_loss, eval_acc, eval_rank, eval_lpm = evaluate(
                     model, test_loader, device, test_legal_mask)
                 eval_steps.append(batch_count)
                 eval_losses.append(eval_loss)
                 eval_accs.append(eval_acc)
                 eval_ranks.append(eval_rank)
+                eval_lpms.append(eval_lpm)
 
                 elapsed = time.time() - t0
                 print(f"  Epoch {epoch+1}, batch {it+1}/{len(train_loader)}, "
                       f"step={batch_count}: loss={eval_loss:.4f}, legal_acc={eval_acc:.4f}, "
-                      f"rank={eval_rank:.2f}, elapsed={elapsed:.0f}s", flush=True)
+                      f"rank={eval_rank:.2f}, lpm={eval_lpm:.4f}, elapsed={elapsed:.0f}s",
+                      flush=True)
 
         # End-of-epoch eval
-        eval_loss, eval_acc, eval_rank = evaluate(
+        eval_loss, eval_acc, eval_rank, eval_lpm = evaluate(
             model, test_loader, device, test_legal_mask)
         eval_steps.append(batch_count)
         eval_losses.append(eval_loss)
         eval_accs.append(eval_acc)
         eval_ranks.append(eval_rank)
+        eval_lpms.append(eval_lpm)
 
         elapsed = time.time() - t0
         print(f"Epoch {epoch+1}: loss={eval_loss:.4f}, legal_acc={eval_acc:.4f}, "
-              f"rank={eval_rank:.2f} ({batch_count} batches, {elapsed:.0f}s)")
+              f"rank={eval_rank:.2f}, lpm={eval_lpm:.4f} ({batch_count} batches, {elapsed:.0f}s)")
 
     elapsed = time.time() - t0
     print(f"\nDone: {batch_count} total batches in {elapsed:.0f}s")
     print(f"Final: loss={eval_losses[-1]:.4f}, legal_acc={eval_accs[-1]:.4f}, "
-          f"rank={eval_ranks[-1]:.2f}")
+          f"rank={eval_ranks[-1]:.2f}, lpm={eval_lpms[-1]:.4f}")
 
     # Save results
     out_path = os.path.join(args.output_dir, f"{args.label}.json")
@@ -291,6 +305,7 @@ def main():
             'eval_losses': eval_losses,
             'eval_accs': eval_accs,
             'eval_ranks': eval_ranks,
+            'eval_lpms': eval_lpms,
             'epochs': args.epochs,
             'batch_size': args.batch_size,
             'lr': args.lr,
