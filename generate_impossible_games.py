@@ -19,7 +19,7 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hand_crafted_flanking import enumerate_flanking_patterns
 from generate_rule_games import (
     precompute_pattern_arrays, generate_games
