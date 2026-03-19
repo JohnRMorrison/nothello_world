@@ -33,7 +33,24 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hand_crafted_flanking import enumerate_flanking_patterns, DIRECTIONS
-from measure_compressibility import patterns_to_bytes, compressed_size
+
+
+def patterns_to_bytes(patterns):
+    """Serialize patterns as a flat byte array."""
+    buf = bytearray()
+    for p in patterns:
+        opps = p['opponents']
+        buf.append(len(opps))
+        buf.append(p['target'])
+        for o in opps:
+            buf.append(o)
+        buf.append(p['terminal'])
+    return bytes(buf)
+
+
+def compressed_size(data_bytes):
+    """Return gzip compressed size in bytes."""
+    return len(gzip.compress(data_bytes, compresslevel=9))
 
 
 def cross_wire_patterns(patterns, beta, rng):
