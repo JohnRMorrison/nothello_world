@@ -18,11 +18,20 @@ from itertools import combinations
 from behavioral_utils import N_MOVES, VALID_MOVES, MOVE_TO_IDX
 
 
-def load_adversarial_and_control(data_dir, cell, max_control=50000):
+def get_move_number(features):
+    """Infer move number from when features (count nonzero when values)."""
+    return (features[:, :N_MOVES] > 0).sum(axis=1)
+
+
+def load_adversarial_and_control(data_dir, cell, max_control=50000,
+                                  phase_matched=False):
     """Load adversarial positions (A) and control positions (B) for a cell.
 
     A: cell is illegal, model prob > 0.5%  (from Stage 2 beam search)
     B: cell is illegal, model prob < 0.1%  (from Stage 1 random games)
+
+    If phase_matched=True, control set is sampled to match the adversarial
+    set's move-number distribution.
     """
     # Adversarial positions
     adv_path = os.path.join(data_dir, "adversarial", f"cell_{cell:02d}.npz")
@@ -32,33 +41,78 @@ def load_adversarial_and_control(data_dir, cell, max_control=50000):
     print(f"  Adversarial (A): {len(adv_features)} positions, "
           f"mean prob={adv_probs.mean():.4f}", flush=True)
 
+    adv_moves = get_move_number(adv_features)
+    print(f"  Adversarial move range: {adv_moves.min()}-{adv_moves.max()}, "
+          f"mean={adv_moves.mean():.1f}", flush=True)
+
     # Control positions from Stage 1 shards
     ctrl_features_list = []
+    ctrl_positions_list = []
     shard_files = sorted([f for f in os.listdir(data_dir)
                           if f.startswith("shard_") and f.endswith(".npz")])
 
+    needed = max_control * 3 if phase_matched else max_control
     for shard_file in shard_files:
         data = np.load(os.path.join(data_dir, shard_file))
         features = data['features'].astype(np.float32)
         probs = data['probs'].astype(np.float32)[:, cell]
         legal = data['legal'][:, cell]
+        positions = data['positions']
 
         # Control: illegal AND model assigns < 0.1%
         ctrl_mask = (legal == 0) & (probs < 0.001)
         if ctrl_mask.any():
             ctrl_features_list.append(features[ctrl_mask])
+            ctrl_positions_list.append(positions[ctrl_mask])
 
-        del data, features, probs, legal
+        del data, features, probs, legal, positions
 
-        if sum(len(c) for c in ctrl_features_list) >= max_control:
+        if sum(len(c) for c in ctrl_features_list) >= needed:
             break
 
     ctrl_features = np.concatenate(ctrl_features_list)
-    if len(ctrl_features) > max_control:
-        idx = np.random.choice(len(ctrl_features), max_control, replace=False)
-        ctrl_features = ctrl_features[idx]
+    ctrl_positions = np.concatenate(ctrl_positions_list)
 
-    print(f"  Control (B): {len(ctrl_features)} positions", flush=True)
+    if phase_matched:
+        # Match control set to adversarial move-number distribution
+        ctrl_moves = get_move_number(ctrl_features)
+        adv_hist, bins = np.histogram(adv_moves, bins=range(0, 62))
+
+        selected_idx = []
+        for bin_idx in range(len(adv_hist)):
+            if adv_hist[bin_idx] == 0:
+                continue
+            move_num = bin_idx
+            # Find control positions at this move number
+            candidates = np.where(ctrl_moves == move_num)[0]
+            if len(candidates) == 0:
+                continue
+            # Sample proportionally (scale up to fill max_control)
+            n_sample = min(len(candidates),
+                           int(adv_hist[bin_idx] / len(adv_moves) * max_control))
+            n_sample = max(n_sample, 1)
+            chosen = np.random.choice(candidates, min(n_sample, len(candidates)),
+                                      replace=False)
+            selected_idx.extend(chosen.tolist())
+
+        if selected_idx:
+            ctrl_features = ctrl_features[selected_idx]
+        else:
+            ctrl_features = ctrl_features[:max_control]
+
+        ctrl_moves_after = get_move_number(ctrl_features)
+        print(f"  Control (B, phase-matched): {len(ctrl_features)} positions, "
+              f"move range={ctrl_moves_after.min()}-{ctrl_moves_after.max()}, "
+              f"mean={ctrl_moves_after.mean():.1f}", flush=True)
+    else:
+        if len(ctrl_features) > max_control:
+            idx = np.random.choice(len(ctrl_features), max_control, replace=False)
+            ctrl_features = ctrl_features[idx]
+        ctrl_moves = get_move_number(ctrl_features)
+        print(f"  Control (B): {len(ctrl_features)} positions, "
+              f"move range={ctrl_moves.min()}-{ctrl_moves.max()}, "
+              f"mean={ctrl_moves.mean():.1f}", flush=True)
+
     return adv_features, ctrl_features
 
 
@@ -163,6 +217,8 @@ def main():
                         help="Comma-separated cell indices to analyze")
     parser.add_argument("--data-dir", type=str, default="behavioral_data")
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--phase-matched", action="store_true",
+                        help="Match control set move-number distribution to adversarial")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -179,7 +235,7 @@ def main():
 
         t0 = time.time()
         adv_feat, ctrl_feat = load_adversarial_and_control(
-            args.data_dir, cell)
+            args.data_dir, cell, phase_matched=args.phase_matched)
 
         # Screen pairs
         print("\n  --- Pair screening ---", flush=True)
