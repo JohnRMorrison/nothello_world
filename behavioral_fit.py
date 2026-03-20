@@ -188,7 +188,7 @@ def feature_name(idx):
         board_pos = VALID_MOVES[idx]
         r, c = board_pos // 8, board_pos % 8
         rows = "ABCDEFGH"
-        return f"played_{rows[r]}{c+1}"
+        return f"when_{rows[r]}{c+1}"
     else:
         move_idx = idx - N_MOVES
         board_pos = VALID_MOVES[move_idx]

@@ -35,8 +35,14 @@ def build_120d_features(games, pos_start=POS_START, pos_end=POS_END):
     """Build 120-d move-history features for a batch of games.
 
     Features per position t:
-      played[i] (60): 1 if move i has been played at or before step t
-      even[i]   (60): 1 if move i was played on an even step (0 if not played)
+      when[i]  (60): normalized step at which move i was played: (step+1)/60.
+                     0 if not yet played at position t.
+      even[i]  (60): 1 if move i was played on an even step (black's turn),
+                     0 if played on odd step or not yet played.
+
+    Together, when[i] and even[i] encode both the timing and color of each
+    piece on the board. when[i] > 0 means the cell is occupied; even[i]
+    tells you which player occupies it.
 
     Args:
         games: list of lists of board positions (0-63), each game ~60 moves
@@ -77,10 +83,12 @@ def build_120d_features(games, pos_start=POS_START, pos_end=POS_END):
 
         # played: move was played at or before step t
         played = (step_of_move >= 0) & (step_of_move <= t)  # (N, 60)
-        # even: played on even step
+        # when: normalized step (0 if not played)
+        when = np.where(played, (step_of_move + 1) / 60.0, 0.0)  # (N, 60)
+        # even: played on even step (black's turn)
         even = np.where(played, (step_of_move % 2 == 0).astype(np.float32), 0.0)
 
-        features[start:end, :N_MOVES] = played.astype(np.float32)
+        features[start:end, :N_MOVES] = when
         features[start:end, N_MOVES:] = even
         positions[start:end] = t
 
