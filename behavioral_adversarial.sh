@@ -19,7 +19,7 @@ python behavioral_adversarial.py \
     --cell ${SLURM_ARRAY_TASK_ID} \
     --output-dir behavioral_data \
     --ckpt ckpts/gpt_synthetic.ckpt \
-    --num-starts 500 \
-    --beam-width 50
+    --num-starts 200 \
+    --beam-width 20
 
 echo "Finished at: $(date)"

@@ -26,6 +26,17 @@ from behavioral_utils import (
 from data.othello import OthelloBoardState
 
 
+def fast_copy_board(board):
+    """Fast copy of OthelloBoardState without deepcopy overhead."""
+    new = OthelloBoardState.__new__(OthelloBoardState)
+    new.board_size = board.board_size
+    new.state = board.state.copy()
+    new.next_hand_color = board.next_hand_color
+    new.history = list(board.history)
+    new.age = board.age.copy()
+    return new
+
+
 def per_cell_beam_search(model, dataset, device, target_cell,
                          num_starts=500, beam_width=50, prefix_len=5,
                          max_depth=59):
@@ -44,6 +55,11 @@ def per_cell_beam_search(model, dataset, device, target_cell,
     target_board_pos = IDX_TO_MOVE[target_cell]
     vocab_to_pos, pos_to_vocab = build_vocab_to_pos_map(dataset)
     target_token_idx = pos_to_vocab[target_board_pos]
+
+    # Build vectorized stoi lookup for fast tokenization
+    stoi_arr = np.zeros(64, dtype=np.int64)
+    for pos in VALID_MOVES:
+        stoi_arr[pos] = dataset.stoi[pos]
 
     all_results = []
 
@@ -67,7 +83,7 @@ def per_cell_beam_search(model, dataset, device, target_cell,
 
         # Beam search from prefix
         # Each beam: (game_seq, board_state, cumulative_score)
-        beams = [(list(prefix), deepcopy(board), 0.0)]
+        beams = [(list(prefix), fast_copy_board(board), 0.0)]
 
         for depth in range(prefix_len, max_depth):
             candidates = []
@@ -79,7 +95,7 @@ def per_cell_beam_search(model, dataset, device, target_cell,
 
                 for move in valid_moves:
                     new_seq = game_seq + [move]
-                    new_board = deepcopy(brd)
+                    new_board = fast_copy_board(brd)
                     new_board.umpire(move)
                     candidates.append((new_seq, new_board, cum_score, False))
 
@@ -91,15 +107,16 @@ def per_cell_beam_search(model, dataset, device, target_cell,
                 all_results.extend([(s, c) for s, b, c in finished])
                 break
 
-            # Batch inference on all active candidates
+            # Batch inference on all active candidates (vectorized tokenization)
             n_cands = len(active)
-            seq_len = len(active[0][0])
-            tokens = torch.zeros(n_cands, min(seq_len, dataset.block_size),
-                                 dtype=torch.long, device=device)
+            seq_len = min(len(active[0][0]), dataset.block_size)
+            seqs_arr = np.zeros((n_cands, seq_len), dtype=np.int64)
             for i, (seq, _, _) in enumerate(active):
-                t_len = min(len(seq), dataset.block_size)
+                t_len = min(len(seq), seq_len)
                 for s in range(t_len):
-                    tokens[i, s] = dataset.stoi[seq[s]]
+                    seqs_arr[i, s] = seq[s]
+            tokens = torch.tensor(stoi_arr[seqs_arr], dtype=torch.long,
+                                  device=device)
 
             with torch.no_grad():
                 # Process in sub-batches if too many candidates
@@ -219,8 +236,8 @@ def main():
     parser.add_argument("--cell", type=int, required=True, help="Target cell index (0-59)")
     parser.add_argument("--ckpt", type=str, default="./ckpts/gpt_synthetic.ckpt")
     parser.add_argument("--output-dir", type=str, default="behavioral_data")
-    parser.add_argument("--num-starts", type=int, default=500)
-    parser.add_argument("--beam-width", type=int, default=50)
+    parser.add_argument("--num-starts", type=int, default=200)
+    parser.add_argument("--beam-width", type=int, default=20)
     parser.add_argument("--prefix-len", type=int, default=5)
     parser.add_argument("--num-save", type=int, default=500,
                         help="Number of top games to extract positions from")
