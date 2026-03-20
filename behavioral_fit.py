@@ -125,7 +125,7 @@ def fit_tree_regressor(X, y, sample_weight=None, max_depth=6,
     tree = DecisionTreeRegressor(
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
-        min_impurity_decrease=0.0001,
+        min_impurity_decrease=1e-7,
     )
     tree.fit(X, y, sample_weight=sample_weight)
     return tree
@@ -137,7 +137,7 @@ def fit_tree_classifier(X, y_legal, sample_weight=None, max_depth=4,
     tree = DecisionTreeClassifier(
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
-        min_impurity_decrease=0.001,
+        min_impurity_decrease=1e-7,
     )
     tree.fit(X, y_legal.astype(int), sample_weight=sample_weight)
     return tree
@@ -312,6 +312,11 @@ def fit_method_two_level(X_random, y_random, legal_random,
     heuristics = []
     l2_trees = {}
 
+    # Compute global avg_prob for lift calculation
+    total_count = sum(s['count'] for s in stats.values())
+    total_prob = sum(s['sum_prob'] for s in stats.values())
+    global_avg_prob = total_prob / total_count if total_count > 0 else 1e-10
+
     # Diagnostic: print leaf value distribution
     leaf_probs = []
     for lid in leaves:
@@ -319,8 +324,10 @@ def fit_method_two_level(X_random, y_random, legal_random,
             leaf_probs.append(stats[lid]['sum_prob'] / stats[lid]['count'])
     if leaf_probs:
         leaf_probs.sort(reverse=True)
-        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.4f}, "
-              f"top5={[f'{p:.4f}' for p in leaf_probs[:5]]}", flush=True)
+        print(f"  Global avg_prob: {global_avg_prob:.5f}", flush=True)
+        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.5f}, "
+              f"top5={[f'{p:.5f}' for p in leaf_probs[:5]]}", flush=True)
+        print(f"  Max lift: {leaf_probs[0]/global_avg_prob:.1f}x", flush=True)
 
     for leaf_id in leaves:
         if leaf_id not in stats:
@@ -332,6 +339,7 @@ def fit_method_two_level(X_random, y_random, legal_random,
 
         avg_prob = s['sum_prob'] / count
         precision = s['sum_legal'] / count
+        lift = avg_prob / global_avg_prob if global_avg_prob > 0 else 0
         path = extract_tree_path(tree_L1, leaf_id)
 
         heuristic = {
@@ -339,14 +347,15 @@ def fit_method_two_level(X_random, y_random, legal_random,
             'conjunction': path,
             'conjunction_readable': make_conjunction_readable(path),
             'avg_model_prob': float(avg_prob),
+            'lift': float(lift),
             'support': count,
             'precision': float(precision),
             'error_rate': float(1 - precision),
             'num_errors': count - s['sum_legal'],
         }
 
-        # Classify
-        if avg_prob > 0.005 and count > 500:
+        # Classify using lift (relative to global average)
+        if lift > 2.0 and count > 500:
             heuristic['type'] = 'promoting'
             if precision > 0.90:
                 heuristic['reliability'] = 'reliable'
@@ -455,6 +464,11 @@ def fit_method_weighted(X_random, y_random, legal_random,
             _find_leaves(tree.tree_.children_right[node])
     _find_leaves(0)
 
+    # Compute global avg_prob for lift calculation
+    total_count = sum(s['count'] for s in stats.values())
+    total_prob = sum(s['sum_prob'] for s in stats.values())
+    global_avg_prob = total_prob / total_count if total_count > 0 else 1e-10
+
     # Diagnostic: print leaf value distribution
     leaf_probs = []
     for lid in leaves:
@@ -462,8 +476,10 @@ def fit_method_weighted(X_random, y_random, legal_random,
             leaf_probs.append(stats[lid]['sum_prob'] / stats[lid]['count'])
     if leaf_probs:
         leaf_probs.sort(reverse=True)
-        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.4f}, "
-              f"top5={[f'{p:.4f}' for p in leaf_probs[:5]]}", flush=True)
+        print(f"  Global avg_prob: {global_avg_prob:.5f}", flush=True)
+        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.5f}, "
+              f"top5={[f'{p:.5f}' for p in leaf_probs[:5]]}", flush=True)
+        print(f"  Max lift: {leaf_probs[0]/global_avg_prob:.1f}x", flush=True)
 
     heuristics = []
     for leaf_id in leaves:
@@ -476,6 +492,7 @@ def fit_method_weighted(X_random, y_random, legal_random,
 
         avg_prob = s['sum_prob'] / count
         precision = s['sum_legal'] / count
+        lift = avg_prob / global_avg_prob if global_avg_prob > 0 else 0
         path = extract_tree_path(tree, leaf_id)
 
         heuristic = {
@@ -483,13 +500,14 @@ def fit_method_weighted(X_random, y_random, legal_random,
             'conjunction': path,
             'conjunction_readable': make_conjunction_readable(path),
             'avg_model_prob': float(avg_prob),
+            'lift': float(lift),
             'support': count,
             'precision': float(precision),
             'error_rate': float(1 - precision),
             'num_errors': count - s['sum_legal'],
         }
 
-        if avg_prob > 0.005 and count > 500:
+        if lift > 2.0 and count > 500:
             heuristic['type'] = 'promoting'
             if precision > 0.90:
                 heuristic['reliability'] = 'reliable'
