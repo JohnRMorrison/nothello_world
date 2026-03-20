@@ -312,6 +312,16 @@ def fit_method_two_level(X_random, y_random, legal_random,
     heuristics = []
     l2_trees = {}
 
+    # Diagnostic: print leaf value distribution
+    leaf_probs = []
+    for lid in leaves:
+        if lid in stats and stats[lid]['count'] > 0:
+            leaf_probs.append(stats[lid]['sum_prob'] / stats[lid]['count'])
+    if leaf_probs:
+        leaf_probs.sort(reverse=True)
+        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.4f}, "
+              f"top5={[f'{p:.4f}' for p in leaf_probs[:5]]}", flush=True)
+
     for leaf_id in leaves:
         if leaf_id not in stats:
             continue
@@ -336,7 +346,7 @@ def fit_method_two_level(X_random, y_random, legal_random,
         }
 
         # Classify
-        if avg_prob > 0.02 and count > 500:
+        if avg_prob > 0.005 and count > 500:
             heuristic['type'] = 'promoting'
             if precision > 0.90:
                 heuristic['reliability'] = 'reliable'
@@ -445,6 +455,16 @@ def fit_method_weighted(X_random, y_random, legal_random,
             _find_leaves(tree.tree_.children_right[node])
     _find_leaves(0)
 
+    # Diagnostic: print leaf value distribution
+    leaf_probs = []
+    for lid in leaves:
+        if lid in stats and stats[lid]['count'] > 0:
+            leaf_probs.append(stats[lid]['sum_prob'] / stats[lid]['count'])
+    if leaf_probs:
+        leaf_probs.sort(reverse=True)
+        print(f"  Leaf avg_prob distribution: max={leaf_probs[0]:.4f}, "
+              f"top5={[f'{p:.4f}' for p in leaf_probs[:5]]}", flush=True)
+
     heuristics = []
     for leaf_id in leaves:
         if leaf_id not in stats:
@@ -469,7 +489,7 @@ def fit_method_weighted(X_random, y_random, legal_random,
             'num_errors': count - s['sum_legal'],
         }
 
-        if avg_prob > 0.02 and count > 500:
+        if avg_prob > 0.005 and count > 500:
             heuristic['type'] = 'promoting'
             if precision > 0.90:
                 heuristic['reliability'] = 'reliable'
