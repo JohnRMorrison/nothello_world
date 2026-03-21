@@ -240,6 +240,8 @@ def main():
     parser.add_argument("--sensitivity-rank", type=str, required=True,
                         choices=['high', 'low', 'random'])
     parser.add_argument("--target-divergence", type=float, default=0.20)
+    parser.add_argument("--fixed-count", type=int, default=None,
+                        help="Corrupt exactly this many rules (skip divergence matching)")
     parser.add_argument("--sensitivity-file", type=str,
                         default="behavioral_data/sensitivity.json")
     parser.add_argument("--num-games", type=int, default=2000000)
@@ -253,7 +255,6 @@ def main():
 
     print(f"Condition: {args.corruption_type} × {args.sensitivity_rank}",
           flush=True)
-    print(f"Target divergence: {args.target_divergence}", flush=True)
 
     # Load sensitivity scores
     with open(args.sensitivity_file) as f:
@@ -261,13 +262,18 @@ def main():
     print(f"Loaded {len(sensitivity_data['rules'])} rule sensitivities",
           flush=True)
 
-    # Find number of rules to corrupt for target divergence
-    n_rules, achieved_div = find_n_rules_for_divergence(
-        sensitivity_data, args.sensitivity_rank, args.corruption_type,
-        args.target_divergence, args.tolerance, args.seed)
-
-    print(f"\nCorrupting {n_rules} rules → divergence {achieved_div:.4f}",
-          flush=True)
+    if args.fixed_count is not None:
+        # Fixed count mode: corrupt exactly N rules, measure divergence
+        n_rules = args.fixed_count
+        print(f"Fixed count mode: corrupting {n_rules} rules", flush=True)
+    else:
+        # Divergence matching mode
+        print(f"Target divergence: {args.target_divergence}", flush=True)
+        n_rules, achieved_div = find_n_rules_for_divergence(
+            sensitivity_data, args.sensitivity_rank, args.corruption_type,
+            args.target_divergence, args.tolerance, args.seed)
+        print(f"\nCorrupting {n_rules} rules → divergence {achieved_div:.4f}",
+              flush=True)
 
     # Select and corrupt rules
     rule_ids = select_rules(sensitivity_data, args.sensitivity_rank,
@@ -276,17 +282,27 @@ def main():
     corrupt_fn = CORRUPTION_FNS[args.corruption_type]
     corrupted_patterns = corrupt_fn(base_patterns, rule_ids, rng)
 
+    # Measure divergence if using fixed count
+    if args.fixed_count is not None:
+        achieved_div = compute_divergence_sample(corrupted_patterns,
+                                                  n_sample=500, seed=args.seed)
+        print(f"  Achieved divergence: {achieved_div:.4f}", flush=True)
+
     # Compute sensitivity stats for corrupted vs uncorrupted
     rule_sens = {r['rule_id']: r['sensitivity']
+                 for r in sensitivity_data['rules']}
+    rule_freq = {r['rule_id']: r['n_satisfied']
                  for r in sensitivity_data['rules']}
     corrupted_sens = [rule_sens[rid] for rid in rule_ids]
     uncorrupted_sens = [rule_sens[rid] for rid in range(len(base_patterns))
                         if rid not in set(rule_ids)]
+    total_impact = sum(rule_sens[rid] * rule_freq[rid] for rid in rule_ids)
 
     print(f"  Corrupted rules: n={len(rule_ids)}, "
           f"mean_sens={np.mean(corrupted_sens):.5f}", flush=True)
     print(f"  Uncorrupted rules: n={len(uncorrupted_sens)}, "
           f"mean_sens={np.mean(uncorrupted_sens):.5f}", flush=True)
+    print(f"  Total impact: {total_impact:.1f}", flush=True)
 
     # Generate games
     targets, terminals, opp_cells, opp_mask = \
@@ -322,10 +338,13 @@ def main():
     metadata = {
         'corruption_type': args.corruption_type,
         'sensitivity_rank': args.sensitivity_rank,
-        'target_divergence': args.target_divergence,
+        'matching_mode': 'fixed_count' if args.fixed_count else 'divergence',
+        'fixed_count': args.fixed_count,
+        'target_divergence': args.target_divergence if args.fixed_count is None else None,
         'achieved_divergence': float(achieved_div),
         'n_rules_corrupted': len(rule_ids),
         'n_rules_total': len(base_patterns),
+        'total_impact': float(total_impact),
         'corrupted_rule_ids': rule_ids,
         'mean_sensitivity_corrupted': float(np.mean(corrupted_sens)),
         'mean_sensitivity_uncorrupted': float(np.mean(uncorrupted_sens)),
