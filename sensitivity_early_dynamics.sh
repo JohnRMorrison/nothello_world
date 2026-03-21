@@ -11,8 +11,6 @@
 source activate othello
 
 CONDITIONS=(
-    fc_full_high fc_full_low fc_full_random
-    fc_terminal_high fc_terminal_low fc_terminal_random
     fm_full_high fm_full_low
     fm_terminal_high fm_terminal_low
     fm_drop_high fm_drop_low
