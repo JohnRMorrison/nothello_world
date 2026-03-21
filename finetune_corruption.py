@@ -135,6 +135,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--eval-every", type=int, default=200)
+    parser.add_argument("--max-steps", type=int, default=0,
+                        help="Stop after this many steps (0 = full training)")
     parser.add_argument("--save-ckpt", action="store_true")
     parser.add_argument("--random-init", action="store_true",
                         help="Skip loading checkpoint; train from random init")
@@ -263,6 +265,9 @@ def main():
 
             batch_count += 1
 
+            if args.max_steps > 0 and batch_count >= args.max_steps:
+                break
+
             if batch_count % args.eval_every == 0:
                 eval_loss, eval_acc, eval_rank, eval_lpm = evaluate(
                     model, test_loader, device, test_legal_mask)
@@ -277,6 +282,9 @@ def main():
                       f"step={batch_count}: loss={eval_loss:.4f}, legal_acc={eval_acc:.4f}, "
                       f"rank={eval_rank:.2f}, lpm={eval_lpm:.4f}, elapsed={elapsed:.0f}s",
                       flush=True)
+
+        if args.max_steps > 0 and batch_count >= args.max_steps:
+            break
 
         # End-of-epoch eval
         eval_loss, eval_acc, eval_rank, eval_lpm = evaluate(
