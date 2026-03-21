@@ -13,7 +13,6 @@ source activate othello
 CONDITIONS=(
     fm_full_high fm_full_low
     fm_terminal_high fm_terminal_low
-    fm_drop_high fm_drop_low
 )
 
 COND=${CONDITIONS[$SLURM_ARRAY_TASK_ID]}
