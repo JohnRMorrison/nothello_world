@@ -82,15 +82,21 @@ CORRUPTION_FNS = {
 # Rule selection by sensitivity rank
 # =============================================================================
 
-def select_rules(sensitivity_data, rank, n_rules, rng):
+def select_rules(sensitivity_data, rank, n_rules, rng,
+                  frequency_matched=False):
     """Select rule IDs based on sensitivity ranking.
 
     rank: 'high' (top of ranking), 'low' (bottom), 'random'
     n_rules: how many to select
+    frequency_matched: if True, select from high/low pools with matched
+        frequency distributions (only for 'high' and 'low' ranks)
     """
     rules = sensitivity_data['rules']
     sorted_rules = sorted(rules, key=lambda r: r['sensitivity'], reverse=True)
     all_ids = [r['rule_id'] for r in sorted_rules]
+
+    if frequency_matched and rank in ('high', 'low'):
+        return _select_frequency_matched(sorted_rules, rank, n_rules, rng)
 
     n_rules = min(n_rules, len(all_ids))
 
@@ -102,6 +108,48 @@ def select_rules(sensitivity_data, rank, n_rules, rng):
         return list(rng.choice(all_ids, n_rules, replace=False))
     else:
         raise ValueError(f"Unknown rank: {rank}")
+
+
+def _select_frequency_matched(sorted_rules, rank, n_rules, rng):
+    """Select rules with matched frequency from high/low sensitivity pools.
+
+    Bins rules by frequency, samples equal numbers from each bin to ensure
+    the high and low selections have similar frequency distributions.
+    """
+    n_pool = len(sorted_rules) // 3
+    high_pool = sorted_rules[:n_pool]
+    low_pool = sorted_rules[-n_pool:]
+
+    pool = high_pool if rank == 'high' else low_pool
+    other = low_pool if rank == 'high' else high_pool
+
+    # Find frequency overlap
+    pool_freqs = [r['n_satisfied'] for r in pool]
+    other_freqs = [r['n_satisfied'] for r in other]
+    overlap_min = max(min(pool_freqs), min(other_freqs))
+    overlap_max = min(max(pool_freqs), max(other_freqs))
+
+    # Bin by log-frequency and sample
+    freq_bins = np.logspace(np.log10(max(overlap_min, 1)),
+                            np.log10(overlap_max), 11)
+    selected = []
+    per_bin = max(1, n_rules // (len(freq_bins) - 1) + 1)
+
+    for i in range(len(freq_bins) - 1):
+        lo, hi = freq_bins[i], freq_bins[i + 1]
+        candidates = [r for r in pool if lo <= r['n_satisfied'] < hi]
+        other_count = sum(1 for r in other if lo <= r['n_satisfied'] < hi)
+        n_take = min(len(candidates), other_count, per_bin)
+        if n_take > 0:
+            chosen = rng.choice(candidates, n_take, replace=False)
+            selected.extend(chosen.tolist())
+
+    # Trim to target count
+    if len(selected) > n_rules:
+        idx = rng.choice(len(selected), n_rules, replace=False)
+        selected = [selected[i] for i in idx]
+
+    return [r['rule_id'] for r in selected]
 
 
 # =============================================================================
@@ -242,6 +290,8 @@ def main():
     parser.add_argument("--target-divergence", type=float, default=0.20)
     parser.add_argument("--fixed-count", type=int, default=None,
                         help="Corrupt exactly this many rules (skip divergence matching)")
+    parser.add_argument("--frequency-matched", action="store_true",
+                        help="Match frequency distributions between high/low selections")
     parser.add_argument("--sensitivity-file", type=str,
                         default="behavioral_data/sensitivity.json")
     parser.add_argument("--num-games", type=int, default=2000000)
@@ -275,9 +325,13 @@ def main():
         print(f"\nCorrupting {n_rules} rules → divergence {achieved_div:.4f}",
               flush=True)
 
+    if args.frequency_matched:
+        print("Frequency-matched mode", flush=True)
+
     # Select and corrupt rules
     rule_ids = select_rules(sensitivity_data, args.sensitivity_rank,
-                            n_rules, rng)
+                            n_rules, rng,
+                            frequency_matched=args.frequency_matched)
     base_patterns = enumerate_flanking_patterns()
     corrupt_fn = CORRUPTION_FNS[args.corruption_type]
     corrupted_patterns = corrupt_fn(base_patterns, rule_ids, rng)
@@ -338,7 +392,8 @@ def main():
     metadata = {
         'corruption_type': args.corruption_type,
         'sensitivity_rank': args.sensitivity_rank,
-        'matching_mode': 'fixed_count' if args.fixed_count else 'divergence',
+        'matching_mode': 'freq_matched' if args.frequency_matched else ('fixed_count' if args.fixed_count else 'divergence'),
+        'frequency_matched': args.frequency_matched,
         'fixed_count': args.fixed_count,
         'target_divergence': args.target_divergence if args.fixed_count is None else None,
         'achieved_divergence': float(achieved_div),
