@@ -767,7 +767,9 @@ def evaluate_standard_lpm(model, std_games, std_legal, dataset, device, bs=64):
 
 
 def train_and_evaluate(model, train_games, train_legal, test_sets,
-                       device, std_games=None, std_legal=None, bs=16, lr=3e-4):
+                       device, std_games=None, std_legal=None,
+                       cor_test_games=None, cor_test_legal=None,
+                       bs=16, lr=3e-4):
     """Fine-tune model and evaluate at scheduled steps."""
     train_dataset = CharDataset(train_games)
     train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
@@ -785,6 +787,7 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
         results[f'{k}_prob'] = []
         results[f'{k}_acc'] = []
     results['std_lpm'] = []
+    results['cor_lpm'] = []
     t0 = time.time()
 
     def do_eval(step):
@@ -794,21 +797,32 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
             results[f'{k}_prob'].append(metrics.get(f'{k}_prob', 0.0))
             results[f'{k}_acc'].append(metrics.get(f'{k}_acc', 0.0))
 
+        extra_str = ""
+
         # Standard LPM (catastrophic forgetting check)
         if std_games is not None:
             std_metrics = evaluate_standard_lpm(model, std_games, std_legal,
                                                 train_dataset, device)
             results['std_lpm'].append(std_metrics['std_lpm'])
-            std_lpm_str = f" std_lpm={std_metrics['std_lpm']:.4f}"
+            extra_str += f" std_lpm={std_metrics['std_lpm']:.4f}"
         else:
             results['std_lpm'].append(None)
-            std_lpm_str = ""
+
+        # Corrupted game LPM (learning check)
+        if cor_test_games is not None:
+            cor_metrics = evaluate_standard_lpm(model, cor_test_games,
+                                                cor_test_legal,
+                                                train_dataset, device)
+            results['cor_lpm'].append(cor_metrics['std_lpm'])
+            extra_str += f" cor_lpm={cor_metrics['std_lpm']:.4f}"
+        else:
+            results['cor_lpm'].append(None)
 
         elapsed = time.time() - t0
         print(f"  Step {step}: LL_prob={metrics.get('LL_prob',0):.4f} "
               f"IL_prob={metrics.get('IL_prob',0):.4f} "
               f"LI_prob={metrics.get('LI_prob',0):.4f}"
-              f"{std_lpm_str} elapsed={elapsed:.0f}s", flush=True)
+              f"{extra_str} elapsed={elapsed:.0f}s", flush=True)
 
     # Step 0 evaluation
     do_eval(0)
@@ -975,11 +989,19 @@ def main():
     std_games, std_legal = build_standard_lpm_test(n_games=10000, seed=123)
     print(f"  {len(std_games)} standard games")
 
+    # Sample 10K from training data for corrupted-game LPM
+    print("Sampling 10K training games for corrupted LPM test...")
+    cor_test_idx = rng.choice(len(train_games), min(10000, len(train_games)), replace=False)
+    cor_test_games = [train_games[i] for i in cor_test_idx]
+    cor_test_legal = [train_legal[i] for i in cor_test_idx]
+    print(f"  {len(cor_test_games)} corrupted test games")
+
     # Train and evaluate
     print("Training...")
     results = train_and_evaluate(
         model, train_games, train_legal, test_sets, device,
-        std_games=std_games, std_legal=std_legal)
+        std_games=std_games, std_legal=std_legal,
+        cor_test_games=cor_test_games, cor_test_legal=cor_test_legal)
 
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)
