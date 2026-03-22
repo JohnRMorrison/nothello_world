@@ -529,9 +529,36 @@ def generate_games_extended(arrays, num_games, rng, save_legal=False,
 # Targeted test position collection
 # ============================================================================
 
-def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=2000,
+def _count_corrupted_rules_per_cell(flat, is_black, corrupted_patterns,
+                                     rule_ids):
+    """For each cell, count how many corrupted rules fire at this position."""
+    my_val = 1 if is_black else -1
+    opp_val = -my_val
+    counts = {}
+    for rid in rule_ids:
+        p = corrupted_patterns[rid]
+        target = p['target']
+        # Check if this rule fires
+        if flat[target] != 0 and not p.get('skip_target_check', False):
+            continue
+        if flat[p['terminal']] != my_val:
+            continue
+        all_opp = True
+        flipped = p.get('flipped_indices', [])
+        for j, opp_cell in enumerate(p['opponents']):
+            expected = my_val if j in flipped else opp_val
+            if flat[opp_cell] != expected:
+                all_opp = False
+                break
+        if all_opp:
+            counts[target] = counts.get(target, 0) + 1
+    return counts
+
+
+def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
                             max_games=200000, rng=None,
-                            arrays_late=None, phase_boundary=0):
+                            arrays_late=None, phase_boundary=0,
+                            corrupted_patterns=None, rule_ids=None):
     """Collect three test sets based on standard vs corrupted legality.
 
     For each position, categorize each cell into:
@@ -539,15 +566,17 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=2000,
       - illegal_legal (IL): illegal under standard, legal under corrupted
       - legal_illegal (LI): legal under standard, illegal under corrupted
 
+    Also records n_corrupted_rules: how many corrupted rules fire for each
+    target cell, for filtering in analysis.
+
     Returns dict with three lists of test positions. Each position has:
-      game_prefix, move_idx, target_cells (list of cells in this category)
+      game_prefix, move_idx, target_cells, n_corrupted_rules (per cell)
     """
     if rng is None:
         rng = np.random.RandomState(99)
 
     test_sets = {'LL': [], 'IL': [], 'LI': []}
     games_tried = 0
-    min_needed = min(n_per_set, 500)  # minimum before we stop
 
     while games_tried < max_games:
         # Check if we have enough
@@ -575,6 +604,13 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=2000,
             il_cells = sorted(cor_set - std_set)  # newly legal
             li_cells = sorted(std_set - cor_set)  # no longer legal
 
+            # Count corrupted rules per cell (if patterns provided)
+            if corrupted_patterns is not None and rule_ids is not None:
+                n_cor_rules = _count_corrupted_rules_per_cell(
+                    flat, is_black, corrupted_patterns, rule_ids)
+            else:
+                n_cor_rules = {}
+
             pos_info = {
                 'game_prefix': list(game_moves),
                 'move_idx': turn,
@@ -583,15 +619,18 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=2000,
             if ll_cells and len(test_sets['LL']) < n_per_set:
                 test_sets['LL'].append({**pos_info, 'target_cells': ll_cells,
                                         'std_legal': sorted(std_set),
-                                        'cor_legal': sorted(cor_set)})
+                                        'cor_legal': sorted(cor_set),
+                                        'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in ll_cells}})
             if il_cells and len(test_sets['IL']) < n_per_set:
                 test_sets['IL'].append({**pos_info, 'target_cells': il_cells,
                                         'std_legal': sorted(std_set),
-                                        'cor_legal': sorted(cor_set)})
+                                        'cor_legal': sorted(cor_set),
+                                        'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in il_cells}})
             if li_cells and len(test_sets['LI']) < n_per_set:
                 test_sets['LI'].append({**pos_info, 'target_cells': li_cells,
                                         'std_legal': sorted(std_set),
-                                        'cor_legal': sorted(cor_set)})
+                                        'cor_legal': sorted(cor_set),
+                                        'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in li_cells}})
 
             # Play under corrupted rules
             if cor_legal is not None and len(cor_legal) > 0:
@@ -684,8 +723,51 @@ def evaluate_on_test_sets(model, test_sets, dataset, device):
 EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 300]  # plus final step
 
 
+def build_standard_lpm_test(n_games=10000, seed=123):
+    """Load standard Othello games and build legal mask for LPM evaluation."""
+    from data.othello import OthelloBoardState
+    import random as _random
+
+    _random.seed(seed)
+    rng = np.random.RandomState(seed)
+
+    # Generate standard Othello games
+    games = []
+    legal_moves_all = []
+    for _ in range(n_games):
+        board = OthelloBoardState()
+        game = []
+        legal_per_turn = []
+        for turn in range(60):
+            valid = board.get_valid_moves()
+            if not valid:
+                break
+            legal_per_turn.append(valid)
+            move = valid[rng.randint(len(valid))]
+            game.append(move)
+            board.umpire(move)
+        if len(game) >= 5:
+            games.append(game)
+            legal_moves_all.append(legal_per_turn)
+
+    return games, legal_moves_all
+
+
+def evaluate_standard_lpm(model, std_games, std_legal, dataset, device, bs=64):
+    """Evaluate LPM on standard Othello games (catastrophic forgetting test)."""
+    from finetune_corruption import evaluate, build_legal_mask
+
+    std_dataset = CharDataset(std_games)
+    std_mask = build_legal_mask(std_games, std_legal, dataset.stoi,
+                                dataset.block_size, dataset.vocab_size)
+    std_loader = DataLoader(std_dataset, batch_size=bs, shuffle=False,
+                            num_workers=0)
+    loss, acc, rank, lpm = evaluate(model, std_loader, device, std_mask)
+    return {'std_loss': loss, 'std_acc': acc, 'std_rank': rank, 'std_lpm': lpm}
+
+
 def train_and_evaluate(model, train_games, train_legal, test_sets,
-                       device, bs=16, lr=3e-4):
+                       device, std_games=None, std_legal=None, bs=16, lr=3e-4):
     """Fine-tune model and evaluate at scheduled steps."""
     train_dataset = CharDataset(train_games)
     train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
@@ -702,6 +784,7 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
     for k in ['LL', 'IL', 'LI']:
         results[f'{k}_prob'] = []
         results[f'{k}_acc'] = []
+    results['std_lpm'] = []
     t0 = time.time()
 
     def do_eval(step):
@@ -710,11 +793,22 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
         for k in ['LL', 'IL', 'LI']:
             results[f'{k}_prob'].append(metrics.get(f'{k}_prob', 0.0))
             results[f'{k}_acc'].append(metrics.get(f'{k}_acc', 0.0))
+
+        # Standard LPM (catastrophic forgetting check)
+        if std_games is not None:
+            std_metrics = evaluate_standard_lpm(model, std_games, std_legal,
+                                                train_dataset, device)
+            results['std_lpm'].append(std_metrics['std_lpm'])
+            std_lpm_str = f" std_lpm={std_metrics['std_lpm']:.4f}"
+        else:
+            results['std_lpm'].append(None)
+            std_lpm_str = ""
+
         elapsed = time.time() - t0
         print(f"  Step {step}: LL_prob={metrics.get('LL_prob',0):.4f} "
               f"IL_prob={metrics.get('IL_prob',0):.4f} "
-              f"LI_prob={metrics.get('LI_prob',0):.4f} "
-              f"elapsed={elapsed:.0f}s", flush=True)
+              f"LI_prob={metrics.get('LI_prob',0):.4f}"
+              f"{std_lpm_str} elapsed={elapsed:.0f}s", flush=True)
 
     # Step 0 evaluation
     do_eval(0)
@@ -849,7 +943,8 @@ def main():
     print(f"Collecting test positions ({args.n_test} per set)...")
     test_sets = collect_three_test_sets(
         corrupted_arrays, std_arrays, n_per_set=args.n_test, rng=rng,
-        arrays_late=arrays_late, phase_boundary=phase_boundary)
+        arrays_late=arrays_late, phase_boundary=phase_boundary,
+        corrupted_patterns=corrupted_patterns, rule_ids=rule_ids)
 
     # Save games and test sets for reproducibility
     with open(os.path.join(games_dir, "train_games.pickle"), 'wb') as f:
@@ -875,10 +970,16 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(device)
 
+    # Build standard Othello test set for catastrophic forgetting measurement
+    print("Building standard Othello test set (10K games)...")
+    std_games, std_legal = build_standard_lpm_test(n_games=10000, seed=123)
+    print(f"  {len(std_games)} standard games")
+
     # Train and evaluate
     print("Training...")
     results = train_and_evaluate(
-        model, train_games, train_legal, test_sets, device)
+        model, train_games, train_legal, test_sets, device,
+        std_games=std_games, std_legal=std_legal)
 
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)
