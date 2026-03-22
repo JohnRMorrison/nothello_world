@@ -659,7 +659,7 @@ def evaluate_on_targeted(model, positions, dataset, device, legal_mask):
     return total_legal / n, total_legal_prob / n
 
 
-EVAL_SCHEDULE = [0, 50, 100, 200, 300]  # plus final step
+EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 300]  # plus final step
 
 
 def train_and_evaluate(model, train_games, train_legal, test_positions,
