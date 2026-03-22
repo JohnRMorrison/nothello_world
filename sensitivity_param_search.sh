@@ -2,7 +2,7 @@
 #SBATCH --job-name=sps
 #SBATCH --output=logs/sps_%A_%a.out
 #SBATCH --error=logs/sps_%A_%a.err
-#SBATCH --time=6:00:00
+#SBATCH --time=12:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1

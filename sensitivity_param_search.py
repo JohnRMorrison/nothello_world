@@ -529,17 +529,31 @@ def generate_games_extended(arrays, num_games, rng, save_legal=False,
 # Targeted test position collection
 # ============================================================================
 
-def collect_targeted_positions(corrupted_arrays, std_arrays, n_target=5000,
-                               max_games=200000, rng=None,
-                               arrays_late=None, phase_boundary=0):
-    """Collect positions where corrupted rules disagree with standard rules."""
+def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=2000,
+                            max_games=200000, rng=None,
+                            arrays_late=None, phase_boundary=0):
+    """Collect three test sets based on standard vs corrupted legality.
+
+    For each position, categorize each cell into:
+      - legal_legal (LL): legal under both standard and corrupted rules
+      - illegal_legal (IL): illegal under standard, legal under corrupted
+      - legal_illegal (LI): legal under standard, illegal under corrupted
+
+    Returns dict with three lists of test positions. Each position has:
+      game_prefix, move_idx, target_cells (list of cells in this category)
+    """
     if rng is None:
         rng = np.random.RandomState(99)
 
-    positions = []  # list of (game_prefix, std_legal, cor_legal)
+    test_sets = {'LL': [], 'IL': [], 'LI': []}
     games_tried = 0
+    min_needed = min(n_per_set, 500)  # minimum before we stop
 
-    while len(positions) < n_target and games_tried < max_games:
+    while games_tried < max_games:
+        # Check if we have enough
+        if all(len(test_sets[k]) >= n_per_set for k in test_sets):
+            break
+
         board = OthelloBoardState()
         game_moves = []
 
@@ -547,24 +561,37 @@ def collect_targeted_positions(corrupted_arrays, std_arrays, n_target=5000,
             flat = board.state.flatten()
             is_black = (board.next_hand_color == 1)
 
-            # Standard rules (just basic arrays, no extensions)
             std_legal = evaluate_rules_extended(flat, is_black, *std_arrays)
             std_set = set(std_legal.tolist()) if std_legal is not None else set()
 
-            # Corrupted rules (with phase if applicable)
             if arrays_late is not None and turn >= phase_boundary:
                 cor_legal = evaluate_rules_extended(flat, is_black, *arrays_late)
             else:
                 cor_legal = evaluate_rules_extended(flat, is_black, *corrupted_arrays)
             cor_set = set(cor_legal.tolist()) if cor_legal is not None else set()
 
-            if std_set != cor_set:
-                positions.append({
-                    'game_prefix': list(game_moves),
-                    'move_idx': turn,
-                    'std_legal': sorted(std_set),
-                    'cor_legal': sorted(cor_set),
-                })
+            # Categorize cells
+            ll_cells = sorted(std_set & cor_set)
+            il_cells = sorted(cor_set - std_set)  # newly legal
+            li_cells = sorted(std_set - cor_set)  # no longer legal
+
+            pos_info = {
+                'game_prefix': list(game_moves),
+                'move_idx': turn,
+            }
+
+            if ll_cells and len(test_sets['LL']) < n_per_set:
+                test_sets['LL'].append({**pos_info, 'target_cells': ll_cells,
+                                        'std_legal': sorted(std_set),
+                                        'cor_legal': sorted(cor_set)})
+            if il_cells and len(test_sets['IL']) < n_per_set:
+                test_sets['IL'].append({**pos_info, 'target_cells': il_cells,
+                                        'std_legal': sorted(std_set),
+                                        'cor_legal': sorted(cor_set)})
+            if li_cells and len(test_sets['LI']) < n_per_set:
+                test_sets['LI'].append({**pos_info, 'target_cells': li_cells,
+                                        'std_legal': sorted(std_set),
+                                        'cor_legal': sorted(cor_set)})
 
             # Play under corrupted rules
             if cor_legal is not None and len(cor_legal) > 0:
@@ -582,95 +609,83 @@ def collect_targeted_positions(corrupted_arrays, std_arrays, n_target=5000,
                 place_piece_no_flip(board, move)
             game_moves.append(move)
 
-            if len(positions) >= n_target:
-                break
-
         games_tried += 1
 
-    print(f"  Collected {len(positions)} targeted positions from {games_tried} games",
-          flush=True)
-    return positions[:n_target]
+    for k in test_sets:
+        test_sets[k] = test_sets[k][:n_per_set]
+
+    print(f"  Test sets: LL={len(test_sets['LL'])}, IL={len(test_sets['IL'])}, "
+          f"LI={len(test_sets['LI'])} (from {games_tried} games)", flush=True)
+    return test_sets
 
 
 # ============================================================================
 # Training and evaluation
 # ============================================================================
 
-def build_legal_mask_from_positions(positions, stoi, block_size, vocab_size):
-    """Build legal mask from targeted test positions.
+def evaluate_on_test_sets(model, test_sets, dataset, device):
+    """Evaluate model on three test sets.
 
-    Each position has a game_prefix and cor_legal (legal moves under corrupted rules).
-    We build a dataset of (game_prefix, cor_legal) and return the mask.
+    For each test set (LL, IL, LI), measures:
+      - For LL: fraction of model probability on LL cells (should stay high)
+      - For IL: fraction of model probability on IL cells (should increase)
+      - For LI: fraction of model probability on LI cells (should decrease)
+
+    Returns dict with metrics per test set.
     """
-    max_key = max(k for k in stoi.keys() if k >= 0)
-    stoi_map = np.full(max_key + 1, -1, dtype=np.int32)
-    for k, v in stoi.items():
-        if k >= 0:
-            stoi_map[k] = v
-
-    # Each position contributes one row to the mask
-    n = len(positions)
-    mask = np.zeros((n, vocab_size), dtype=np.bool_)
-
-    for i, pos in enumerate(positions):
-        for cell in pos['cor_legal']:
-            if cell <= max_key and stoi_map[cell] >= 0:
-                mask[i, stoi_map[cell]] = True
-
-    return mask
-
-
-def evaluate_on_targeted(model, positions, dataset, device, legal_mask):
-    """Evaluate model on targeted test positions."""
     model.eval()
+    stoi = dataset.stoi
 
-    total_legal = 0
-    total_legal_prob = 0.0
-    total_loss = 0.0
-    total_rank = 0.0
-    n = 0
-
+    results = {}
     with torch.no_grad():
-        for i, pos in enumerate(positions):
-            prefix = pos['game_prefix']
-            if len(prefix) < 1:
-                continue
+        for set_name, positions in test_sets.items():
+            total_prob_on_targets = 0.0
+            total_acc = 0
+            n = 0
 
-            # Tokenize prefix
-            tokens = [dataset.stoi[m] for m in prefix]
-            x = torch.tensor([tokens], dtype=torch.long, device=device)
+            for pos in positions:
+                prefix = pos['game_prefix']
+                if len(prefix) < 1:
+                    continue
 
-            logits, _ = model(x)
-            # Last position predicts next move
-            last_logits = logits[0, -1, :]  # (vocab_size,)
-            probs = torch.softmax(last_logits, dim=-1)
+                tokens = [stoi[m] for m in prefix]
+                x = torch.tensor([tokens], dtype=torch.long, device=device)
 
-            # Legal accuracy: is argmax legal under corrupted rules?
-            pred = last_logits.argmax().item()
-            if i < len(legal_mask):
-                is_legal = legal_mask[i, pred]
-                total_legal += int(is_legal)
+                logits, _ = model(x)
+                probs = torch.softmax(logits[0, -1, :], dim=-1)
 
-                # Legal probability mass
-                legal_torch = torch.from_numpy(legal_mask[i:i+1]).to(device).float()
-                total_legal_prob += (probs * legal_torch[0]).sum().item()
+                # Probability mass on target cells
+                target_prob = 0.0
+                for cell in pos['target_cells']:
+                    if cell in stoi:
+                        target_prob += probs[stoi[cell]].item()
+                total_prob_on_targets += target_prob
 
-            # Loss: cross-entropy against uniform over legal moves
-            # (not meaningful for single positions, skip)
+                # Is argmax one of the target cells?
+                pred_token = logits[0, -1, :].argmax().item()
+                pred_cell = dataset.itos[pred_token]
+                if pred_cell in set(pos['target_cells']):
+                    total_acc += 1
 
-            n += 1
+                n += 1
 
-    if n == 0:
-        return 0.0, 0.0
+            if n > 0:
+                results[f'{set_name}_prob'] = total_prob_on_targets / n
+                results[f'{set_name}_acc'] = total_acc / n
+                results[f'{set_name}_n'] = n
+            else:
+                results[f'{set_name}_prob'] = 0.0
+                results[f'{set_name}_acc'] = 0.0
+                results[f'{set_name}_n'] = 0
 
-    return total_legal / n, total_legal_prob / n
+    return results
 
 
 EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 300]  # plus final step
 
 
-def train_and_evaluate(model, train_games, train_legal, test_positions,
-                       test_mask, device, bs=16, lr=3e-4):
+def train_and_evaluate(model, train_games, train_legal, test_sets,
+                       device, bs=16, lr=3e-4):
     """Fine-tune model and evaluate at scheduled steps."""
     train_dataset = CharDataset(train_games)
     train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
@@ -682,16 +697,27 @@ def train_and_evaluate(model, train_games, train_legal, test_positions,
     total_steps = len(train_loader)
     eval_set = set(EVAL_SCHEDULE)
 
-    results = {'eval_steps': [], 'eval_accs': [], 'eval_lpms': []}
+    # Store per-step results for each test set
+    results = {'eval_steps': []}
+    for k in ['LL', 'IL', 'LI']:
+        results[f'{k}_prob'] = []
+        results[f'{k}_acc'] = []
     t0 = time.time()
 
+    def do_eval(step):
+        metrics = evaluate_on_test_sets(model, test_sets, train_dataset, device)
+        results['eval_steps'].append(step)
+        for k in ['LL', 'IL', 'LI']:
+            results[f'{k}_prob'].append(metrics.get(f'{k}_prob', 0.0))
+            results[f'{k}_acc'].append(metrics.get(f'{k}_acc', 0.0))
+        elapsed = time.time() - t0
+        print(f"  Step {step}: LL_prob={metrics.get('LL_prob',0):.4f} "
+              f"IL_prob={metrics.get('IL_prob',0):.4f} "
+              f"LI_prob={metrics.get('LI_prob',0):.4f} "
+              f"elapsed={elapsed:.0f}s", flush=True)
+
     # Step 0 evaluation
-    acc, lpm = evaluate_on_targeted(model, test_positions, train_dataset,
-                                    device, test_mask)
-    results['eval_steps'].append(0)
-    results['eval_accs'].append(acc)
-    results['eval_lpms'].append(lpm)
-    print(f"  Step 0: acc={acc:.4f}, lpm={lpm:.4f}", flush=True)
+    do_eval(0)
 
     batch_count = 0
     model.train()
@@ -708,27 +734,18 @@ def train_and_evaluate(model, train_games, train_legal, test_positions,
         batch_count += 1
 
         if batch_count in eval_set:
-            acc, lpm = evaluate_on_targeted(model, test_positions,
-                                            train_dataset, device, test_mask)
-            results['eval_steps'].append(batch_count)
-            results['eval_accs'].append(acc)
-            results['eval_lpms'].append(lpm)
-            elapsed = time.time() - t0
-            print(f"  Step {batch_count}: acc={acc:.4f}, lpm={lpm:.4f}, "
-                  f"elapsed={elapsed:.0f}s", flush=True)
+            do_eval(batch_count)
 
     # Final evaluation
-    acc, lpm = evaluate_on_targeted(model, test_positions, train_dataset,
-                                    device, test_mask)
-    results['eval_steps'].append(batch_count)
-    results['eval_accs'].append(acc)
-    results['eval_lpms'].append(lpm)
-    elapsed = time.time() - t0
-    print(f"  Final (step {batch_count}): acc={acc:.4f}, lpm={lpm:.4f}, "
-          f"elapsed={elapsed:.0f}s", flush=True)
+    do_eval(batch_count)
 
     results['total_steps'] = batch_count
-    results['elapsed_seconds'] = elapsed
+    results['elapsed_seconds'] = time.time() - t0
+
+    # Record test set sizes
+    for k in ['LL', 'IL', 'LI']:
+        results[f'{k}_n'] = len(test_sets.get(k, []))
+
     return results
 
 
@@ -742,8 +759,9 @@ def main():
     parser.add_argument("--output-dir", type=str, default="experiments/param_search")
     parser.add_argument("--ckpt", type=str, default="ckpts/gpt_synthetic.ckpt")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n-train", type=int, default=50000)
-    parser.add_argument("--n-test", type=int, default=5000)
+    parser.add_argument("--n-train", type=int, default=200000)
+    parser.add_argument("--n-test", type=int, default=5000,
+                        help="Number of test positions per test set (LL, IL, LI)")
     args = parser.parse_args()
 
     rng = np.random.RandomState(args.seed)
@@ -797,11 +815,29 @@ def main():
         # Corrupted rules for all moves (no phase)
         pass
 
-    # Generate training games
-    print(f"Generating {args.n_train} training games...")
-    train_games, train_legal = generate_games_extended(
-        corrupted_arrays, args.n_train, rng, save_legal=True,
-        arrays_late=arrays_late, phase_boundary=phase_boundary)
+    # Generate training games (load existing if available, generate more if needed)
+    games_dir = os.path.join(args.output_dir, f"games/cond_{args.condition_id:03d}")
+    os.makedirs(games_dir, exist_ok=True)
+    existing_games_path = os.path.join(games_dir, "train_games.pickle")
+    existing_legal_path = os.path.join(games_dir, "train_legal.pickle")
+
+    train_games, train_legal = [], []
+    if os.path.exists(existing_games_path) and os.path.exists(existing_legal_path):
+        print(f"Loading existing games from {games_dir}...")
+        with open(existing_games_path, 'rb') as f:
+            train_games = pickle.load(f)
+        with open(existing_legal_path, 'rb') as f:
+            train_legal = pickle.load(f)
+        print(f"  Loaded {len(train_games)} existing games")
+
+    n_remaining = args.n_train - len(train_games)
+    if n_remaining > 0:
+        print(f"Generating {n_remaining} additional training games...")
+        new_games, new_legal = generate_games_extended(
+            corrupted_arrays, n_remaining, rng, save_legal=True,
+            arrays_late=arrays_late, phase_boundary=phase_boundary)
+        train_games.extend(new_games)
+        train_legal.extend(new_legal)
 
     # Filter short games
     valid = [(g, l) for g, l in zip(train_games, train_legal) if len(g) >= 5]
@@ -809,21 +845,19 @@ def main():
     train_legal = [l for _, l in valid]
     print(f"  {len(train_games)} games after filtering")
 
-    # Collect targeted test positions
-    print(f"Collecting {args.n_test} targeted test positions...")
-    test_positions = collect_targeted_positions(
-        corrupted_arrays, std_arrays, n_target=args.n_test, rng=rng,
+    # Collect three test sets
+    print(f"Collecting test positions ({args.n_test} per set)...")
+    test_sets = collect_three_test_sets(
+        corrupted_arrays, std_arrays, n_per_set=args.n_test, rng=rng,
         arrays_late=arrays_late, phase_boundary=phase_boundary)
 
-    # Save games and test positions for reproducibility
-    games_dir = os.path.join(args.output_dir, f"games/cond_{args.condition_id:03d}")
-    os.makedirs(games_dir, exist_ok=True)
+    # Save games and test sets for reproducibility
     with open(os.path.join(games_dir, "train_games.pickle"), 'wb') as f:
         pickle.dump(train_games, f)
     with open(os.path.join(games_dir, "train_legal.pickle"), 'wb') as f:
         pickle.dump(train_legal, f)
-    with open(os.path.join(games_dir, "test_positions.pickle"), 'wb') as f:
-        pickle.dump(test_positions, f)
+    with open(os.path.join(games_dir, "test_sets.pickle"), 'wb') as f:
+        pickle.dump(test_sets, f)
     with open(os.path.join(games_dir, "corrupted_patterns.pickle"), 'wb') as f:
         pickle.dump(corrupted_patterns, f)
     print(f"  Saved games to {games_dir}")
@@ -841,15 +875,10 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(device)
 
-    # Build test legal mask
-    test_mask = build_legal_mask_from_positions(
-        test_positions, dummy_dataset.stoi, dummy_dataset.block_size,
-        dummy_dataset.vocab_size)
-
     # Train and evaluate
     print("Training...")
     results = train_and_evaluate(
-        model, train_games, train_legal, test_positions, test_mask, device)
+        model, train_games, train_legal, test_sets, device)
 
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)
@@ -861,7 +890,6 @@ def main():
         'n_rules_modified': n_mod,
         'rule_ids': [int(r) for r in rule_ids],
         'n_train_games': len(train_games),
-        'n_test_positions': len(test_positions),
         'seed': args.seed,
         **results,
     }
