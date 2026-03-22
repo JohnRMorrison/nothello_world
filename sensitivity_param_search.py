@@ -579,7 +579,16 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
     games_tried = 0
 
     while games_tried < max_games:
-        # Check if we have enough
+        # Check if we have enough (stop if all non-empty sets are full,
+        # or if we've tried enough games to conclude some sets will stay empty)
+        non_empty = {k for k in test_sets if len(test_sets[k]) > 0}
+        if games_tried > 1000 and non_empty:
+            # After 1000 games, only wait for sets that have started filling
+            if all(len(test_sets[k]) >= n_per_set for k in non_empty):
+                break
+        elif games_tried > 1000:
+            # No sets filling after 1000 games — give up
+            break
         if all(len(test_sets[k]) >= n_per_set for k in test_sets):
             break
 
