@@ -585,6 +585,15 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
     while games_tried < max_games:
         if all(len(test_sets[k]) >= n_per_set for k in active_sets):
             break
+        # Stop early if no positions found after 20K games for any set
+        if games_tried >= 20000:
+            empty = [k for k in active_sets if len(test_sets[k]) == 0]
+            if empty:
+                print(f"  Warning: no positions found for {empty} after {games_tried} games, stopping",
+                      flush=True)
+                active_sets -= set(empty)
+                if not active_sets:
+                    break
 
         board = OthelloBoardState()
         game_moves = []
