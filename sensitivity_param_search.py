@@ -358,9 +358,16 @@ def apply_spatial_corruption(group_name, patterns, rule_ids, corruption_type, rn
 
 
 def _shift_cell(cell, dr, dc):
-    """Shift a cell by (dr, dc), wrapping around the 8x8 board."""
+    """Shift a cell by (dr, dc), wrapping around the 8x8 board.
+    If result lands on a center cell, shift again until it doesn't."""
     r, c = cell // 8, cell % 8
-    return ((r + dr) % 8) * 8 + ((c + dc) % 8)
+    for attempt in range(8):
+        nr = (r + dr + attempt) % 8
+        nc = (c + dc + attempt) % 8
+        result = nr * 8 + nc
+        if result not in CENTER_CELLS:
+            return result
+    return cell  # fallback: no shift
 
 
 # ============================================================================
