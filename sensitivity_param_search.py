@@ -753,27 +753,30 @@ def build_standard_lpm_test(n_games=10000, seed=123):
     return games, legal_moves_all
 
 
-def evaluate_standard_lpm(model, std_games, std_legal, dataset, device, bs=64):
-    """Evaluate LPM on standard Othello games (catastrophic forgetting test).
+def prepare_lpm_test(games, legal_moves, ref_dataset, device, bs=64):
+    """Pre-build dataset, mask, and loader for LPM evaluation.
 
-    Uses the passed dataset's stoi/itos for tokenization to ensure vocab
-    compatibility with the model.
+    Creates CharDataset with overridden stoi/itos to match the model's
+    vocabulary. Returns (loader, mask) ready for evaluate().
     """
-    from finetune_corruption import evaluate, build_legal_mask
+    from finetune_corruption import build_legal_mask
 
-    # Create dataset that uses the SAME vocabulary as the training dataset
-    std_dataset = CharDataset(std_games)
-    # Override stoi/itos to match the model's expected vocabulary
-    std_dataset.stoi = dataset.stoi
-    std_dataset.itos = dataset.itos
-    std_dataset.vocab_size = dataset.vocab_size
+    ds = CharDataset(games)
+    ds.stoi = ref_dataset.stoi
+    ds.itos = ref_dataset.itos
+    ds.vocab_size = ref_dataset.vocab_size
 
-    std_mask = build_legal_mask(std_games, std_legal, dataset.stoi,
-                                dataset.block_size, dataset.vocab_size)
-    std_loader = DataLoader(std_dataset, batch_size=bs, shuffle=False,
-                            num_workers=0)
-    loss, acc, rank, lpm = evaluate(model, std_loader, device, std_mask)
-    return {'std_loss': loss, 'std_acc': acc, 'std_rank': rank, 'std_lpm': lpm}
+    mask = build_legal_mask(games, legal_moves, ref_dataset.stoi,
+                            ref_dataset.block_size, ref_dataset.vocab_size)
+    loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=0)
+    return loader, mask
+
+
+def evaluate_lpm(model, loader, mask, device):
+    """Evaluate LPM using pre-built loader and mask."""
+    from finetune_corruption import evaluate
+    loss, acc, rank, lpm = evaluate(model, loader, device, mask)
+    return {'loss': loss, 'acc': acc, 'rank': rank, 'lpm': lpm}
 
 
 def train_and_evaluate(model, train_games, train_legal, test_sets,
@@ -784,6 +787,20 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
     train_dataset = CharDataset(train_games)
     train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
                               num_workers=0, drop_last=True)
+
+    # Pre-build LPM test loaders/masks ONCE (avoid vocab mismatch from
+    # creating new CharDatasets during training)
+    std_loader, std_mask = None, None
+    if std_games is not None:
+        print("  Building standard LPM test loader...", flush=True)
+        std_loader, std_mask = prepare_lpm_test(
+            std_games, std_legal, train_dataset, device)
+
+    cor_loader, cor_mask = None, None
+    if cor_test_games is not None:
+        print("  Building corrupted LPM test loader...", flush=True)
+        cor_loader, cor_mask = prepare_lpm_test(
+            cor_test_games, cor_test_legal, train_dataset, device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.1,
                                  betas=(0.9, 0.95))
@@ -810,21 +827,18 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
         extra_str = ""
 
         # Standard LPM (catastrophic forgetting check)
-        if std_games is not None:
-            std_metrics = evaluate_standard_lpm(model, std_games, std_legal,
-                                                train_dataset, device)
-            results['std_lpm'].append(std_metrics['std_lpm'])
-            extra_str += f" std_lpm={std_metrics['std_lpm']:.4f}"
+        if std_loader is not None:
+            std_metrics = evaluate_lpm(model, std_loader, std_mask, device)
+            results['std_lpm'].append(std_metrics['lpm'])
+            extra_str += f" std_lpm={std_metrics['lpm']:.4f}"
         else:
             results['std_lpm'].append(None)
 
         # Corrupted game LPM (learning check)
-        if cor_test_games is not None:
-            cor_metrics = evaluate_standard_lpm(model, cor_test_games,
-                                                cor_test_legal,
-                                                train_dataset, device)
-            results['cor_lpm'].append(cor_metrics['std_lpm'])
-            extra_str += f" cor_lpm={cor_metrics['std_lpm']:.4f}"
+        if cor_loader is not None:
+            cor_metrics = evaluate_lpm(model, cor_loader, cor_mask, device)
+            results['cor_lpm'].append(cor_metrics['lpm'])
+            extra_str += f" cor_lpm={cor_metrics['lpm']:.4f}"
         else:
             results['cor_lpm'].append(None)
 
