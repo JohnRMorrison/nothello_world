@@ -26,7 +26,7 @@ class CharDataset(Dataset):
 
     def __getitem__(self, idx):
         # grab a chunk of (block_size + 1) characters from the data
-        chunk = self.data[idx]
+        chunk = list(self.data[idx])  # copy to avoid mutating original data
         if len(chunk) != self.max_len:
             chunk += [-100, ] * (self.max_len - len(chunk))  # -100 can be ignored in CE
         # encode every character to an integer
