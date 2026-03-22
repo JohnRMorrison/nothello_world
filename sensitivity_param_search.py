@@ -754,10 +754,20 @@ def build_standard_lpm_test(n_games=10000, seed=123):
 
 
 def evaluate_standard_lpm(model, std_games, std_legal, dataset, device, bs=64):
-    """Evaluate LPM on standard Othello games (catastrophic forgetting test)."""
+    """Evaluate LPM on standard Othello games (catastrophic forgetting test).
+
+    Uses the passed dataset's stoi/itos for tokenization to ensure vocab
+    compatibility with the model.
+    """
     from finetune_corruption import evaluate, build_legal_mask
 
+    # Create dataset that uses the SAME vocabulary as the training dataset
     std_dataset = CharDataset(std_games)
+    # Override stoi/itos to match the model's expected vocabulary
+    std_dataset.stoi = dataset.stoi
+    std_dataset.itos = dataset.itos
+    std_dataset.vocab_size = dataset.vocab_size
+
     std_mask = build_legal_mask(std_games, std_legal, dataset.stoi,
                                 dataset.block_size, dataset.vocab_size)
     std_loader = DataLoader(std_dataset, batch_size=bs, shuffle=False,
