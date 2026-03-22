@@ -558,7 +558,8 @@ def _count_corrupted_rules_per_cell(flat, is_black, corrupted_patterns,
 def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
                             max_games=200000, rng=None,
                             arrays_late=None, phase_boundary=0,
-                            corrupted_patterns=None, rule_ids=None):
+                            corrupted_patterns=None, rule_ids=None,
+                            skip_sets=None):
     """Collect three test sets based on standard vs corrupted legality.
 
     For each position, categorize each cell into:
@@ -575,21 +576,14 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
     if rng is None:
         rng = np.random.RandomState(99)
 
-    test_sets = {'LL': [], 'IL': [], 'LI': []}
+    if skip_sets is None:
+        skip_sets = set()
+    active_sets = {'LL', 'IL', 'LI'} - set(skip_sets)
+    test_sets = {k: [] for k in active_sets}
     games_tried = 0
 
     while games_tried < max_games:
-        # Check if we have enough (stop if all non-empty sets are full,
-        # or if we've tried enough games to conclude some sets will stay empty)
-        non_empty = {k for k in test_sets if len(test_sets[k]) > 0}
-        if games_tried > 1000 and non_empty:
-            # After 1000 games, only wait for sets that have started filling
-            if all(len(test_sets[k]) >= n_per_set for k in non_empty):
-                break
-        elif games_tried > 1000:
-            # No sets filling after 1000 games — give up
-            break
-        if all(len(test_sets[k]) >= n_per_set for k in test_sets):
+        if all(len(test_sets[k]) >= n_per_set for k in active_sets):
             break
 
         board = OthelloBoardState()
@@ -625,17 +619,17 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
                 'move_idx': turn,
             }
 
-            if ll_cells and len(test_sets['LL']) < n_per_set:
+            if 'LL' in active_sets and ll_cells and len(test_sets['LL']) < n_per_set:
                 test_sets['LL'].append({**pos_info, 'target_cells': ll_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in ll_cells}})
-            if il_cells and len(test_sets['IL']) < n_per_set:
+            if 'IL' in active_sets and il_cells and len(test_sets['IL']) < n_per_set:
                 test_sets['IL'].append({**pos_info, 'target_cells': il_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in il_cells}})
-            if li_cells and len(test_sets['LI']) < n_per_set:
+            if 'LI' in active_sets and li_cells and len(test_sets['LI']) < n_per_set:
                 test_sets['LI'].append({**pos_info, 'target_cells': li_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
@@ -986,12 +980,25 @@ def main():
     train_legal = [l for _, l in valid]
     print(f"  {len(train_games)} games after filtering")
 
-    # Collect three test sets
-    print(f"Collecting test positions ({args.n_test} per set)...")
+    # Determine which test sets are possible based on corruption type
+    # Permissive corruptions (more legal moves): IL exists, LI doesn't
+    # Restrictive corruptions (fewer legal moves): LI exists, IL doesn't
+    # Mixed corruptions: both exist
+    PERMISSIVE = {'drop_third'}
+    RESTRICTIVE = {'add_adjacent', 'extend_chain'}
+    # corrupt_nearby and flip_color can go either way → both exist
+    skip_sets = set()
+    if corruption_type in PERMISSIVE:
+        skip_sets.add('LI')
+    elif corruption_type in RESTRICTIVE:
+        skip_sets.add('IL')
+
+    print(f"Collecting test positions ({args.n_test} per set, skip={skip_sets or 'none'})...")
     test_sets = collect_three_test_sets(
         corrupted_arrays, std_arrays, n_per_set=args.n_test, rng=rng,
         arrays_late=arrays_late, phase_boundary=phase_boundary,
-        corrupted_patterns=corrupted_patterns, rule_ids=rule_ids)
+        corrupted_patterns=corrupted_patterns, rule_ids=rule_ids,
+        skip_sets=skip_sets)
 
     # Save games and test sets for reproducibility
     with open(os.path.join(games_dir, "train_games.pickle"), 'wb') as f:
