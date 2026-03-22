@@ -1,0 +1,876 @@
+"""
+Sensitivity Parameter Search: 84 conditions (14 rule groups × 6 corruption types)
+
+Each condition:
+  - Selects 100 flanking rules (frequency-matched within pairs)
+  - Applies a specific corruption type
+  - Generates 50K training games + 5K targeted test positions
+  - Fine-tunes pretrained OthelloGPT (bs=16, full 50K games)
+  - Evaluates at steps 0, 50, 100, 200, 300, final
+
+Usage:
+    python sensitivity_param_search.py --condition-id 0 --output-dir experiments/param_search
+"""
+
+import argparse
+import json
+import os
+import pickle
+import sys
+import time
+import numpy as np
+from copy import deepcopy
+
+import torch
+from torch.utils.data.dataloader import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from hand_crafted_flanking import (
+    enumerate_flanking_patterns, VALID_MOVES, MOVE_TO_IDX, N_MOVES,
+    CENTER_CELLS, DIRECTIONS
+)
+from data.othello import OthelloBoardState
+from mingpt.model import GPT, GPTConfig
+from mingpt.dataset import CharDataset
+
+CENTER_SET = np.array(sorted(CENTER_CELLS))
+
+# ============================================================================
+# Condition mapping
+# ============================================================================
+
+RULE_GROUPS = [
+    'high_sens', 'low_sens',       # (a) sensitivity
+    'diagonal', 'random_dir',      # (b) direction
+    'left_board', 'full_board',    # (c) left vs whole board
+    'center', 'periphery',        # (d) center vs periphery
+    'coherent', 'incoherent',     # (e) spatial coherence
+    'one_color', 'both_colors',   # (f) color restriction
+    'after30', 'all_moves',       # (g) temporal restriction
+]
+
+CORRUPTION_TYPES = [
+    'drop_third',
+    'corrupt_nearby',
+    'add_adjacent',
+    'flip_color',
+    'extend_chain',
+    'play_occupied',
+]
+
+
+def condition_id_to_names(cid):
+    group_idx = cid // 6
+    corr_idx = cid % 6
+    return RULE_GROUPS[group_idx], CORRUPTION_TYPES[corr_idx]
+
+
+# ============================================================================
+# Rule selection
+# ============================================================================
+
+def _frequency_match(pool, other_pool, n_rules, rng):
+    """Select n_rules from pool with frequency matched to other_pool."""
+    pool_freqs = [r['n_satisfied'] for r in pool]
+    other_freqs = [r['n_satisfied'] for r in other_pool]
+    overlap_min = max(min(pool_freqs), min(other_freqs))
+    overlap_max = min(max(pool_freqs), max(other_freqs))
+
+    if overlap_min >= overlap_max:
+        # No overlap — just take n_rules from pool
+        chosen = list(rng.choice(pool, min(n_rules, len(pool)), replace=False))
+        return [r['rule_id'] for r in chosen]
+
+    freq_bins = np.logspace(np.log10(max(overlap_min, 1)),
+                            np.log10(overlap_max), 11)
+    selected = []
+    per_bin = max(1, n_rules // (len(freq_bins) - 1) + 1)
+
+    for i in range(len(freq_bins) - 1):
+        lo, hi = freq_bins[i], freq_bins[i + 1]
+        candidates = [r for r in pool if lo <= r['n_satisfied'] < hi]
+        other_count = sum(1 for r in other_pool if lo <= r['n_satisfied'] < hi)
+        n_take = min(len(candidates), other_count, per_bin)
+        if n_take > 0:
+            chosen = rng.choice(candidates, n_take, replace=False)
+            selected.extend(chosen.tolist())
+
+    if len(selected) > n_rules:
+        idx = rng.choice(len(selected), n_rules, replace=False)
+        selected = [selected[i] for i in idx]
+
+    return [r['rule_id'] for r in selected]
+
+
+def select_rules_for_group(group_name, sensitivity_data, rng):
+    """Select 100 rule IDs based on the rule group."""
+    rules = sensitivity_data['rules']
+    sorted_rules = sorted(rules, key=lambda r: r['sensitivity'], reverse=True)
+    n_pool = len(sorted_rules) // 3
+
+    if group_name == 'high_sens':
+        high_pool = sorted_rules[:n_pool]
+        low_pool = sorted_rules[-n_pool:]
+        return _frequency_match(high_pool, low_pool, 100, rng)
+
+    elif group_name == 'low_sens':
+        high_pool = sorted_rules[:n_pool]
+        low_pool = sorted_rules[-n_pool:]
+        return _frequency_match(low_pool, high_pool, 100, rng)
+
+    elif group_name == 'diagonal':
+        diag_dirs = {(-1, -1), (-1, 1), (1, -1), (1, 1)}
+        pool = [r for r in rules if tuple(r['direction_vec']) in diag_dirs]
+        other = [r for r in rules if tuple(r['direction_vec']) not in diag_dirs]
+        return _frequency_match(pool, other, 100, rng)
+
+    elif group_name == 'random_dir':
+        diag_dirs = {(-1, -1), (-1, 1), (1, -1), (1, 1)}
+        pool = [r for r in rules if tuple(r['direction_vec']) not in diag_dirs]
+        diag_pool = [r for r in rules if tuple(r['direction_vec']) in diag_dirs]
+        # Match to diagonal selection's frequency
+        diag_ids = _frequency_match(diag_pool, pool, 100, rng)
+        diag_selected = [r for r in diag_pool if r['rule_id'] in set(diag_ids)]
+        return _frequency_match(pool, diag_selected, 100, rng)
+
+    elif group_name == 'left_board':
+        pool = [r for r in rules if r['target'] % 8 < 4]
+        other = [r for r in rules if r['target'] % 8 >= 4]
+        return _frequency_match(pool, other, 100, rng)
+
+    elif group_name == 'full_board':
+        left_pool = [r for r in rules if r['target'] % 8 < 4]
+        right_pool = [r for r in rules if r['target'] % 8 >= 4]
+        left_ids = _frequency_match(left_pool, right_pool, 100, rng)
+        left_selected = [r for r in left_pool if r['rule_id'] in set(left_ids)]
+        return _frequency_match(rules, left_selected, 100, rng)
+
+    elif group_name == 'center':
+        center_cells = set()
+        for r in range(2, 6):
+            for c in range(2, 6):
+                cell = r * 8 + c
+                if cell not in CENTER_CELLS:
+                    center_cells.add(cell)
+        pool = [r for r in rules if r['target'] in center_cells]
+        other = [r for r in rules if r['target'] not in center_cells]
+        return _frequency_match(pool, other, 100, rng)
+
+    elif group_name == 'periphery':
+        center_cells = set()
+        for r in range(2, 6):
+            for c in range(2, 6):
+                cell = r * 8 + c
+                if cell not in CENTER_CELLS:
+                    center_cells.add(cell)
+        pool = [r for r in rules if r['target'] not in center_cells]
+        center_pool = [r for r in rules if r['target'] in center_cells]
+        center_ids = _frequency_match(center_pool, pool, 100, rng)
+        center_selected = [r for r in center_pool if r['rule_id'] in set(center_ids)]
+        return _frequency_match(pool, center_selected, 100, rng)
+
+    elif group_name in ('coherent', 'incoherent'):
+        # Both use the same 100 random rules; corruption differs
+        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+
+    elif group_name in ('one_color', 'both_colors'):
+        # Same 100 rules; the difference is in how corruption is applied
+        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+
+    elif group_name in ('after30', 'all_moves'):
+        # Same 100 rules; the difference is temporal application
+        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+
+    else:
+        raise ValueError(f"Unknown group: {group_name}")
+
+
+# ============================================================================
+# Corruption functions
+# ============================================================================
+
+def corrupt_drop_third(patterns, rule_ids, rng):
+    """Remove floor(len(opp)/3) opponents from chain (min 1 if len >= 2)."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        p = patterns[rid]
+        if len(p['opponents']) >= 2:
+            n_drop = max(1, len(p['opponents']) // 3)
+            drop_idx = sorted(rng.choice(len(p['opponents']), n_drop, replace=False),
+                              reverse=True)
+            for di in drop_idx:
+                p['opponents'].pop(di)
+            p['length'] = len(p['opponents'])
+            n_modified += 1
+    return patterns, n_modified
+
+
+def corrupt_nearby(patterns, rule_ids, rng):
+    """Replace floor(len(opp)/3) opponents with nearby (dist 2-3) cells."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        p = patterns[rid]
+        n_replace = max(1, len(p['opponents']) // 3)
+        replace_idx = rng.choice(len(p['opponents']), min(n_replace, len(p['opponents'])),
+                                 replace=False)
+        for idx in replace_idx:
+            cell = p['opponents'][idx]
+            candidates = _get_nearby_cells(cell)
+            if candidates:
+                p['opponents'][idx] = int(rng.choice(candidates))
+                n_modified += 1
+    return patterns, n_modified
+
+
+def _get_nearby_cells(cell):
+    """Get cells at Chebyshev distance 2-3 from cell."""
+    r, c = cell // 8, cell % 8
+    candidates = []
+    for dr in range(-3, 4):
+        for dc in range(-3, 4):
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < 8 and 0 <= nc < 8:
+                dist = max(abs(dr), abs(dc))
+                if 2 <= dist <= 3:
+                    candidates.append(nr * 8 + nc)
+    return candidates
+
+
+def corrupt_add_adjacent(patterns, rule_ids, rng):
+    """Add floor(len(opp)/3) adjacent cells as extra opponent requirements."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        p = patterns[rid]
+        n_add = max(1, len(p['opponents']) // 3)
+        used = {p['target'], p['terminal']} | set(p['opponents'])
+        neighbors = set()
+        for cell in p['opponents']:
+            r, c = cell // 8, cell % 8
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = r + dr, c + dc
+                    if 0 <= nr < 8 and 0 <= nc < 8:
+                        nc_cell = nr * 8 + nc
+                        if nc_cell not in used:
+                            neighbors.add(nc_cell)
+        neighbors = list(neighbors)
+        if neighbors:
+            n_add = min(n_add, len(neighbors))
+            chosen = rng.choice(neighbors, n_add, replace=False)
+            p['opponents'].extend([int(c) for c in chosen])
+            p['length'] = len(p['opponents'])
+            n_modified += 1
+    return patterns, n_modified
+
+
+def corrupt_flip_color(patterns, rule_ids, rng):
+    """Flip color check for floor(len(opp)/3) opponents (opponent→friendly)."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        p = patterns[rid]
+        n_flip = max(1, len(p['opponents']) // 3)
+        flip_idx = rng.choice(len(p['opponents']), min(n_flip, len(p['opponents'])),
+                              replace=False)
+        p['flipped_indices'] = sorted(flip_idx.tolist())
+        n_modified += 1
+    return patterns, n_modified
+
+
+def corrupt_extend_chain(patterns, rule_ids, rng):
+    """Add one more opponent at end, shift terminal one cell further."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        p = patterns[rid]
+        dr, dc = p['direction']
+        old_term = p['terminal']
+        tr, tc = old_term // 8, old_term % 8
+        new_tr, new_tc = tr + dr, tc + dc
+        if 0 <= new_tr < 8 and 0 <= new_tc < 8:
+            p['opponents'].append(old_term)
+            p['terminal'] = new_tr * 8 + new_tc
+            p['length'] = len(p['opponents'])
+            n_modified += 1
+    return patterns, n_modified
+
+
+def corrupt_play_occupied(patterns, rule_ids, rng):
+    """Allow play on occupied squares for these rules' targets."""
+    patterns = deepcopy(patterns)
+    n_modified = 0
+    for rid in rule_ids:
+        patterns[rid]['skip_target_check'] = True
+        n_modified += 1
+    return patterns, n_modified
+
+
+def apply_corruption(corruption_type, patterns, rule_ids, rng):
+    """Apply the specified corruption to the given rules."""
+    if corruption_type == 'drop_third':
+        return corrupt_drop_third(patterns, rule_ids, rng)
+    elif corruption_type == 'corrupt_nearby':
+        return corrupt_nearby(patterns, rule_ids, rng)
+    elif corruption_type == 'add_adjacent':
+        return corrupt_add_adjacent(patterns, rule_ids, rng)
+    elif corruption_type == 'flip_color':
+        return corrupt_flip_color(patterns, rule_ids, rng)
+    elif corruption_type == 'extend_chain':
+        return corrupt_extend_chain(patterns, rule_ids, rng)
+    elif corruption_type == 'play_occupied':
+        return corrupt_play_occupied(patterns, rule_ids, rng)
+    else:
+        raise ValueError(f"Unknown corruption: {corruption_type}")
+
+
+def apply_spatial_corruption(group_name, patterns, rule_ids, corruption_type, rng):
+    """For coherent/incoherent groups, apply spatial transformation THEN corruption."""
+    patterns = deepcopy(patterns)
+
+    if group_name == 'coherent':
+        # Shift all cell references by (+1, +1), wrapping mod 8
+        for rid in rule_ids:
+            p = patterns[rid]
+            p['target'] = _shift_cell(p['target'], 1, 1)
+            p['opponents'] = [_shift_cell(c, 1, 1) for c in p['opponents']]
+            p['terminal'] = _shift_cell(p['terminal'], 1, 1)
+
+    elif group_name == 'incoherent':
+        # Cross-wire: swap opponents/terminal between distant rules
+        ids = list(rule_ids)
+        rng.shuffle(ids)
+        for i in range(0, len(ids) - 1, 2):
+            a, b = ids[i], ids[i + 1]
+            pa, pb = patterns[a], patterns[b]
+            pa['opponents'], pb['opponents'] = pb['opponents'], pa['opponents']
+            pa['terminal'], pb['terminal'] = pb['terminal'], pa['terminal']
+            pa['length'] = len(pa['opponents'])
+            pb['length'] = len(pb['opponents'])
+
+    # Now apply the actual corruption type on top
+    return apply_corruption(corruption_type, patterns, rule_ids, rng)
+
+
+def _shift_cell(cell, dr, dc):
+    """Shift a cell by (dr, dc), wrapping around the 8x8 board."""
+    r, c = cell // 8, cell % 8
+    return ((r + dr) % 8) * 8 + ((c + dc) % 8)
+
+
+# ============================================================================
+# Extended pattern evaluation (supports flip_color, play_occupied, player_only)
+# ============================================================================
+
+def precompute_pattern_arrays_extended(patterns):
+    """Like precompute_pattern_arrays but with extra fields for extended eval."""
+    n = len(patterns)
+    max_opp = max(len(p['opponents']) for p in patterns)
+
+    targets = np.array([p['target'] for p in patterns], dtype=np.int32)
+    terminals = np.array([p['terminal'] for p in patterns], dtype=np.int32)
+    opp_lens = np.array([len(p['opponents']) for p in patterns], dtype=np.int32)
+
+    opp_cells = np.zeros((n, max_opp), dtype=np.int32)
+    for i, p in enumerate(patterns):
+        for j, o in enumerate(p['opponents']):
+            opp_cells[i, j] = o
+
+    opp_mask = np.arange(max_opp)[None, :] < opp_lens[:, None]
+
+    # flip_mask: True where opponent check should be friendly instead
+    flip_mask = np.zeros((n, max_opp), dtype=np.bool_)
+    for i, p in enumerate(patterns):
+        if 'flipped_indices' in p:
+            for fi in p['flipped_indices']:
+                if fi < max_opp:
+                    flip_mask[i, fi] = True
+
+    # skip_target_check: True where target doesn't need to be empty
+    skip_target = np.array([p.get('skip_target_check', False) for p in patterns],
+                           dtype=np.bool_)
+
+    # player_only: -1 = any player, 0 = black only, 1 = white only
+    player_only = np.array([p.get('player_restrict', -1) for p in patterns],
+                           dtype=np.int32)
+
+    return targets, terminals, opp_cells, opp_mask, flip_mask, skip_target, player_only
+
+
+def evaluate_rules_extended(flat, is_black_turn, targets, terminals, opp_cells,
+                            opp_mask, flip_mask, skip_target, player_only):
+    """Extended vectorized rule evaluation."""
+    my_val = 1 if is_black_turn else -1
+    opp_val = -my_val
+
+    # Target check
+    target_empty = (flat[targets] == 0) | skip_target
+
+    # Terminal check
+    terminal_friendly = (flat[terminals] == my_val)
+
+    # Opponent check with color flipping
+    opp_vals = flat[opp_cells]
+    opp_is_opponent = (opp_vals == opp_val)
+    opp_is_friendly = (opp_vals == my_val)
+    opp_match = np.where(flip_mask, opp_is_friendly, opp_is_opponent) | ~opp_mask
+    opp_all = opp_match.all(axis=1)
+
+    # Player restriction
+    player_color = 0 if is_black_turn else 1
+    player_ok = (player_only == -1) | (player_only == player_color)
+
+    fires = target_empty & opp_all & terminal_friendly & player_ok
+
+    if not fires.any():
+        return None
+
+    return np.unique(targets[fires])
+
+
+# ============================================================================
+# Game generation
+# ============================================================================
+
+def place_piece_no_flip(board, pos):
+    """Place a piece without applying Othello flip rules."""
+    r, c = pos // 8, pos % 8
+    board.state[r, c] = board.next_hand_color
+    board.next_hand_color *= -1
+
+
+def generate_single_game_extended(arrays, rng, save_legal=False,
+                                  arrays_late=None, phase_boundary=0):
+    """Generate a single game. If arrays_late provided, switch at phase_boundary."""
+    targets, terminals, opp_cells, opp_mask, flip_mask, skip_target, player_only = arrays
+    if arrays_late is not None:
+        t2, te2, oc2, om2, fm2, st2, po2 = arrays_late
+
+    board = OthelloBoardState()
+    moves = []
+    legal_per_turn = [] if save_legal else None
+
+    for turn in range(60):
+        flat = board.state.flatten()
+        is_black = (board.next_hand_color == 1)
+
+        # Choose rule set based on phase
+        if arrays_late is not None and turn >= phase_boundary:
+            legal_cells = evaluate_rules_extended(
+                flat, is_black, t2, te2, oc2, om2, fm2, st2, po2)
+        else:
+            legal_cells = evaluate_rules_extended(
+                flat, is_black, targets, terminals, opp_cells, opp_mask,
+                flip_mask, skip_target, player_only)
+
+        if legal_cells is None:
+            empty = np.where(flat == 0)[0]
+            empty = np.setdiff1d(empty, CENTER_SET)
+            if len(empty) == 0:
+                break
+            if save_legal:
+                legal_per_turn.append(empty.tolist())
+            board_pos = int(empty[rng.randint(len(empty))])
+        else:
+            if save_legal:
+                legal_per_turn.append(legal_cells.tolist())
+            board_pos = int(legal_cells[rng.randint(len(legal_cells))])
+
+        if board.tentative_move(board_pos) != 0:
+            board.update([board_pos])
+        else:
+            place_piece_no_flip(board, board_pos)
+
+        moves.append(board_pos)
+
+    if save_legal:
+        return moves, legal_per_turn
+    return moves
+
+
+def generate_games_extended(arrays, num_games, rng, save_legal=False,
+                            arrays_late=None, phase_boundary=0):
+    """Generate multiple games with extended rules."""
+    all_games = []
+    all_legal = [] if save_legal else None
+
+    for i in range(num_games):
+        result = generate_single_game_extended(
+            arrays, rng, save_legal=save_legal,
+            arrays_late=arrays_late, phase_boundary=phase_boundary)
+        if save_legal:
+            game, legal = result
+            all_games.append(game)
+            all_legal.append(legal)
+        else:
+            all_games.append(result)
+
+        if (i + 1) % 10000 == 0:
+            print(f"  Generated {i+1}/{num_games} games...", flush=True)
+
+    if save_legal:
+        return all_games, all_legal
+    return all_games
+
+
+# ============================================================================
+# Targeted test position collection
+# ============================================================================
+
+def collect_targeted_positions(corrupted_arrays, std_arrays, n_target=5000,
+                               max_games=200000, rng=None,
+                               arrays_late=None, phase_boundary=0):
+    """Collect positions where corrupted rules disagree with standard rules."""
+    if rng is None:
+        rng = np.random.RandomState(99)
+
+    positions = []  # list of (game_prefix, std_legal, cor_legal)
+    games_tried = 0
+
+    while len(positions) < n_target and games_tried < max_games:
+        board = OthelloBoardState()
+        game_moves = []
+
+        for turn in range(60):
+            flat = board.state.flatten()
+            is_black = (board.next_hand_color == 1)
+
+            # Standard rules (just basic arrays, no extensions)
+            std_legal = evaluate_rules_extended(flat, is_black, *std_arrays)
+            std_set = set(std_legal.tolist()) if std_legal is not None else set()
+
+            # Corrupted rules (with phase if applicable)
+            if arrays_late is not None and turn >= phase_boundary:
+                cor_legal = evaluate_rules_extended(flat, is_black, *arrays_late)
+            else:
+                cor_legal = evaluate_rules_extended(flat, is_black, *corrupted_arrays)
+            cor_set = set(cor_legal.tolist()) if cor_legal is not None else set()
+
+            if std_set != cor_set:
+                positions.append({
+                    'game_prefix': list(game_moves),
+                    'move_idx': turn,
+                    'std_legal': sorted(std_set),
+                    'cor_legal': sorted(cor_set),
+                })
+
+            # Play under corrupted rules
+            if cor_legal is not None and len(cor_legal) > 0:
+                move = int(cor_legal[rng.randint(len(cor_legal))])
+            else:
+                empty = np.where(flat == 0)[0]
+                empty = np.setdiff1d(empty, CENTER_SET)
+                if len(empty) == 0:
+                    break
+                move = int(empty[rng.randint(len(empty))])
+
+            if board.tentative_move(move) != 0:
+                board.update([move])
+            else:
+                place_piece_no_flip(board, move)
+            game_moves.append(move)
+
+            if len(positions) >= n_target:
+                break
+
+        games_tried += 1
+
+    print(f"  Collected {len(positions)} targeted positions from {games_tried} games",
+          flush=True)
+    return positions[:n_target]
+
+
+# ============================================================================
+# Training and evaluation
+# ============================================================================
+
+def build_legal_mask_from_positions(positions, stoi, block_size, vocab_size):
+    """Build legal mask from targeted test positions.
+
+    Each position has a game_prefix and cor_legal (legal moves under corrupted rules).
+    We build a dataset of (game_prefix, cor_legal) and return the mask.
+    """
+    max_key = max(k for k in stoi.keys() if k >= 0)
+    stoi_map = np.full(max_key + 1, -1, dtype=np.int32)
+    for k, v in stoi.items():
+        if k >= 0:
+            stoi_map[k] = v
+
+    # Each position contributes one row to the mask
+    n = len(positions)
+    mask = np.zeros((n, vocab_size), dtype=np.bool_)
+
+    for i, pos in enumerate(positions):
+        for cell in pos['cor_legal']:
+            if cell <= max_key and stoi_map[cell] >= 0:
+                mask[i, stoi_map[cell]] = True
+
+    return mask
+
+
+def evaluate_on_targeted(model, positions, dataset, device, legal_mask):
+    """Evaluate model on targeted test positions."""
+    model.eval()
+
+    total_legal = 0
+    total_legal_prob = 0.0
+    total_loss = 0.0
+    total_rank = 0.0
+    n = 0
+
+    with torch.no_grad():
+        for i, pos in enumerate(positions):
+            prefix = pos['game_prefix']
+            if len(prefix) < 1:
+                continue
+
+            # Tokenize prefix
+            tokens = [dataset.stoi[m] for m in prefix]
+            x = torch.tensor([tokens], dtype=torch.long, device=device)
+
+            logits, _ = model(x)
+            # Last position predicts next move
+            last_logits = logits[0, -1, :]  # (vocab_size,)
+            probs = torch.softmax(last_logits, dim=-1)
+
+            # Legal accuracy: is argmax legal under corrupted rules?
+            pred = last_logits.argmax().item()
+            if i < len(legal_mask):
+                is_legal = legal_mask[i, pred]
+                total_legal += int(is_legal)
+
+                # Legal probability mass
+                legal_torch = torch.from_numpy(legal_mask[i:i+1]).to(device).float()
+                total_legal_prob += (probs * legal_torch[0]).sum().item()
+
+            # Loss: cross-entropy against uniform over legal moves
+            # (not meaningful for single positions, skip)
+
+            n += 1
+
+    if n == 0:
+        return 0.0, 0.0
+
+    return total_legal / n, total_legal_prob / n
+
+
+EVAL_SCHEDULE = [0, 50, 100, 200, 300]  # plus final step
+
+
+def train_and_evaluate(model, train_games, train_legal, test_positions,
+                       test_mask, device, bs=16, lr=3e-4):
+    """Fine-tune model and evaluate at scheduled steps."""
+    train_dataset = CharDataset(train_games)
+    train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
+                              num_workers=0, drop_last=True)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.1,
+                                 betas=(0.9, 0.95))
+
+    total_steps = len(train_loader)
+    eval_set = set(EVAL_SCHEDULE)
+
+    results = {'eval_steps': [], 'eval_accs': [], 'eval_lpms': []}
+    t0 = time.time()
+
+    # Step 0 evaluation
+    acc, lpm = evaluate_on_targeted(model, test_positions, train_dataset,
+                                    device, test_mask)
+    results['eval_steps'].append(0)
+    results['eval_accs'].append(acc)
+    results['eval_lpms'].append(lpm)
+    print(f"  Step 0: acc={acc:.4f}, lpm={lpm:.4f}", flush=True)
+
+    batch_count = 0
+    model.train()
+    for it, (x, y) in enumerate(train_loader):
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        loss = loss.mean()
+
+        model.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        batch_count += 1
+
+        if batch_count in eval_set:
+            acc, lpm = evaluate_on_targeted(model, test_positions,
+                                            train_dataset, device, test_mask)
+            results['eval_steps'].append(batch_count)
+            results['eval_accs'].append(acc)
+            results['eval_lpms'].append(lpm)
+            elapsed = time.time() - t0
+            print(f"  Step {batch_count}: acc={acc:.4f}, lpm={lpm:.4f}, "
+                  f"elapsed={elapsed:.0f}s", flush=True)
+
+    # Final evaluation
+    acc, lpm = evaluate_on_targeted(model, test_positions, train_dataset,
+                                    device, test_mask)
+    results['eval_steps'].append(batch_count)
+    results['eval_accs'].append(acc)
+    results['eval_lpms'].append(lpm)
+    elapsed = time.time() - t0
+    print(f"  Final (step {batch_count}): acc={acc:.4f}, lpm={lpm:.4f}, "
+          f"elapsed={elapsed:.0f}s", flush=True)
+
+    results['total_steps'] = batch_count
+    results['elapsed_seconds'] = elapsed
+    return results
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--condition-id", type=int, required=True)
+    parser.add_argument("--output-dir", type=str, default="experiments/param_search")
+    parser.add_argument("--ckpt", type=str, default="ckpts/gpt_synthetic.ckpt")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--n-train", type=int, default=50000)
+    parser.add_argument("--n-test", type=int, default=5000)
+    args = parser.parse_args()
+
+    rng = np.random.RandomState(args.seed)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    group_name, corruption_type = condition_id_to_names(args.condition_id)
+    print(f"Condition {args.condition_id}: {group_name} × {corruption_type}")
+    print(f"Device: {device}")
+
+    # Load sensitivity data
+    sens_path = os.path.join(os.path.dirname(__file__), 'behavioral_data/sensitivity.json')
+    with open(sens_path) as f:
+        sensitivity_data = json.load(f)
+
+    # Select 100 rules
+    rule_ids = select_rules_for_group(group_name, sensitivity_data, rng)
+    print(f"Selected {len(rule_ids)} rules")
+
+    # Get base patterns
+    base_patterns = enumerate_flanking_patterns()
+
+    # Apply corruption
+    if group_name in ('coherent', 'incoherent'):
+        corrupted_patterns, n_mod = apply_spatial_corruption(
+            group_name, base_patterns, rule_ids, corruption_type, rng)
+    elif group_name == 'one_color':
+        # Apply corruption, then set player restriction
+        corrupted_patterns, n_mod = apply_corruption(
+            corruption_type, base_patterns, rule_ids, rng)
+        for rid in rule_ids:
+            corrupted_patterns[rid]['player_restrict'] = 0  # black only
+    else:
+        corrupted_patterns, n_mod = apply_corruption(
+            corruption_type, base_patterns, rule_ids, rng)
+
+    print(f"Corrupted {n_mod} rules (type={corruption_type})")
+
+    # Build pattern arrays
+    corrupted_arrays = precompute_pattern_arrays_extended(corrupted_patterns)
+    std_arrays = precompute_pattern_arrays_extended(base_patterns)
+
+    # Handle phased conditions (after30)
+    arrays_late = None
+    phase_boundary = 0
+    if group_name == 'after30':
+        # Standard rules for early, corrupted for late
+        arrays_late = corrupted_arrays
+        corrupted_arrays = std_arrays  # early phase uses standard
+        phase_boundary = 30
+    elif group_name == 'all_moves':
+        # Corrupted rules for all moves (no phase)
+        pass
+
+    # Generate training games
+    print(f"Generating {args.n_train} training games...")
+    train_games, train_legal = generate_games_extended(
+        corrupted_arrays, args.n_train, rng, save_legal=True,
+        arrays_late=arrays_late, phase_boundary=phase_boundary)
+
+    # Filter short games
+    valid = [(g, l) for g, l in zip(train_games, train_legal) if len(g) >= 5]
+    train_games = [g for g, _ in valid]
+    train_legal = [l for _, l in valid]
+    print(f"  {len(train_games)} games after filtering")
+
+    # Collect targeted test positions
+    print(f"Collecting {args.n_test} targeted test positions...")
+    test_positions = collect_targeted_positions(
+        corrupted_arrays, std_arrays, n_target=args.n_test, rng=rng,
+        arrays_late=arrays_late, phase_boundary=phase_boundary)
+
+    # Save games and test positions for reproducibility
+    games_dir = os.path.join(args.output_dir, f"games/cond_{args.condition_id:03d}")
+    os.makedirs(games_dir, exist_ok=True)
+    with open(os.path.join(games_dir, "train_games.pickle"), 'wb') as f:
+        pickle.dump(train_games, f)
+    with open(os.path.join(games_dir, "train_legal.pickle"), 'wb') as f:
+        pickle.dump(train_legal, f)
+    with open(os.path.join(games_dir, "test_positions.pickle"), 'wb') as f:
+        pickle.dump(test_positions, f)
+    with open(os.path.join(games_dir, "corrupted_patterns.pickle"), 'wb') as f:
+        pickle.dump(corrupted_patterns, f)
+    print(f"  Saved games to {games_dir}")
+
+    # Load model
+    print("Loading model...")
+    from data import get_othello
+    othello = get_othello(ood_num=100)
+    dummy_dataset = CharDataset(othello)
+
+    mconf = GPTConfig(dummy_dataset.vocab_size, dummy_dataset.block_size,
+                      n_layer=8, n_head=8, n_embd=512)
+    model = GPT(mconf)
+    state_dict = torch.load(args.ckpt, map_location='cpu')
+    model.load_state_dict(state_dict)
+    model = model.to(device)
+
+    # Build test legal mask
+    test_mask = build_legal_mask_from_positions(
+        test_positions, dummy_dataset.stoi, dummy_dataset.block_size,
+        dummy_dataset.vocab_size)
+
+    # Train and evaluate
+    print("Training...")
+    results = train_and_evaluate(
+        model, train_games, train_legal, test_positions, test_mask, device)
+
+    # Save results
+    os.makedirs(args.output_dir, exist_ok=True)
+    output = {
+        'condition_id': args.condition_id,
+        'rule_group': group_name,
+        'corruption_type': corruption_type,
+        'n_rules_selected': len(rule_ids),
+        'n_rules_modified': n_mod,
+        'rule_ids': [int(r) for r in rule_ids],
+        'n_train_games': len(train_games),
+        'n_test_positions': len(test_positions),
+        'seed': args.seed,
+        **results,
+    }
+
+    # Add sensitivity stats for selected rules
+    rule_sens = [sensitivity_data['rules'][rid]['sensitivity'] for rid in rule_ids]
+    rule_freq = [sensitivity_data['rules'][rid]['n_satisfied'] for rid in rule_ids]
+    output['mean_sensitivity'] = float(np.mean(rule_sens))
+    output['mean_frequency'] = float(np.mean(rule_freq))
+    output['total_impact'] = float(np.sum([s * f for s, f in zip(rule_sens, rule_freq)]))
+
+    out_path = os.path.join(args.output_dir, f"cond_{args.condition_id:03d}.json")
+    with open(out_path, 'w') as f:
+        json.dump(output, f, indent=2)
+    print(f"Saved {out_path}")
+
+
+if __name__ == "__main__":
+    main()
