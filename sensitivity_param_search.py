@@ -665,8 +665,9 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
     for k in test_sets:
         test_sets[k] = test_sets[k][:n_per_set]
 
-    print(f"  Test sets: LL={len(test_sets['LL'])}, IL={len(test_sets['IL'])}, "
-          f"LI={len(test_sets['LI'])} (from {games_tried} games)", flush=True)
+    counts = {k: len(test_sets.get(k, [])) for k in ['LL', 'IL', 'LI']}
+    print(f"  Test sets: LL={counts['LL']}, IL={counts['IL']}, "
+          f"LI={counts['LI']} (from {games_tried} games)", flush=True)
     return test_sets
 
 
