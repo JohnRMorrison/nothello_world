@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --mem=32G
-#SBATCH --time=3:00:00
+#SBATCH --time=1:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=nklab,burst
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
