@@ -33,6 +33,7 @@ task_id = int(os.environ.get('SLURM_ARRAY_TASK_ID', 0))
 # 0-3: n_rules sweep (2,4,6,8 random rules, flip_color, bs=16, lr=5e-5)
 # 4-6: batch_size sweep (bs=32,64,128 on left_board 100 rules, lr=5e-5)
 # 7-10: lr=3e-4 sweep (5,10,50,100 random rules, flip_color, bs=16)
+# 11-15: n_rules sweep (10,20,40,60,80 random rules, flip_color, bs=16, lr=5e-5)
 configs = [
     {'n_rules': 2,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
     {'n_rules': 4,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
@@ -45,6 +46,11 @@ configs = [
     {'n_rules': 10,  'bs': 16,  'lr': 3e-4, 'group': 'random'},
     {'n_rules': 50,  'bs': 16,  'lr': 3e-4, 'group': 'random'},
     {'n_rules': 100, 'bs': 16,  'lr': 3e-4, 'group': 'random'},
+    {'n_rules': 10,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 20,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 40,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 60,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 80,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
 ]
 
 cfg = configs[task_id]
@@ -120,7 +126,7 @@ else:
         pickle.dump(train_legal, f)
 
 n_train = min(190000, len(train_games))
-print(f"Training on {n_train} games, bs={cfg['bs']}, lr=5e-5", flush=True)
+print(f"Training on {n_train} games, bs={cfg['bs']}, lr={cfg['lr']}", flush=True)
 
 # Build corrupted test set
 cor_test_games = train_games[n_train:n_train+10000]
