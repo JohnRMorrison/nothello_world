@@ -103,8 +103,8 @@ def _frequency_match(pool, other_pool, n_rules, rng):
     return [r['rule_id'] for r in selected]
 
 
-def select_rules_for_group(group_name, sensitivity_data, rng):
-    """Select 100 rule IDs based on the rule group."""
+def select_rules_for_group(group_name, sensitivity_data, rng, n_rules=100):
+    """Select n_rules rule IDs based on the rule group."""
     rules = sensitivity_data['rules']
     sorted_rules = sorted(rules, key=lambda r: r['sensitivity'], reverse=True)
     n_pool = len(sorted_rules) // 3
@@ -112,39 +112,39 @@ def select_rules_for_group(group_name, sensitivity_data, rng):
     if group_name == 'high_sens':
         high_pool = sorted_rules[:n_pool]
         low_pool = sorted_rules[-n_pool:]
-        return _frequency_match(high_pool, low_pool, 100, rng)
+        return _frequency_match(high_pool, low_pool, n_rules, rng)
 
     elif group_name == 'low_sens':
         high_pool = sorted_rules[:n_pool]
         low_pool = sorted_rules[-n_pool:]
-        return _frequency_match(low_pool, high_pool, 100, rng)
+        return _frequency_match(low_pool, high_pool, n_rules, rng)
 
     elif group_name == 'diagonal':
         diag_dirs = {(-1, -1), (-1, 1), (1, -1), (1, 1)}
         pool = [r for r in rules if tuple(r['direction_vec']) in diag_dirs]
         other = [r for r in rules if tuple(r['direction_vec']) not in diag_dirs]
-        return _frequency_match(pool, other, 100, rng)
+        return _frequency_match(pool, other, n_rules, rng)
 
     elif group_name == 'random_dir':
         diag_dirs = {(-1, -1), (-1, 1), (1, -1), (1, 1)}
         pool = [r for r in rules if tuple(r['direction_vec']) not in diag_dirs]
         diag_pool = [r for r in rules if tuple(r['direction_vec']) in diag_dirs]
         # Match to diagonal selection's frequency
-        diag_ids = _frequency_match(diag_pool, pool, 100, rng)
+        diag_ids = _frequency_match(diag_pool, pool, n_rules, rng)
         diag_selected = [r for r in diag_pool if r['rule_id'] in set(diag_ids)]
-        return _frequency_match(pool, diag_selected, 100, rng)
+        return _frequency_match(pool, diag_selected, n_rules, rng)
 
     elif group_name == 'left_board':
         pool = [r for r in rules if r['target'] % 8 < 4]
         other = [r for r in rules if r['target'] % 8 >= 4]
-        return _frequency_match(pool, other, 100, rng)
+        return _frequency_match(pool, other, n_rules, rng)
 
     elif group_name == 'full_board':
         left_pool = [r for r in rules if r['target'] % 8 < 4]
         right_pool = [r for r in rules if r['target'] % 8 >= 4]
-        left_ids = _frequency_match(left_pool, right_pool, 100, rng)
+        left_ids = _frequency_match(left_pool, right_pool, n_rules, rng)
         left_selected = [r for r in left_pool if r['rule_id'] in set(left_ids)]
-        return _frequency_match(rules, left_selected, 100, rng)
+        return _frequency_match(rules, left_selected, n_rules, rng)
 
     elif group_name == 'center':
         center_cells = set()
@@ -155,7 +155,7 @@ def select_rules_for_group(group_name, sensitivity_data, rng):
                     center_cells.add(cell)
         pool = [r for r in rules if r['target'] in center_cells]
         other = [r for r in rules if r['target'] not in center_cells]
-        return _frequency_match(pool, other, 100, rng)
+        return _frequency_match(pool, other, n_rules, rng)
 
     elif group_name == 'periphery':
         center_cells = set()
@@ -166,21 +166,21 @@ def select_rules_for_group(group_name, sensitivity_data, rng):
                     center_cells.add(cell)
         pool = [r for r in rules if r['target'] not in center_cells]
         center_pool = [r for r in rules if r['target'] in center_cells]
-        center_ids = _frequency_match(center_pool, pool, 100, rng)
+        center_ids = _frequency_match(center_pool, pool, n_rules, rng)
         center_selected = [r for r in center_pool if r['rule_id'] in set(center_ids)]
-        return _frequency_match(pool, center_selected, 100, rng)
+        return _frequency_match(pool, center_selected, n_rules, rng)
 
     elif group_name in ('coherent', 'incoherent'):
         # Both use the same 100 random rules; corruption differs
-        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+        return list(rng.choice([r['rule_id'] for r in rules], n_rules, replace=False))
 
     elif group_name in ('one_color', 'both_colors'):
         # Same 100 rules; the difference is in how corruption is applied
-        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+        return list(rng.choice([r['rule_id'] for r in rules], n_rules, replace=False))
 
     elif group_name in ('after30', 'all_moves'):
         # Same 100 rules; the difference is temporal application
-        return list(rng.choice([r['rule_id'] for r in rules], 100, replace=False))
+        return list(rng.choice([r['rule_id'] for r in rules], n_rules, replace=False))
 
     else:
         raise ValueError(f"Unknown group: {group_name}")
@@ -930,12 +930,8 @@ def main():
         sensitivity_data = json.load(f)
 
     # Select rules
-    if args.n_rules is not None:
-        # Override: select n random rules
-        rule_ids = rng.choice(960, args.n_rules, replace=False).tolist()
-        group_name = f"random_{args.n_rules}"
-    else:
-        rule_ids = select_rules_for_group(group_name, sensitivity_data, rng)
+    n_rules = args.n_rules if args.n_rules is not None else 100
+    rule_ids = select_rules_for_group(group_name, sensitivity_data, rng, n_rules=n_rules)
     print(f"Selected {len(rule_ids)} rules")
 
     # Get base patterns
