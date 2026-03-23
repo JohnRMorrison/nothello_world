@@ -909,7 +909,11 @@ def main():
                         help="Number of test positions per test set (LL, IL, LI)")
     parser.add_argument("--lr", type=float, default=5e-5,
                         help="Learning rate for fine-tuning")
+    parser.add_argument("--games-dir", type=str, default=None,
+                        help="Directory with saved games (default: output-dir)")
     args = parser.parse_args()
+    if args.games_dir is None:
+        args.games_dir = args.output_dir
 
     rng = np.random.RandomState(args.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -963,7 +967,7 @@ def main():
         pass
 
     # Generate training games (load existing if available, generate more if needed)
-    games_dir = os.path.join(args.output_dir, f"games/cond_{args.condition_id:03d}")
+    games_dir = os.path.join(args.games_dir, f"games/cond_{args.condition_id:03d}")
     os.makedirs(games_dir, exist_ok=True)
     existing_games_path = os.path.join(games_dir, "train_games.pickle")
     existing_legal_path = os.path.join(games_dir, "train_legal.pickle")
