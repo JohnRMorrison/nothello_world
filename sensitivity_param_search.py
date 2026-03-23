@@ -911,6 +911,8 @@ def main():
                         help="Learning rate for fine-tuning")
     parser.add_argument("--games-dir", type=str, default=None,
                         help="Directory with saved games (default: output-dir)")
+    parser.add_argument("--n-rules", type=int, default=None,
+                        help="Override number of rules to corrupt (random selection)")
     args = parser.parse_args()
     if args.games_dir is None:
         args.games_dir = args.output_dir
@@ -927,8 +929,13 @@ def main():
     with open(sens_path) as f:
         sensitivity_data = json.load(f)
 
-    # Select 100 rules
-    rule_ids = select_rules_for_group(group_name, sensitivity_data, rng)
+    # Select rules
+    if args.n_rules is not None:
+        # Override: select n random rules
+        rule_ids = rng.choice(960, args.n_rules, replace=False).tolist()
+        group_name = f"random_{args.n_rules}"
+    else:
+        rule_ids = select_rules_for_group(group_name, sensitivity_data, rng)
     print(f"Selected {len(rule_ids)} rules")
 
     # Get base patterns
@@ -1081,7 +1088,10 @@ def main():
     output['mean_frequency'] = float(np.mean(rule_freq))
     output['total_impact'] = float(np.sum([s * f for s, f in zip(rule_sens, rule_freq)]))
 
-    out_path = os.path.join(args.output_dir, f"cond_{args.condition_id:03d}.json")
+    if args.n_rules is not None:
+        out_path = os.path.join(args.output_dir, f"nrules_{args.n_rules:03d}.json")
+    else:
+        out_path = os.path.join(args.output_dir, f"cond_{args.condition_id:03d}.json")
     with open(out_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"Saved {out_path}")
