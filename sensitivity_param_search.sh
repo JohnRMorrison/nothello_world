@@ -2,7 +2,7 @@
 #SBATCH --job-name=sps
 #SBATCH --output=logs/sps_%A_%a.out
 #SBATCH --error=logs/sps_%A_%a.err
-#SBATCH --time=12:00:00
+#SBATCH --time=1:00:00
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --gres=gpu:1
@@ -16,8 +16,7 @@ echo "Started at: $(date)"
 
 python sensitivity_param_search.py \
     --condition-id $SLURM_ARRAY_TASK_ID \
-    --output-dir experiments/param_search_v3 \
-    --games-dir experiments/param_search \
+    --output-dir experiments/param_search_v4 \
     --lr 5e-5 \
     --seed 42
 
