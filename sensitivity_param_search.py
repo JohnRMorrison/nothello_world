@@ -597,6 +597,8 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
 
         board = OthelloBoardState()
         game_moves = []
+        # Track which sets got a position from this game (at most 1 per set per game)
+        game_used = set()
 
         for turn in range(60):
             flat = board.state.flatten()
@@ -628,21 +630,24 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
                 'move_idx': turn,
             }
 
-            if 'LL' in active_sets and ll_cells and len(test_sets['LL']) < n_per_set:
+            if 'LL' in active_sets and ll_cells and len(test_sets['LL']) < n_per_set and 'LL' not in game_used:
                 test_sets['LL'].append({**pos_info, 'target_cells': ll_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in ll_cells}})
-            if 'IL' in active_sets and il_cells and len(test_sets['IL']) < n_per_set:
+                game_used.add('LL')
+            if 'IL' in active_sets and il_cells and len(test_sets['IL']) < n_per_set and 'IL' not in game_used:
                 test_sets['IL'].append({**pos_info, 'target_cells': il_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in il_cells}})
-            if 'LI' in active_sets and li_cells and len(test_sets['LI']) < n_per_set:
+                game_used.add('IL')
+            if 'LI' in active_sets and li_cells and len(test_sets['LI']) < n_per_set and 'LI' not in game_used:
                 test_sets['LI'].append({**pos_info, 'target_cells': li_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in li_cells}})
+                game_used.add('LI')
 
             # Play under corrupted rules
             if cor_legal is not None and len(cor_legal) > 0:
