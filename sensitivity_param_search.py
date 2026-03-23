@@ -630,19 +630,19 @@ def collect_three_test_sets(corrupted_arrays, std_arrays, n_per_set=5000,
                 'move_idx': turn,
             }
 
-            if 'LL' in active_sets and ll_cells and len(test_sets['LL']) < n_per_set and 'LL' not in game_used:
+            if 'LL' in active_sets and ll_cells and len(test_sets['LL']) < n_per_set and 'LL' not in game_used and turn >= 4:
                 test_sets['LL'].append({**pos_info, 'target_cells': ll_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in ll_cells}})
                 game_used.add('LL')
-            if 'IL' in active_sets and il_cells and len(test_sets['IL']) < n_per_set and 'IL' not in game_used:
+            if 'IL' in active_sets and il_cells and len(test_sets['IL']) < n_per_set and 'IL' not in game_used and turn >= 4:
                 test_sets['IL'].append({**pos_info, 'target_cells': il_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
                                         'n_corrupted_rules': {c: n_cor_rules.get(c, 0) for c in il_cells}})
                 game_used.add('IL')
-            if 'LI' in active_sets and li_cells and len(test_sets['LI']) < n_per_set and 'LI' not in game_used:
+            if 'LI' in active_sets and li_cells and len(test_sets['LI']) < n_per_set and 'LI' not in game_used and turn >= 4:
                 test_sets['LI'].append({**pos_info, 'target_cells': li_cells,
                                         'std_legal': sorted(std_set),
                                         'cor_legal': sorted(cor_set),
