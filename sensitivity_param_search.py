@@ -815,8 +815,7 @@ def train_and_evaluate(model, train_games, train_legal, test_sets,
         cor_loader, cor_mask = prepare_lpm_test(
             cor_test_games, cor_test_legal, train_dataset, device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=0.1,
-                                 betas=(0.9, 0.95))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     total_steps = len(train_loader)
     eval_set = set(EVAL_SCHEDULE)
