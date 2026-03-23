@@ -7,7 +7,7 @@
 #SBATCH --output=logs/diag_sweep_%A_%a.out
 #SBATCH --error=logs/diag_sweep_%A_%a.err
 #SBATCH --job-name=diag_sw
-#SBATCH --array=0-6
+#SBATCH --array=0-10
 
 source activate othello
 
@@ -32,18 +32,23 @@ task_id = int(os.environ.get('SLURM_ARRAY_TASK_ID', 0))
 # Conditions:
 # 0-3: n_rules sweep (2,4,6,8 random rules, flip_color, bs=16, lr=5e-5)
 # 4-6: batch_size sweep (bs=32,64,128 on left_board 100 rules, lr=5e-5)
+# 7-10: lr=3e-4 sweep (5,10,50,100 random rules, flip_color, bs=16)
 configs = [
-    {'n_rules': 2,   'bs': 16,  'group': 'random'},
-    {'n_rules': 4,   'bs': 16,  'group': 'random'},
-    {'n_rules': 6,   'bs': 16,  'group': 'random'},
-    {'n_rules': 8,   'bs': 16,  'group': 'random'},
-    {'n_rules': 100, 'bs': 32,  'group': 'left_board'},
-    {'n_rules': 100, 'bs': 64,  'group': 'left_board'},
-    {'n_rules': 100, 'bs': 128, 'group': 'left_board'},
+    {'n_rules': 2,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 4,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 6,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 8,   'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 100, 'bs': 32,  'lr': 5e-5, 'group': 'left_board'},
+    {'n_rules': 100, 'bs': 64,  'lr': 5e-5, 'group': 'left_board'},
+    {'n_rules': 100, 'bs': 128, 'lr': 5e-5, 'group': 'left_board'},
+    {'n_rules': 5,   'bs': 16,  'lr': 3e-4, 'group': 'random'},
+    {'n_rules': 10,  'bs': 16,  'lr': 3e-4, 'group': 'random'},
+    {'n_rules': 50,  'bs': 16,  'lr': 3e-4, 'group': 'random'},
+    {'n_rules': 100, 'bs': 16,  'lr': 3e-4, 'group': 'random'},
 ]
 
 cfg = configs[task_id]
-label = f"nrules={cfg['n_rules']}_bs={cfg['bs']}_{cfg['group']}"
+label = f"nrules={cfg['n_rules']}_bs={cfg['bs']}_lr={cfg['lr']}_{cfg['group']}"
 print(f"Task {task_id}: {label}", flush=True)
 print(f"Started at: {__import__('time').strftime('%c')}", flush=True)
 
@@ -80,7 +85,8 @@ else:
 print(f"Selected {len(rule_ids)} rules", flush=True)
 
 # Apply flip_color corruption
-corrupted_patterns = apply_corruption('flip_color', deepcopy(patterns), rule_ids, rng)
+corrupted_patterns, n_modified = apply_corruption('flip_color', deepcopy(patterns), rule_ids, rng)
+print(f"Modified {n_modified} rules", flush=True)
 
 # Generate or load games
 games_dir = f"experiments/diag_sweep/task_{task_id:02d}"
@@ -126,7 +132,7 @@ cor_loader = DataLoader(cor_ds, batch_size=64, shuffle=False)
 # Train
 model = deepcopy(model_orig)
 model.train()
-optimizer = optim.Adam(model.parameters(), lr=5e-5)
+optimizer = optim.Adam(model.parameters(), lr=cfg['lr'])
 
 train_ds = CharDataset(train_games[:n_train])
 train_loader = DataLoader(train_ds, batch_size=cfg['bs'], shuffle=True)
