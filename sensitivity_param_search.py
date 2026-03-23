@@ -718,10 +718,10 @@ def evaluate_on_test_sets(model, test_sets, dataset, device):
                         target_prob += probs[stoi[cell]].item()
                 total_prob_on_targets += target_prob
 
-                # Is argmax one of the target cells?
+                # Is argmax legal under corrupted rules?
                 pred_token = logits[0, -1, :].argmax().item()
                 pred_cell = dataset.itos[pred_token]
-                if pred_cell in set(pos['target_cells']):
+                if pred_cell in set(pos['cor_legal']):
                     total_acc += 1
 
                 n += 1
