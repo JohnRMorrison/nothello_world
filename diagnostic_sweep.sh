@@ -51,6 +51,7 @@ configs = [
     {'n_rules': 40,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
     {'n_rules': 60,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
     {'n_rules': 80,  'bs': 16,  'lr': 5e-5, 'group': 'random'},
+    {'n_rules': 100, 'bs': 16,  'lr': 5e-5, 'group': 'random'},
 ]
 
 cfg = configs[task_id]
