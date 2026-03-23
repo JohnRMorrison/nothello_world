@@ -733,7 +733,7 @@ def evaluate_on_test_sets(model, test_sets, dataset, device):
     return results
 
 
-EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 300]  # plus final step
+EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 300, 500, 1000, 2000, 5000, 10000]  # plus final step
 
 
 def build_standard_lpm_test(n_games=10000, seed=123):
@@ -907,6 +907,8 @@ def main():
     parser.add_argument("--n-train", type=int, default=200000)
     parser.add_argument("--n-test", type=int, default=5000,
                         help="Number of test positions per test set (LL, IL, LI)")
+    parser.add_argument("--lr", type=float, default=5e-5,
+                        help="Learning rate for fine-tuning")
     args = parser.parse_args()
 
     rng = np.random.RandomState(args.seed)
@@ -1051,7 +1053,8 @@ def main():
     results = train_and_evaluate(
         model, train_games, train_legal, test_sets, device,
         std_games=std_games, std_legal=std_legal,
-        cor_test_games=cor_test_games, cor_test_legal=cor_test_legal)
+        cor_test_games=cor_test_games, cor_test_legal=cor_test_legal,
+        lr=args.lr)
 
     # Save results
     os.makedirs(args.output_dir, exist_ok=True)

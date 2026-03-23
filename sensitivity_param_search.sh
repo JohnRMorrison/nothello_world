@@ -16,7 +16,8 @@ echo "Started at: $(date)"
 
 python sensitivity_param_search.py \
     --condition-id $SLURM_ARRAY_TASK_ID \
-    --output-dir experiments/param_search \
+    --output-dir experiments/param_search_v3 \
+    --lr 5e-5 \
     --seed 42
 
 echo "Finished at: $(date)"
