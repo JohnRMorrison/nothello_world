@@ -1088,10 +1088,7 @@ def main():
     output['mean_frequency'] = float(np.mean(rule_freq))
     output['total_impact'] = float(np.sum([s * f for s, f in zip(rule_sens, rule_freq)]))
 
-    if args.n_rules is not None:
-        out_path = os.path.join(args.output_dir, f"nrules_{args.n_rules:03d}.json")
-    else:
-        out_path = os.path.join(args.output_dir, f"cond_{args.condition_id:03d}.json")
+    out_path = os.path.join(args.output_dir, f"cond_{args.condition_id:03d}.json")
     with open(out_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"Saved {out_path}")
