@@ -118,6 +118,64 @@ def apply_spatial_only(group_name, patterns, rule_ids, rng):
             pb['length'] = len(pb['opponents'])
             n_modified += 2
 
+    elif group_name == 'proximal_nonlinear':
+        # Replace opponents and terminal with random cells within 1 square
+        # of the target, but NOT on a line. Tests proximity without linearity.
+        for rid in rule_ids:
+            p = patterns[rid]
+            target = p['target']
+            tr, tc = target // 8, target % 8
+            n_cells_needed = len(p['opponents']) + 1  # opponents + terminal
+
+            # Get all cells within 1 square of target (king-move neighbors)
+            neighbors = []
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = tr + dr, tc + dc
+                    if 0 <= nr < 8 and 0 <= nc < 8:
+                        cell = nr * 8 + nc
+                        if cell not in CENTER_CELLS:
+                            neighbors.append(cell)
+
+            if len(neighbors) >= n_cells_needed:
+                chosen = rng.choice(neighbors, n_cells_needed, replace=False).tolist()
+                p['opponents'] = chosen[:-1]
+                p['terminal'] = chosen[-1]
+                p['length'] = len(p['opponents'])
+                n_modified += 1
+
+    elif group_name == 'distal_linear':
+        # Replace opponents and terminal with a valid flanking line at a
+        # random location far from the target. Tests linearity without proximity.
+        # Pick a random existing pattern from a DISTANT cell (Manhattan dist >= 3)
+        # and use its opponents and terminal.
+        all_patterns = list(enumerate(patterns))
+        for rid in rule_ids:
+            p = patterns[rid]
+            target = p['target']
+            tr, tc = target // 8, target % 8
+            length = p['length']
+
+            # Find patterns from distant cells with the same length
+            candidates = []
+            for pid2, p2 in all_patterns:
+                if pid2 == rid:
+                    continue
+                t2 = p2['target']
+                t2r, t2c = t2 // 8, t2 % 8
+                manhattan = abs(tr - t2r) + abs(tc - t2c)
+                if manhattan >= 3 and p2['length'] == length:
+                    candidates.append(p2)
+
+            if candidates:
+                donor = candidates[rng.randint(len(candidates))]
+                p['opponents'] = list(donor['opponents'])
+                p['terminal'] = donor['terminal']
+                p['direction'] = donor['direction']
+                n_modified += 1
+
     return patterns, n_modified
 
 
@@ -195,12 +253,21 @@ def main():
     args = parser.parse_args()
 
     cid = args.condition_id
+    # 0-5: coherent, 6-11: incoherent, 12-17: proximal_nonlinear, 18-23: distal_linear
     if cid < 6:
         group_name = 'coherent'
         n_rules = N_RULES_LEVELS[cid]
-    else:
+    elif cid < 12:
         group_name = 'incoherent'
         n_rules = N_RULES_LEVELS[cid - 6]
+    elif cid < 18:
+        group_name = 'proximal_nonlinear'
+        n_rules = N_RULES_LEVELS[cid - 12]
+    elif cid < 24:
+        group_name = 'distal_linear'
+        n_rules = N_RULES_LEVELS[cid - 18]
+    else:
+        raise ValueError(f"Invalid condition-id: {cid}")
 
     print(f"Condition {cid}: {group_name} with {n_rules} rules")
     print(f"Started at: {time.strftime('%c')}", flush=True)
