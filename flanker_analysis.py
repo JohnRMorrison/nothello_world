@@ -318,10 +318,16 @@ def main():
 
     # Load games
     print(f"Loading {args.n_games} games...", flush=True)
-    games = load_shard_games(
-        n_games=args.n_games,
-        pickle_dir="data/othello_synthetic"
-    )
+    games = []
+    shard = 0
+    while len(games) < args.n_games:
+        shard_games = load_shard_games(shard_id=shard, games_per_shard=100000,
+                                       pickle_dir="data/othello_synthetic")
+        games.extend(shard_games)
+        shard += 1
+        if shard > 20:
+            break
+    games = games[:args.n_games]
     print(f"  Loaded {len(games)} games", flush=True)
 
     # Run inference
