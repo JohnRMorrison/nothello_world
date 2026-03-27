@@ -274,7 +274,7 @@ def main():
         print(f"Generating {args.n_train} games...", flush=True)
         corrupted_arrays = precompute_pattern_arrays_extended(corrupted_patterns)
         train_games, train_legal = generate_games_extended(
-            corrupted_arrays, n_games=args.n_train, seed=args.seed)
+            corrupted_arrays, num_games=args.n_train, rng=rng, save_legal=True)
         with open(games_path, 'wb') as f:
             pickle.dump(train_games, f)
         with open(legal_path, 'wb') as f:
@@ -293,7 +293,8 @@ def main():
     std_arrays = precompute_pattern_arrays_extended(base_patterns)
     test_sets = collect_three_test_sets(
         corrupted_arrays, std_arrays, n_per_set=5000,
-        skip_sets=skip_sets, n_games_max=200000, seed=args.seed + 1)
+        skip_sets=skip_sets, max_games=200000,
+        rng=np.random.RandomState(args.seed + 1))
 
     counts = {k: len(test_sets.get(k, [])) for k in ['LL', 'IL', 'LI']}
     print(f"  Test sets: LL={counts['LL']}, IL={counts['IL']}, "
