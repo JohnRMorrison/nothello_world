@@ -59,11 +59,9 @@ def _shift_cell_no_wrap(cell, dr, dc):
 
 
 def _shift_pattern_no_wrap(pattern, dr, dc):
-    """Try to shift all cells in a pattern by (dr, dc). Returns shifted pattern or None."""
-    new_target = _shift_cell_no_wrap(pattern['target'], dr, dc)
-    if new_target is None:
-        return None
-
+    """Try to shift opponents and terminal by (dr, dc). Target stays fixed.
+    Returns shifted pattern or None if any cell goes off-board."""
+    # Target stays the same — only check cells shift
     new_opponents = []
     for opp in pattern['opponents']:
         shifted = _shift_cell_no_wrap(opp, dr, dc)
@@ -76,7 +74,7 @@ def _shift_pattern_no_wrap(pattern, dr, dc):
         return None
 
     return {
-        'target': new_target,
+        'target': pattern['target'],  # unchanged
         'opponents': new_opponents,
         'terminal': new_terminal,
         'direction': pattern['direction'],
