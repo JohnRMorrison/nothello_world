@@ -631,6 +631,11 @@ def main():
     model, dataset, device = load_model()
     old_vocab = model.tok_emb.weight.shape[0]
 
+    # Truncate games to 60 moves (model block_size = 59, needs seq length 60)
+    MAX_MOVES = 60
+    games = [g[:MAX_MOVES] for g in games]
+    legal_moves = [l[:MAX_MOVES] for l in legal_moves]
+
     # Create extended dataset to get proper stoi/itos
     n_train = int(len(games) * 0.95)
     train_games = games[:n_train]
@@ -644,11 +649,6 @@ def main():
     # Build standard LPM test
     print("Building standard test set...", flush=True)
     from finetune_corruption import build_legal_mask
-    std_games_raw = pickle.load(open(
-        sorted([f for f in os.listdir('data/othello_synthetic')
-                if f.startswith('gen10e5')])[0].join(
-                    ['data/othello_synthetic/', '']), 'rb'))[:2000]
-    # Simpler: just load from behavioral_utils
     from behavioral_utils import load_shard_games
     std_games_raw = load_shard_games(0, games_per_shard=2000)
     std_legal_raw = []
