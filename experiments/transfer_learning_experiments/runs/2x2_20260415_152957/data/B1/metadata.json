@@ -1,0 +1,10 @@
+{
+  "config_file": "runs/2x2_20260415_152957/configs/B1.json",
+  "num_games": 10000,
+  "seed": 42,
+  "min_game_length": 4,
+  "game_length_mean": 59.9732,
+  "game_length_std": 0.8836751439301662,
+  "restrictions_per_position": 0.22121714365750034,
+  "moves_removed_per_position": 0.028077541301781462
+}

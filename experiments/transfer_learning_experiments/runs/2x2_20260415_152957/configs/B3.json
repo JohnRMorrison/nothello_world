@@ -1,0 +1,102 @@
+{
+  "label": "B3",
+  "description": "Random antecedent + aligned consequent (consequent-only alignment)",
+  "num_restrictions": 2,
+  "meta": {
+    "K_target": 2,
+    "K_actual": 2,
+    "layers": [
+      2,
+      3,
+      4,
+      5
+    ],
+    "min_conditions": 2,
+    "tautology_threshold": 0.85,
+    "tautology_games": 200,
+    "max_firing_rate_diff": 0.05,
+    "n_random_attempts": 50,
+    "seed": 42,
+    "source_rules_file": "../reverse_engineering_experiments/rules_085_200_2-6.json",
+    "ckpt": "../../ckpts/gpt_synthetic.ckpt",
+    "drops": {
+      "cons_aligned_fail": 0,
+      "ant_random_fail": 0,
+      "cons_random_fail": 0
+    }
+  },
+  "restrictions": [
+    {
+      "id": "L5N970_r0",
+      "quadruple_id": "L5N970_r0",
+      "arm": "B3",
+      "source_neuron": "L5N970",
+      "antecedent_kind": "random",
+      "consequent_kind": "aligned",
+      "conditions": [
+        {
+          "square": "D1",
+          "feature_type": "empty",
+          "polarity": true
+        },
+        {
+          "square": "D5",
+          "feature_type": "theirs",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 8,
+      "forbidden_square": "B0",
+      "target_board_pos": 8,
+      "target_square": "B0",
+      "dla_value": 0.0225,
+      "tautology_score": 0.0754,
+      "dla_rank": 1,
+      "fire_rate": 0.1046,
+      "rule_str": "(A0_empty) AND (B1_theirs)",
+      "influence_score": 0.853071,
+      "neuron_f1": 0.994,
+      "rule_source": {
+        "layer": 5,
+        "neuron": 970,
+        "rule_idx": 0
+      }
+    },
+    {
+      "id": "L5N29_r0",
+      "quadruple_id": "L5N29_r0",
+      "arm": "B3",
+      "source_neuron": "L5N29",
+      "antecedent_kind": "random",
+      "consequent_kind": "aligned",
+      "conditions": [
+        {
+          "square": "G2",
+          "feature_type": "empty",
+          "polarity": true
+        },
+        {
+          "square": "F3",
+          "feature_type": "theirs",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 13,
+      "forbidden_square": "B5",
+      "target_board_pos": 13,
+      "target_square": "B5",
+      "dla_value": 0.0428,
+      "tautology_score": 0.0791,
+      "dla_rank": 1,
+      "fire_rate": 0.1173,
+      "rule_str": "(B6_empty) AND (C5_theirs)",
+      "influence_score": 0.849851,
+      "neuron_f1": 0.9884,
+      "rule_source": {
+        "layer": 5,
+        "neuron": 29,
+        "rule_idx": 0
+      }
+    }
+  ]
+}

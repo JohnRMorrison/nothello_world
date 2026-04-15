@@ -1,0 +1,61 @@
+{
+  "meta": {
+    "K_target": 2,
+    "K_actual": 2,
+    "layers": [
+      2,
+      3,
+      4,
+      5
+    ],
+    "min_conditions": 2,
+    "tautology_threshold": 0.85,
+    "tautology_games": 200,
+    "max_firing_rate_diff": 0.05,
+    "n_random_attempts": 50,
+    "seed": 42,
+    "source_rules_file": "../reverse_engineering_experiments/rules_085_200_2-6.json",
+    "ckpt": "../../ckpts/gpt_synthetic.ckpt",
+    "drops": {
+      "cons_aligned_fail": 0,
+      "ant_random_fail": 0,
+      "cons_random_fail": 0
+    }
+  },
+  "arms_emitted": [
+    "B1",
+    "B2",
+    "B3",
+    "C"
+  ],
+  "quadruple_ids": [
+    "L5N970_r0",
+    "L5N29_r0"
+  ],
+  "per_quadruple": [
+    {
+      "quadruple_id": "L5N970_r0",
+      "source_neuron": "L5N970",
+      "fire_rate_aligned": 0.0992,
+      "fire_rate_random": 0.0948,
+      "fire_rate_diff": 0.0044,
+      "cons_aligned_square": "B0",
+      "cons_random_square": "F0",
+      "dla_rank": 1,
+      "tautology_score": 0.0754,
+      "rule_str": "(A0_empty) AND (B1_theirs)"
+    },
+    {
+      "quadruple_id": "L5N29_r0",
+      "source_neuron": "L5N29",
+      "fire_rate_aligned": 0.117,
+      "fire_rate_random": 0.1196,
+      "fire_rate_diff": 0.0026,
+      "cons_aligned_square": "B5",
+      "cons_random_square": "F6",
+      "dla_rank": 1,
+      "tautology_score": 0.0791,
+      "rule_str": "(B6_empty) AND (C5_theirs)"
+    }
+  ]
+}

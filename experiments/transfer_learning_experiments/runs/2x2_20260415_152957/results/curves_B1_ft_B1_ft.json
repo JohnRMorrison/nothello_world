@@ -1,0 +1,62 @@
+{
+  "label": "B1_ft",
+  "condition": "B1",
+  "mode": "ft",
+  "mode_canonical": "ft",
+  "config_file": "runs/2x2_20260415_152957/configs/B1.json",
+  "games_dir": "runs/2x2_20260415_152957/data/B1",
+  "num_restrictions": 2,
+  "num_train_games": 10000,
+  "num_eval_games": 50,
+  "batch_size": 16,
+  "lr": 0.0003,
+  "lr_scratch": 0.0005,
+  "max_steps": 200,
+  "eval_every": 50,
+  "runs": 1,
+  "seed": 42,
+  "curves": {
+    "run_0": [
+      {
+        "step": 0,
+        "train_loss": null,
+        "top1_legal": 0.996949,
+        "top1_prob": 0.182527,
+        "legal_mass": 0.996274,
+        "n_positions": 2950
+      },
+      {
+        "step": 50,
+        "train_loss": 2.111623,
+        "top1_legal": 0.995932,
+        "top1_prob": 0.223282,
+        "legal_mass": 0.968672,
+        "n_positions": 2950
+      },
+      {
+        "step": 100,
+        "train_loss": 2.100362,
+        "top1_legal": 0.993559,
+        "top1_prob": 0.22268,
+        "legal_mass": 0.952567,
+        "n_positions": 2950
+      },
+      {
+        "step": 150,
+        "train_loss": 2.119325,
+        "top1_legal": 0.994576,
+        "top1_prob": 0.225559,
+        "legal_mass": 0.955933,
+        "n_positions": 2950
+      },
+      {
+        "step": 200,
+        "train_loss": 2.125751,
+        "top1_legal": 0.989831,
+        "top1_prob": 0.219679,
+        "legal_mass": 0.945954,
+        "n_positions": 2950
+      }
+    ]
+  }
+}

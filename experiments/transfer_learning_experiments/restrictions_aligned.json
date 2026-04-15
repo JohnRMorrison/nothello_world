@@ -1,0 +1,394 @@
+{
+  "description": "Heuristic-aligned restrictions (Condition B): neuron conditions -> forbid the DLA-promoted position",
+  "num_restrictions": 20,
+  "layers": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "K": 20,
+  "source_rules": "../reverse_engineering_experiments/rules_085_200_2-6.json",
+  "restrictions": [
+    {
+      "id": 0,
+      "source": "L5N945",
+      "conditions": [
+        {
+          "square": "F6",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 45,
+      "forbidden_square": "F5",
+      "dla_value": 0.0253,
+      "tautology_score": 0.7351,
+      "dla_rank": 1,
+      "influence_score": 1.934183,
+      "neuron_f1": 1.0,
+      "rule_str": "(F6_empty)"
+    },
+    {
+      "id": 1,
+      "source": "L5N1406",
+      "conditions": [
+        {
+          "square": "D5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 21,
+      "forbidden_square": "C5",
+      "dla_value": 0.0112,
+      "tautology_score": 0.3052,
+      "dla_rank": 1,
+      "influence_score": 1.832399,
+      "neuron_f1": 1.0,
+      "rule_str": "(D5_empty)"
+    },
+    {
+      "id": 2,
+      "source": "L5N1985",
+      "conditions": [
+        {
+          "square": "F4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 37,
+      "forbidden_square": "E5",
+      "dla_value": 0.0142,
+      "tautology_score": 0.2576,
+      "dla_rank": 1,
+      "influence_score": 1.824293,
+      "neuron_f1": 1.0,
+      "rule_str": "(F4_empty)"
+    },
+    {
+      "id": 3,
+      "source": "L5N54",
+      "conditions": [
+        {
+          "square": "C5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 24,
+      "forbidden_square": "D0",
+      "dla_value": 0.0077,
+      "tautology_score": 0.2595,
+      "dla_rank": 1,
+      "influence_score": 1.736668,
+      "neuron_f1": 1.0,
+      "rule_str": "(C5_empty)"
+    },
+    {
+      "id": 4,
+      "source": "L5N810",
+      "conditions": [
+        {
+          "square": "F2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 13,
+      "forbidden_square": "B5",
+      "dla_value": 0.0119,
+      "tautology_score": 0.3347,
+      "dla_rank": 1,
+      "influence_score": 1.716028,
+      "neuron_f1": 1.0,
+      "rule_str": "(F2_empty)"
+    },
+    {
+      "id": 5,
+      "source": "L5N295",
+      "conditions": [
+        {
+          "square": "C6",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 21,
+      "forbidden_square": "C5",
+      "dla_value": 0.0123,
+      "tautology_score": 0.6194,
+      "dla_rank": 1,
+      "influence_score": 1.659839,
+      "neuron_f1": 0.9993,
+      "rule_str": "(C6_empty)"
+    },
+    {
+      "id": 6,
+      "source": "L5N35",
+      "conditions": [
+        {
+          "square": "F3",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 5,
+      "forbidden_square": "A5",
+      "dla_value": 0.0114,
+      "tautology_score": 0.1117,
+      "dla_rank": 1,
+      "influence_score": 1.599456,
+      "neuron_f1": 1.0,
+      "rule_str": "(F3_empty)"
+    },
+    {
+      "id": 7,
+      "source": "L4N352",
+      "conditions": [
+        {
+          "square": "D2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 32,
+      "forbidden_square": "E0",
+      "dla_value": 0.0232,
+      "tautology_score": 0.1049,
+      "dla_rank": 1,
+      "influence_score": 1.584329,
+      "neuron_f1": 1.0,
+      "rule_str": "(D2_empty)"
+    },
+    {
+      "id": 8,
+      "source": "L5N1949",
+      "conditions": [
+        {
+          "square": "D2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 34,
+      "forbidden_square": "E2",
+      "dla_value": 0.0131,
+      "tautology_score": 0.3085,
+      "dla_rank": 1,
+      "influence_score": 1.519581,
+      "neuron_f1": 1.0,
+      "rule_str": "(D2_empty)"
+    },
+    {
+      "id": 9,
+      "source": "L4N1867",
+      "conditions": [
+        {
+          "square": "F5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 44,
+      "forbidden_square": "F4",
+      "dla_value": 0.0264,
+      "tautology_score": 0.3427,
+      "dla_rank": 1,
+      "influence_score": 1.514529,
+      "neuron_f1": 1.0,
+      "rule_str": "(F5_empty)"
+    },
+    {
+      "id": 10,
+      "source": "L4N1076",
+      "conditions": [
+        {
+          "square": "F4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 50,
+      "forbidden_square": "G2",
+      "dla_value": 0.016,
+      "tautology_score": 0.1966,
+      "dla_rank": 1,
+      "influence_score": 1.475201,
+      "neuron_f1": 1.0,
+      "rule_str": "(F4_empty)"
+    },
+    {
+      "id": 11,
+      "source": "L5N310",
+      "conditions": [
+        {
+          "square": "C4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 5,
+      "forbidden_square": "A5",
+      "dla_value": 0.0118,
+      "tautology_score": 0.1079,
+      "dla_rank": 1,
+      "influence_score": 1.45766,
+      "neuron_f1": 1.0,
+      "rule_str": "(C4_empty)"
+    },
+    {
+      "id": 12,
+      "source": "L4N112",
+      "conditions": [
+        {
+          "square": "F2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 43,
+      "forbidden_square": "F3",
+      "dla_value": 0.0193,
+      "tautology_score": 0.6729,
+      "dla_rank": 1,
+      "influence_score": 1.431626,
+      "neuron_f1": 1.0,
+      "rule_str": "(F2_empty)"
+    },
+    {
+      "id": 13,
+      "source": "L5N424",
+      "conditions": [
+        {
+          "square": "A4",
+          "feature_type": "empty",
+          "polarity": false
+        }
+      ],
+      "forbidden_position": 3,
+      "forbidden_square": "A3",
+      "dla_value": 0.0275,
+      "tautology_score": 0.3984,
+      "dla_rank": 0,
+      "influence_score": 1.40758,
+      "neuron_f1": 0.9985,
+      "rule_str": "(NOT A4_empty)"
+    },
+    {
+      "id": 14,
+      "source": "L5N1087",
+      "conditions": [
+        {
+          "square": "E0",
+          "feature_type": "empty",
+          "polarity": false
+        }
+      ],
+      "forbidden_position": 48,
+      "forbidden_square": "G0",
+      "dla_value": 0.0279,
+      "tautology_score": 0.521,
+      "dla_rank": 0,
+      "influence_score": 1.384906,
+      "neuron_f1": 0.9998,
+      "rule_str": "(NOT E0_empty)"
+    },
+    {
+      "id": 15,
+      "source": "L4N691",
+      "conditions": [
+        {
+          "square": "C5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 29,
+      "forbidden_square": "D5",
+      "dla_value": 0.021,
+      "tautology_score": 0.5731,
+      "dla_rank": 1,
+      "influence_score": 1.384371,
+      "neuron_f1": 1.0,
+      "rule_str": "(C5_empty)"
+    },
+    {
+      "id": 16,
+      "source": "L4N841",
+      "conditions": [
+        {
+          "square": "C1",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 26,
+      "forbidden_square": "D2",
+      "dla_value": 0.0208,
+      "tautology_score": 0.7397,
+      "dla_rank": 1,
+      "influence_score": 1.372443,
+      "neuron_f1": 1.0,
+      "rule_str": "(C1_empty)"
+    },
+    {
+      "id": 17,
+      "source": "L4N547",
+      "conditions": [
+        {
+          "square": "F3",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 58,
+      "forbidden_square": "H2",
+      "dla_value": 0.0189,
+      "tautology_score": 0.0805,
+      "dla_rank": 1,
+      "influence_score": 1.361006,
+      "neuron_f1": 1.0,
+      "rule_str": "(F3_empty)"
+    },
+    {
+      "id": 18,
+      "source": "L5N584",
+      "conditions": [
+        {
+          "square": "E5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 44,
+      "forbidden_square": "F4",
+      "dla_value": 0.0167,
+      "tautology_score": 0.2511,
+      "dla_rank": 1,
+      "influence_score": 1.333774,
+      "neuron_f1": 1.0,
+      "rule_str": "(E5_empty)"
+    },
+    {
+      "id": 19,
+      "source": "L5N1514",
+      "conditions": [
+        {
+          "square": "C2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 53,
+      "forbidden_square": "G5",
+      "dla_value": 0.0118,
+      "tautology_score": 0.2748,
+      "dla_rank": 1,
+      "influence_score": 1.31088,
+      "neuron_f1": 1.0,
+      "rule_str": "(C2_empty)"
+    }
+  ]
+}

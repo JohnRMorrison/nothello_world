@@ -1,0 +1,274 @@
+{
+  "description": "Non-aligned restrictions (Condition C): random conditions (same structure) -> same forbidden positions",
+  "num_restrictions": 20,
+  "layers": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "K": 20,
+  "matched_to": "restrictions_aligned.json",
+  "restrictions": [
+    {
+      "id": 0,
+      "source": "random_matched_to_L5N945",
+      "conditions": [
+        {
+          "square": "G2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 45,
+      "forbidden_square": "F5"
+    },
+    {
+      "id": 1,
+      "source": "random_matched_to_L5N1406",
+      "conditions": [
+        {
+          "square": "C4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 21,
+      "forbidden_square": "C5"
+    },
+    {
+      "id": 2,
+      "source": "random_matched_to_L5N1985",
+      "conditions": [
+        {
+          "square": "D2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 37,
+      "forbidden_square": "E5"
+    },
+    {
+      "id": 3,
+      "source": "random_matched_to_L5N54",
+      "conditions": [
+        {
+          "square": "F2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 24,
+      "forbidden_square": "D0"
+    },
+    {
+      "id": 4,
+      "source": "random_matched_to_L5N810",
+      "conditions": [
+        {
+          "square": "C5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 13,
+      "forbidden_square": "B5"
+    },
+    {
+      "id": 5,
+      "source": "random_matched_to_L5N295",
+      "conditions": [
+        {
+          "square": "G2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 21,
+      "forbidden_square": "C5"
+    },
+    {
+      "id": 6,
+      "source": "random_matched_to_L5N35",
+      "conditions": [
+        {
+          "square": "F4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 5,
+      "forbidden_square": "A5"
+    },
+    {
+      "id": 7,
+      "source": "random_matched_to_L4N352",
+      "conditions": [
+        {
+          "square": "F4",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 32,
+      "forbidden_square": "E0"
+    },
+    {
+      "id": 8,
+      "source": "random_matched_to_L5N1949",
+      "conditions": [
+        {
+          "square": "E5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 34,
+      "forbidden_square": "E2"
+    },
+    {
+      "id": 9,
+      "source": "random_matched_to_L4N1867",
+      "conditions": [
+        {
+          "square": "C3",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 44,
+      "forbidden_square": "F4"
+    },
+    {
+      "id": 10,
+      "source": "random_matched_to_L4N1076",
+      "conditions": [
+        {
+          "square": "E5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 50,
+      "forbidden_square": "G2"
+    },
+    {
+      "id": 11,
+      "source": "random_matched_to_L5N310",
+      "conditions": [
+        {
+          "square": "E2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 5,
+      "forbidden_square": "A5"
+    },
+    {
+      "id": 12,
+      "source": "random_matched_to_L4N112",
+      "conditions": [
+        {
+          "square": "C5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 43,
+      "forbidden_square": "F3"
+    },
+    {
+      "id": 13,
+      "source": "random_matched_to_L5N424",
+      "conditions": [
+        {
+          "square": "E0",
+          "feature_type": "empty",
+          "polarity": false
+        }
+      ],
+      "forbidden_position": 3,
+      "forbidden_square": "A3"
+    },
+    {
+      "id": 14,
+      "source": "random_matched_to_L5N1087",
+      "conditions": [
+        {
+          "square": "A4",
+          "feature_type": "empty",
+          "polarity": false
+        }
+      ],
+      "forbidden_position": 48,
+      "forbidden_square": "G0"
+    },
+    {
+      "id": 15,
+      "source": "random_matched_to_L4N691",
+      "conditions": [
+        {
+          "square": "F2",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 29,
+      "forbidden_square": "D5"
+    },
+    {
+      "id": 16,
+      "source": "random_matched_to_L4N841",
+      "conditions": [
+        {
+          "square": "D1",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 26,
+      "forbidden_square": "D2"
+    },
+    {
+      "id": 17,
+      "source": "random_matched_to_L4N547",
+      "conditions": [
+        {
+          "square": "E5",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 58,
+      "forbidden_square": "H2"
+    },
+    {
+      "id": 18,
+      "source": "random_matched_to_L5N584",
+      "conditions": [
+        {
+          "square": "F3",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 44,
+      "forbidden_square": "F4"
+    },
+    {
+      "id": 19,
+      "source": "random_matched_to_L5N1514",
+      "conditions": [
+        {
+          "square": "C3",
+          "feature_type": "empty",
+          "polarity": true
+        }
+      ],
+      "forbidden_position": 53,
+      "forbidden_square": "G5"
+    }
+  ]
+}
