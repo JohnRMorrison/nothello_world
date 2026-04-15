@@ -29,6 +29,37 @@ from hand_crafted_flanking import (
 )
 from generate_rule_games import precompute_pattern_arrays, evaluate_rules_vec
 
+
+def _load_pattern_labels(chunk_path):
+    """Load precomputed pattern labels if available.
+
+    Looks for chunk_NNNN_patterns.npz alongside chunk_NNNN.npz.
+    Returns (N, 960) uint8 tensor (kept as uint8 to save memory;
+    convert to float32 per batch when needed), or None if not found.
+    """
+    pat_path = chunk_path.replace(".npz", "_patterns.npz")
+    if os.path.exists(pat_path):
+        data = np.load(pat_path)
+        return torch.tensor(data['pattern_labels'], dtype=torch.uint8)
+    return None
+
+
+def _get_pattern_labels(chunk_path, board_labels, positions,
+                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask):
+    """Get pattern labels: load precomputed if available, else compute per batch.
+
+    Returns uint8 tensor if precomputed (4.6 GB/chunk vs 17.5 GB for float32),
+    or float32 tensor if computed on the fly.
+    """
+    cached = _load_pattern_labels(chunk_path)
+    if cached is not None:
+        return cached
+    # Fallback: compute (returned as float32 tensor)
+    labels_np = compute_pattern_labels_batch(
+        board_labels.numpy(), positions.numpy(),
+        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+    return torch.tensor(labels_np, dtype=torch.uint8)
+
 # ---------------------------------------------------------------------------
 # Pattern label computation
 # ---------------------------------------------------------------------------
@@ -460,17 +491,17 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
 
+            # Load precomputed pattern labels (or compute on the fly)
+            pat_labels = _get_pattern_labels(
+                train_paths[ci], tr_Y, tr_pos,
+                pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 pos = tr_pos[idx]
-
-                # Compute pattern labels per batch (avoids OOM on full chunk)
-                y_pat = compute_pattern_labels_batch(
-                    tr_Y[idx].numpy(), pos.numpy(),
-                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-                y_pat = torch.tensor(y_pat, dtype=torch.float32).to(device)
+                y_pat = pat_labels[idx].float().to(device)
 
                 # Get MLP predictions (frozen)
                 with torch.no_grad():
@@ -495,7 +526,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos
+            del tr_X, tr_Y, tr_pos, pat_labels
 
         # Eval
         detectors.eval()
@@ -629,18 +660,18 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
 
+            # Load precomputed pattern labels (or compute on the fly)
+            pat_labels = _get_pattern_labels(
+                train_paths[ci], tr_Y, tr_pos,
+                pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 y_board = tr_Y[idx].to(device)
+                y_pat = pat_labels[idx].float().to(device)
                 pos = tr_pos[idx]
-
-                # Compute pattern labels per batch (avoids OOM on full chunk)
-                y_pat = compute_pattern_labels_batch(
-                    tr_Y[idx].numpy(), pos.numpy(),
-                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-                y_pat = torch.tensor(y_pat, dtype=torch.float32).to(device)
 
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -669,7 +700,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos
+            del tr_X, tr_Y, tr_pos, pat_labels
 
         # Eval
         model_even.eval(); model_odd.eval()
