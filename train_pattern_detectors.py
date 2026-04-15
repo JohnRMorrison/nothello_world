@@ -279,7 +279,8 @@ def patterns_to_legal_moves(pattern_probs, patterns):
 
 def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
-                    feature_cols, epochs=3, batch_size=1024, save_dir=None):
+                    feature_cols, epochs=3, batch_size=1024, save_dir=None,
+                    mlp_checkpoint=None):
     """Stage 1: train MLP on board state. Stage 2: train detectors on MLP output."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -294,19 +295,6 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
     print(f"Two-stage training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs per stage")
 
-    # --- Stage 1: Train MLP on board state ---
-    print(f"\n{'='*60}")
-    print("STAGE 1: Train MLP on board state prediction")
-    print(f"{'='*60}")
-
-    # Separate even/odd MLPs (consistent with existing codebase)
-    mlp_even = BoardStateMLP(input_dim, hidden_dim).to(device)
-    mlp_odd = BoardStateMLP(input_dim, hidden_dim).to(device)
-    optimizer = torch.optim.Adam(
-        list(mlp_even.parameters()) + list(mlp_odd.parameters()), lr=1e-3)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.75, patience=1)
-
     # Load eval data
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
@@ -314,89 +302,133 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
-    best_acc = 0.0
-    best_mlp_state = None
+    # --- Stage 1: Train MLP on board state (or load checkpoint) ---
+    mlp_even = BoardStateMLP(input_dim, hidden_dim).to(device)
+    mlp_odd = BoardStateMLP(input_dim, hidden_dim).to(device)
 
-    for epoch in range(1, epochs + 1):
-        mlp_even.train(); mlp_odd.train()
-        rng = np.random.RandomState(epoch)
-        chunk_order = rng.permutation(len(train_paths))
-        epoch_loss, epoch_batches = 0.0, 0
+    mlp_ckpt_path = os.path.join(save_dir, f"mlp_stage1_H{hidden_dim}.pt") if save_dir else None
 
-        for ci in chunk_order:
-            tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            if feature_cols is not None:
-                tr_X = tr_X[:, feature_cols]
-            perm = torch.randperm(len(tr_X))
+    if mlp_checkpoint and os.path.exists(mlp_checkpoint):
+        print(f"\nLoading MLP checkpoint from {mlp_checkpoint}")
+        ckpt = torch.load(mlp_checkpoint, map_location=device)
+        mlp_even.load_state_dict(ckpt['even'])
+        mlp_odd.load_state_dict(ckpt['odd'])
+        best_acc = ckpt['best_acc']
+        best_mlp_state = {'even': ckpt['even'], 'odd': ckpt['odd']}
+        print(f"  MLP acc: {best_acc:.4%} (loaded)")
+    elif mlp_ckpt_path and os.path.exists(mlp_ckpt_path):
+        print(f"\nFound existing MLP checkpoint at {mlp_ckpt_path}")
+        ckpt = torch.load(mlp_ckpt_path, map_location=device)
+        mlp_even.load_state_dict(ckpt['even'])
+        mlp_odd.load_state_dict(ckpt['odd'])
+        best_acc = ckpt['best_acc']
+        best_mlp_state = {'even': ckpt['even'], 'odd': ckpt['odd']}
+        print(f"  MLP acc: {best_acc:.4%} (loaded)")
+    else:
+        print(f"\n{'='*60}")
+        print("STAGE 1: Train MLP on board state prediction")
+        print(f"{'='*60}")
 
-            for i in range(0, len(tr_X), batch_size):
-                idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
-                y = tr_Y[idx].to(device)
-                pos = tr_pos[idx]
-                even_mask = (pos % 2 == 0)
-                odd_mask = ~even_mask
+        optimizer = torch.optim.Adam(
+            list(mlp_even.parameters()) + list(mlp_odd.parameters()), lr=1e-3)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.75, patience=1)
 
-                loss = torch.tensor(0.0, device=device)
-                if even_mask.any():
-                    logits = mlp_even(x[even_mask])
-                    loss = loss + nn.functional.cross_entropy(
-                        logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
-                if odd_mask.any():
-                    logits = mlp_odd(x[odd_mask])
-                    loss = loss + nn.functional.cross_entropy(
-                        logits.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
+        best_acc = 0.0
+        best_mlp_state = None
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-                epoch_batches += 1
+        for epoch in range(1, epochs + 1):
+            mlp_even.train(); mlp_odd.train()
+            rng = np.random.RandomState(epoch)
+            chunk_order = rng.permutation(len(train_paths))
+            epoch_loss, epoch_batches = 0.0, 0
 
-            del tr_X, tr_Y, tr_pos
+            for ci in chunk_order:
+                tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
+                if feature_cols is not None:
+                    tr_X = tr_X[:, feature_cols]
+                perm = torch.randperm(len(tr_X))
 
-        # Eval
-        mlp_even.eval(); mlp_odd.eval()
-        correct, total = 0, 0
-        losses = []
-        with torch.no_grad():
-            for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y = ev_Y[i:i + batch_size].to(device)
-                pos = ev_pos[i:i + batch_size]
-                even_mask = (pos % 2 == 0)
-                odd_mask = ~even_mask
-                preds = torch.zeros_like(y)
+                for i in range(0, len(tr_X), batch_size):
+                    idx = perm[i:i + batch_size]
+                    x = tr_X[idx].to(device)
+                    y = tr_Y[idx].to(device)
+                    pos = tr_pos[idx]
+                    even_mask = (pos % 2 == 0)
+                    odd_mask = ~even_mask
 
-                if even_mask.any():
-                    logits = mlp_even(x[even_mask])
-                    preds[even_mask] = logits.argmax(-1)
-                    losses.append(nn.functional.cross_entropy(
-                        logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1)).item())
-                if odd_mask.any():
-                    logits = mlp_odd(x[odd_mask])
-                    preds[odd_mask] = logits.argmax(-1)
-                    losses.append(nn.functional.cross_entropy(
-                        logits.reshape(-1, OPTIONS), y[odd_mask].reshape(-1)).item())
+                    loss = torch.tensor(0.0, device=device)
+                    if even_mask.any():
+                        logits = mlp_even(x[even_mask])
+                        loss = loss + nn.functional.cross_entropy(
+                            logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
+                    if odd_mask.any():
+                        logits = mlp_odd(x[odd_mask])
+                        loss = loss + nn.functional.cross_entropy(
+                            logits.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
 
-                correct += (preds == y).sum().item()
-                total += y.numel()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    epoch_loss += loss.item()
+                    epoch_batches += 1
 
-        acc = correct / total
-        mean_loss = np.mean(losses)
-        if acc > best_acc:
-            best_acc = acc
-            best_mlp_state = {
-                'even': {k: v.cpu().clone() for k, v in mlp_even.state_dict().items()},
-                'odd': {k: v.cpu().clone() for k, v in mlp_odd.state_dict().items()},
-            }
-        scheduler.step(mean_loss)
-        cur_lr = optimizer.param_groups[0]['lr']
-        avg_loss = epoch_loss / max(epoch_batches, 1)
-        print(f"  Stage 1 Epoch {epoch}: acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
-              flush=True)
+                del tr_X, tr_Y, tr_pos
 
-    # Restore best MLP
+            # Eval
+            mlp_even.eval(); mlp_odd.eval()
+            correct, total = 0, 0
+            losses = []
+            with torch.no_grad():
+                for i in range(0, len(ev_X), batch_size):
+                    x = ev_X[i:i + batch_size].to(device)
+                    y = ev_Y[i:i + batch_size].to(device)
+                    pos = ev_pos[i:i + batch_size]
+                    even_mask = (pos % 2 == 0)
+                    odd_mask = ~even_mask
+                    preds = torch.zeros_like(y)
+
+                    if even_mask.any():
+                        logits = mlp_even(x[even_mask])
+                        preds[even_mask] = logits.argmax(-1)
+                        losses.append(nn.functional.cross_entropy(
+                            logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1)).item())
+                    if odd_mask.any():
+                        logits = mlp_odd(x[odd_mask])
+                        preds[odd_mask] = logits.argmax(-1)
+                        losses.append(nn.functional.cross_entropy(
+                            logits.reshape(-1, OPTIONS), y[odd_mask].reshape(-1)).item())
+
+                    correct += (preds == y).sum().item()
+                    total += y.numel()
+
+            acc = correct / total
+            mean_loss = np.mean(losses)
+            if acc > best_acc:
+                best_acc = acc
+                best_mlp_state = {
+                    'even': {k: v.cpu().clone() for k, v in mlp_even.state_dict().items()},
+                    'odd': {k: v.cpu().clone() for k, v in mlp_odd.state_dict().items()},
+                }
+            scheduler.step(mean_loss)
+            cur_lr = optimizer.param_groups[0]['lr']
+            avg_loss = epoch_loss / max(epoch_batches, 1)
+            print(f"  Stage 1 Epoch {epoch}: acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
+                  flush=True)
+
+        # Save MLP checkpoint between stages
+        if mlp_ckpt_path:
+            os.makedirs(save_dir, exist_ok=True)
+            torch.save({
+                'even': best_mlp_state['even'],
+                'odd': best_mlp_state['odd'],
+                'best_acc': best_acc,
+                'hidden_dim': hidden_dim,
+                'input_dim': input_dim,
+            }, mlp_ckpt_path)
+            print(f"  Saved MLP checkpoint to {mlp_ckpt_path}")
+
+    # Restore best MLP and freeze
     mlp_even.load_state_dict(best_mlp_state['even'])
     mlp_odd.load_state_dict(best_mlp_state['odd'])
     mlp_even.eval(); mlp_odd.eval()
@@ -855,6 +887,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--mlp-checkpoint", type=str, default=None,
+                        help="Path to saved MLP checkpoint (skip stage 1 in two-stage mode)")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -880,7 +914,7 @@ if __name__ == "__main__":
             chunk_dir, device, input_dim, args.hidden, patterns,
             pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
             feature_cols, epochs=args.epochs, batch_size=args.batch_size,
-            save_dir=save_dir)
+            save_dir=save_dir, mlp_checkpoint=args.mlp_checkpoint)
     else:
         train_end_to_end(
             chunk_dir, device, input_dim, args.hidden, patterns,
