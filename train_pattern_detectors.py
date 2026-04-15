@@ -428,18 +428,17 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
 
-            # Compute pattern labels from ground truth board state
-            pat_labels = compute_pattern_labels_batch(
-                tr_Y.numpy(), tr_pos.numpy(),
-                pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            pat_labels = torch.tensor(pat_labels, dtype=torch.float32)
-
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 pos = tr_pos[idx]
-                y_pat = pat_labels[idx].to(device)
+
+                # Compute pattern labels per batch (avoids OOM on full chunk)
+                y_pat = compute_pattern_labels_batch(
+                    tr_Y[idx].numpy(), pos.numpy(),
+                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+                y_pat = torch.tensor(y_pat, dtype=torch.float32).to(device)
 
                 # Get MLP predictions (frozen)
                 with torch.no_grad():
@@ -464,7 +463,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos, pat_labels
+            del tr_X, tr_Y, tr_pos
 
         # Eval
         detectors.eval()
@@ -598,19 +597,19 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
 
-            # Compute pattern labels
-            tr_pat = compute_pattern_labels_batch(
-                tr_Y.numpy(), tr_pos.numpy(),
-                pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            tr_pat = torch.tensor(tr_pat, dtype=torch.float32)
-
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 y_board = tr_Y[idx].to(device)
-                y_pat = tr_pat[idx].to(device)
                 pos = tr_pos[idx]
+
+                # Compute pattern labels per batch (avoids OOM on full chunk)
+                y_pat = compute_pattern_labels_batch(
+                    tr_Y[idx].numpy(), pos.numpy(),
+                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+                y_pat = torch.tensor(y_pat, dtype=torch.float32).to(device)
+
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -638,7 +637,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos, tr_pat
+            del tr_X, tr_Y, tr_pos
 
         # Eval
         model_even.eval(); model_odd.eval()
