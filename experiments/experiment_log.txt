@@ -540,21 +540,417 @@ Scripts:
 Hypothesis: if OthelloGPT relies on spatial structure, higher GER should slow
 LPM convergence during fine-tuning, even though compressibility is similar.
 
-Status: READY TO SUBMIT. Scripts created, not yet run.
+Status: COMPLETE. All GER levels trained FT+RND. Results downloaded.
 
+Results (LPM at step ~55K, mid-training):
+  GER  | FT LPM | RND LPM
+  0.0  | 0.913  | 0.833
+  0.1  | 0.854  | —
+  0.2  | —      | 0.685
+  0.3  | 0.749  | 0.685
+  0.5  | 0.676  | 0.640
+
+Higher GER → lower LPM for both FT and RND. FT consistently beats RND.
+
+--------------------------------------------------------------------------------
+A4. Sensitivity analysis
+--------------------------------------------------------------------------------
+Computed per-rule sensitivity: how much the model's probability for a target cell
+increases when a specific flanking rule's conditions are satisfied vs not.
+960 rules, 50K games, ~2.75M positions.
+
+Key findings:
+  - Sensitivity by board region: corners (0.091) >> edges (0.061) >> interior (0.042)
+  - Strong negative correlation with base rate (r=-0.687): rare-legal cells have
+    highest sensitivity
+  - Weak correlation with frequency (r=0.293): sensitivity ≠ just rule frequency
+  - Orthogonal ≈ diagonal directions (0.054 vs 0.051)
+  - Per-cell sensitivity varies 4-5x across directions for the same cell
+
+  Partial flanking finding:
+    The model checks for opponent chains but NOT terminal pieces. Evidence:
+    1. opp_no_term positions (opponents present, terminal wrong) fire 40-133x more
+       in adversarial vs control positions across all tested cells
+    2. Terminal-only corruption produces identical results regardless of sensitivity
+       rank (high ≈ low) in all experiments
+    3. The model's heuristic: "long line of opponent pieces → cell is probably legal"
+       without verifying the anchor piece that completes the flank
+
+Scripts:
+  behavioral_sensitivity.py      — sensitivity computation
+  behavioral_boardstate_screen.py — board-state triple screening
+  behavioral_flank_screen.py     — flanking pattern screening
+  behavioral_triple_screen.py    — move-history triple screening
+  behavioral_data/sensitivity.json — per-rule sensitivity scores
+
+Status: COMPLETE. Sensitivity scores computed for all 960 rules.
+
+--------------------------------------------------------------------------------
+A5. Sensitivity-ranked corruption experiments (SUPERSEDED)
+--------------------------------------------------------------------------------
+Corrupted high-sensitivity vs low-sensitivity rules, matched by divergence,
+fixed count, and frequency. Three corruption types (full, terminal-only,
+drop-opponent). 18 conditions each matching strategy = 54 total.
+
+Results were contaminated by catastrophic forgetting caused by:
+  1. weight_decay=0.1 in Adam optimizer (destroyed model over 12.5K steps)
+  2. betas=(0.9, 0.95) non-default (more aggressive than default 0.999)
+
+These optimizer settings caused ALL conditions to collapse to LPM ~0.20 by
+step 1000, masking any real differences between conditions.
+
+Status: SUPERSEDED by A6 (diagnostic sweep) and A7 (parameter search v4).
+Results in behavioral_data/losses_sensitivity/, losses_fixedcount/,
+losses_freqmatch/ — use with EXTREME CAUTION (forgetting artifacts).
+
+NOTE: The n_rules sweep from the night of Mar 22 was also invalid — it
+reused games generated with 100 corrupted rules regardless of the n_rules
+parameter. The "even 10 rules causes forgetting" finding was wrong.
+
+--------------------------------------------------------------------------------
+A6. Diagnostic sweep
+--------------------------------------------------------------------------------
+Systematic sweep of training parameters to find stable regime.
+
+N-rules sweep (lr=5e-5, bs=16, flip_color on random rules):
+  N rules | std_lpm 0→final | cor_lpm 0→final | Forgetting?
+  2       | 0.998→0.987     | 0.983→0.983     | None
+  4       | 0.998→0.987     | 0.983→0.983     | None
+  6       | 0.998→0.987     | 0.978→0.981     | None
+  8       | 0.998→0.986     | 0.975→0.978     | None
+  10      | 0.998→0.979     | 0.955→0.966     | None
+  20      | 0.998→0.959     | 0.897→0.929     | None
+  40      | 0.998→0.944     | 0.865→0.910     | None
+  60      | 0.998→0.929     | 0.820→0.877     | None
+  100     | 0.998→0.882     | 0.754→0.837     | None
+
+  No catastrophic forgetting at ANY level when using default Adam optimizer.
+  The model successfully trades standard knowledge for corrupted knowledge
+  proportionally to the number of corrupted rules.
+
+Batch size sweep (100 rules, lr=5e-5, left_board flip_color):
+  BS  | std_lpm final | cor_lpm final
+  32  | 0.916         | 0.837
+  64  | 0.907         | 0.857
+  128 | 0.909         | 0.851
+
+  All stable. Larger BS → fewer steps but similar final performance.
+
+LR sweep (bs=16, random rules, flip_color):
+  N rules | LR    | std_lpm final | cor_lpm final | Behavior
+  5       | 3e-4  | 0.920         | 0.915         | Dip-and-recovery
+  10      | 3e-4  | 0.905         | 0.893         | Stable
+  50      | 3e-4  | 0.852         | 0.830         | Stable, learning
+  100     | 3e-4  | 0.777         | 0.765         | Stable, learning
+
+  lr=3e-4 causes more std_lpm decline but also more cor_lpm improvement.
+  lr=5e-5 is more conservative — chosen for parameter search.
+
+Confirmed: training on standard Othello games at lr=5e-5, bs=16 shows
+NO forgetting (std_lpm stays at 0.995 after 2000 steps). The forgetting
+is entirely from corrupted training signal, not from the lr/bs.
+
+Scripts: diagnostic_sweep.sh
+Status: COMPLETE. Results in experiments/diag_sweep/
+
+--------------------------------------------------------------------------------
+A7. Parameter search v4 (RUNNING — 84 conditions)
+--------------------------------------------------------------------------------
+Systematic test of heuristic vs world model predictions across 7 rule
+selection strategies × 6 corruption types = 84 conditions.
+
+Training parameters:
+  - 50 corrupted rules per condition (frequency-matched within pairs)
+  - 200K games, bs=16, lr=5e-5, 1 epoch (12,500 steps)
+  - Adam optimizer (DEFAULT — no weight_decay, no custom betas)
+  - Eval: LL/IL/LI prob+acc, std_lpm, cor_lpm at 13 steps
+  - Test positions: 1 per game (independent), min 4-move prefix
+
+Rule selection groups (pairs for comparison):
+  (a) high_sens vs low_sens — frequency-matched
+  (b) diagonal vs random_dir — frequency-matched
+  (c) left_board vs full_board — frequency-matched
+  (d) center vs periphery — frequency-matched
+  (e) coherent vs incoherent — random 50 rules, spatial transform differs
+  (f) one_color vs both_colors — random 50 rules, application differs
+  (g) after30 vs all_moves — random 50 rules, temporal application differs
+
+Corruption types:
+  1. drop_third — remove 1/3 of opponent cells (permissive, no LI)
+  2. corrupt_nearby — replace 1/3 opponents with nearby cells (both IL and LI)
+  3. add_adjacent — add 1/3 more opponents at adjacent cells (restrictive, no IL)
+  4. flip_color — flip color check for 1/3 opponents (both IL and LI)
+  5. extend_chain — add one more opponent at end (restrictive, no IL)
+  6. play_occupied — allow play on occupied squares (permissive, no LI)
+
+Predictions:
+  (e) Coherent vs Incoherent:
+    WM: coherent easier (spatial structure preserved)
+    Heur: equal (both break heuristics equally)
+
+  (f) One_color vs Both_colors:
+    WM: one_color harder (conditional rule = more complex)
+    Heur: one_color easier (half heuristics preserved)
+
+  (g) After30 vs All_moves:
+    WM: after30 harder (phase-dependent switch = more complex)
+    Heur: after30 easier (first 30 moves unaffected)
+
+  (d) Center vs Periphery:
+    WM: equal (world model treats all regions equally)
+    Heur: center harder (model's heuristics concentrated at center)
+
+Pilot results (5 conditions, confirmed no forgetting):
+  Cond 3 (high_sens × flip_color):
+    std_lpm 0.998→0.970, cor_lpm 0.921→0.956, IL 0.028→0.081, LI 0.138→0.028
+  Cond 51 (coherent × flip_color):
+    std_lpm 0.998→0.927, cor_lpm 0.794→0.888, IL 0.015→0.112, LI 0.128→0.027
+  Cond 75 (after30 × flip_color):
+    std_lpm 0.998→0.953, cor_lpm 0.909→0.918, IL 0.030→0.109, LI 0.125→0.072
+
+Scripts:
+  sensitivity_param_search.py — game gen + corruption + training + eval
+  sensitivity_param_search.sh — SLURM array job
+  plot_param_search_v2.py — multi-page PDF visualization
+
+Status: COMPLETE. All 84 conditions finished. Results downloaded.
+  Results in experiments/param_search_v4/cond_*.json
+  Analysis in behavioral_data/param_search_v4_raw_results.txt
+                   behavioral_data/param_search_v4_analysis.txt
+                   behavioral_data/param_search_v4_corruption_analysis.txt
+
+Key findings from v4:
+
+  1. SUPPRESSION >> PROMOTION (strongest finding, across all corruption types)
+     The model suppresses LI cells almost completely (93% reduction) but
+     only learns 13% of possible IL. Unlearning is 7x more efficient than
+     new learning. Consistent with heuristic representations (removing a
+     heuristic is easier than building a new one). A world model should
+     treat both directions equally.
+
+  2. COHERENT ≈ INCOHERENT for learning (supports heuristic)
+     Spatial coherence of new rules doesn't help learning. But coherent
+     retains more existing knowledge → model HAS spatial structure in
+     existing representations but doesn't USE it for learning new rules.
+     NOTE: coherent corruption effectively duplicates existing rules
+     (shifted patterns already exist in standard rule set), making it
+     similar to rule dropping rather than true spatial corruption.
+
+  3. AFTER30 learning proportional to signal (uninformative)
+     IL learning scales linearly with the fraction of corrupted positions
+     (~54%). No extra difficulty from phase-dependent rules.
+     LI suppression is disproportionately slow → model resists unlearning.
+     CONFOUND: rules fire at different rates before/after move 30
+     (edge rules ~80% after, center rules ~50% after).
+
+  4. CENTER learns more than PERIPHERY
+     Driven by concentration: 50 rules → 11 center cells (4.5 rules/cell)
+     vs 27 periphery cells (1.9 rules/cell). More rules per cell = more
+     training signal per cell = faster learning. CONFOUNDED.
+
+  5. PLAY_OCCUPIED causes most forgetting
+     std_drop = 0.170, far more than other corruptions (~0.03-0.05).
+     Suggests "must play on empty" is deeply embedded — a hierarchy of
+     rules with basic constraints more deeply encoded than flanking.
+
+  6. RESTRICTIVE corruptions (add_adjacent) are most efficient
+     cor_gain/std_drop ratio = 2.18 (learns without forgetting).
+     PERMISSIVE corruptions (drop_third, play_occupied) are least efficient.
+
+  7. extend_chain is invalid — just duplicates existing longer rules.
+     Effectively drops the original rule. Same issue as coherent.
+
+Design revisions for future runs:
+
+  DROPPED variants:
+    - (a) high_sens vs low_sens — didn't show meaningful differences
+      at matched frequency. Effect driven by when rules fire in game
+      (late-game edge rules vs early-game center rules), not by
+      model's reliance on specific rules.
+
+  DROPPED corruption types:
+    - extend_chain — creates duplicate of existing longer rule,
+      effectively just drops the original. Not a genuine corruption.
+
+  RENAMED:
+    - corrupt_nearby → move_nearby (better describes the operation)
+
+  REVISED for future:
+    - play_occupied — should allow playing on ANY occupied square
+      and flanking from there (current version only skips the
+      empty-target check for specific rules' target cells)
+
+  STANDALONE comparison (not crossed with corruption types):
+    - (e) coherent vs incoherent — spatial transformation, applied
+      with one fixed corruption type (e.g., flip_color)
+
+  Revised design:
+    Rule pairs: (b) diagonal/random_dir, (c) left/full_board,
+      (d) center/periphery, (f) one_color/both_colors,
+      (g) after30/all_moves
+    Corruption types: drop_third, move_nearby, add_adjacent, flip_color
+    Standalone: (e) coherent/incoherent
+    Total: 5 pairs × 4 corruptions + 1 standalone = 21 conditions
+    Consider: 100 rules instead of 50 for stronger signal
+
+--------------------------------------------------------------------------------
+A8. Flanker Analysis (COMPLETE)
+--------------------------------------------------------------------------------
+For each flanking rule with 3+ opponent pieces, compared the model's probability
+for the target cell when:
+  - "satisfied": all opponents present AND terminal has friendly piece
+  - "unsatisfied": all opponents present AND terminal does NOT have friendly piece
+  - "baseline": average probability for that cell at that move number
+
+Results (100K games, 428 rules with length >= 3):
+
+  Length  N_rules  Baseline  No_flank  With_flank  Chain_boost  Flank_boost  Chain%
+  3      180      0.019     0.066     0.125       +0.047       +0.059       45%
+  4      132      0.020     0.066     0.134       +0.046       +0.068       40%
+  5       80      0.022     0.066     0.147       +0.044       +0.081       35%
+  6       36      0.026     0.070     0.162       +0.045       +0.092       33%
+
+Key findings:
+  1. The model uses BOTH the opponent chain AND the terminal piece.
+     100% of rules (all 428) show positive chain boost AND positive flank boost.
+
+  2. The chain alone accounts for 30-45% of the total probability boost.
+     The chain boost is roughly constant (~0.045) across all chain lengths.
+     The flanker boost INCREASES with chain length (0.059 → 0.092).
+
+  3. Without the flanker, the model still assigns 3.5x the baseline probability
+     (0.066 vs 0.019). The opponent chain is a strong signal by itself.
+
+  4. The flanker becomes MORE important for longer chains:
+     Length 3: chain 45%, flanker 55%
+     Length 6: chain 33%, flanker 67%
+
+  5. Per-rule consistency: every single rule shows both effects. No rule has
+     zero chain effect (min chain boost = 0.005). No rule has zero flanker
+     effect (min flanker boost = 0.033).
+
+  This revises the earlier "partial flanking" finding (from adversarial beam
+  search, Section A4). The model DOES check for terminals — the earlier
+  adversarial analysis showed that the model promotes cells when the chain
+  is present without the terminal, but this new analysis shows the terminal
+  adds substantial additional probability on top. The model uses a graded
+  heuristic, not a binary check.
+
+Scripts: flanker_analysis.py, flanker_analysis.sh
+Results: experiments/flanker_analysis.json, experiments/flanker_analysis.png
+Status: COMPLETE.
+
+--------------------------------------------------------------------------------
+A9. Suppression vs Promotion — Paired Contrasts (COMPLETE)
+--------------------------------------------------------------------------------
+Three paired contrasts testing whether suppression (learning to stop predicting
+a cell) is faster than promotion (learning to start predicting a cell).
+Each pair uses the SAME rules — only the direction differs.
+
+Pairs:
+  1. drop_opponent (permissive, IL) vs add_opponent (restrictive, LI)
+  2. eliminate rule vs duplicate rule
+  3. relax_color (permissive, IL) vs tighten_color (restrictive, LI)
+
+Results (200K games, bs=16, lr=5e-5, 1 epoch):
+
+  Pair                      N_rules  IL_gain   LI_drop   Ratio(LI/IL)
+  drop vs add opponent      50       0.127     0.132     1.0x
+  drop vs add opponent      100      0.150     0.226     1.5x
+  eliminate vs duplicate    50       0.000     0.000     N/A (see note)
+  eliminate vs duplicate    100      0.000     0.000     N/A (see note)
+  relax vs tighten color    50       0.131     0.135     1.0x
+  relax vs tighten color    100      0.157     0.240     1.5x
+
+  NOTE: eliminate/duplicate pair shows 0 for both — needs investigation.
+
+  At 100 rules, suppression is ~1.5x faster than promotion across both
+  valid pairs (drop/add and relax/tighten). This is a more modest asymmetry
+  than the 7x found in the v4 parameter search, likely because the paired
+  contrasts are cleaner (same rules, opposite direction).
+
+  Restrictive corruptions (add_opponent, tighten_color) barely affect
+  std_lpm (0.988-0.990) while permissive corruptions (drop_opponent,
+  relax_color) cause more forgetting (0.953-0.973). Suppression doesn't
+  disrupt existing knowledge; promotion does.
+
+Scripts: suppression_vs_promotion.py, suppression_vs_promotion.sh
+Results: experiments/supp_vs_prom/cond_*.json
+Status: COMPLETE.
+
+--------------------------------------------------------------------------------
+A10. Coherent vs Incoherent at Scale (RUNNING)
+--------------------------------------------------------------------------------
+12 conditions: 6 n_rules levels × 2 spatial transforms.
+No additional corruption — the spatial transform IS the rule change.
+
+Coherent: shift opponents and terminal by (+1,+1) — target stays fixed.
+  Creates rules that check a valid flanking line at a shifted location.
+Incoherent: cross-wire opponents/terminal between distant rules.
+  Creates spatially nonsensical patterns.
+
+2M games per condition, 1 epoch, bs=16, lr=5e-5.
+
+Incoherent conditions (6-11): COMPLETE.
+Coherent conditions (0-5): RUNNING (fixed bug where target was also shifted,
+  making coherent patterns duplicates of existing rules).
+
+Scripts: coherent_scale_experiment.py, coherent_scale_experiment.sh
+Results: experiments/coherent_scale/cond_*.json
+Status: PARTIALLY COMPLETE. Coherent conditions rerunning.
 
 TODO:
-  - Transfer remaining results (swapped_colors, delayed_flips, self_flanking) when jobs complete
-  - Rerun traj divergence for swapped_colors after training completes
-  - Generate summary table with all variant FT vs RND results
-  - Submit impossible board experiments (GER 0.0-0.5)
-  - Non-8x8 spatially coherent boards (spatially possible but wrong shape)
-  - Beta corruption idea: Instead of substituting random moves (alpha), randomly
-    drop legal moves from the legal set — make some normally-legal moves illegal.
-    With probability beta, each legal move is removed from the legal set before
-    choosing. This tests selective unlearning: variant results (e.g. no_diagonal_flips)
-    show the model can quickly forget specific heuristics, so beta corruption would
-    parameterize this. Hypothesis: forgetting (beta) may be easier than relearning
-    from noise (alpha), since it only requires suppressing existing knowledge.
+  - Analyze coherent vs incoherent when coherent conditions complete
+  - Run RND (random init) for conditions that show FT differences
+  - Rerun key conditions with 100 rules for stronger signal
+  - Compute per-rule firing rates before/after move 30 (analyze_after30.py)
+  - Revised play_occupied: allow play on occupied squares generally
+  - Investigate eliminate/duplicate pair (both show 0 — likely code issue)
+  - Try single MLP with 120-d features (when + even, no played) for board
+    state prediction, without even/odd split
 
+
+================================================================================
+MLP Feature Ablation on Move History (2026-04-13)
+================================================================================
+
+Question: How much of the 99.78% board-state accuracy (180-d, H=1024) comes
+from each feature group? The 180-d features are:
+  played[i] (60): 1 if position i has been played
+  when[i]   (60): normalized step when position i was played (0 if unplayed)
+  even[i]   (60): 1 if position i was played on an even-numbered turn
+
+Note: `played` and `even` are both derivable from `when` (when>0 ↔ played,
+and the even/odd identity is encoded in the fractional value). The MLP also
+uses Nanda's even/odd split (separate MLPs for even and odd turns).
+
+Architecture: single hidden layer MLP, Linear(input, H) -> ReLU -> Linear(H, 64*3),
+with even/odd split. Trained via chunk-streaming on 12M games (39 train chunks,
+1 eval chunk ≈ 490K samples). 10 epochs, lr=1e-3, batch_size=1024.
+
+Scripts: train_streaming.sh, train_streaming.py
+Precompute: precompute_more.sh (chunks 0-19 from earlier, 20-39 added)
+
+Results:
+
+  Features         | H=512   | H=1024
+  -----------------|---------|--------
+  when (60-d)      | 98.68%  | 99.35%
+  when+even (120-d)| 99.15%  | 99.63%
+  all (180-d)*     |   —     | 99.78%
+
+  * 180-d H=1024 from earlier run with 19 chunks (~6M games).
+
+Key observations:
+  - `when` alone (60-d) reaches 99.35% — move timing is the dominant signal.
+  - Adding `even` gives +0.3-0.5%. Despite being derivable from `when`, the
+    explicit parity feature helps the MLP.
+  - H=512 → H=1024 adds ~0.5-0.7%.
+  - Even the smallest config (60-d, H=512) reaches 98.68%.
+  - A single-layer MLP on just move timing reconstructs nearly the entire
+    board state — no model activations needed.
+
+SLURM jobs: 5857200 (when H=1024), 5857201 (when+even H=1024),
+            5868559 (when H=512), 5868560 (when+even H=512)
+Checkpoints: heuristic_probe_results/mlp_checkpoints/mlp_{when,when+even}_H{512,1024}_streaming.pt
 
