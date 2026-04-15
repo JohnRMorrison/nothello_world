@@ -507,14 +507,14 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 with torch.no_grad():
                     even_mask = (pos % 2 == 0)
                     odd_mask = ~even_mask
-                    pred_labels = torch.zeros(len(idx), 64, dtype=torch.long)
+                    pred_labels = torch.zeros(len(idx), 64, dtype=torch.long, device=device)
                     if even_mask.any():
                         pred_labels[even_mask] = mlp_even.predict_board(x[even_mask])
                     if odd_mask.any():
                         pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
                 # Convert to 192-d encoding
-                encoding = labels_to_192d(pred_labels, pos).to(device)
+                encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
 
                 # Train detectors
                 logits = detectors(encoding)
@@ -547,13 +547,13 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 # MLP predictions
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
-                pred_labels = torch.zeros(len(x), 64, dtype=torch.long)
+                pred_labels = torch.zeros(len(x), 64, dtype=torch.long, device=device)
                 if even_mask.any():
                     pred_labels[even_mask] = mlp_even.predict_board(x[even_mask])
                 if odd_mask.any():
                     pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
-                encoding = labels_to_192d(pred_labels, pos).to(device)
+                encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
                 logits = detectors(encoding)
 
                 preds = (logits > 0).float()
@@ -799,13 +799,13 @@ def _evaluate_legal_moves(mlp_even, mlp_odd, detectors, patterns,
             even_mask = (pos % 2 == 0)
             odd_mask = ~even_mask
 
-            pred_labels = torch.zeros(len(x), 64, dtype=torch.long)
+            pred_labels = torch.zeros(len(x), 64, dtype=torch.long, device=device)
             if even_mask.any():
                 pred_labels[even_mask] = mlp_even.predict_board(x[even_mask])
             if odd_mask.any():
                 pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
-            encoding = labels_to_192d(pred_labels, pos).to(device)
+            encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
             logits = detectors(encoding)
             all_pat_probs.append(torch.sigmoid(logits).cpu().numpy())
 
