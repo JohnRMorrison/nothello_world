@@ -1551,7 +1551,7 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
     transform_fn: optional function(X) -> X' applied after column selection.
     """
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
         raise ValueError(f"No chunk files in {chunk_dir}")
     print(f"Streaming training: {len(chunk_files)} chunks, H={hidden_dim}, "
@@ -2001,7 +2001,7 @@ def _load_all_chunks(output_dir, eval_frac=0.1):
     Returns (tr_X, tr_Y, tr_pos, ev_X, ev_Y, ev_pos).
     """
     chunk_dir = os.path.join(output_dir, "feature_chunks")
-    chunk_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+    chunk_files = sorted(f for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     print(f"Loading {len(chunk_files)} chunks from {chunk_dir}...")
 
     all_X, all_Y, all_pos = [], [], []
@@ -2034,7 +2034,7 @@ def _try_load_precomputed(args):
     if not os.path.exists(chunk_dir):
         print(f"  No feature_chunks directory in {args.output_dir}")
         return None
-    chunk_files = [f for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f]
+    chunk_files = [f for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f]
     if not chunk_files:
         print(f"  No chunk files found in {chunk_dir}")
         return None

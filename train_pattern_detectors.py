@@ -335,7 +335,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
     """Stage 1: train MLP on board state. Stage 2: train detectors on MLP output."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
         raise ValueError(f"No chunk files in {chunk_dir}")
 
@@ -644,7 +644,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
     """Train MLP + detectors jointly on pattern labels."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
         raise ValueError(f"No chunk files in {chunk_dir}")
 
@@ -831,7 +831,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
     Separate even/odd models.
     """
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
         raise ValueError(f"No chunk files in {chunk_dir}")
 
