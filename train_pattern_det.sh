@@ -54,9 +54,9 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python train_pattern_detectors.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 MALLOC_ARENA_MAX=2 python train_pattern_detectors.py \
     --mode $MODE \
     --hidden $HIDDEN \
-    --epochs 1
+    --epochs 3
 
 echo "Completed at: $(date)"

@@ -29,6 +29,32 @@ except ImportError:
     def _mem_gb():
         return -1.0
 
+
+def _cgroup_mem_gb():
+    """Read the job's cgroup memory.usage — this is what SLURM tracks."""
+    for path in ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                 "/sys/fs/cgroup/memory.current"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip()) / 1e9
+        except (OSError, ValueError):
+            continue
+    return -1.0
+
+
+def _cgroup_cache_gb():
+    """Read cgroup memory.stat's cache line (page cache charged to cgroup)."""
+    for path in ("/sys/fs/cgroup/memory/memory.stat",
+                 "/sys/fs/cgroup/memory.stat"):
+        try:
+            with open(path) as f:
+                for line in f:
+                    if line.startswith(("cache ", "file ")):
+                        return int(line.split()[1]) / 1e9
+        except OSError:
+            continue
+    return -1.0
+
 # Try to release memory back to OS (glibc only) — Python's gc.collect()
 # reclaims references but doesn't shrink the allocator arena.
 try:
@@ -38,6 +64,24 @@ try:
         _LIBC.malloc_trim(0)
 except (OSError, AttributeError):
     def _malloc_trim():
+        pass
+
+
+def _drop_file_cache(path):
+    """Tell the kernel to evict this file's pages from cache (advisory).
+
+    Page cache from .npz reads accumulates in the cgroup memory budget over
+    many chunks. This hint releases that cache immediately after we have
+    materialized the arrays into our own anonymous memory.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            # POSIX_FADV_DONTNEED = 4 on Linux
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(fd)
+    except (OSError, AttributeError):
         pass
 
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
@@ -67,12 +111,14 @@ def _load_features_when60(chunk_path, feature_cols=None):
             X = torch.from_numpy(data['features'].astype(np.float32))
             Y = torch.from_numpy(data['labels'].astype(np.int64))
             pos = torch.from_numpy(data['positions'].astype(np.int64))
+        _drop_file_cache(when60_path)
         return X, Y, pos
 
     # Fallback: load full 180-d chunk and slice
     X, Y, pos = _load_features(chunk_path)
     if feature_cols is not None:
         X = X[:, feature_cols]
+    _drop_file_cache(chunk_path)
     return X, Y, pos
 
 
@@ -97,7 +143,9 @@ def _get_pattern_labels(chunk_path, board_labels, positions,
         with np.load(pat_path) as data:
             # Return as torch uint8 tensor (same 4.6 GB as numpy), enabling
             # native torch indexing per batch without numpy fancy-indexing leaks.
-            return torch.from_numpy(data['pattern_labels'].copy())
+            result = torch.from_numpy(data['pattern_labels'].copy())
+        _drop_file_cache(pat_path)
+        return result
     # Fallback: compute
     labels_np = compute_pattern_labels_batch(
         board_labels.numpy(), positions.numpy(),
@@ -579,7 +627,9 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
-                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
+                print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
+                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
         detectors.eval()
@@ -780,7 +830,9 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
-                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
+                print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
+                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
         model_even.eval(); model_odd.eval()
@@ -967,7 +1019,9 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
-                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
+                print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
+                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
         mlp_even.eval(); mlp_odd.eval()
