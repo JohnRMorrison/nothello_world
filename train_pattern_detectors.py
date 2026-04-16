@@ -654,8 +654,15 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
 
 def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                      pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
-                     feature_cols, epochs=3, batch_size=1024, save_dir=None):
-    """Train MLP + detectors jointly on pattern labels."""
+                     feature_cols, epochs=3, batch_size=1024, save_dir=None,
+                     board_loss_weight=0.5, mode_tag="e2e"):
+    """Train MLP + detectors jointly on pattern labels.
+
+    board_loss_weight=0.5 (default): joint training with board state aux loss
+    board_loss_weight=0.0: emergent mode — only pattern loss, board layer is
+      pure bottleneck (tests if board state emerges naturally).
+    mode_tag: suffix used in the saved checkpoint filename.
+    """
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
@@ -689,8 +696,8 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
     ev_pat = torch.tensor(ev_pat, dtype=torch.float32)
 
-    # Weight for auxiliary board-state loss
-    board_loss_weight = 0.5
+    # board_loss_weight passed in as argument; printed for transparency
+    print(f"  board_loss_weight={board_loss_weight} ({'joint' if board_loss_weight > 0 else 'emergent (patterns only)'})")
 
     best_pat_acc = 0.0
     best_state = None
@@ -795,7 +802,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         # Save checkpoint after each epoch (in case of timeout)
         if best_state and save_dir:
             os.makedirs(save_dir, exist_ok=True)
-            ckpt_path = os.path.join(save_dir, f"pattern_det_e2e_H{hidden_dim}.pt")
+            ckpt_path = os.path.join(save_dir, f"pattern_det_{mode_tag}_H{hidden_dim}.pt")
             torch.save({
                 'even': best_state['even'],
                 'odd': best_state['odd'],
@@ -804,7 +811,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 'n_patterns': n_patterns,
                 'best_pat_acc': best_pat_acc,
                 'board_acc': board_acc,
-                'mode': 'end-to-end',
+                'mode': mode_tag,
                 'epoch': epoch,
             }, ckpt_path)
             print(f"  Checkpoint saved to {ckpt_path}", flush=True)
@@ -823,7 +830,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir,
-            f"pattern_det_e2e_H{hidden_dim}.pt")
+            f"pattern_det_{mode_tag}_H{hidden_dim}.pt")
         torch.save({
             'even': best_state['even'] if best_state else None,
             'odd': best_state['odd'] if best_state else None,
@@ -832,7 +839,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             'n_patterns': n_patterns,
             'best_pat_acc': best_pat_acc,
             'board_acc': board_acc,
-            'mode': 'end-to-end',
+            'mode': mode_tag,
         }, save_path)
         print(f"Saved to {save_path}")
 
@@ -1192,7 +1199,7 @@ def _report_legal_move_metrics(pat_probs, gt_pat, patterns,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["two-stage", "end-to-end", "direct"])
+                        choices=["two-stage", "end-to-end", "direct", "emergent"])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1024)
@@ -1229,7 +1236,13 @@ if __name__ == "__main__":
             chunk_dir, device, input_dim, args.hidden, patterns,
             pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
             feature_cols, epochs=args.epochs, batch_size=args.batch_size,
-            save_dir=save_dir)
+            save_dir=save_dir, board_loss_weight=0.5, mode_tag="e2e")
+    elif args.mode == "emergent":
+        train_end_to_end(
+            chunk_dir, device, input_dim, args.hidden, patterns,
+            pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
+            feature_cols, epochs=args.epochs, batch_size=args.batch_size,
+            save_dir=save_dir, board_loss_weight=0.0, mode_tag="emergent")
     else:
         train_direct(
             chunk_dir, device, input_dim, args.hidden, patterns,
