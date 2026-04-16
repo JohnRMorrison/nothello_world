@@ -2,10 +2,10 @@
 # Train random projection models: frozen random first layer, train output only.
 #
 # Usage:
-#   sbatch --array=0-5 train_random_proj.sh
+#   sbatch --array=0-1 train_random_proj.sh
 #
-# Tasks 0-2:  H=512,  seeds 0-2
-# Tasks 3-5:  H=1024, seeds 0-2
+# Task 0: H=2048, seed 0
+# Task 1: H=4096, seed 0
 
 #SBATCH --job-name=randproj
 #SBATCH -c 4
@@ -26,12 +26,12 @@ cd $SLURM_SUBMIT_DIR
 
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
-if [ $TASK -lt 3 ]; then
-    HIDDEN=512
-    SEED=$TASK
+if [ $TASK -eq 0 ]; then
+    HIDDEN=2048
+    SEED=0
 else
-    HIDDEN=1024
-    SEED=$((TASK - 3))
+    HIDDEN=4096
+    SEED=0
 fi
 
 echo "============================================"
@@ -44,7 +44,7 @@ echo "============================================"
 CUDA_VISIBLE_DEVICES=0 python train_streaming.py \
     --features when \
     --hidden $HIDDEN \
-    --epochs 10 \
+    --epochs 2 \
     --random-proj \
     --seed $SEED
 
