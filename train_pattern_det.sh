@@ -50,7 +50,7 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 python train_pattern_detectors.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python train_pattern_detectors.py \
     --mode $MODE \
     --hidden $HIDDEN \
     --epochs 3
