@@ -57,6 +57,6 @@ echo "============================================"
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python train_pattern_detectors.py \
     --mode $MODE \
     --hidden $HIDDEN \
-    --epochs 3
+    --epochs 1
 
 echo "Completed at: $(date)"
