@@ -39,7 +39,7 @@ def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
         x (input_dim) -> [frozen] Linear+ReLU (hidden_dim) -> [trained] Linear (64*3)
     """
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz"))
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
     if not chunk_files:
         raise ValueError(f"No chunk files in {chunk_dir}")
 
