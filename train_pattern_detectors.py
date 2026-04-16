@@ -30,35 +30,22 @@ from hand_crafted_flanking import (
 from generate_rule_games import precompute_pattern_arrays, evaluate_rules_vec
 
 
-def _load_pattern_labels(chunk_path):
-    """Load precomputed pattern labels if available.
+def _get_pattern_labels(chunk_path, board_labels, positions,
+                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask):
+    """Get pattern labels: load precomputed if available, else compute.
 
-    Looks for chunk_NNNN_patterns.npz alongside chunk_NNNN.npz.
-    Returns (N, 960) uint8 tensor (kept as uint8 to save memory;
-    convert to float32 per batch when needed), or None if not found.
+    Returns numpy uint8 array (N, 960) — stays as numpy to avoid
+    duplicating 4.6 GB into a torch tensor. Callers index per-batch
+    and convert to float32 torch tensor only for that batch.
     """
     pat_path = chunk_path.replace(".npz", "_patterns.npz")
     if os.path.exists(pat_path):
-        data = np.load(pat_path)
-        return torch.tensor(data['pattern_labels'], dtype=torch.uint8)
-    return None
-
-
-def _get_pattern_labels(chunk_path, board_labels, positions,
-                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask):
-    """Get pattern labels: load precomputed if available, else compute per batch.
-
-    Returns uint8 tensor if precomputed (4.6 GB/chunk vs 17.5 GB for float32),
-    or float32 tensor if computed on the fly.
-    """
-    cached = _load_pattern_labels(chunk_path)
-    if cached is not None:
-        return cached
-    # Fallback: compute (returned as float32 tensor)
+        return np.load(pat_path)['pattern_labels']  # (N, 960) uint8
+    # Fallback: compute
     labels_np = compute_pattern_labels_batch(
         board_labels.numpy(), positions.numpy(),
         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-    return torch.tensor(labels_np, dtype=torch.uint8)
+    return labels_np.astype(np.uint8)
 
 # ---------------------------------------------------------------------------
 # Pattern label computation
@@ -501,7 +488,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 pos = tr_pos[idx]
-                y_pat = pat_labels[idx].float().to(device)
+                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
 
                 # Get MLP predictions (frozen)
                 with torch.no_grad():
@@ -670,7 +657,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 y_board = tr_Y[idx].to(device)
-                y_pat = pat_labels[idx].float().to(device)
+                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
                 pos = tr_pos[idx]
 
                 even_mask = (pos % 2 == 0)
@@ -845,7 +832,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
-                y_pat = pat_labels[idx].float().to(device)
+                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
                 pos = tr_pos[idx]
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -875,7 +862,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
                 x = ev_X[i:i + batch_size].to(device)
-                y_pat = ev_pat[i:i + batch_size].float().to(device)
+                y_pat = torch.from_numpy(ev_pat[i:i + batch_size].astype(np.float32)).to(device)
                 pos = ev_pos[i:i + batch_size]
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -967,7 +954,7 @@ def _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
                 pat_logits[odd_mask] = mlp_odd(x[odd_mask])
 
             all_pat_probs.append(torch.sigmoid(pat_logits).cpu().numpy())
-            all_gt_pat.append(ev_pat[i:i + batch_size].float().numpy())
+            all_gt_pat.append(ev_pat[i:i + batch_size].astype(np.float32))
 
     all_pat_probs = np.concatenate(all_pat_probs)
     all_gt_pat = np.concatenate(all_gt_pat)
