@@ -95,12 +95,14 @@ def _get_pattern_labels(chunk_path, board_labels, positions,
     pat_path = _chunk_pattern_path(chunk_path)
     if os.path.exists(pat_path):
         with np.load(pat_path) as data:
-            return data['pattern_labels'].copy()  # (N, 960) uint8; copy breaks ref to NpzFile
+            # Return as torch uint8 tensor (same 4.6 GB as numpy), enabling
+            # native torch indexing per batch without numpy fancy-indexing leaks.
+            return torch.from_numpy(data['pattern_labels'].copy())
     # Fallback: compute
     labels_np = compute_pattern_labels_batch(
         board_labels.numpy(), positions.numpy(),
         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-    return labels_np.astype(np.uint8)
+    return torch.from_numpy(labels_np.astype(np.uint8))
 
 # ---------------------------------------------------------------------------
 # Pattern label computation
@@ -539,7 +541,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 pos = tr_pos[idx]
-                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
+                y_pat = pat_labels[idx].float().to(device)
 
                 # Get MLP predictions (frozen)
                 with torch.no_grad():
@@ -733,7 +735,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
                 y_board = tr_Y[idx].to(device)
-                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
+                y_pat = pat_labels[idx].float().to(device)
                 pos = tr_pos[idx]
 
                 even_mask = (pos % 2 == 0)
@@ -927,7 +929,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
                 x = tr_X[idx].to(device)
-                y_pat = torch.from_numpy(pat_labels[idx.numpy()].astype(np.float32)).to(device)
+                y_pat = pat_labels[idx].float().to(device)
                 pos = tr_pos[idx]
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -961,7 +963,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
                 x = ev_X[i:i + batch_size].to(device)
-                y_pat = torch.from_numpy(ev_pat[i:i + batch_size].astype(np.float32)).to(device)
+                y_pat = ev_pat[i:i + batch_size].float().to(device)
                 pos = ev_pos[i:i + batch_size]
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -1069,7 +1071,7 @@ def _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
                 pat_logits[odd_mask] = mlp_odd(x[odd_mask])
 
             all_pat_probs.append(torch.sigmoid(pat_logits).cpu().numpy())
-            all_gt_pat.append(ev_pat[i:i + batch_size].astype(np.float32))
+            all_gt_pat.append(ev_pat[i:i + batch_size].float().numpy())
 
     all_pat_probs = np.concatenate(all_pat_probs)
     all_gt_pat = np.concatenate(all_gt_pat)
