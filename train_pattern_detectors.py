@@ -30,6 +30,39 @@ from hand_crafted_flanking import (
 from generate_rule_games import precompute_pattern_arrays, evaluate_rules_vec
 
 
+def _load_features_when60(chunk_path, feature_cols=None):
+    """Load features/labels/positions, preferring the smaller when60 file.
+
+    If chunk_NNNN_when60.npz exists, loads from it (60-d features, uint8
+    labels, uint8 positions) — much smaller memory footprint.
+    Otherwise falls back to _load_features on the full 180-d chunk.
+
+    Returns torch tensors: (features (float32), labels (int64), positions (int64)).
+    When loading from when60, `feature_cols` is ignored (already sliced).
+    """
+    when60_path = chunk_path.replace(".npz", "_when60.npz")
+    if os.path.exists(when60_path):
+        data = np.load(when60_path)
+        X = torch.from_numpy(data['features'])  # already float32
+        Y = torch.from_numpy(data['labels'].astype(np.int64))
+        pos = torch.from_numpy(data['positions'].astype(np.int64))
+        return X, Y, pos
+
+    # Fallback: load full 180-d chunk and slice
+    X, Y, pos = _load_features(chunk_path)
+    if feature_cols is not None:
+        X = X[:, feature_cols]
+    return X, Y, pos
+
+
+def _chunk_pattern_path(chunk_path):
+    """Map any chunk variant path (plain/when60) to its pattern-labels path."""
+    # chunk_NNNN.npz → chunk_NNNN_patterns.npz
+    # chunk_NNNN_when60.npz → chunk_NNNN_patterns.npz
+    base = chunk_path.replace("_when60.npz", ".npz")
+    return base.replace(".npz", "_patterns.npz")
+
+
 def _get_pattern_labels(chunk_path, board_labels, positions,
                         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask):
     """Get pattern labels: load precomputed if available, else compute.
@@ -38,7 +71,7 @@ def _get_pattern_labels(chunk_path, board_labels, positions,
     duplicating 4.6 GB into a torch tensor. Callers index per-batch
     and convert to float32 torch tensor only for that batch.
     """
-    pat_path = chunk_path.replace(".npz", "_patterns.npz")
+    pat_path = _chunk_pattern_path(chunk_path)
     if os.path.exists(pat_path):
         return np.load(pat_path)['pattern_labels']  # (N, 960) uint8
     # Fallback: compute
@@ -314,9 +347,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
           f"input={input_dim}, {epochs} epochs per stage")
 
     # Load eval data
-    ev_X, ev_Y, ev_pos = _load_features(eval_path)
-    if feature_cols is not None:
-        ev_X = ev_X[:, feature_cols]
+    ev_X, ev_Y, ev_pos = _load_features_when60(eval_path, feature_cols)
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
@@ -362,9 +393,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             epoch_loss, epoch_batches = 0.0, 0
 
             for ci in chunk_order:
-                tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-                if feature_cols is not None:
-                    tr_X = tr_X[:, feature_cols]
+                tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
                 perm = torch.randperm(len(tr_X))
 
                 for i in range(0, len(tr_X), batch_size):
@@ -474,9 +503,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
-            tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            if feature_cols is not None:
-                tr_X = tr_X[:, feature_cols]
+            tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
 
             # Load precomputed pattern labels (or compute on the fly)
             pat_labels = _get_pattern_labels(
@@ -638,9 +665,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         optimizer, mode='min', factor=0.75, patience=1)
 
     # Load eval data
-    ev_X, ev_Y, ev_pos = _load_features(eval_path)
-    if feature_cols is not None:
-        ev_X = ev_X[:, feature_cols]
+    ev_X, ev_Y, ev_pos = _load_features_when60(eval_path, feature_cols)
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
@@ -663,9 +688,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
-            tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            if feature_cols is not None:
-                tr_X = tr_X[:, feature_cols]
+            tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
 
             # Load precomputed pattern labels (or compute on the fly)
             pat_labels = _get_pattern_labels(
@@ -836,9 +859,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         optimizer, mode='min', factor=0.75, patience=1)
 
     # Load eval data
-    ev_X, ev_Y, ev_pos = _load_features(eval_path)
-    if feature_cols is not None:
-        ev_X = ev_X[:, feature_cols]
+    ev_X, ev_Y, ev_pos = _load_features_when60(eval_path, feature_cols)
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
@@ -857,9 +878,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
-            tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            if feature_cols is not None:
-                tr_X = tr_X[:, feature_cols]
+            tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
 
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
