@@ -35,7 +35,8 @@ def precompute_one_chunk(chunk_path, output_path):
     t0 = time.time()
 
     # Extract 'when' slice: columns N_MOVES to 2*N_MOVES (60 to 120)
-    features_when = features_180[:, N_MOVES:2 * N_MOVES].copy()
+    # Force float32 — source chunks may be float16
+    features_when = features_180[:, N_MOVES:2 * N_MOVES].astype(np.float32)
 
     # Compact labels to uint8 (values are 0, 1, 2)
     labels_u8 = labels.astype(np.uint8)

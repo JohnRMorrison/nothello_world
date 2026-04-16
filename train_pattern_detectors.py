@@ -43,7 +43,7 @@ def _load_features_when60(chunk_path, feature_cols=None):
     when60_path = chunk_path.replace(".npz", "_when60.npz")
     if os.path.exists(when60_path):
         data = np.load(when60_path)
-        X = torch.from_numpy(data['features'])  # already float32
+        X = torch.from_numpy(data['features'].astype(np.float32))
         Y = torch.from_numpy(data['labels'].astype(np.int64))
         pos = torch.from_numpy(data['positions'].astype(np.int64))
         return X, Y, pos
