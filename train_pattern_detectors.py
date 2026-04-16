@@ -29,6 +29,17 @@ except ImportError:
     def _mem_gb():
         return -1.0
 
+# Try to release memory back to OS (glibc only) — Python's gc.collect()
+# reclaims references but doesn't shrink the allocator arena.
+try:
+    import ctypes
+    _LIBC = ctypes.CDLL("libc.so.6")
+    def _malloc_trim():
+        _LIBC.malloc_trim(0)
+except (OSError, AttributeError):
+    def _malloc_trim():
+        pass
+
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
 )
@@ -555,6 +566,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
 
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
             gc.collect()
+            _malloc_trim()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
@@ -753,6 +765,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
 
             del tr_X, tr_Y, tr_pos, pat_labels
             gc.collect()
+            _malloc_trim()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
@@ -937,6 +950,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
 
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
             gc.collect()
+            _malloc_trim()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
