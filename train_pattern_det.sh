@@ -1,17 +1,19 @@
 #!/bin/bash
 # Train 960 pattern detectors on MLP-predicted board state.
 #
-# 4 jobs (sbatch --array=0-3):
+# 6 jobs (sbatch --array=0-5):
 #   Task 0: two-stage,   H=512
 #   Task 1: two-stage,   H=1024
 #   Task 2: end-to-end,  H=512
 #   Task 3: end-to-end,  H=1024
+#   Task 4: direct,      H=512
+#   Task 5: direct,      H=1024
 #
 # Prerequisites: feature chunks 0-39 precomputed (12M games).
 #   If only chunks 0-19 exist, run: sbatch --array=20-39 precompute_12m.sh
 #
 # Usage:
-#   sbatch --array=0-3 train_pattern_det.sh
+#   sbatch --array=0-5 train_pattern_det.sh
 
 #SBATCH --job-name=patdet
 #SBATCH -c 4
@@ -37,6 +39,8 @@ case $TASK in
     1) MODE="two-stage";  HIDDEN=1024 ;;
     2) MODE="end-to-end"; HIDDEN=512  ;;
     3) MODE="end-to-end"; HIDDEN=1024 ;;
+    4) MODE="direct";     HIDDEN=512  ;;
+    5) MODE="direct";     HIDDEN=1024 ;;
 esac
 
 echo "============================================"

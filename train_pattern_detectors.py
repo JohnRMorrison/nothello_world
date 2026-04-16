@@ -775,9 +775,206 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
     return best_pat_acc, board_acc
 
 
+def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
+                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
+                 feature_cols, epochs=3, batch_size=1024, save_dir=None):
+    """Train MLP directly from move features to 960 pattern labels.
+
+    No board state intermediate — just 60-d 'when' → H → 960 sigmoid.
+    Separate even/odd models.
+    """
+    chunk_files = sorted(os.path.join(chunk_dir, f)
+                         for f in os.listdir(chunk_dir) if f.endswith(".npz") and "_patterns" not in f)
+    if not chunk_files:
+        raise ValueError(f"No chunk files in {chunk_dir}")
+
+    eval_path = chunk_files[-1]
+    train_paths = chunk_files[:-1]
+    n_patterns = len(patterns)
+
+    print(f"Direct training: {len(chunk_files)} chunks, H={hidden_dim}, "
+          f"input={input_dim}, {epochs} epochs")
+
+    # Simple MLP: input_dim → H → 960
+    def _build_direct_mlp(in_dim, h_dim, out_dim):
+        return nn.Sequential(
+            nn.Linear(in_dim, h_dim),
+            nn.ReLU(),
+            nn.Linear(h_dim, out_dim),
+        )
+
+    mlp_even = _build_direct_mlp(input_dim, hidden_dim, n_patterns).to(device)
+    mlp_odd = _build_direct_mlp(input_dim, hidden_dim, n_patterns).to(device)
+
+    optimizer = torch.optim.Adam(
+        list(mlp_even.parameters()) + list(mlp_odd.parameters()), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=1)
+
+    # Load eval data
+    ev_X, ev_Y, ev_pos = _load_features(eval_path)
+    if feature_cols is not None:
+        ev_X = ev_X[:, feature_cols]
+    n_eval = min(len(ev_X), 49 * 10000)
+    ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
+
+    # Precompute eval pattern labels
+    ev_pat = _get_pattern_labels(
+        eval_path, ev_Y, ev_pos,
+        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+
+    best_acc = 0.0
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
+        mlp_even.train(); mlp_odd.train()
+        rng = np.random.RandomState(epoch)
+        chunk_order = rng.permutation(len(train_paths))
+        epoch_loss, epoch_batches = 0.0, 0
+
+        for ci in chunk_order:
+            tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
+            if feature_cols is not None:
+                tr_X = tr_X[:, feature_cols]
+
+            pat_labels = _get_pattern_labels(
+                train_paths[ci], tr_Y, tr_pos,
+                pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+
+            perm = torch.randperm(len(tr_X))
+            for i in range(0, len(tr_X), batch_size):
+                idx = perm[i:i + batch_size]
+                x = tr_X[idx].to(device)
+                y_pat = pat_labels[idx].float().to(device)
+                pos = tr_pos[idx]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+
+                loss = torch.tensor(0.0, device=device)
+                if even_mask.any():
+                    logits = mlp_even(x[even_mask])
+                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                        logits, y_pat[even_mask])
+                if odd_mask.any():
+                    logits = mlp_odd(x[odd_mask])
+                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                        logits, y_pat[odd_mask])
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                epoch_batches += 1
+
+            del tr_X, tr_Y, tr_pos, pat_labels
+
+        # Eval
+        mlp_even.eval(); mlp_odd.eval()
+        correct, total = 0, 0
+        losses = []
+        with torch.no_grad():
+            for i in range(0, len(ev_X), batch_size):
+                x = ev_X[i:i + batch_size].to(device)
+                y_pat = ev_pat[i:i + batch_size].float().to(device)
+                pos = ev_pos[i:i + batch_size]
+                even_mask = (pos % 2 == 0)
+                odd_mask = ~even_mask
+
+                preds = torch.zeros_like(y_pat)
+                if even_mask.any():
+                    logits = mlp_even(x[even_mask])
+                    preds[even_mask] = (logits > 0).float()
+                    losses.append(nn.functional.binary_cross_entropy_with_logits(
+                        logits, y_pat[even_mask]).item())
+                if odd_mask.any():
+                    logits = mlp_odd(x[odd_mask])
+                    preds[odd_mask] = (logits > 0).float()
+                    losses.append(nn.functional.binary_cross_entropy_with_logits(
+                        logits, y_pat[odd_mask]).item())
+
+                correct += (preds == y_pat).sum().item()
+                total += y_pat.numel()
+
+        acc = correct / total
+        mean_loss = np.mean(losses)
+        if acc > best_acc:
+            best_acc = acc
+            best_state = {
+                'even': {k: v.cpu().clone() for k, v in mlp_even.state_dict().items()},
+                'odd': {k: v.cpu().clone() for k, v in mlp_odd.state_dict().items()},
+            }
+        scheduler.step(mean_loss)
+        cur_lr = optimizer.param_groups[0]['lr']
+        avg_loss = epoch_loss / max(epoch_batches, 1)
+        print(f"  Epoch {epoch}: pat_acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
+              flush=True)
+
+    # Restore best and evaluate legal moves
+    if best_state:
+        mlp_even.load_state_dict(best_state['even'])
+        mlp_odd.load_state_dict(best_state['odd'])
+    mlp_even.eval(); mlp_odd.eval()
+
+    _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
+                                 ev_X, ev_Y, ev_pos, ev_pat, device, batch_size,
+                                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+
+    # Save
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir,
+            f"pattern_det_direct_H{hidden_dim}.pt")
+        torch.save({
+            'even': best_state['even'] if best_state else None,
+            'odd': best_state['odd'] if best_state else None,
+            'hidden_dim': hidden_dim,
+            'input_dim': input_dim,
+            'n_patterns': n_patterns,
+            'best_pat_acc': best_acc,
+            'mode': 'direct',
+        }, save_path)
+        print(f"Saved to {save_path}")
+
+    return best_acc
+
+
 # ---------------------------------------------------------------------------
 # Legal move evaluation
 # ---------------------------------------------------------------------------
+
+def _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
+                                  ev_X, ev_Y, ev_pos, ev_pat, device, batch_size,
+                                  pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask):
+    """Evaluate legal move prediction for direct model."""
+    print(f"\n{'='*60}")
+    print("EVALUATION: Legal move prediction (direct)")
+    print(f"{'='*60}")
+
+    all_pat_probs = []
+    all_gt_pat = []
+
+    with torch.no_grad():
+        for i in range(0, len(ev_X), batch_size):
+            x = ev_X[i:i + batch_size].to(device)
+            pos = ev_pos[i:i + batch_size]
+            even_mask = (pos % 2 == 0)
+            odd_mask = ~even_mask
+
+            pat_logits = torch.zeros(len(x), len(patterns), device=device)
+            if even_mask.any():
+                pat_logits[even_mask] = mlp_even(x[even_mask])
+            if odd_mask.any():
+                pat_logits[odd_mask] = mlp_odd(x[odd_mask])
+
+            all_pat_probs.append(torch.sigmoid(pat_logits).cpu().numpy())
+            all_gt_pat.append(ev_pat[i:i + batch_size].float().numpy())
+
+    all_pat_probs = np.concatenate(all_pat_probs)
+    all_gt_pat = np.concatenate(all_gt_pat)
+
+    _report_legal_move_metrics(all_pat_probs, all_gt_pat, patterns,
+                                pat_targets, pat_opp_cells, pat_opp_mask)
+
 
 def _evaluate_legal_moves(mlp_even, mlp_odd, detectors, patterns,
                           ev_X, ev_Y, ev_pos, device, batch_size,
@@ -914,7 +1111,7 @@ def _report_legal_move_metrics(pat_probs, gt_pat, patterns,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", type=str, required=True,
-                        choices=["two-stage", "end-to-end"])
+                        choices=["two-stage", "end-to-end", "direct"])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=1024)
@@ -946,8 +1143,14 @@ if __name__ == "__main__":
             pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
             feature_cols, epochs=args.epochs, batch_size=args.batch_size,
             save_dir=save_dir, mlp_checkpoint=args.mlp_checkpoint)
-    else:
+    elif args.mode == "end-to-end":
         train_end_to_end(
+            chunk_dir, device, input_dim, args.hidden, patterns,
+            pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
+            feature_cols, epochs=args.epochs, batch_size=args.batch_size,
+            save_dir=save_dir)
+    else:
+        train_direct(
             chunk_dir, device, input_dim, args.hidden, patterns,
             pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
             feature_cols, epochs=args.epochs, batch_size=args.batch_size,
