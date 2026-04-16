@@ -2,10 +2,12 @@
 # Train random projection models: frozen random first layer, train output only.
 #
 # Usage:
-#   sbatch --array=0-1 train_random_proj.sh
+#   sbatch train_random_proj.sh 2048        # single run, H=2048
+#   sbatch train_random_proj.sh 2048 3      # H=2048, 3 epochs
+#   sbatch train_random_proj.sh 2048 2 5    # H=2048, 2 epochs, seed=5
 #
-# Task 0: H=2048, seed 0
-# Task 1: H=4096, seed 0
+# Or array mode (uses positional args for H and epochs, array ID for seed):
+#   sbatch --array=0-2 train_random_proj.sh 1024 2   # H=1024, 2 epochs, seeds 0-2
 
 #SBATCH --job-name=randproj
 #SBATCH -c 4
@@ -24,19 +26,13 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 mkdir -p logs
 cd $SLURM_SUBMIT_DIR
 
-TASK=${SLURM_ARRAY_TASK_ID:-0}
-
-if [ $TASK -eq 0 ]; then
-    HIDDEN=2048
-    SEED=0
-else
-    HIDDEN=4096
-    SEED=0
-fi
+HIDDEN=${1:-1024}
+EPOCHS=${2:-2}
+SEED=${3:-${SLURM_ARRAY_TASK_ID:-0}}
 
 echo "============================================"
-echo "Random projection: H=$HIDDEN seed=$SEED"
-echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: $TASK"
+echo "Random projection: H=$HIDDEN seed=$SEED epochs=$EPOCHS"
+echo "Job ID: ${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}, Task: ${SLURM_ARRAY_TASK_ID:-N/A}"
 echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
@@ -44,7 +40,7 @@ echo "============================================"
 CUDA_VISIBLE_DEVICES=0 python train_streaming.py \
     --features when \
     --hidden $HIDDEN \
-    --epochs 2 \
+    --epochs $EPOCHS \
     --random-proj \
     --seed $SEED
 
