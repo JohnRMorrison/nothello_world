@@ -229,13 +229,18 @@ def labels_to_192d(board_labels, positions):
 
     Per cell: (P(empty), P(mine), P(opponent)) — one-hot from hard labels.
 
-    board_labels: (N, 64) int — 0=empty, 1=white, 2=black
-    positions: (N,) int — move index
+    board_labels: (N, 64) int — 0=empty, 1=white, 2=black. Stays on whatever
+        device it's on — no CPU/GPU roundtrips.
+    positions: (N,) int — move index. Moved to board_labels.device if needed.
 
-    Returns: (N, 192) float32
+    Returns: (N, 192) float32 on board_labels.device.
     """
+    device = board_labels.device
+    if positions.device != device:
+        positions = positions.to(device)
+
     n = len(board_labels)
-    encoding = torch.zeros(n, 192, dtype=torch.float32)
+    encoding = torch.zeros(n, 192, dtype=torch.float32, device=device)
 
     is_black_turn = (positions % 2 == 1)  # next player is black
 
@@ -272,6 +277,8 @@ def labels_to_192d_soft(logits, positions):
     n = len(logits)
     encoding = torch.zeros(n, 192, dtype=logits.dtype, device=logits.device)
 
+    if positions.device != logits.device:
+        positions = positions.to(logits.device)
     is_black_turn = (positions % 2 == 1)
     black_mask = is_black_turn.bool()
 
@@ -554,7 +561,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                         pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
                 # Convert to 192-d encoding
-                encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
+                encoding = labels_to_192d(pred_labels, pos)
 
                 # Train detectors
                 logits = detectors(encoding)
@@ -569,6 +576,8 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
             gc.collect()
             _malloc_trim()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
@@ -597,7 +606,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 if odd_mask.any():
                     pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
-                encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
+                encoding = labels_to_192d(pred_labels, pos)
                 logits = detectors(encoding)
 
                 preds = (logits > 0).float()
@@ -768,6 +777,8 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             del tr_X, tr_Y, tr_pos, pat_labels
             gc.collect()
             _malloc_trim()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
@@ -953,6 +964,8 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
             gc.collect()
             _malloc_trim()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
@@ -1106,7 +1119,7 @@ def _evaluate_legal_moves(mlp_even, mlp_odd, detectors, patterns,
             if odd_mask.any():
                 pred_labels[odd_mask] = mlp_odd.predict_board(x[odd_mask])
 
-            encoding = labels_to_192d(pred_labels.cpu(), pos).to(device)
+            encoding = labels_to_192d(pred_labels, pos)
             logits = detectors(encoding)
             all_pat_probs.append(torch.sigmoid(logits).cpu().numpy())
 
