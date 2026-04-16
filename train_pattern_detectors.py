@@ -482,6 +482,8 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+            # Free tr_Y — only needed for pattern labels, which are now loaded
+            del tr_Y
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
@@ -513,7 +515,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos, pat_labels
+            del tr_X, tr_pos, pat_labels  # tr_Y already freed above
 
         # Eval
         detectors.eval()
@@ -862,6 +864,8 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+            # Free tr_Y — only needed for pattern labels, which are now loaded
+            del tr_Y
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
@@ -888,7 +892,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_Y, tr_pos, pat_labels
+            del tr_X, tr_pos, pat_labels  # tr_Y already freed above
 
         # Eval
         mlp_even.eval(); mlp_odd.eval()
