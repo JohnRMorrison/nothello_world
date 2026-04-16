@@ -30,29 +30,72 @@ except ImportError:
         return -1.0
 
 
+def _my_cgroup_memory_path():
+    """Find this process's own memory cgroup directory (not the system root).
+
+    /proc/self/cgroup lists memberships like:
+      12:memory:/slurm/uid_123/job_456/step_batch
+    We build the actual path: /sys/fs/cgroup/memory/slurm/uid_123/...
+    """
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) != 3:
+                    continue
+                # v1 format: "N:controller:path"; v2 format: "0::path"
+                if parts[1] == "memory":  # v1 memory controller
+                    rel = parts[2]
+                    return os.path.join("/sys/fs/cgroup/memory", rel.lstrip("/"))
+                if parts[1] == "":  # v2 unified hierarchy
+                    rel = parts[2]
+                    return os.path.join("/sys/fs/cgroup", rel.lstrip("/"))
+    except OSError:
+        pass
+    return None
+
+
+_CGROUP_PATH = _my_cgroup_memory_path()
+
+
 def _cgroup_mem_gb():
     """Read the job's cgroup memory.usage — this is what SLURM tracks."""
-    for path in ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
-                 "/sys/fs/cgroup/memory.current"):
-        try:
-            with open(path) as f:
-                return int(f.read().strip()) / 1e9
-        except (OSError, ValueError):
-            continue
+    if _CGROUP_PATH:
+        for fname in ("memory.usage_in_bytes", "memory.current"):
+            p = os.path.join(_CGROUP_PATH, fname)
+            try:
+                with open(p) as f:
+                    return int(f.read().strip()) / 1e9
+            except (OSError, ValueError):
+                continue
     return -1.0
 
 
 def _cgroup_cache_gb():
     """Read cgroup memory.stat's cache line (page cache charged to cgroup)."""
-    for path in ("/sys/fs/cgroup/memory/memory.stat",
-                 "/sys/fs/cgroup/memory.stat"):
+    if _CGROUP_PATH:
+        p = os.path.join(_CGROUP_PATH, "memory.stat")
         try:
-            with open(path) as f:
+            with open(p) as f:
                 for line in f:
                     if line.startswith(("cache ", "file ")):
                         return int(line.split()[1]) / 1e9
         except OSError:
-            continue
+            pass
+    return -1.0
+
+
+def _cgroup_anon_gb():
+    """Anonymous memory charged to the cgroup (should match rss if alone)."""
+    if _CGROUP_PATH:
+        p = os.path.join(_CGROUP_PATH, "memory.stat")
+        try:
+            with open(p) as f:
+                for line in f:
+                    if line.startswith(("rss ", "anon ")):
+                        return int(line.split()[1]) / 1e9
+        except OSError:
+            pass
     return -1.0
 
 # Try to release memory back to OS (glibc only) — Python's gc.collect()
@@ -629,6 +672,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
                       f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"anon={_cgroup_anon_gb():.1f} GB  "
                       f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
@@ -832,6 +876,7 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
                       f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"anon={_cgroup_anon_gb():.1f} GB  "
                       f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
@@ -1021,6 +1066,7 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             if ci % 10 == 0:
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
                       f"cgroup={_cgroup_mem_gb():.1f} GB  "
+                      f"anon={_cgroup_anon_gb():.1f} GB  "
                       f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
 
         # Eval
