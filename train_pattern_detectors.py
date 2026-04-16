@@ -561,6 +561,24 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
         print(f"  Stage 2 Epoch {epoch}: pattern_acc={acc:.4%}  "
               f"loss={avg_loss:.5f}  lr={cur_lr:.2e}", flush=True)
 
+        # Save checkpoint after each epoch (in case of timeout)
+        if best_det_state is not None and save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = os.path.join(save_dir, f"pattern_det_two_stage_H{hidden_dim}.pt")
+            torch.save({
+                'mlp_even': best_mlp_state['even'],
+                'mlp_odd': best_mlp_state['odd'],
+                'detectors': best_det_state,
+                'hidden_dim': hidden_dim,
+                'input_dim': input_dim,
+                'n_patterns': n_patterns,
+                'mlp_best_acc': best_acc,
+                'detector_best_acc': best_det_acc,
+                'mode': 'two-stage',
+                'epoch': epoch,
+            }, ckpt_path)
+            print(f"  Checkpoint saved to {ckpt_path}", flush=True)
+
     # Restore best detectors
     if best_det_state is not None:
         detectors.load_state_dict(best_det_state)
@@ -732,6 +750,23 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         print(f"  Epoch {epoch}: pat_acc={pat_acc:.4%}  board_acc={board_acc:.4%}  "
               f"loss={avg_loss:.5f}  lr={cur_lr:.2e}", flush=True)
 
+        # Save checkpoint after each epoch (in case of timeout)
+        if best_state and save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = os.path.join(save_dir, f"pattern_det_e2e_H{hidden_dim}.pt")
+            torch.save({
+                'even': best_state['even'],
+                'odd': best_state['odd'],
+                'hidden_dim': hidden_dim,
+                'input_dim': input_dim,
+                'n_patterns': n_patterns,
+                'best_pat_acc': best_pat_acc,
+                'board_acc': board_acc,
+                'mode': 'end-to-end',
+                'epoch': epoch,
+            }, ckpt_path)
+            print(f"  Checkpoint saved to {ckpt_path}", flush=True)
+
     # Restore best and evaluate legal moves
     if best_state:
         model_even.load_state_dict(best_state['even'])
@@ -895,6 +930,22 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f"  Epoch {epoch}: pat_acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
               flush=True)
+
+        # Save checkpoint after each epoch (in case of timeout)
+        if best_state and save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            ckpt_path = os.path.join(save_dir, f"pattern_det_direct_H{hidden_dim}.pt")
+            torch.save({
+                'even': best_state['even'],
+                'odd': best_state['odd'],
+                'hidden_dim': hidden_dim,
+                'input_dim': input_dim,
+                'n_patterns': n_patterns,
+                'best_pat_acc': best_acc,
+                'mode': 'direct',
+                'epoch': epoch,
+            }, ckpt_path)
+            print(f"  Checkpoint saved to {ckpt_path}", flush=True)
 
     # Restore best and evaluate legal moves
     if best_state:
