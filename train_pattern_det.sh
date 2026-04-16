@@ -20,7 +20,7 @@
 #SBATCH --job-name=patdet
 #SBATCH -c 4
 #SBATCH --time=8:00:00
-#SBATCH --mem=120GB
+#SBATCH --mem=200GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/patdet_%A_%a.out
 #SBATCH --account=nklab
