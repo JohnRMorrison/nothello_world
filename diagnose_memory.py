@@ -90,6 +90,10 @@ def main():
                         choices=["two-stage", "end-to-end", "direct"])
     parser.add_argument("--n-chunks", type=int, default=5,
                         help="Number of chunks to iterate")
+    parser.add_argument("--batches-per-chunk", type=int, default=500,
+                        help="Batches per chunk (for testing slow leaks)")
+    parser.add_argument("--log-every", type=int, default=1000,
+                        help="Log memory every N batches within a chunk")
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--chunk-dir",
@@ -149,11 +153,13 @@ def main():
 
         log_memory(f"chunk {ci} after load")
 
-        # Run a few hundred batches
+        # Run batches
         perm = torch.randperm(len(tr_X))
-        n_batches = min(500, len(tr_X) // args.batch_size)
+        n_batches = min(args.batches_per_chunk, len(tr_X) // args.batch_size)
 
         for bi in range(n_batches):
+            if bi > 0 and bi % args.log_every == 0:
+                log_memory(f"chunk {ci} batch {bi}")
             i = bi * args.batch_size
             idx = perm[i:i + args.batch_size]
             x = tr_X[idx].to(device)
