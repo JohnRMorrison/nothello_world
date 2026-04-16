@@ -12,13 +12,22 @@ Usage:
     python train_pattern_detectors.py --mode two-stage --hidden 512 --epochs 3
     python train_pattern_detectors.py --mode end-to-end --hidden 1024 --epochs 3
 """
-import sys, os, json, math
+import sys, os, json, math, gc
 sys.path.insert(0, '.')
 
 import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+
+try:
+    import psutil
+    _PROC = psutil.Process()
+    def _mem_gb():
+        return _PROC.memory_info().rss / 1e9
+except ImportError:
+    def _mem_gb():
+        return -1.0
 
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
@@ -42,10 +51,11 @@ def _load_features_when60(chunk_path, feature_cols=None):
     """
     when60_path = chunk_path.replace(".npz", "_when60.npz")
     if os.path.exists(when60_path):
-        data = np.load(when60_path)
-        X = torch.from_numpy(data['features'].astype(np.float32))
-        Y = torch.from_numpy(data['labels'].astype(np.int64))
-        pos = torch.from_numpy(data['positions'].astype(np.int64))
+        # Use `with` to ensure NpzFile is closed and file handles released
+        with np.load(when60_path) as data:
+            X = torch.from_numpy(data['features'].astype(np.float32))
+            Y = torch.from_numpy(data['labels'].astype(np.int64))
+            pos = torch.from_numpy(data['positions'].astype(np.int64))
         return X, Y, pos
 
     # Fallback: load full 180-d chunk and slice
@@ -73,7 +83,8 @@ def _get_pattern_labels(chunk_path, board_labels, positions,
     """
     pat_path = _chunk_pattern_path(chunk_path)
     if os.path.exists(pat_path):
-        return np.load(pat_path)['pattern_labels']  # (N, 960) uint8
+        with np.load(pat_path) as data:
+            return data['pattern_labels'].copy()  # (N, 960) uint8; copy breaks ref to NpzFile
     # Fallback: compute
     labels_np = compute_pattern_labels_batch(
         board_labels.numpy(), positions.numpy(),
@@ -543,6 +554,9 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_batches += 1
 
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
+            gc.collect()
+            if ci % 10 == 0:
+                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
         # Eval
         detectors.eval()
@@ -731,6 +745,9 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_batches += 1
 
             del tr_X, tr_Y, tr_pos, pat_labels
+            gc.collect()
+            if ci % 10 == 0:
+                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
         # Eval
         model_even.eval(); model_odd.eval()
@@ -912,6 +929,9 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_batches += 1
 
             del tr_X, tr_pos, pat_labels  # tr_Y already freed above
+            gc.collect()
+            if ci % 10 == 0:
+                print(f"    [chunk {ci}] mem={_mem_gb():.1f} GB", flush=True)
 
         # Eval
         mlp_even.eval(); mlp_odd.eval()
