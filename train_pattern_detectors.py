@@ -864,12 +864,12 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
-    # Precompute eval pattern labels (ev_Y/ev_pos are numpy mmaps — no .numpy() needed)
+    # Precompute eval pattern labels (ev_Y/ev_pos are numpy mmaps — no .numpy() needed).
+    # Keep as numpy; convert per batch to avoid duplicate 1.9 GB torch copy.
     ev_pat = compute_pattern_labels_batch(
         np.ascontiguousarray(ev_Y, dtype=np.int64),
         np.ascontiguousarray(ev_pos, dtype=np.int64),
-        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-    ev_pat = torch.tensor(ev_pat, dtype=torch.float32)
+        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)  # (N, 960) float32
 
     # board_loss_weight passed in as argument; printed for transparency
     print(f"  board_loss_weight={board_loss_weight} ({'joint' if board_loss_weight > 0 else 'emergent (patterns only)'})")
@@ -954,7 +954,9 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                     ev_X[i:i + batch_size], dtype=np.float32)).to(device)
                 y_board = torch.from_numpy(np.ascontiguousarray(
                     ev_Y[i:i + batch_size], dtype=np.int64)).to(device)
-                y_pat = ev_pat[i:i + batch_size].to(device)
+                y_pat = torch.from_numpy(
+                    np.ascontiguousarray(ev_pat[i:i + batch_size], dtype=np.float32)
+                ).to(device)
                 pos = torch.from_numpy(np.ascontiguousarray(
                     ev_pos[i:i + batch_size], dtype=np.int64))
                 even_mask = (pos % 2 == 0)
