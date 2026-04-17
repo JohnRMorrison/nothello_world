@@ -158,28 +158,9 @@ class TwoStageMLP(nn.Module):
             p.requires_grad = False
 
 
-def load_mlp_checkpoint(model, ckpt_path, device):
-    """Load backbone weights from a stage-1 MLP checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location=device)
-    # The checkpoint has 'even'/'odd' state dicts from BoardStateMLP
-    # which is nn.Sequential(Linear, ReLU, Linear) inside .net
-    # Our backbone is also nn.Sequential(Linear, ReLU, Linear)
-    # Need to map: ckpt['net.0.weight'] → backbone['0.weight'] etc.
-    state = ckpt if 'net.0.weight' in ckpt else None
-    if state is None:
-        # Try unwrapping from BoardStateMLP format
-        for key_prefix in ['', 'net.']:
-            mapped = {}
-            for k, v in ckpt.items():
-                if k.startswith(key_prefix):
-                    mapped[k[len(key_prefix):]] = v
-            if '0.weight' in mapped:
-                state = mapped
-                break
-    if state is not None:
-        model.backbone.load_state_dict(state)
-    else:
-        raise ValueError(f"Cannot load backbone from {ckpt_path}: keys={list(ckpt.keys())}")
+def _strip_prefix(d, prefix):
+    """Strip a key prefix from a state dict, only at the start of each key."""
+    return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in d.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +171,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None):
+
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
@@ -213,19 +195,20 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         model_odd = TwoStageMLP(input_dim, hidden_dim, n_patterns).to(device)
         # Load frozen MLP backbones from stage-1 checkpoints
         if mlp_ckpt_dir is None:
-            mlp_ckpt_dir = os.path.join(os.path.dirname(save_path))
-        even_ckpt = os.path.join(mlp_ckpt_dir, f"mlp_stage1_H{hidden_dim}.pt")
-        if os.path.exists(even_ckpt):
-            ckpt = torch.load(even_ckpt, map_location=device)
-            model_even.backbone.load_state_dict(
-                {k.replace("net.", ""): v for k, v in ckpt['even'].items()})
-            model_odd.backbone.load_state_dict(
-                {k.replace("net.", ""): v for k, v in ckpt['odd'].items()})
-            print(f"  Loaded MLP backbone from {even_ckpt} (acc={ckpt['best_acc']:.4%})")
-        else:
-            print(f"  WARNING: no MLP checkpoint at {even_ckpt}, using random backbone")
+            mlp_ckpt_dir = os.path.dirname(save_path) if save_path else "."
+        ckpt_path = os.path.join(mlp_ckpt_dir, f"mlp_stage1_H{hidden_dim}.pt")
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(
+                f"two-stage requires a stage-1 MLP checkpoint at {ckpt_path}. "
+                f"Train one first with train_streaming.py.")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        model_even.backbone.load_state_dict(_strip_prefix(ckpt['even'], "net."))
+        model_odd.backbone.load_state_dict(_strip_prefix(ckpt['odd'], "net."))
+        print(f"  Loaded MLP backbone from {ckpt_path} (acc={ckpt['best_acc']:.4%})")
         model_even.freeze_backbone()
         model_odd.freeze_backbone()
+        # board_loss_weight is ignored for two-stage (backbone is frozen,
+        # board_logits computed under no_grad — no gradients flow)
     else:  # e2e or emergent
         model_even = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
