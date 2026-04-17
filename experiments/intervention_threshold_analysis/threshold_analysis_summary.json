@@ -1,0 +1,14 @@
+[
+  {
+    "label": "OthelloGPT_cd0",
+    "n_interventions": 1000,
+    "n_newly_legal": 490,
+    "n_newly_illegal": 421,
+    "mean_promo_prob": 0.00090492913044407,
+    "mean_suppress_prob": 0.07726296482292073,
+    "frac_legal_cross_delta0": 0.6530612244897959,
+    "frac_illegal_cross_delta0": 0.45605700712589076,
+    "mean_always_illegal_prob": 3.4064408131264466e-05,
+    "mean_always_legal_prob": 0.0934618932827814
+  }
+]
