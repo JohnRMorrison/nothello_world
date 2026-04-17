@@ -161,30 +161,43 @@ from generate_rule_games import precompute_pattern_arrays, evaluate_rules_vec
 
 
 def _load_features_when60(chunk_path, feature_cols=None):
-    """Load features/labels/positions, preferring the smaller when60 file.
+    """Load features/labels/positions, preferring mmap-backed .npy files.
 
-    If chunk_NNNN_when60.npz exists, loads from it (60-d features, uint8
-    labels, uint8 positions) — much smaller memory footprint.
-    Otherwise falls back to _load_features on the full 180-d chunk.
+    Preferred path (when _when60_{features,labels,pos}.npy exist):
+      Returns numpy memmaps. Pages are file-backed, so kernel can evict
+      them freely under memory pressure (fixes cgroup cache accumulation).
 
-    Returns torch tensors: (features (float32), labels (int64), positions (int64)).
-    When loading from when60, `feature_cols` is ignored (already sliced).
+    Fallback: compressed .npz (loads everything into RAM).
+
+    Returns (X, Y, pos) — ALL NUMPY ARRAYS. Callers must index per-batch
+    and convert small slices to torch tensors. Don't wrap in torch.from_numpy
+    at chunk level — that defeats mmap.
     """
+    feat_npy = chunk_path.replace(".npz", "_when60_features.npy")
+    labels_npy = chunk_path.replace(".npz", "_when60_labels.npy")
+    pos_npy = chunk_path.replace(".npz", "_when60_pos.npy")
+    if os.path.exists(feat_npy) and os.path.exists(labels_npy) and os.path.exists(pos_npy):
+        X = np.load(feat_npy, mmap_mode='r')    # float32, (N, 60)
+        Y = np.load(labels_npy, mmap_mode='r')   # uint8,   (N, 64)
+        pos = np.load(pos_npy, mmap_mode='r')    # uint8,   (N,)
+        return X, Y, pos
+
+    # Fallback: compressed .npz (loads all into RAM — used if .npy files not present)
     when60_path = chunk_path.replace(".npz", "_when60.npz")
     if os.path.exists(when60_path):
         with np.load(when60_path) as data:
-            X = torch.from_numpy(data['features'].astype(np.float32))
-            Y = torch.from_numpy(data['labels'].astype(np.int64))
-            pos = torch.from_numpy(data['positions'].astype(np.int64))
+            X = data['features'].astype(np.float32).copy()
+            Y = data['labels'].astype(np.uint8).copy()
+            pos = data['positions'].astype(np.uint8).copy()
         _drop_file_cache(when60_path)
         return X, Y, pos
 
-    # Fallback: load full 180-d chunk and slice
-    X, Y, pos = _load_features(chunk_path)
+    # Last resort: full 180-d chunk
+    X_t, Y_t, pos_t = _load_features(chunk_path)
     if feature_cols is not None:
-        X = X[:, feature_cols]
+        X_t = X_t[:, feature_cols]
     _drop_file_cache(chunk_path)
-    return X, Y, pos
+    return X_t.numpy(), Y_t.numpy().astype(np.uint8), pos_t.numpy().astype(np.uint8)
 
 
 def _chunk_pattern_path(chunk_path):
@@ -203,19 +216,25 @@ def _get_pattern_labels(chunk_path, board_labels, positions,
     duplicating 4.6 GB into a torch tensor. Callers index per-batch
     and convert to float32 torch tensor only for that batch.
     """
+    # Preferred: mmap-backed .npy file (pages are file-backed, freely evictable)
+    pat_npy = chunk_path.replace(".npz", "_patterns.npy").replace("_when60", "")
+    if os.path.exists(pat_npy):
+        return np.load(pat_npy, mmap_mode='r')  # (N, 960) uint8, file-backed
+
+    # Fallback: compressed .npz (loads all into RAM)
     pat_path = _chunk_pattern_path(chunk_path)
     if os.path.exists(pat_path):
         with np.load(pat_path) as data:
-            # Return as torch uint8 tensor (same 4.6 GB as numpy), enabling
-            # native torch indexing per batch without numpy fancy-indexing leaks.
-            result = torch.from_numpy(data['pattern_labels'].copy())
+            result = data['pattern_labels'].copy()
         _drop_file_cache(pat_path)
         return result
-    # Fallback: compute
-    labels_np = compute_pattern_labels_batch(
-        board_labels.numpy(), positions.numpy(),
-        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-    return torch.from_numpy(labels_np.astype(np.uint8))
+
+    # Last resort: compute on the fly
+    bl = board_labels.numpy() if hasattr(board_labels, "numpy") else np.asarray(board_labels)
+    ps = positions.numpy() if hasattr(positions, "numpy") else np.asarray(positions)
+    return compute_pattern_labels_batch(
+        bl, ps, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask
+    ).astype(np.uint8)
 
 # ---------------------------------------------------------------------------
 # Pattern label computation
@@ -537,14 +556,20 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             epoch_loss, epoch_batches = 0.0, 0
 
             for ci in chunk_order:
+                # numpy (possibly memmap) arrays
                 tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
-                perm = torch.randperm(len(tr_X))
+                n = len(tr_X)
+                perm = np.random.permutation(n)
 
-                for i in range(0, len(tr_X), batch_size):
-                    idx = perm[i:i + batch_size]
-                    x = tr_X[idx].to(device)
-                    y = tr_Y[idx].to(device)
-                    pos = tr_pos[idx]
+                for i in range(0, n, batch_size):
+                    idx = np.sort(perm[i:i + batch_size])
+                    x_np = np.ascontiguousarray(tr_X[idx], dtype=np.float32)
+                    y_np = np.ascontiguousarray(tr_Y[idx], dtype=np.int64)
+                    pos_np = np.ascontiguousarray(tr_pos[idx], dtype=np.int64)
+
+                    x = torch.from_numpy(x_np).to(device)
+                    y = torch.from_numpy(y_np).to(device)
+                    pos = torch.from_numpy(pos_np)
                     even_mask = (pos % 2 == 0)
                     odd_mask = ~even_mask
 
@@ -566,15 +591,18 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
 
                 del tr_X, tr_Y, tr_pos
 
-            # Eval
+            # Eval (ev_X/ev_Y/ev_pos are numpy mmaps)
             mlp_even.eval(); mlp_odd.eval()
             correct, total = 0, 0
             losses = []
             with torch.no_grad():
                 for i in range(0, len(ev_X), batch_size):
-                    x = ev_X[i:i + batch_size].to(device)
-                    y = ev_Y[i:i + batch_size].to(device)
-                    pos = ev_pos[i:i + batch_size]
+                    x = torch.from_numpy(np.ascontiguousarray(
+                        ev_X[i:i + batch_size], dtype=np.float32)).to(device)
+                    y = torch.from_numpy(np.ascontiguousarray(
+                        ev_Y[i:i + batch_size], dtype=np.int64)).to(device)
+                    pos = torch.from_numpy(np.ascontiguousarray(
+                        ev_pos[i:i + batch_size], dtype=np.int64))
                     even_mask = (pos % 2 == 0)
                     odd_mask = ~even_mask
                     preds = torch.zeros_like(y)
@@ -647,21 +675,23 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
+            # numpy (possibly memmap) arrays
             tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
-
-            # Load precomputed pattern labels (or compute on the fly)
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            # Free tr_Y — only needed for pattern labels, which are now loaded
-            del tr_Y
 
-            perm = torch.randperm(len(tr_X))
-            for i in range(0, len(tr_X), batch_size):
-                idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
-                pos = tr_pos[idx]
-                y_pat = pat_labels[idx].float().to(device)
+            n = len(tr_X)
+            perm = np.random.permutation(n)
+            for i in range(0, n, batch_size):
+                idx = np.sort(perm[i:i + batch_size])
+                x_np = np.ascontiguousarray(tr_X[idx], dtype=np.float32)
+                pos_np = np.ascontiguousarray(tr_pos[idx], dtype=np.int64)
+                y_pat_np = np.ascontiguousarray(pat_labels[idx], dtype=np.float32)
+
+                x = torch.from_numpy(x_np).to(device)
+                pos = torch.from_numpy(pos_np)
+                y_pat = torch.from_numpy(y_pat_np).to(device)
 
                 # Get MLP predictions (frozen)
                 with torch.no_grad():
@@ -686,7 +716,7 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_pos, pat_labels  # tr_Y already freed above
+            del tr_X, tr_Y, tr_pos, pat_labels
             gc.collect()
             _malloc_trim()
             if torch.cuda.is_available():
@@ -698,21 +728,25 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
                       f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
                       flush=True)
 
-        # Eval
+        # Eval (ev_X/ev_Y/ev_pos are numpy, possibly mmaps)
         detectors.eval()
         correct, total = 0, 0
         losses = []
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y_board = ev_Y[i:i + batch_size]
-                pos = ev_pos[i:i + batch_size]
+                x_np = np.ascontiguousarray(ev_X[i:i + batch_size], dtype=np.float32)
+                y_board_np = np.ascontiguousarray(ev_Y[i:i + batch_size], dtype=np.int64)
+                pos_np = np.ascontiguousarray(ev_pos[i:i + batch_size], dtype=np.int64)
+
+                x = torch.from_numpy(x_np).to(device)
+                pos = torch.from_numpy(pos_np)
 
                 # Pattern ground truth
                 y_pat = compute_pattern_labels_batch(
-                    y_board.numpy(), pos.numpy(),
+                    y_board_np, pos_np,
                     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-                y_pat_t = torch.tensor(y_pat, dtype=torch.float32).to(device)
+                y_pat_t = torch.from_numpy(
+                    np.ascontiguousarray(y_pat, dtype=np.float32)).to(device)
 
                 # MLP predictions
                 even_mask = (pos % 2 == 0)
@@ -830,9 +864,10 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X, ev_Y, ev_pos = ev_X[:n_eval], ev_Y[:n_eval], ev_pos[:n_eval]
 
-    # Precompute eval pattern labels
+    # Precompute eval pattern labels (ev_Y/ev_pos are numpy mmaps — no .numpy() needed)
     ev_pat = compute_pattern_labels_batch(
-        ev_Y.numpy(), ev_pos.numpy(),
+        np.ascontiguousarray(ev_Y, dtype=np.int64),
+        np.ascontiguousarray(ev_pos, dtype=np.int64),
         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
     ev_pat = torch.tensor(ev_pat, dtype=torch.float32)
 
@@ -849,20 +884,25 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
+            # numpy (possibly memmap) arrays
             tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
-
-            # Load precomputed pattern labels (or compute on the fly)
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
 
-            perm = torch.randperm(len(tr_X))
-            for i in range(0, len(tr_X), batch_size):
-                idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
-                y_board = tr_Y[idx].to(device)
-                y_pat = pat_labels[idx].float().to(device)
-                pos = tr_pos[idx]
+            n = len(tr_X)
+            perm = np.random.permutation(n)
+            for i in range(0, n, batch_size):
+                idx = np.sort(perm[i:i + batch_size])
+                x_np = np.ascontiguousarray(tr_X[idx], dtype=np.float32)
+                y_board_np = np.ascontiguousarray(tr_Y[idx], dtype=np.int64)
+                y_pat_np = np.ascontiguousarray(pat_labels[idx], dtype=np.float32)
+                pos_np = np.ascontiguousarray(tr_pos[idx], dtype=np.int64)
+
+                x = torch.from_numpy(x_np).to(device)
+                y_board = torch.from_numpy(y_board_np).to(device)
+                y_pat = torch.from_numpy(y_pat_np).to(device)
+                pos = torch.from_numpy(pos_np)
 
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
@@ -903,17 +943,20 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
                       f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
                       flush=True)
 
-        # Eval
+        # Eval (ev_X/ev_Y/ev_pos are numpy mmaps; ev_pat is torch already)
         model_even.eval(); model_odd.eval()
         pat_correct, pat_total = 0, 0
         board_correct, board_total = 0, 0
         losses = []
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y_board = ev_Y[i:i + batch_size].to(device)
+                x = torch.from_numpy(np.ascontiguousarray(
+                    ev_X[i:i + batch_size], dtype=np.float32)).to(device)
+                y_board = torch.from_numpy(np.ascontiguousarray(
+                    ev_Y[i:i + batch_size], dtype=np.int64)).to(device)
                 y_pat = ev_pat[i:i + batch_size].to(device)
-                pos = ev_pos[i:i + batch_size]
+                pos = torch.from_numpy(np.ascontiguousarray(
+                    ev_pos[i:i + batch_size], dtype=np.int64))
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -1049,20 +1092,26 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
         epoch_loss, epoch_batches = 0.0, 0
 
         for ci in chunk_order:
+            # tr_X, tr_Y, tr_pos are numpy (possibly memmap) — NOT torch
             tr_X, tr_Y, tr_pos = _load_features_when60(train_paths[ci], feature_cols)
-
             pat_labels = _get_pattern_labels(
                 train_paths[ci], tr_Y, tr_pos,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            # Free tr_Y — only needed for pattern labels, which are now loaded
-            del tr_Y
 
-            perm = torch.randperm(len(tr_X))
-            for i in range(0, len(tr_X), batch_size):
-                idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
-                y_pat = pat_labels[idx].float().to(device)
-                pos = tr_pos[idx]
+            n = len(tr_X)
+            perm = np.random.permutation(n)
+            for i in range(0, n, batch_size):
+                # Sort idx within batch for mmap page locality (batch ordering
+                # is random at chunk level, sort only inside a 1024-sample batch)
+                idx = np.sort(perm[i:i + batch_size])
+
+                x_np = np.ascontiguousarray(tr_X[idx], dtype=np.float32)
+                pos_np = np.ascontiguousarray(tr_pos[idx], dtype=np.int64)
+                y_pat_np = np.ascontiguousarray(pat_labels[idx], dtype=np.float32)
+
+                x = torch.from_numpy(x_np).to(device)
+                y_pat = torch.from_numpy(y_pat_np).to(device)
+                pos = torch.from_numpy(pos_np)
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -1082,7 +1131,8 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
                 epoch_loss += loss.item()
                 epoch_batches += 1
 
-            del tr_X, tr_pos, pat_labels  # tr_Y already freed above
+            # Release memmaps (tiny — just closes file handles)
+            del tr_X, tr_Y, tr_pos, pat_labels
             gc.collect()
             _malloc_trim()
             if torch.cuda.is_available():
@@ -1094,15 +1144,18 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
                       f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
                       flush=True)
 
-        # Eval
+        # Eval (ev_X/ev_Y/ev_pos/ev_pat are numpy, possibly mmaps)
         mlp_even.eval(); mlp_odd.eval()
         correct, total = 0, 0
         losses = []
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y_pat = ev_pat[i:i + batch_size].float().to(device)
-                pos = ev_pos[i:i + batch_size]
+                x = torch.from_numpy(np.ascontiguousarray(
+                    ev_X[i:i + batch_size], dtype=np.float32)).to(device)
+                y_pat = torch.from_numpy(np.ascontiguousarray(
+                    ev_pat[i:i + batch_size], dtype=np.float32)).to(device)
+                pos = torch.from_numpy(np.ascontiguousarray(
+                    ev_pos[i:i + batch_size], dtype=np.int64))
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -1197,8 +1250,10 @@ def _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
 
     with torch.no_grad():
         for i in range(0, len(ev_X), batch_size):
-            x = ev_X[i:i + batch_size].to(device)
-            pos = ev_pos[i:i + batch_size]
+            x = torch.from_numpy(np.ascontiguousarray(
+                ev_X[i:i + batch_size], dtype=np.float32)).to(device)
+            pos = torch.from_numpy(np.ascontiguousarray(
+                ev_pos[i:i + batch_size], dtype=np.int64))
             even_mask = (pos % 2 == 0)
             odd_mask = ~even_mask
 
@@ -1209,7 +1264,8 @@ def _evaluate_legal_moves_direct(mlp_even, mlp_odd, patterns,
                 pat_logits[odd_mask] = mlp_odd(x[odd_mask])
 
             all_pat_probs.append(torch.sigmoid(pat_logits).cpu().numpy())
-            all_gt_pat.append(ev_pat[i:i + batch_size].float().numpy())
+            all_gt_pat.append(np.ascontiguousarray(
+                ev_pat[i:i + batch_size], dtype=np.float32))
 
     all_pat_probs = np.concatenate(all_pat_probs)
     all_gt_pat = np.concatenate(all_gt_pat)
@@ -1232,9 +1288,12 @@ def _evaluate_legal_moves(mlp_even, mlp_odd, detectors, patterns,
 
     with torch.no_grad():
         for i in range(0, len(ev_X), batch_size):
-            x = ev_X[i:i + batch_size].to(device)
-            y_board = ev_Y[i:i + batch_size]
-            pos = ev_pos[i:i + batch_size]
+            x_np = np.ascontiguousarray(ev_X[i:i + batch_size], dtype=np.float32)
+            y_board_np = np.ascontiguousarray(ev_Y[i:i + batch_size], dtype=np.int64)
+            pos_np = np.ascontiguousarray(ev_pos[i:i + batch_size], dtype=np.int64)
+
+            x = torch.from_numpy(x_np).to(device)
+            pos = torch.from_numpy(pos_np)
             even_mask = (pos % 2 == 0)
             odd_mask = ~even_mask
 
@@ -1249,7 +1308,7 @@ def _evaluate_legal_moves(mlp_even, mlp_odd, detectors, patterns,
             all_pat_probs.append(torch.sigmoid(logits).cpu().numpy())
 
             gt_pat = compute_pattern_labels_batch(
-                y_board.numpy(), pos.numpy(),
+                y_board_np, pos_np,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
             all_gt_pat.append(gt_pat)
 
@@ -1273,9 +1332,12 @@ def _evaluate_legal_moves_e2e(model_even, model_odd, patterns,
 
     with torch.no_grad():
         for i in range(0, len(ev_X), batch_size):
-            x = ev_X[i:i + batch_size].to(device)
-            y_board = ev_Y[i:i + batch_size]
-            pos = ev_pos[i:i + batch_size]
+            x_np = np.ascontiguousarray(ev_X[i:i + batch_size], dtype=np.float32)
+            y_board_np = np.ascontiguousarray(ev_Y[i:i + batch_size], dtype=np.int64)
+            pos_np = np.ascontiguousarray(ev_pos[i:i + batch_size], dtype=np.int64)
+
+            x = torch.from_numpy(x_np).to(device)
+            pos = torch.from_numpy(pos_np)
             even_mask = (pos % 2 == 0)
             odd_mask = ~even_mask
 
@@ -1289,7 +1351,7 @@ def _evaluate_legal_moves_e2e(model_even, model_odd, patterns,
             all_pat_probs.append(torch.sigmoid(pat_logits).cpu().numpy())
 
             gt_pat = compute_pattern_labels_batch(
-                y_board.numpy(), pos.numpy(),
+                y_board_np, pos_np,
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
             all_gt_pat.append(gt_pat)
 
