@@ -42,7 +42,7 @@ Othello:
 > *"Standard Othello, except: whenever some board-state condition `C` holds,
 > moves in the set `S` are forbidden (even if otherwise legal)."*
 
-The condition `C` is called the **antecedent**; the forbidden square is the
+The condition `C` is called the **antecedent**; the forbidden set `S` is the
 **consequent**. Each can independently be either *aligned* (derived from the
 model) or *random*, giving a 2×2 factorial:
 
@@ -99,6 +99,53 @@ recognizing its own output square.
 exists, or random-antecedent sampling fails), the neuron is dropped with a
 diagnostic message. The over-selection pool (3K candidates) typically keeps
 K survivors; use `--strict-K` to hard-fail otherwise.
+
+---
+
+## 3a. Multi-square consequents (`--n-forbidden-squares`)
+
+By default each restriction forbids only **one** square when it fires. With
+a typical board offering ~8 legal moves, the pretrained model's argmax almost
+never hits that exact square — step-0 violation rates are ~2–3%, and the
+model adapts in <50 gradient steps regardless of condition. The alignment
+signal is undetectable because the task is too easy.
+
+The `--n-forbidden-squares N` flag (default 5, exposed as `N_FORBIDDEN` in
+`run_2x2.sh`) instructs `build_restriction_configs.py` to select the **top-N
+DLA squares** per neuron as the aligned consequent, and N uniformly random
+squares (disjoint from aligned) as the random consequent. When a restriction
+fires, all N squares become illegal simultaneously.
+
+**Why this amplifies the alignment signal:**
+
+- **Higher step-0 violation rate.** With N=5, the model must avoid 5 of ~8
+  legal moves per fired position. The aligned targets are exactly the squares
+  the neuron *promotes* via DLA — so the pretrained model is most likely to
+  predict those. Step-0 `violation_rate_when_fires` should be substantially
+  higher for aligned consequents (B₁, B₃) than random ones (B₂, C).
+- **Harder task.** Redistributing probability mass away from 5 squares is
+  much harder than from 1. The model can no longer trivially satisfy the
+  restriction; it must genuinely learn the antecedent to know *when* the
+  restriction applies.
+- **More room for alignment to help.** If the pretrained model's recognition
+  circuitry already computes the antecedent, it has a head start for B₁
+  (both antecedent and consequent aligned) vs C (neither aligned).
+
+**Construction changes:** `choose_aligned_consequent` walks the DLA-sorted
+target list and picks the top N non-tautological squares (excluding antecedent
+squares). `choose_random_consequent` samples N random squares (excluding
+antecedent squares and the aligned set). All self-reference exclusion
+invariants extend to sets: no consequent square (aligned or random) may
+appear in any antecedent.
+
+**JSON schema:** restrictions now carry `forbidden_positions: [int, ...]` and
+`forbidden_squares: [str, ...]` (lists). The legacy `forbidden_position` /
+`forbidden_square` keys still exist (pointing to the first target) for
+backward compatibility.
+
+**Recommended value:** N=5 for a publishable run. N=1 recovers the original
+single-square design. Values above ~8 risk making the task too hard (most
+legal moves forbidden → frequent fallback to full legal set).
 
 ---
 
@@ -184,6 +231,7 @@ All pipeline knobs are exposed as env vars in `run_2x2.sh`:
 | `CKPT`                    | `../../ckpts/gpt_synthetic.ckpt`                            | Pretrained OthelloGPT checkpoint                            |
 | `LAYERS`                  | `2-5`                                                       | Layers to draw neurons from                                 |
 | `K`                       | `20`                                                        | Target number of quadruples                                 |
+| `N_FORBIDDEN`             | `5`                                                         | Squares forbidden per restriction (see §3a)                 |
 | `N_RUNS`                  | `3`                                                         | Seeds per sweep (8 sweeps × N_RUNS = total runs)            |
 | `NUM_GAMES`               | `500000`                                                    | Games generated per condition                               |
 | `MAX_STEPS`               | `5000`                                                      | Gradient steps per sweep                                    |
@@ -202,7 +250,8 @@ Reasonable parameter set for a publishable run (adjust to taste):
 
 | Parameter       | Value        | Rationale                                               |
 |-----------------|--------------|---------------------------------------------------------|
-| `K`             | 20           | Enough restrictions for `fire_rate` ≈ 0.5–0.8           |
+| `K`             | 5            | Fewer restrictions with multi-square consequents         |
+| `N_FORBIDDEN`   | 5            | Squares forbidden per fired restriction (see §3a)        |
 | `N_RUNS`        | 3            | Seeds for mean ± SEM error bars                         |
 | `NUM_GAMES`     | 500,000      | Standard OthelloGPT-scale training corpus per condition |
 | `MAX_STEPS`     | 5,000        | Enough for ft curves to plateau                         |
@@ -217,9 +266,9 @@ Total compute: 8 training sweeps × 3 seeds = **24 trainings × 5,000 steps** at
 ```bash
 cd experiments/transfer_learning_experiments
 
-K=20 N_RUNS=3 NUM_GAMES=500000 MAX_STEPS=5000 \
+K=5 N_FORBIDDEN=5 N_RUNS=3 NUM_GAMES=500000 MAX_STEPS=5000 \
     EVAL_GAMES=200 EVAL_EVERY=50 \
-    BATCH_SIZE=16 LR=3e-4 LR_SCRATCH=5e-4 \
+    BATCH_SIZE=16 LR=1e-5 LR_SCRATCH=5e-4 \
     MAX_FIRING_RATE_DIFF=0.05 TAUTOLOGY_THRESHOLD=0.85 \
     RULES_FILE=../reverse_engineering_experiments/rules_085_200_2-6.json \
     bash run_2x2.sh 2>&1 | tee full_run.log
@@ -437,13 +486,11 @@ runs/2x2_<timestamp>/
       "antecedent_kind": "aligned",
       "consequent_kind": "aligned",
       "conditions": [{"square": "F3", "feature_type": "flipped", "polarity": true}, ...],
+      "forbidden_positions": [45, 37, 21, 53, 12],
+      "forbidden_squares": ["F5", "E5", "C5", "G5", "B4"],
       "forbidden_position": 45,
       "forbidden_square": "F5",
-      "target_board_pos": 45,
-      "target_square": "F5",
-      "dla_value": 0.0253,
-      "dla_rank": 1,
-      "tautology_score": 0.7351,
+      "targets": [{"target_board_pos": 45, "target_square": "F5", "dla_value": 0.0253, "dla_rank": 1, "tautology_score": 0.73}, ...],
       "fire_rate": 0.12,
       "rule_str": "(F3_flipped) AND (G3_not_empty)",
       "influence_score": 1.934183,

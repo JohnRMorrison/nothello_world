@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from data.othello import OthelloBoardState
 
 from restriction_utils import (
-    evaluate_restriction, get_flipped_squares,
+    evaluate_restriction, get_flipped_squares, _get_forbidden_positions,
 )
 
 
@@ -80,7 +80,7 @@ def generate_game(seed):
             forbidden = set()
             for r in _RESTRICTIONS:
                 if evaluate_restriction(r, board, last_move, last_flipped):
-                    forbidden.add(r["forbidden_position"])
+                    forbidden.update(_get_forbidden_positions(r))
                     restrictions_fired += 1
 
             filtered = [m for m in standard_legal if m not in forbidden]

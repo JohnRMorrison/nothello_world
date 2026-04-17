@@ -38,6 +38,7 @@ K="${K:-20}"
 MIN_CONDITIONS="${MIN_CONDITIONS:-2}"
 TAUTOLOGY_THRESHOLD="${TAUTOLOGY_THRESHOLD:-0.85}"
 MAX_FIRING_RATE_DIFF="${MAX_FIRING_RATE_DIFF:-0.05}"
+N_FORBIDDEN="${N_FORBIDDEN:-5}"
 
 N_RUNS="${N_RUNS:-3}"
 NUM_GAMES="${NUM_GAMES:-500000}"
@@ -73,7 +74,7 @@ echo "=============================================================="
 echo "2x2 factorial transfer learning experiment"
 echo "  base:        ${BASE}"
 echo "  rules:       ${RULES_FILE}"
-echo "  K=${K}  layers=${LAYERS}  runs=${N_RUNS}"
+echo "  K=${K}  layers=${LAYERS}  runs=${N_RUNS}  n_forbidden=${N_FORBIDDEN}"
 echo "  max_steps=${MAX_STEPS}  num_games=${NUM_GAMES}"
 echo "=============================================================="
 
@@ -94,6 +95,7 @@ else
         --ckpt "${CKPT}" \
         --layers "${LAYERS}" \
         --K "${K}" \
+        --n-forbidden-squares "${N_FORBIDDEN}" \
         --min-conditions "${MIN_CONDITIONS}" \
         --tautology-threshold "${TAUTOLOGY_THRESHOLD}" \
         --max-firing-rate-diff "${MAX_FIRING_RATE_DIFF}" \

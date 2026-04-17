@@ -50,7 +50,7 @@ from data.othello import OthelloBoardState, get_ood_game
 
 from restriction_utils import (
     VALID_POSITIONS, CENTER_SQUARES,
-    evaluate_restriction, get_flipped_squares,
+    evaluate_restriction, get_flipped_squares, _get_forbidden_positions,
 )
 
 
@@ -122,7 +122,7 @@ def evaluate(model, eval_games, restrictions, stoi, itos, device,
                 forbidden = set()
                 for r in restrictions:
                     if evaluate_restriction(r, board, move, flipped):
-                        forbidden.add(r["forbidden_position"])
+                        forbidden.update(_get_forbidden_positions(r))
                 restricted_legal = [m for m in standard_legal if m not in forbidden]
                 if not restricted_legal:
                     restricted_legal = standard_legal

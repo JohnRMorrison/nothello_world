@@ -145,15 +145,19 @@ def _cond_fires_on_snapshots(conditions, snapshots):
 # ---------------------------------------------------------------------------
 
 def choose_aligned_consequent(dla, cond_fires, legal_matrix, forbid_positions,
-                              tautology_threshold, min_legal=10):
-    """Walk DLA targets in descending strength; pick the first non-tautological
-    target whose board position is not in `forbid_positions`.
+                              tautology_threshold, n_squares=1, min_legal=10):
+    """Walk DLA targets in descending strength; pick the top `n_squares`
+    non-tautological targets whose board positions are not in `forbid_positions`.
 
-    Returns a dict {target_board_pos, target_square, dla_value, tautology_score,
-    dla_rank} or None if no target satisfies the constraints.
+    Returns a list of dicts [{target_board_pos, target_square, dla_value,
+    tautology_score, dla_rank}, ...] of length n_squares, or None if fewer
+    than n_squares targets satisfy the constraints.
     """
     sorted_indices = np.argsort(-dla)
+    chosen = []
     for rank, idx in enumerate(sorted_indices):
+        if len(chosen) >= n_squares:
+            break
         target_pos = VALID_POSITIONS[idx]
         if target_pos in forbid_positions:
             continue
@@ -164,33 +168,38 @@ def choose_aligned_consequent(dla, cond_fires, legal_matrix, forbid_positions,
         n_fires_when_legal = int((cond_fires & target_legal).sum())
         tautology_score = n_fires_when_legal / n_legal
         if tautology_score <= tautology_threshold:
-            return {
+            chosen.append({
                 "target_board_pos": target_pos,
                 "target_square": board_pos_to_square(target_pos),
                 "dla_value": round(float(dla[idx]), 4),
                 "tautology_score": round(tautology_score, 4),
                 "dla_rank": int(rank),
-            }
-    return None
+            })
+            # Add this position to forbid set so we don't pick it again
+            forbid_positions = forbid_positions | {target_pos}
+    return chosen if len(chosen) == n_squares else None
 
 
-def choose_random_consequent(forbid_positions, rng):
-    """Uniform sample from VALID_POSITIONS minus `forbid_positions`.
+def choose_random_consequent(forbid_positions, rng, n_squares=1):
+    """Uniform sample of `n_squares` from VALID_POSITIONS minus `forbid_positions`.
 
-    Returns a consequent dict in the same shape as the aligned version
-    (dla_value / tautology_score / dla_rank are None for random).
+    Returns a list of consequent dicts (dla_value / tautology_score / dla_rank
+    are None for random), or None if not enough squares available.
     """
     available = [p for p in VALID_POSITIONS if p not in forbid_positions]
-    if not available:
+    if len(available) < n_squares:
         return None
-    pos = rng.choice(available)
-    return {
-        "target_board_pos": pos,
-        "target_square": board_pos_to_square(pos),
-        "dla_value": None,
-        "tautology_score": None,
-        "dla_rank": None,
-    }
+    rng.shuffle(available)
+    return [
+        {
+            "target_board_pos": pos,
+            "target_square": board_pos_to_square(pos),
+            "dla_value": None,
+            "tautology_score": None,
+            "dla_rank": None,
+        }
+        for pos in available[:n_squares]
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -266,17 +275,22 @@ def generate_frequency_matched_random(aligned_conditions, forbidden_squares,
 # ---------------------------------------------------------------------------
 
 def build_quadruple(neuron_info, state_dict, snapshots, legal_matrix,
-                    rng, tautology_threshold, n_random_attempts=50):
+                    rng, tautology_threshold, n_random_attempts=50,
+                    n_forbidden=1):
     """Construct all four arms for one neuron.
 
     Construction order (see module docstring) is strict: ant_aligned,
     cons_aligned, ant_random (with ant_aligned U cons_aligned forbidden),
     cons_random (with ant_aligned U ant_random U cons_aligned forbidden).
 
+    `n_forbidden` controls how many squares each restriction forbids when it
+    fires. Higher values make the task harder (more probability mass to
+    redistribute) and amplify the alignment signal.
+
     Returns a dict with keys:
         quadruple_id (str), source_neuron (str), layer (int), neuron (int),
         ant_aligned, ant_random,
-        cons_aligned, cons_random,
+        cons_aligned (list), cons_random (list),
         fire_rate_aligned (float), fire_rate_random (float),
         rule_str (str), influence_score, f1
     or None if any arm cannot be satisfied.
@@ -293,7 +307,7 @@ def build_quadruple(neuron_info, state_dict, snapshots, legal_matrix,
     cond_fires_A = _cond_fires_on_snapshots(ant_aligned, snapshots)
     fire_rate_aligned = float(cond_fires_A.sum() / len(snapshots))
 
-    # --- 2. Cons_aligned ---
+    # --- 2. Cons_aligned (list of n_forbidden targets) ---
     W_U = state_dict["head.weight"]
     W_out_col = state_dict[f"blocks.{layer}.mlp.2.weight"][:, neuron]
     dla = (W_U @ W_out_col)[1:].detach().numpy()  # [60]
@@ -302,12 +316,16 @@ def build_quadruple(neuron_info, state_dict, snapshots, legal_matrix,
         dla, cond_fires_A, legal_matrix,
         forbid_positions=S_A_positions,
         tautology_threshold=tautology_threshold,
+        n_squares=n_forbidden,
     )
     if cons_aligned is None:
-        return None  # no non-tautological DLA target exists
+        return None  # not enough non-tautological DLA targets
 
-    # --- 3. Ant_random (freq-matched; excludes S_A and cons_aligned square) ---
-    forbidden_ant_squares = set(S_A_squares) | {cons_aligned["target_square"]}
+    cons_aligned_positions = {t["target_board_pos"] for t in cons_aligned}
+    cons_aligned_squares = {t["target_square"] for t in cons_aligned}
+
+    # --- 3. Ant_random (freq-matched; excludes S_A and all cons_aligned squares) ---
+    forbidden_ant_squares = set(S_A_squares) | cons_aligned_squares
     ant_random, fire_rate_random = generate_frequency_matched_random(
         ant_aligned, forbidden_ant_squares, fire_rate_aligned,
         snapshots, rng, n_attempts=n_random_attempts,
@@ -317,13 +335,14 @@ def build_quadruple(neuron_info, state_dict, snapshots, legal_matrix,
 
     S_R_squares = {c["square"] for c in ant_random}
 
-    # --- 4. Cons_random (uniform; excludes S_A u S_R u cons_aligned) ---
+    # --- 4. Cons_random (n_forbidden uniform; excludes S_A u S_R u cons_aligned) ---
     forbidden_cons_positions = (
         S_A_positions
         | {square_to_board_pos(s) for s in S_R_squares}
-        | {cons_aligned["target_board_pos"]}
+        | cons_aligned_positions
     )
-    cons_random = choose_random_consequent(forbidden_cons_positions, rng)
+    cons_random = choose_random_consequent(forbidden_cons_positions, rng,
+                                           n_squares=n_forbidden)
     if cons_random is None:
         return None
 
@@ -369,6 +388,10 @@ def _restriction_for_arm(q, arm):
     else:
         raise ValueError(f"unknown arm: {arm}")
 
+    # cons is now a list of target dicts
+    forbidden_positions = [t["target_board_pos"] for t in cons]
+    forbidden_squares = [t["target_square"] for t in cons]
+
     return {
         "id": q["quadruple_id"],
         "quadruple_id": q["quadruple_id"],
@@ -377,16 +400,14 @@ def _restriction_for_arm(q, arm):
         "antecedent_kind": ant_kind,
         "consequent_kind": cons_kind,
         "conditions": ant,
-        # Legacy keys (kept for compatibility with generate_restricted_games.py
-        # and finetune_and_evaluate.py which read these directly):
-        "forbidden_position": cons["target_board_pos"],
-        "forbidden_square": cons["target_square"],
-        # New explicit keys:
-        "target_board_pos": cons["target_board_pos"],
-        "target_square": cons["target_square"],
-        "dla_value": cons["dla_value"],
-        "tautology_score": cons["tautology_score"],
-        "dla_rank": cons["dla_rank"],
+        # Multi-square forbidden set:
+        "forbidden_positions": forbidden_positions,
+        "forbidden_squares": forbidden_squares,
+        # Legacy single-square key (first target; for backward compat):
+        "forbidden_position": forbidden_positions[0],
+        "forbidden_square": forbidden_squares[0],
+        # Per-target details:
+        "targets": cons,
         "fire_rate": round(fire_rate, 4),
         "rule_str": q["rule_str"],
         "influence_score": q["influence_score"],
@@ -407,19 +428,23 @@ def verify_quadruple(q):
     """Assert all self-reference exclusions and structural invariants."""
     S_A = {c["square"] for c in q["ant_aligned"]}
     S_R = {c["square"] for c in q["ant_random"]}
-    c_aligned_sq = q["cons_aligned"]["target_square"]
-    c_random_sq = q["cons_random"]["target_square"]
+    # cons_aligned and cons_random are now lists of target dicts
+    C_A_sq = {t["target_square"] for t in q["cons_aligned"]}
+    C_R_sq = {t["target_square"] for t in q["cons_random"]}
 
-    assert c_aligned_sq not in S_A, (
-        f"{q['quadruple_id']}: cons_aligned {c_aligned_sq} in S_A {S_A}")
-    assert c_aligned_sq not in S_R, (
-        f"{q['quadruple_id']}: cons_aligned {c_aligned_sq} in S_R {S_R}")
-    assert c_random_sq not in S_A, (
-        f"{q['quadruple_id']}: cons_random {c_random_sq} in S_A {S_A}")
-    assert c_random_sq not in S_R, (
-        f"{q['quadruple_id']}: cons_random {c_random_sq} in S_R {S_R}")
-    assert c_aligned_sq != c_random_sq, (
-        f"{q['quadruple_id']}: cons_aligned == cons_random ({c_aligned_sq})")
+    for sq in C_A_sq:
+        assert sq not in S_A, (
+            f"{q['quadruple_id']}: cons_aligned {sq} in S_A {S_A}")
+        assert sq not in S_R, (
+            f"{q['quadruple_id']}: cons_aligned {sq} in S_R {S_R}")
+    for sq in C_R_sq:
+        assert sq not in S_A, (
+            f"{q['quadruple_id']}: cons_random {sq} in S_A {S_A}")
+        assert sq not in S_R, (
+            f"{q['quadruple_id']}: cons_random {sq} in S_R {S_R}")
+    assert C_A_sq.isdisjoint(C_R_sq), (
+        f"{q['quadruple_id']}: cons_aligned and cons_random overlap: "
+        f"{C_A_sq & C_R_sq}")
     assert len(q["ant_aligned"]) == len(q["ant_random"]), (
         f"{q['quadruple_id']}: antecedent length mismatch")
 
@@ -475,6 +500,10 @@ def main():
                              "this are skipped. Default: 0.85")
     parser.add_argument("--tautology-games", type=int, default=200,
                         help="Sample games for snapshot precomputation")
+    parser.add_argument("--n-forbidden-squares", type=int, default=1,
+                        help="Number of squares forbidden per restriction when "
+                             "it fires. Higher values make the task harder and "
+                             "amplify the alignment signal. Default: 1")
     parser.add_argument("--n-random-attempts", type=int, default=50,
                         help="Best-of-N for frequency-matched random antecedent")
     parser.add_argument("--max-firing-rate-diff", type=float, default=0.05,
@@ -533,6 +562,7 @@ def main():
             rng=random.Random(args.seed + info["layer"] * 10_000 + info["neuron"]),
             tautology_threshold=args.tautology_threshold,
             n_random_attempts=args.n_random_attempts,
+            n_forbidden=args.n_forbidden_squares,
         )
         if q is None:
             # Recompute causes to give useful diagnostics.
@@ -563,9 +593,10 @@ def main():
             sys.exit(2)
 
         diff = abs(q["fire_rate_aligned"] - q["fire_rate_random"])
-        print(f"  {q['source_neuron']:<10} target={q['cons_aligned']['target_square']} "
-              f"(rank {q['cons_aligned']['dla_rank']})  "
-              f"cons_rand={q['cons_random']['target_square']}  "
+        ca_sq = ",".join(t["target_square"] for t in q["cons_aligned"])
+        cr_sq = ",".join(t["target_square"] for t in q["cons_random"])
+        print(f"  {q['source_neuron']:<10} targets=[{ca_sq}]  "
+              f"rand=[{cr_sq}]  "
               f"fire_A={q['fire_rate_aligned']:.3f} fire_R={q['fire_rate_random']:.3f} "
               f"diff={diff:.3f}  rule: {q['rule_str']}")
         quadruples.append(q)
@@ -605,6 +636,7 @@ def main():
     meta = {
         "K_target": args.K,
         "K_actual": len(quadruples),
+        "n_forbidden_squares": args.n_forbidden_squares,
         "layers": layers,
         "min_conditions": args.min_conditions,
         "tautology_threshold": args.tautology_threshold,
@@ -651,10 +683,10 @@ def main():
                 "fire_rate_random": round(q["fire_rate_random"], 4),
                 "fire_rate_diff": round(
                     abs(q["fire_rate_aligned"] - q["fire_rate_random"]), 4),
-                "cons_aligned_square": q["cons_aligned"]["target_square"],
-                "cons_random_square": q["cons_random"]["target_square"],
-                "dla_rank": q["cons_aligned"]["dla_rank"],
-                "tautology_score": q["cons_aligned"]["tautology_score"],
+                "cons_aligned_squares": [t["target_square"] for t in q["cons_aligned"]],
+                "cons_random_squares": [t["target_square"] for t in q["cons_random"]],
+                "dla_ranks": [t["dla_rank"] for t in q["cons_aligned"]],
+                "tautology_scores": [t["tautology_score"] for t in q["cons_aligned"]],
                 "rule_str": q["rule_str"],
             }
             for q in quadruples

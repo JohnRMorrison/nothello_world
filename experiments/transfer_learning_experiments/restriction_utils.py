@@ -110,6 +110,18 @@ def evaluate_restriction(restriction, board, move_just_played, flipped_squares):
     return True
 
 
+def _get_forbidden_positions(restriction):
+    """Extract the set of forbidden board positions from a restriction.
+
+    Supports both multi-square (forbidden_positions: list) and legacy
+    single-square (forbidden_position: int) schemas.
+    """
+    fp = restriction.get("forbidden_positions")
+    if fp is not None:
+        return fp  # list of ints
+    return [restriction["forbidden_position"]]
+
+
 def apply_restrictions(standard_legal, restrictions, board,
                        move_just_played, flipped_squares):
     """Remove forbidden positions from the legal-move set.
@@ -120,7 +132,7 @@ def apply_restrictions(standard_legal, restrictions, board,
     forbidden = set()
     for r in restrictions:
         if evaluate_restriction(r, board, move_just_played, flipped_squares):
-            forbidden.add(r["forbidden_position"])
+            forbidden.update(_get_forbidden_positions(r))
 
     restricted = [m for m in standard_legal if m not in forbidden]
     return restricted if restricted else standard_legal
