@@ -130,14 +130,19 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
                 total += y.numel()
 
         acc = correct / total
-        best_acc = max(best_acc, acc)
+        if acc > best_acc:
+            best_acc = acc
+            best_probe_state = {
+                'even': {k: v.cpu().clone() for k, v in probe_even.state_dict().items()},
+                'odd': {k: v.cpu().clone() for k, v in probe_odd.state_dict().items()},
+            }
         scheduler.step(epoch_loss / max(epoch_batches, 1))
         cur_lr = optimizer.param_groups[0]['lr']
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f"  Probe epoch {epoch}: acc={acc:.4%}  loss={avg_loss:.5f}  lr={cur_lr:.2e}",
               flush=True)
 
-    return best_acc
+    return best_acc, best_probe_state
 
 
 if __name__ == "__main__":
@@ -186,9 +191,22 @@ if __name__ == "__main__":
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
 
-    best_acc = train_probe(
+    best_acc, best_probe_state = train_probe(
         chunk_dir, device, model_even, model_odd, args.mode,
         feature_cols, args.hidden, epochs=args.epochs)
+
+    # Save probe weights
+    save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
+    probe_path = os.path.join(save_dir, f"probe_{args.mode}_H{args.hidden}.pt")
+    torch.save({
+        'even': best_probe_state['even'],
+        'odd': best_probe_state['odd'],
+        'hidden_dim': args.hidden,
+        'best_acc': best_acc,
+        'mode': args.mode,
+    }, probe_path)
+    print(f"Saved probe to {probe_path}")
 
     print(f"\n{'='*60}")
     print(f"Mode: {args.mode}, H={args.hidden}")
