@@ -1,10 +1,11 @@
 #!/bin/bash
 # Train pattern detectors — simple version.
 #
-# 6 jobs (sbatch --array=0-5):
-#   0: direct    H=512     3: emergent H=512
-#   1: direct    H=1024    4: emergent H=1024
-#   2: e2e       H=512     5: e2e      H=1024
+# 8 jobs (sbatch --array=0-7):
+#   0: direct    H=512     4: emergent H=1024
+#   1: direct    H=1024    5: e2e      H=512
+#   2: emergent  H=512     6: e2e      H=1024
+#   3: two-stage H=512     7: two-stage H=1024
 #
 # Usage:
 #   sbatch --array=0-5 --time=12:00:00 train_pattern_simple.sh
@@ -29,12 +30,14 @@ cd $SLURM_SUBMIT_DIR
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
 case $TASK in
-    0) MODE="direct";   HIDDEN=512  ;;
-    1) MODE="direct";   HIDDEN=1024 ;;
-    2) MODE="e2e";      HIDDEN=512  ;;
-    3) MODE="emergent"; HIDDEN=512  ;;
-    4) MODE="emergent"; HIDDEN=1024 ;;
-    5) MODE="e2e";      HIDDEN=1024 ;;
+    0) MODE="direct";    HIDDEN=512  ;;
+    1) MODE="direct";    HIDDEN=1024 ;;
+    2) MODE="emergent";  HIDDEN=512  ;;
+    3) MODE="two-stage"; HIDDEN=512  ;;
+    4) MODE="emergent";  HIDDEN=1024 ;;
+    5) MODE="e2e";       HIDDEN=512  ;;
+    6) MODE="e2e";       HIDDEN=1024 ;;
+    7) MODE="two-stage"; HIDDEN=1024 ;;
 esac
 
 echo "============================================"

@@ -110,6 +110,78 @@ class EndToEndMLP(nn.Module):
         return pat_logits, board_logits
 
 
+class TwoStageMLP(nn.Module):
+    """Frozen MLP → hard 192-d encoding → trainable Linear(192, 960).
+
+    The MLP predicts board state (64×3), argmax gives class per cell,
+    converted to 192-d one-hot (empty/mine/opponent), then a linear
+    detector layer maps to 960 pattern logits.
+    """
+    def __init__(self, input_dim, hidden_dim, n_patterns=960):
+        super().__init__()
+        # Board state MLP (will be frozen after loading checkpoint)
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, 64 * 3))
+        self.detectors = nn.Linear(192, n_patterns)
+
+    def forward(self, x, positions):
+        # Frozen MLP → hard board state → 192-d encoding → detectors
+        with torch.no_grad():
+            board_logits = self.backbone(x).view(-1, 64, 3)
+            pred_classes = board_logits.argmax(dim=-1)  # (N, 64)
+
+        # Build 192-d hard encoding on device
+        device = x.device
+        if positions.device != device:
+            positions = positions.to(device)
+        n = len(x)
+        enc = torch.zeros(n, 192, dtype=torch.float32, device=device)
+        is_black = (positions % 2 == 1).bool()
+
+        enc[:, 0::3] = (pred_classes == 0).float()  # empty
+        if is_black.any():
+            i = is_black.nonzero(as_tuple=True)[0]
+            enc[i, 1::3] = (pred_classes[i] == 2).float()  # mine = black
+            enc[i, 2::3] = (pred_classes[i] == 1).float()  # opp = white
+        wh = (~is_black)
+        if wh.any():
+            i = wh.nonzero(as_tuple=True)[0]
+            enc[i, 1::3] = (pred_classes[i] == 1).float()
+            enc[i, 2::3] = (pred_classes[i] == 2).float()
+
+        pat_logits = self.detectors(enc)
+        return pat_logits, board_logits
+
+    def freeze_backbone(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+
+
+def load_mlp_checkpoint(model, ckpt_path, device):
+    """Load backbone weights from a stage-1 MLP checkpoint."""
+    ckpt = torch.load(ckpt_path, map_location=device)
+    # The checkpoint has 'even'/'odd' state dicts from BoardStateMLP
+    # which is nn.Sequential(Linear, ReLU, Linear) inside .net
+    # Our backbone is also nn.Sequential(Linear, ReLU, Linear)
+    # Need to map: ckpt['net.0.weight'] → backbone['0.weight'] etc.
+    state = ckpt if 'net.0.weight' in ckpt else None
+    if state is None:
+        # Try unwrapping from BoardStateMLP format
+        for key_prefix in ['', 'net.']:
+            mapped = {}
+            for k, v in ckpt.items():
+                if k.startswith(key_prefix):
+                    mapped[k[len(key_prefix):]] = v
+            if '0.weight' in mapped:
+                state = mapped
+                break
+    if state is not None:
+        model.backbone.load_state_dict(state)
+    else:
+        raise ValueError(f"Cannot load backbone from {ckpt_path}: keys={list(ckpt.keys())}")
+
+
 # ---------------------------------------------------------------------------
 # Training (mirrors _train_random_proj_streaming exactly)
 # ---------------------------------------------------------------------------
@@ -117,7 +189,7 @@ class EndToEndMLP(nn.Module):
 def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
-          save_path=None):
+          save_path=None, mlp_ckpt_dir=None):
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
@@ -136,12 +208,32 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     if mode == "direct":
         model_even = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
-    else:
+    elif mode == "two-stage":
+        model_even = TwoStageMLP(input_dim, hidden_dim, n_patterns).to(device)
+        model_odd = TwoStageMLP(input_dim, hidden_dim, n_patterns).to(device)
+        # Load frozen MLP backbones from stage-1 checkpoints
+        if mlp_ckpt_dir is None:
+            mlp_ckpt_dir = os.path.join(os.path.dirname(save_path))
+        even_ckpt = os.path.join(mlp_ckpt_dir, f"mlp_stage1_H{hidden_dim}.pt")
+        if os.path.exists(even_ckpt):
+            ckpt = torch.load(even_ckpt, map_location=device)
+            model_even.backbone.load_state_dict(
+                {k.replace("net.", ""): v for k, v in ckpt['even'].items()})
+            model_odd.backbone.load_state_dict(
+                {k.replace("net.", ""): v for k, v in ckpt['odd'].items()})
+            print(f"  Loaded MLP backbone from {even_ckpt} (acc={ckpt['best_acc']:.4%})")
+        else:
+            print(f"  WARNING: no MLP checkpoint at {even_ckpt}, using random backbone")
+        model_even.freeze_backbone()
+        model_odd.freeze_backbone()
+    else:  # e2e or emergent
         model_even = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
 
-    optimizer = torch.optim.Adam(
-        list(model_even.parameters()) + list(model_odd.parameters()), lr=lr)
+    # Only optimize trainable parameters
+    trainable = [p for p in list(model_even.parameters()) + list(model_odd.parameters())
+                 if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable, lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
@@ -296,7 +388,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", required=True, choices=["direct", "emergent", "e2e"])
+    parser.add_argument("--mode", required=True,
+                        choices=["direct", "emergent", "e2e", "two-stage"])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--output-dir",
@@ -321,4 +414,4 @@ if __name__ == "__main__":
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=board_loss_weight, epochs=args.epochs,
-          save_path=save_path)
+          save_path=save_path, mlp_ckpt_dir=save_dir)
