@@ -38,7 +38,7 @@ K="${K:-20}"
 MIN_CONDITIONS="${MIN_CONDITIONS:-2}"
 TAUTOLOGY_THRESHOLD="${TAUTOLOGY_THRESHOLD:-0.85}"
 MAX_FIRING_RATE_DIFF="${MAX_FIRING_RATE_DIFF:-0.05}"
-N_FORBIDDEN="${N_FORBIDDEN:-5}"
+N_FORBIDDEN="${N_FORBIDDEN:-10}"
 
 N_RUNS="${N_RUNS:-3}"
 NUM_GAMES="${NUM_GAMES:-500000}"
@@ -49,6 +49,8 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-3e-4}"
 LR_SCRATCH="${LR_SCRATCH:-5e-4}"
 EVAL_EVERY="${EVAL_EVERY:-50}"
+EVAL_EVERY_EARLY="${EVAL_EVERY_EARLY:-5}"
+EVAL_EARLY_UNTIL="${EVAL_EARLY_UNTIL:-200}"
 
 # ---- Resolve base directory --------------------------------------------
 if [[ -n "${RESUME:-}" ]]; then
@@ -146,6 +148,8 @@ for C in B1 B2 B3 C; do
             --lr "${LR}" \
             --lr-scratch "${LR_SCRATCH}" \
             --eval-every "${EVAL_EVERY}" \
+            --eval-every-early "${EVAL_EVERY_EARLY}" \
+            --eval-early-until "${EVAL_EARLY_UNTIL}" \
             --output-dir "${RESULTS_DIR}"
     done
 done

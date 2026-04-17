@@ -564,7 +564,52 @@ partial or ablated variant.
 
 ---
 
-## 10. References
+## 10. Zero-shot evaluation
+
+The strongest result from early experiments is that the pretrained model
+already shows differential performance at **step 0** — before any fine-tuning.
+Aligned-consequent conditions (B₁, B₃) have lower `violation_rate_when_fires`
+than random-consequent conditions (B₂, C), meaning the model already partially
+avoids its own DLA-promoted squares when the heuristic conditions hold.
+
+This is measured by `zero_shot_eval.py`:
+
+```bash
+python zero_shot_eval.py \
+    --configs-dir runs/2x2_run1/configs/ \
+    --eval-games 1000 --seeds 10 \
+    --output zero_shot_results.json
+```
+
+No game data needed — the script loads the pretrained model, generates
+standard Othello games on the fly, and evaluates against each arm's
+restrictions. Multiple seeds (different eval game sets) give mean ± SEM
+for all metrics.
+
+**Interpretation:** if `violation_rate_when_fires` for B₁/B₃ is significantly
+lower than for B₂/C, the pretrained model's DLA circuitry is causally aligned
+with the restriction conditions. This is the cleanest version of the causal
+claim — no training confound, no LR sensitivity, no convergence issues.
+
+## 10a. Fine-grained early dynamics
+
+The `--eval-every-early` flag captures the first ~200 steps at high resolution
+(every 5 steps by default) to trace the convergence curves. This shows whether
+B₁ recovers from its initial violation rate faster than C.
+
+```bash
+# In run_2x2.sh, controlled by:
+EVAL_EVERY_EARLY=5      # eval every 5 steps for the first ...
+EVAL_EARLY_UNTIL=200    # ... 200 steps, then switch to EVAL_EVERY
+```
+
+After step 200 the eval schedule reverts to `--eval-every` (default 50).
+Result JSONs will contain dense eval points at steps 5, 10, 15, ..., 200,
+then 250, 300, ..., 5000.
+
+---
+
+## 11. References
 
 - Li et al. (2023), *Emergent World Representations: Exploring a Sequence
   Model Trained on a Synthetic Task*, ICLR.

@@ -256,8 +256,15 @@ def run_single(
         "step": 0, "train_loss": None,
         **{k: round(v, 6) if isinstance(v, float) else v for k, v in metrics.items()},
     }]
+    vf0 = metrics.get('violation_rate_when_fires')
+    vf0_str = f"  viol_fires={vf0:.4f}" if vf0 is not None else ""
+    tf0 = metrics.get('top1_legal_when_fires')
+    tf0_str = f"  top1_fires={tf0:.4f}" if tf0 is not None else ""
+    fr0 = metrics.get('fire_rate')
+    fr0_str = f"  fire_rate={fr0:.4f}" if fr0 is not None else ""
     print(f"  Step 0: top1_legal={metrics['top1_legal']:.4f}  "
-          f"legal_mass={metrics['legal_mass']:.4f}", flush=True)
+          f"legal_mass={metrics['legal_mass']:.4f}"
+          f"{tf0_str}{vf0_str}{fr0_str}", flush=True)
 
     # --- Training ---
     global_step = 0
@@ -283,8 +290,11 @@ def run_single(
             pbar.update(1)
 
             # --- Periodic eval ---
-            if global_step % args.eval_every == 0:
-                avg_loss = np.mean(recent_losses[-args.eval_every:])
+            early_phase = (args.eval_every_early is not None
+                           and global_step <= args.eval_early_until)
+            eval_interval = args.eval_every_early if early_phase else args.eval_every
+            if global_step % eval_interval == 0:
+                avg_loss = np.mean(recent_losses[-eval_interval:])
                 metrics = evaluate(
                     model, eval_games, restrictions, stoi, itos, device,
                     max_games=args.eval_games,
@@ -297,9 +307,13 @@ def run_single(
                 }
                 curve.append(entry)
 
+                vf = metrics.get('violation_rate_when_fires')
+                vf_str = f"{vf:.3f}" if vf is not None else "n/a"
+                tf = metrics.get('top1_legal_when_fires')
+                tf_str = f"{tf:.3f}" if tf is not None else "n/a"
                 pbar.set_postfix_str(
                     f"loss={avg_loss:.3f} top1={metrics['top1_legal']:.3f} "
-                    f"mass={metrics['legal_mass']:.3f}")
+                    f"top1_fires={tf_str} viol_fires={vf_str}")
 
             if global_step >= args.max_steps:
                 break
@@ -370,6 +384,12 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--eval-every", type=int, default=50,
                         help="Evaluate every N training steps")
+    parser.add_argument("--eval-every-early", type=int, default=None,
+                        help="Eval every N steps during early training "
+                             "(before --eval-early-until). Default: disabled")
+    parser.add_argument("--eval-early-until", type=int, default=200,
+                        help="Step at which to switch from --eval-every-early "
+                             "back to --eval-every. Default: 200")
     parser.add_argument("--eval-games", type=int, default=200,
                         help="Number of standard-Othello games for evaluation")
     parser.add_argument("--num-workers", type=int, default=4)
