@@ -12,7 +12,7 @@
 
 #SBATCH --job-name=probe
 #SBATCH -c 4
-#SBATCH --time=2:00:00
+#SBATCH --time=8:00:00
 #SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/probe_%A_%a.out
