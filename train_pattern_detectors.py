@@ -98,6 +98,29 @@ def _cgroup_anon_gb():
             pass
     return -1.0
 
+
+def _cgroup_stat_dump():
+    """Return key memory.stat fields as a dict in GB for debugging."""
+    if _CGROUP_PATH is None:
+        return {}
+    keys_of_interest = ("rss", "anon", "cache", "file", "shmem",
+                        "mapped_file", "kernel", "kernel_stack", "slab",
+                        "inactive_anon", "active_anon",
+                        "inactive_file", "active_file", "unevictable")
+    out = {}
+    try:
+        with open(os.path.join(_CGROUP_PATH, "memory.stat")) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in keys_of_interest:
+                    try:
+                        out[parts[0]] = int(parts[1]) / 1e9
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return out
+
 # Try to release memory back to OS (glibc only) — Python's gc.collect()
 # reclaims references but doesn't shrink the allocator arena.
 try:
@@ -149,7 +172,6 @@ def _load_features_when60(chunk_path, feature_cols=None):
     """
     when60_path = chunk_path.replace(".npz", "_when60.npz")
     if os.path.exists(when60_path):
-        # Use `with` to ensure NpzFile is closed and file handles released
         with np.load(when60_path) as data:
             X = torch.from_numpy(data['features'].astype(np.float32))
             Y = torch.from_numpy(data['labels'].astype(np.int64))
@@ -670,10 +692,11 @@ def train_two_stage(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
+                stat = _cgroup_stat_dump()
+                stat_s = " ".join(f"{k}={v:.1f}" for k, v in stat.items()) if stat else ""
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
-                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
-                      f"anon={_cgroup_anon_gb():.1f} GB  "
-                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
+                      f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
+                      flush=True)
 
         # Eval
         detectors.eval()
@@ -874,10 +897,11 @@ def train_end_to_end(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
+                stat = _cgroup_stat_dump()
+                stat_s = " ".join(f"{k}={v:.1f}" for k, v in stat.items()) if stat else ""
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
-                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
-                      f"anon={_cgroup_anon_gb():.1f} GB  "
-                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
+                      f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
+                      flush=True)
 
         # Eval
         model_even.eval(); model_odd.eval()
@@ -1064,10 +1088,11 @@ def train_direct(chunk_dir, device, input_dim, hidden_dim, patterns,
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             if ci % 10 == 0:
+                stat = _cgroup_stat_dump()
+                stat_s = " ".join(f"{k}={v:.1f}" for k, v in stat.items()) if stat else ""
                 print(f"    [chunk {ci}] rss={_mem_gb():.1f} GB  "
-                      f"cgroup={_cgroup_mem_gb():.1f} GB  "
-                      f"anon={_cgroup_anon_gb():.1f} GB  "
-                      f"cache={_cgroup_cache_gb():.1f} GB", flush=True)
+                      f"cgroup={_cgroup_mem_gb():.1f} GB | {stat_s}",
+                      flush=True)
 
         # Eval
         mlp_even.eval(); mlp_odd.eval()
