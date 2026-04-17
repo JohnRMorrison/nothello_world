@@ -207,9 +207,9 @@ def run_single(
     """Execute one full training run. Returns the learning curve."""
     seed = args.seed + run_idx
     set_seed(seed)
-    print(f"\n{'='*60}")
-    print(f"  Run {run_idx + 1}/{args.runs}  (seed={seed})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"  Run {run_idx + 1}/{args.runs}  (seed={seed})", flush=True)
+    print(f"{'='*60}", flush=True)
 
     # --- Dataset ---
     dataset = CharDataset(train_games)
@@ -239,8 +239,11 @@ def run_single(
     )
 
     # --- DataLoader ---
+    # pin_memory only helps (and is only supported) on CUDA. MPS uses unified
+    # memory so pinning is meaningless; CPU doesn't benefit either.
+    pin_memory = str(device).startswith("cuda")
     loader = DataLoader(
-        dataset, shuffle=True, pin_memory=True,
+        dataset, shuffle=True, pin_memory=pin_memory,
         batch_size=args.batch_size, num_workers=args.num_workers,
     )
 
@@ -254,13 +257,15 @@ def run_single(
         **{k: round(v, 6) if isinstance(v, float) else v for k, v in metrics.items()},
     }]
     print(f"  Step 0: top1_legal={metrics['top1_legal']:.4f}  "
-          f"legal_mass={metrics['legal_mass']:.4f}")
+          f"legal_mass={metrics['legal_mass']:.4f}", flush=True)
 
     # --- Training ---
     global_step = 0
     recent_losses = []
     t0 = time.time()
 
+    pbar = tqdm(total=args.max_steps, desc=f"  Run {run_idx+1}/{args.runs}",
+                unit="step", dynamic_ncols=True)
     for epoch in range(args.epochs):
         model.train()
         for x, y in loader:
@@ -275,6 +280,7 @@ def run_single(
 
             global_step += 1
             recent_losses.append(loss.item())
+            pbar.update(1)
 
             # --- Periodic eval ---
             if global_step % args.eval_every == 0:
@@ -291,16 +297,15 @@ def run_single(
                 }
                 curve.append(entry)
 
-                elapsed = time.time() - t0
-                print(f"  Step {global_step}: loss={avg_loss:.4f}  "
-                      f"top1_legal={metrics['top1_legal']:.4f}  "
-                      f"legal_mass={metrics['legal_mass']:.4f}  "
-                      f"({elapsed:.0f}s)")
+                pbar.set_postfix_str(
+                    f"loss={avg_loss:.3f} top1={metrics['top1_legal']:.3f} "
+                    f"mass={metrics['legal_mass']:.3f}")
 
             if global_step >= args.max_steps:
                 break
         if global_step >= args.max_steps:
             break
+    pbar.close()
 
     # --- Final eval ---
     if global_step % args.eval_every != 0:
@@ -379,7 +384,7 @@ def main():
         device = "mps"
     else:
         device = "cpu"
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -387,20 +392,21 @@ def main():
     with open(args.config) as f:
         config = json.load(f)
     restrictions = config["restrictions"]
-    print(f"Loaded {len(restrictions)} restrictions from {args.config}")
+    print(f"Loaded {len(restrictions)} restrictions from {args.config}", flush=True)
 
     # --- Load training games ---
-    print(f"\nLoading training games from {args.games_dir}...")
+    print(f"\nLoading training games from {args.games_dir}...", flush=True)
     train_games = load_games_from_dir(args.games_dir)
     train_games = [g for g in train_games if len(g) >= 5]
-    print(f"Training games: {len(train_games)}")
+    print(f"Training games: {len(train_games)}", flush=True)
 
     # --- Generate eval games (standard Othello, fixed across runs) ---
-    print(f"\nGenerating {args.eval_games} standard Othello games for evaluation...")
+    print(f"\nGenerating {args.eval_games} standard Othello games for evaluation...",
+          flush=True)
     set_seed(0)  # fixed seed for eval games
     eval_games = [get_ood_game(i) for i in range(args.eval_games)]
     print(f"Eval games: {len(eval_games)}, "
-          f"avg length: {np.mean([len(g) for g in eval_games]):.1f}")
+          f"avg length: {np.mean([len(g) for g in eval_games]):.1f}", flush=True)
 
     # --- Load pre-trained weights (only for ft; scratch/rnd skip) ---
     pretrained_sd = None
@@ -408,7 +414,7 @@ def main():
         ckpt_path = args.ckpt
         if not os.path.isabs(ckpt_path):
             ckpt_path = os.path.join(os.path.dirname(__file__), ckpt_path)
-        print(f"\nLoading pre-trained checkpoint: {ckpt_path}")
+        print(f"\nLoading pre-trained checkpoint: {ckpt_path}", flush=True)
         pretrained_sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)
 
     # --- Run experiments ---
@@ -450,18 +456,19 @@ def main():
     out_path = os.path.join(args.output_dir, fname)
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
-    print(f"\nSaved results to {out_path}")
+    print(f"\nSaved results to {out_path}", flush=True)
 
     # --- Print summary ---
-    print(f"\n{'='*60}")
-    print(f"Summary: {args.label} ({args.mode})")
-    print(f"{'='*60}")
+    print(f"\n{'='*60}", flush=True)
+    print(f"Summary: {args.label} ({args.mode})", flush=True)
+    print(f"{'='*60}", flush=True)
     for run_key, curve in all_curves.items():
         first = curve[0]
         last = curve[-1]
         print(f"  {run_key}: step 0 top1_legal={first['top1_legal']:.4f} "
               f"-> step {last['step']} top1_legal={last['top1_legal']:.4f}  "
-              f"legal_mass: {first['legal_mass']:.4f} -> {last['legal_mass']:.4f}")
+              f"legal_mass: {first['legal_mass']:.4f} -> {last['legal_mass']:.4f}",
+              flush=True)
 
 
 if __name__ == "__main__":

@@ -140,7 +140,23 @@ cython_debug/
 # customized for files too large to get onto github
 data/othello_synthetic
 data/othello_championship
+data/quadrant_restricted_synthetic
+data/restricted_aligned
 ckpts/*
 
 experiments/mathematical_transformation_experiments/ckpts/*
 experiments/mathematical_transformation_experiments/generated_labels/*
+
+# Transfer learning experiment run outputs (data/figures/results per run)
+experiments/transfer_learning_experiments/runs/
+
+# Extracted rule JSONs (generated outputs; keep only already-tracked ones)
+experiments/reverse_engineering_experiments/rules_*.json
+!experiments/reverse_engineering_experiments/rules_050_2000_5.json
+!experiments/reverse_engineering_experiments/rules_060_2000_2-6.json
+
+# macOS
+.DS_Store
+
+# JetBrains IDE
+.idea/

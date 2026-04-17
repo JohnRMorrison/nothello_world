@@ -2,19 +2,31 @@
 # Orchestrate the full 2x2 factorial transfer learning experiment.
 #
 # Pipeline:
-#   1. build_restriction_configs.py      -> configs/2x2_TIMESTAMP/{B1,B2,B3,C}.json
-#   2. generate_restricted_games.py x4   -> data/2x2_TIMESTAMP/{B1,B2,B3,C}/
+#   1. build_restriction_configs.py      -> configs/{B1,B2,B3,C}.json
+#   2. generate_restricted_games.py x4   -> data/{B1,B2,B3,C}/
 #   3. finetune_and_evaluate.py x8 sweeps x N_RUNS seeds
-#                                         -> results/2x2_TIMESTAMP/
-#   4. plot_transfer_curves.py            -> figures/2x2_TIMESTAMP/
+#                                         -> results/
+#   4. plot_transfer_curves.py            -> figures/
+#
+# Modes:
+#   Fresh run (default):   bash run_2x2.sh
+#   Resume a partial run:  RESUME=runs/2x2_20260415_160147 bash run_2x2.sh
+#
+# When resuming, the script detects what's already completed and skips it:
+#   - Configs:  skipped if configs/{B1,B2,B3,C}.json all exist
+#   - Games:    skipped per-condition if data/{C}/*.pickle files exist
+#   - Training: skipped per-sweep if results/curves_{C}_{MODE}_*.json exists
+#   - Plotting: always re-run (fast, uses whatever results exist)
 #
 # Environment overrides (all optional):
+#   RESUME (path to existing run dir — enables resume mode)
 #   RULES_FILE, CKPT, LAYERS, K, N_RUNS, NUM_GAMES,
 #   MAX_STEPS, EVAL_GAMES, BATCH_SIZE, LR, LR_SCRATCH,
 #   MIN_CONDITIONS, TAUTOLOGY_THRESHOLD, MAX_FIRING_RATE_DIFF,
-#   OUTPUT_ROOT (parent dir for configs/data/results/figures)
+#   OUTPUT_ROOT (parent dir for configs/data/results/figures; ignored if RESUME set)
 
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 
 cd "$(dirname "$0")"
 
@@ -37,9 +49,20 @@ LR="${LR:-3e-4}"
 LR_SCRATCH="${LR_SCRATCH:-5e-4}"
 EVAL_EVERY="${EVAL_EVERY:-50}"
 
-STAMP="$(date +%Y%m%d_%H%M%S)"
-OUTPUT_ROOT="${OUTPUT_ROOT:-runs}"
-BASE="${OUTPUT_ROOT}/2x2_${STAMP}"
+# ---- Resolve base directory --------------------------------------------
+if [[ -n "${RESUME:-}" ]]; then
+    BASE="${RESUME}"
+    if [[ ! -d "${BASE}" ]]; then
+        echo "ERROR: resume directory does not exist: ${BASE}"
+        exit 1
+    fi
+    echo "RESUMING from: ${BASE}"
+else
+    STAMP="$(date +%Y%m%d_%H%M%S)"
+    OUTPUT_ROOT="${OUTPUT_ROOT:-runs}"
+    BASE="${OUTPUT_ROOT}/2x2_${STAMP}"
+fi
+
 CONFIGS_DIR="${BASE}/configs"
 DATA_DIR="${BASE}/data"
 RESULTS_DIR="${BASE}/results"
@@ -55,27 +78,42 @@ echo "  max_steps=${MAX_STEPS}  num_games=${NUM_GAMES}"
 echo "=============================================================="
 
 # ---- 1. Build configs --------------------------------------------------
-echo
-echo "[1/4] Building restriction configs..."
-python build_restriction_configs.py \
-    --rules "${RULES_FILE}" \
-    --ckpt "${CKPT}" \
-    --layers "${LAYERS}" \
-    --K "${K}" \
-    --min-conditions "${MIN_CONDITIONS}" \
-    --tautology-threshold "${TAUTOLOGY_THRESHOLD}" \
-    --max-firing-rate-diff "${MAX_FIRING_RATE_DIFF}" \
-    --output-dir "${CONFIGS_DIR}"
+CONFIGS_EXIST=true
+for C in B1 B2 B3 C; do
+    [[ -f "${CONFIGS_DIR}/${C}.json" ]] || CONFIGS_EXIST=false
+done
+
+if $CONFIGS_EXIST; then
+    echo
+    echo "[1/4] Configs already exist — skipping."
+else
+    echo
+    echo "[1/4] Building restriction configs..."
+    python build_restriction_configs.py \
+        --rules "${RULES_FILE}" \
+        --ckpt "${CKPT}" \
+        --layers "${LAYERS}" \
+        --K "${K}" \
+        --min-conditions "${MIN_CONDITIONS}" \
+        --tautology-threshold "${TAUTOLOGY_THRESHOLD}" \
+        --max-firing-rate-diff "${MAX_FIRING_RATE_DIFF}" \
+        --output-dir "${CONFIGS_DIR}"
+fi
 
 # ---- 2. Generate restricted games (4 conditions) ----------------------
 echo
 echo "[2/4] Generating restricted games..."
 for C in B1 B2 B3 C; do
-    echo "  -> condition ${C}"
-    python generate_restricted_games.py \
-        --config "${CONFIGS_DIR}/${C}.json" \
-        --output-dir "${DATA_DIR}/${C}" \
-        --num-games "${NUM_GAMES}"
+    PICKLE_COUNT=$(find "${DATA_DIR}/${C}" -name '*.pickle' 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    if [[ "${PICKLE_COUNT}" -gt 0 ]]; then
+        echo "  -> condition ${C}: ${PICKLE_COUNT} pickle files found — skipping."
+    else
+        echo "  -> condition ${C}: generating..."
+        python generate_restricted_games.py \
+            --config "${CONFIGS_DIR}/${C}.json" \
+            --output-dir "${DATA_DIR}/${C}" \
+            --num-games "${NUM_GAMES}"
+    fi
 done
 
 # ---- 3. Finetune + evaluate (4 conditions x {ft, scratch} x N_RUNS) ---
@@ -84,7 +122,14 @@ echo "[3/4] Finetuning (${N_RUNS} seeds per sweep, 8 sweeps)..."
 for C in B1 B2 B3 C; do
     for MODE in ft scratch; do
         LABEL="${C}_${MODE}"
-        echo "  -> ${LABEL}"
+        # Check if results already exist for this sweep.
+        RESULT_PATTERN="${RESULTS_DIR}/curves_${C}_${MODE}_*.json"
+        EXISTING=$(ls ${RESULT_PATTERN} 2>/dev/null | head -1 || true)
+        if [[ -n "${EXISTING}" ]]; then
+            echo "  -> ${LABEL}: results found ($(basename "${EXISTING}")) — skipping."
+            continue
+        fi
+        echo "  -> ${LABEL}: training..."
         python finetune_and_evaluate.py \
             --games-dir "${DATA_DIR}/${C}" \
             --config "${CONFIGS_DIR}/${C}.json" \
