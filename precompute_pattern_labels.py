@@ -67,7 +67,7 @@ if __name__ == "__main__":
     print(f"Patterns: {len(patterns)}")
 
     chunk_files = sorted(f for f in os.listdir(args.chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f)
+                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
     print(f"Found {len(chunk_files)} feature chunks in {args.chunk_dir}")
 
     if args.chunk_id is not None:
