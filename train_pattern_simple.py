@@ -170,7 +170,7 @@ def _strip_prefix(d, prefix):
 def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
-          save_path=None, mlp_ckpt_dir=None):
+          save_path=None, mlp_ckpt_dir=None, seed=0):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -187,7 +187,26 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           f"input={input_dim}, {epochs} epochs, board_loss_weight={board_loss_weight}")
 
     # Build even/odd models
-    if mode == "direct":
+    if mode == "randproj":
+        # Frozen random first layer + trained output (same for even/odd)
+        import math
+        torch.manual_seed(seed)
+        proj_W = torch.randn(input_dim, hidden_dim, device=device) * math.sqrt(2.0 / input_dim)
+        # Build DirectMLP then replace first layer with frozen random projection
+        model_even = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
+        model_odd = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
+        with torch.no_grad():
+            model_even.net[0].weight.copy_(proj_W.T)
+            model_even.net[0].bias.zero_()
+            model_odd.net[0].weight.copy_(proj_W.T)
+            model_odd.net[0].bias.zero_()
+        # Freeze first layer
+        model_even.net[0].weight.requires_grad = False
+        model_even.net[0].bias.requires_grad = False
+        model_odd.net[0].weight.requires_grad = False
+        model_odd.net[0].bias.requires_grad = False
+        print(f"  Random projection: seed={seed}, H={hidden_dim}")
+    elif mode == "direct":
         model_even = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
     elif mode == "two-stage":
@@ -262,7 +281,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 y_pat = torch.from_numpy(y_pat_np).to(device)
 
                 loss = torch.tensor(0.0, device=device)
-                if mode == "direct":
+                if mode in ("direct", "randproj"):
                     if even_mask.any():
                         logits = model_even(x[even_mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
@@ -311,7 +330,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
                 y_pat = torch.from_numpy(y_pat_np).to(device)
 
-                if mode == "direct":
+                if mode in ("direct", "randproj"):
                     preds = torch.zeros_like(y_pat)
                     if even_mask.any():
                         preds[even_mask] = (model_even(x[even_mask]) > 0).float()
@@ -372,9 +391,11 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", required=True,
-                        choices=["direct", "emergent", "e2e", "two-stage"])
+                        choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed for random projection initialization")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -393,8 +414,12 @@ if __name__ == "__main__":
     save_path = os.path.join(save_dir, f"pattern_simple_{args.mode}_H{args.hidden}.pt")
 
     board_loss_weight = 0.5 if args.mode == "e2e" else 0.0
+    if args.mode == "randproj":
+        save_path = os.path.join(save_dir,
+            f"pattern_simple_randproj_s{args.seed}_H{args.hidden}.pt")
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=board_loss_weight, epochs=args.epochs,
-          save_path=save_path, mlp_ckpt_dir=save_dir)
+          save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed)
+
