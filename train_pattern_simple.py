@@ -170,7 +170,8 @@ def _strip_prefix(d, prefix):
 def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
-          save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None):
+          save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
+          proj_scale=0.183, proj_half_normal=False):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -197,7 +198,9 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         # Frozen random first layer + trained output (same for even/odd)
         import math
         torch.manual_seed(seed)
-        proj_W = torch.randn(input_dim, hidden_dim, device=device) * math.sqrt(2.0 / input_dim)
+        proj_W = torch.randn(input_dim, hidden_dim, device=device) * proj_scale
+        if proj_half_normal:
+            proj_W = proj_W.abs()  # fold to positive half
         # Build DirectMLP then replace first layer with frozen random projection
         model_even = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
@@ -211,7 +214,9 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         model_even.net[0].bias.requires_grad = False
         model_odd.net[0].weight.requires_grad = False
         model_odd.net[0].bias.requires_grad = False
-        print(f"  Random projection: seed={seed}, H={hidden_dim}")
+        dist_str = "half-normal" if proj_half_normal else "normal"
+        print(f"  Random projection: seed={seed}, H={hidden_dim}, "
+              f"dist={dist_str}, scale={proj_scale:.3f}")
     elif mode == "direct":
         model_even = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
@@ -413,6 +418,10 @@ if __name__ == "__main__":
                         help="Random seed for random projection initialization")
     parser.add_argument("--pos-weight", type=float, default=None,
                         help="Upweight positive class in BCE loss (e.g. 50 for ~1.35%% firing rate)")
+    parser.add_argument("--proj-scale", type=float, default=0.183,
+                        help="Std dev for random projection weights (default: Kaiming sqrt(2/60))")
+    parser.add_argument("--proj-half-normal", action="store_true",
+                        help="Use positive-only (half-normal) weights for random projection")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -432,12 +441,14 @@ if __name__ == "__main__":
 
     board_loss_weight = 0.5 if args.mode == "e2e" else 0.0
     if args.mode == "randproj":
+        dist_tag = "hn" if args.proj_half_normal else "n"
         save_path = os.path.join(save_dir,
-            f"pattern_simple_randproj_s{args.seed}_H{args.hidden}.pt")
+            f"pattern_simple_randproj_s{args.seed}_H{args.hidden}_{dist_tag}{args.proj_scale:.2f}.pt")
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=board_loss_weight, epochs=args.epochs,
           save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed,
-          pos_weight=args.pos_weight)
+          pos_weight=args.pos_weight,
+          proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal)
 
