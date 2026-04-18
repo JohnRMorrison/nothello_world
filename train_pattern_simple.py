@@ -163,6 +163,34 @@ def _strip_prefix(d, prefix):
     return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in d.items()}
 
 
+def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
+    """Aggregate (B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
+
+    Soft-max approximation of patterns_to_move_scores(...max-per-cell) used at eval time.
+    Gradient flows through all patterns covering each cell (softmax-weighted).
+    """
+    B = pat_logits.shape[0]
+    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
+
+    with torch.no_grad():
+        cell_max = torch.full((B, n_cells), -1e9, dtype=pat_logits.dtype, device=pat_logits.device)
+        cell_max.scatter_reduce_(1, idx, pat_logits, reduce='amax', include_self=True)
+
+    shifted = pat_logits - cell_max.gather(1, idx)
+    cell_sum = torch.zeros((B, n_cells), dtype=pat_logits.dtype, device=pat_logits.device)
+    cell_sum.scatter_add_(1, idx, torch.exp(shifted))
+    return cell_max + torch.log(cell_sum + 1e-10)
+
+
+def pat_labels_to_cell_labels(y_pat, pattern_to_cell, n_cells=60):
+    """Aggregate (B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
+    B = y_pat.shape[0]
+    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
+    legal = torch.zeros((B, n_cells), dtype=y_pat.dtype, device=y_pat.device)
+    legal.scatter_reduce_(1, idx, y_pat, reduce='amax', include_self=True)
+    return legal
+
+
 # ---------------------------------------------------------------------------
 # Training (mirrors _train_random_proj_streaming exactly)
 # ---------------------------------------------------------------------------
@@ -171,7 +199,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
-          proj_scale=0.183, proj_half_normal=False, single_model=False):
+          proj_scale=0.183, proj_half_normal=False, single_model=False,
+          legal_weight=0.0, pattern_to_cell=None):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -189,6 +218,12 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     if pos_weight is not None:
         pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
         print(f"  pos_weight={pos_weight:.1f}")
+
+    if legal_weight > 0:
+        if pattern_to_cell is None:
+            raise ValueError("legal_weight > 0 requires pattern_to_cell tensor")
+        pattern_to_cell = pattern_to_cell.to(device)
+        print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
 
     print(f"{mode} training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs, board_loss_weight={board_loss_weight}")
@@ -304,10 +339,20 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                         logits = model_even(x[even_mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
                             logits, y_pat[even_mask], pos_weight=pw_tensor)
+                        if legal_weight > 0:
+                            cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
+                            cell_labels = pat_labels_to_cell_labels(y_pat[even_mask], pattern_to_cell)
+                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                cell_logits, cell_labels)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
                             logits, y_pat[odd_mask], pos_weight=pw_tensor)
+                        if legal_weight > 0:
+                            cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
+                            cell_labels = pat_labels_to_cell_labels(y_pat[odd_mask], pattern_to_cell)
+                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                cell_logits, cell_labels)
                 else:
                     y_board_gpu = y_board.to(device)
                     for mask, model in [(even_mask, model_even), (odd_mask, model_odd)]:
@@ -320,6 +365,11 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                             loss = loss + board_loss_weight * nn.functional.cross_entropy(
                                 board_logits.reshape(-1, OPTIONS),
                                 y_board_gpu[mask].reshape(-1))
+                        if legal_weight > 0:
+                            cell_logits = patterns_to_cell_logsumexp(pat_logits, pattern_to_cell)
+                            cell_labels = pat_labels_to_cell_labels(y_pat[mask], pattern_to_cell)
+                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                cell_logits, cell_labels)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -431,6 +481,8 @@ if __name__ == "__main__":
                         help="Use positive-only (half-normal) weights for random projection")
     parser.add_argument("--single-model", action="store_true",
                         help="Use ONE model for all positions (no even/odd split)")
+    parser.add_argument("--legal-weight", type=float, default=0.0,
+                        help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -441,6 +493,7 @@ if __name__ == "__main__":
 
     patterns = enumerate_flanking_patterns()
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
+    pattern_to_cell = torch.tensor([MOVE_TO_IDX[p['target']] for p in patterns], dtype=torch.long)
     print(f"Device: {device}, Mode: {args.mode}, H={args.hidden}, {args.epochs} epochs")
     print(f"Patterns: {len(patterns)}")
 
@@ -457,6 +510,8 @@ if __name__ == "__main__":
         save_path = save_path.replace('.pt', f'_pw{int(args.pos_weight)}.pt')
     if args.single_model:
         save_path = save_path.replace('.pt', '_single.pt')
+    if args.legal_weight > 0:
+        save_path = save_path.replace('.pt', f'_lw{args.legal_weight:g}.pt')
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
@@ -464,5 +519,6 @@ if __name__ == "__main__":
           save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed,
           pos_weight=args.pos_weight,
           proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
-          single_model=args.single_model)
+          single_model=args.single_model,
+          legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell)
 

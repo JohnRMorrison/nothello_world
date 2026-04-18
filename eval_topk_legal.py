@@ -44,7 +44,9 @@ def evaluate(model_even, model_odd, mode, patterns,
     if feature_cols is not None:
         X = X[:, feature_cols]
     n = min(len(X), 49 * 10000)
-    X, Y, pos = X[:n], Y[:n], pos[:n]
+    rng = np.random.RandomState(0)
+    sample_idx = np.sort(rng.choice(len(X), n, replace=False))
+    X, Y, pos = X[sample_idx], Y[sample_idx], pos[sample_idx]
 
     # For each top_n, accumulate (correct, total)
     results = {n_: {'correct': 0, 'total': 0} for n_ in top_ns}
