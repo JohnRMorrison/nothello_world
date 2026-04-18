@@ -453,6 +453,8 @@ if __name__ == "__main__":
         dist_tag = "hn" if args.proj_half_normal else "n"
         save_path = os.path.join(save_dir,
             f"pattern_simple_randproj_s{args.seed}_H{args.hidden}_{dist_tag}{args.proj_scale:.2f}.pt")
+    if args.pos_weight is not None:
+        save_path = save_path.replace('.pt', f'_pw{int(args.pos_weight)}.pt')
     if args.single_model:
         save_path = save_path.replace('.pt', '_single.pt')
 
