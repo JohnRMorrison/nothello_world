@@ -221,8 +221,7 @@ def measure_metrics(orig_pat_probs, intv_pat_probs, original_legal,
     result["n_pred_legal_orig"] = len(orig_legal_set)
     result["n_pred_legal_intv"] = len(intv_legal_set)
 
-    # Li et al. top-N accuracy: how many of the N counterfactual-legal moves
-    # are in the top-N predictions after intervention?
+    # Li et al. top-N accuracy (original): ranking-based
     N = len(counterfactual_legal)
     if N > 0:
         top_n_cells = set()
@@ -234,6 +233,35 @@ def measure_metrics(orig_pat_probs, intv_pat_probs, original_legal,
         result["li_topn_accuracy"] = li_correct / N
     else:
         result["li_topn_accuracy"] = None
+
+    # Adapted legal-set accuracy: threshold patterns at 0.5, aggregate to
+    # legal moves (cell is legal if any pattern fires), compare predicted
+    # legal set to counterfactual legal set.
+    pred_legal_set = patterns_to_legal_set(intv_pat_probs, patterns, threshold=0.5)
+    pred_legal_valid = pred_legal_set & set(VALID_MOVES)
+    cf_legal_valid = counterfactual_legal & set(VALID_MOVES)
+    if cf_legal_valid:
+        # Precision: of predicted legal, how many are actually legal?
+        legal_precision = (len(pred_legal_valid & cf_legal_valid) /
+                           len(pred_legal_valid)) if pred_legal_valid else 0.0
+        # Recall: of actually legal, how many did we predict?
+        legal_recall = len(pred_legal_valid & cf_legal_valid) / len(cf_legal_valid)
+        # Exact match: predicted set == actual set?
+        legal_exact = 1.0 if pred_legal_valid == cf_legal_valid else 0.0
+        # Error count (Li-style): FP + FN
+        fp = len(pred_legal_valid - cf_legal_valid)
+        fn = len(cf_legal_valid - pred_legal_valid)
+        legal_errors = fp + fn
+        legal_adapted_acc = 1.0 - legal_errors / (2 * len(cf_legal_valid))
+    else:
+        legal_precision = legal_recall = legal_exact = legal_adapted_acc = None
+        legal_errors = None
+
+    result["legal_precision"] = legal_precision
+    result["legal_recall"] = legal_recall
+    result["legal_exact_match"] = legal_exact
+    result["legal_errors"] = legal_errors
+    result["legal_adapted_acc"] = legal_adapted_acc
 
     return result
 
@@ -404,9 +432,9 @@ def report_results(results):
     print("INTERVENTION RESULTS")
     print(f"{'='*80}")
 
-    header = (f"{'Condition':<12} {'N':>4} {'LPM':>7} {'BM':>7} "
-              f"{'Li TopN':>7} {'ProbeAcc':>8} {'Xtalk':>7} "
-              f"{'LP legal':>8} {'LP illeg':>8}")
+    header = (f"{'Condition':<12} {'N':>4} {'AdaptAcc':>8} {'Exact':>7} "
+              f"{'Prec':>7} {'Recall':>7} {'ProbeAcc':>8} {'Xtalk':>7} "
+              f"{'Li TopN':>7}")
     print(header)
     print("-" * len(header))
 
@@ -418,20 +446,20 @@ def report_results(results):
             vals = [s[key] for s in samples if s.get(key) is not None]
             return np.mean(vals) if vals else None
 
-        lpm = mean_or("legal_prob_mass")
-        bm = mean_or("boundary_margin")
-        li = mean_or("li_topn_accuracy")
+        aa = mean_or("legal_adapted_acc")
+        ex = mean_or("legal_exact_match")
+        pr = mean_or("legal_precision")
+        rc = mean_or("legal_recall")
         pa = mean_or("probe_acc")
         xt = mean_or("crosstalk")
-        lpl = mean_or("mean_logprob_shift_legal")
-        lpi = mean_or("mean_logprob_shift_illegal")
+        li = mean_or("li_topn_accuracy")
 
         def fmt(v):
             return f"{v:.4f}" if v is not None else "   N/A"
 
-        print(f"{cond_name:<12} {len(samples):>4} {fmt(lpm):>7} {fmt(bm):>7} "
-              f"{fmt(li):>7} {fmt(pa):>8} {fmt(xt):>7} "
-              f"{fmt(lpl):>8} {fmt(lpi):>8}")
+        print(f"{cond_name:<12} {len(samples):>4} {fmt(aa):>8} {fmt(ex):>7} "
+              f"{fmt(pr):>7} {fmt(rc):>7} {fmt(pa):>8} {fmt(xt):>7} "
+              f"{fmt(li):>7}")
 
 
 # ---------------------------------------------------------------------------
