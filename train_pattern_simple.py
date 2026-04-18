@@ -170,7 +170,7 @@ def _strip_prefix(d, prefix):
 def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
-          save_path=None, mlp_ckpt_dir=None, seed=0):
+          save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -182,6 +182,12 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
     n_patterns = len(pat_targets)
+
+    # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%)
+    pw_tensor = None
+    if pos_weight is not None:
+        pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
+        print(f"  pos_weight={pos_weight:.1f}")
 
     print(f"{mode} training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs, board_loss_weight={board_loss_weight}")
@@ -285,11 +291,11 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                     if even_mask.any():
                         logits = model_even(x[even_mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[even_mask])
+                            logits, y_pat[even_mask], pos_weight=pw_tensor)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[odd_mask])
+                            logits, y_pat[odd_mask], pos_weight=pw_tensor)
                 else:
                     y_board_gpu = y_board.to(device)
                     for mask, model in [(even_mask, model_even), (odd_mask, model_odd)]:
@@ -297,7 +303,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                             continue
                         pat_logits, board_logits = model(x[mask], pos[mask])
                         loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            pat_logits, y_pat[mask])
+                            pat_logits, y_pat[mask], pos_weight=pw_tensor)
                         if board_loss_weight > 0:
                             loss = loss + board_loss_weight * nn.functional.cross_entropy(
                                 board_logits.reshape(-1, OPTIONS),
@@ -315,6 +321,9 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         model_even.eval(); model_odd.eval()
         correct = 0
         total = 0
+        tp = 0
+        fp = 0
+        fn = 0
         board_correct = 0
         board_total = 0
         with torch.no_grad():
@@ -351,8 +360,14 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
                 correct += (preds == y_pat).sum().item()
                 total += y_pat.numel()
+                # Per-class metrics
+                tp += ((preds == 1) & (y_pat == 1)).sum().item()
+                fp += ((preds == 1) & (y_pat == 0)).sum().item()
+                fn += ((preds == 0) & (y_pat == 1)).sum().item()
 
         acc = correct / total
+        recall = tp / max(tp + fn, 1)
+        precision = tp / max(tp + fp, 1)
         if acc > best_acc:
             best_acc = acc
             best_state = {
@@ -363,8 +378,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         cur_lr = optimizer.param_groups[0]['lr']
         avg_loss = epoch_loss / max(epoch_batches, 1)
         board_str = f"  board_acc={board_correct/max(board_total,1):.4%}" if board_total > 0 else ""
-        print(f"  Epoch {epoch}: pat_acc={acc:.4%}{board_str}  "
-              f"loss={avg_loss:.5f}  lr={cur_lr:.2e}", flush=True)
+        print(f"  Epoch {epoch}: pat_acc={acc:.4%}  recall={recall:.4%}  prec={precision:.4%}"
+              f"{board_str}  loss={avg_loss:.5f}  lr={cur_lr:.2e}", flush=True)
 
         # Save checkpoint after each epoch
         if best_state and save_path:
@@ -396,6 +411,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0,
                         help="Random seed for random projection initialization")
+    parser.add_argument("--pos-weight", type=float, default=None,
+                        help="Upweight positive class in BCE loss (e.g. 50 for ~1.35%% firing rate)")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -421,5 +438,6 @@ if __name__ == "__main__":
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=board_loss_weight, epochs=args.epochs,
-          save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed)
+          save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed,
+          pos_weight=args.pos_weight)
 
