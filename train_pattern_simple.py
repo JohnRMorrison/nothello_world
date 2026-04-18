@@ -171,7 +171,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
-          proj_scale=0.183, proj_half_normal=False):
+          proj_scale=0.183, proj_half_normal=False, single_model=False):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -243,9 +243,16 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
         model_even = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
         model_odd = EndToEndMLP(input_dim, hidden_dim, n_patterns).to(device)
 
-    # Only optimize trainable parameters
-    trainable = [p for p in list(model_even.parameters()) + list(model_odd.parameters())
-                 if p.requires_grad]
+    if single_model:
+        # Tie: one model for all positions (no even/odd split)
+        model_odd = model_even
+        print(f"  single_model=True (odd model = even model)")
+
+    # Only optimize trainable parameters — deduplicate by id if single_model
+    all_params = list(model_even.parameters())
+    if model_odd is not model_even:
+        all_params += list(model_odd.parameters())
+    trainable = [p for p in all_params if p.requires_grad]
     optimizer = torch.optim.Adam(trainable, lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
@@ -422,6 +429,8 @@ if __name__ == "__main__":
                         help="Std dev for random projection weights (default: Kaiming sqrt(2/60))")
     parser.add_argument("--proj-half-normal", action="store_true",
                         help="Use positive-only (half-normal) weights for random projection")
+    parser.add_argument("--single-model", action="store_true",
+                        help="Use ONE model for all positions (no even/odd split)")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -444,11 +453,14 @@ if __name__ == "__main__":
         dist_tag = "hn" if args.proj_half_normal else "n"
         save_path = os.path.join(save_dir,
             f"pattern_simple_randproj_s{args.seed}_H{args.hidden}_{dist_tag}{args.proj_scale:.2f}.pt")
+    if args.single_model:
+        save_path = save_path.replace('.pt', '_single.pt')
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           board_loss_weight=board_loss_weight, epochs=args.epochs,
           save_path=save_path, mlp_ckpt_dir=save_dir, seed=args.seed,
           pos_weight=args.pos_weight,
-          proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal)
+          proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
+          single_model=args.single_model)
 
