@@ -1,11 +1,10 @@
-"""Evaluate legal move prediction accuracy from pattern detector models.
+"""Evaluate whether the model's top-1 predicted move is legal.
 
-Loads a checkpoint, runs pattern predictions on eval data, aggregates
-960 patterns → 60 legal moves, reports precision/recall/F1/perfect-position.
+For each position: aggregate 960 pattern logits → 60 move scores,
+pick the argmax, check if it's a legal move.
 
 Usage:
     python eval_legal_moves.py --ckpt pattern_simple_direct_H512.pt --mode direct --hidden 512
-    python eval_legal_moves.py --ckpt pattern_simple_randproj_s0_H1024.pt --mode direct --hidden 1024
 """
 import sys, os
 sys.path.insert(0, '.')
@@ -16,27 +15,27 @@ import torch
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
 )
-from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
+from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX, VALID_MOVES
 from generate_rule_games import precompute_pattern_arrays
 from train_pattern_simple import (
     DirectMLP, EndToEndMLP, TwoStageMLP, compute_pattern_labels_batch,
 )
 
 
-def patterns_to_legal(pat_probs, patterns, threshold=0.5):
-    """Aggregate 960 pattern probs → 60-d legal move predictions."""
-    n = len(pat_probs)
-    legal = np.zeros((n, 60), dtype=np.float32)
+def patterns_to_move_scores(pat_logits, patterns):
+    """Aggregate 960 pattern logits → 60-d move scores (max per cell)."""
+    n = len(pat_logits)
+    scores = np.full((n, 60), -1e9, dtype=np.float32)
     for j, pat in enumerate(patterns):
         move_idx = MOVE_TO_IDX[pat['target']]
-        legal[:, move_idx] = np.maximum(legal[:, move_idx], pat_probs[:, j])
-    return legal
+        scores[:, move_idx] = np.maximum(scores[:, move_idx], pat_logits[:, j])
+    return scores
 
 
 def evaluate(model_even, model_odd, mode, patterns,
              pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
              chunk_path, feature_cols, device, batch_size=1024):
-    """Evaluate legal move accuracy on one chunk."""
+    """Evaluate top-1 legal move accuracy on one chunk."""
     X, Y, pos = _load_features(chunk_path)
     if feature_cols is not None:
         X = X[:, feature_cols]
@@ -44,8 +43,10 @@ def evaluate(model_even, model_odd, mode, patterns,
     n = min(len(X), 49 * 10000)
     X, Y, pos = X[:n], Y[:n], pos[:n]
 
-    all_pred_pat = []
-    all_gt_pat = []
+    top1_correct = 0
+    top1_total = 0
+    top5_correct = 0
+    all_legal_correct = 0  # all 60 squares classified correctly
 
     model_even.eval(); model_odd.eval()
     with torch.no_grad():
@@ -71,48 +72,45 @@ def evaluate(model_even, model_odd, mode, patterns,
                     pl, _ = model(x[mask], p[mask])
                     pat_logits[mask] = pl
 
-            all_pred_pat.append(torch.sigmoid(pat_logits).cpu().numpy())
+            pred_pat = pat_logits.cpu().numpy()
 
-            # Ground truth patterns
-            gt = compute_pattern_labels_batch(
+            # Ground truth patterns → ground truth legal moves
+            gt_pat = compute_pattern_labels_batch(
                 y_board.numpy(), p.numpy(),
                 pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            all_gt_pat.append(gt)
 
-    pred_pat = np.concatenate(all_pred_pat)
-    gt_pat = np.concatenate(all_gt_pat)
+            # Aggregate to 60-d move scores
+            pred_scores = patterns_to_move_scores(pred_pat, patterns)
+            gt_scores = patterns_to_move_scores(gt_pat, patterns)
 
-    # Pattern-level accuracy
-    pat_pred_binary = (pred_pat > 0.5).astype(np.float32)
-    pat_acc = (pat_pred_binary == gt_pat).mean()
+            gt_legal = (gt_scores > 0.5)  # (batch, 60) bool
 
-    # Aggregate to legal moves
-    pred_legal = patterns_to_legal(pred_pat, patterns)
-    gt_legal = patterns_to_legal(gt_pat, patterns)
+            for b in range(len(x)):
+                legal_set = set(np.where(gt_legal[b])[0])
+                if not legal_set:
+                    continue
 
-    pred_binary = (pred_legal > 0.5).astype(np.float32)
-    gt_binary = (gt_legal > 0.5).astype(np.float32)
+                # Top-1: is argmax legal?
+                top1 = np.argmax(pred_scores[b])
+                if top1 in legal_set:
+                    top1_correct += 1
+                top1_total += 1
 
-    tp = ((pred_binary == 1) & (gt_binary == 1)).sum()
-    fp = ((pred_binary == 1) & (gt_binary == 0)).sum()
-    fn = ((pred_binary == 0) & (gt_binary == 1)).sum()
-    tn = ((pred_binary == 0) & (gt_binary == 0)).sum()
+                # Top-5: is any of top-5 legal?
+                top5 = set(np.argsort(pred_scores[b])[-5:])
+                if top5 & legal_set:
+                    top5_correct += 1
 
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    accuracy = (tp + tn) / (tp + fp + fn + tn)
-    perfect = (pred_binary == gt_binary).all(axis=1).mean()
+                # All-correct: every square classified right
+                pred_legal = set(np.where(pred_scores[b] > 0)[0])
+                if pred_legal == legal_set:
+                    all_legal_correct += 1
 
     return {
-        "pat_acc": pat_acc,
-        "legal_acc": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "perfect_position": perfect,
-        "tp": int(tp), "fp": int(fp), "fn": int(fn), "tn": int(tn),
-        "n_samples": n,
+        "top1_legal": top1_correct / top1_total if top1_total > 0 else 0,
+        "top5_legal": top5_correct / top1_total if top1_total > 0 else 0,
+        "perfect_position": all_legal_correct / top1_total if top1_total > 0 else 0,
+        "n_samples": top1_total,
     }
 
 
@@ -165,10 +163,7 @@ if __name__ == "__main__":
         pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
         eval_path, feature_cols, device)
 
-    print(f"\nPattern accuracy:     {results['pat_acc']:.4%}")
-    print(f"Legal move accuracy:  {results['legal_acc']:.4%}")
-    print(f"Precision:            {results['precision']:.4f}")
-    print(f"Recall:               {results['recall']:.4f}")
-    print(f"F1:                   {results['f1']:.4f}")
-    print(f"Perfect position:     {results['perfect_position']:.4%}")
-    print(f"TP={results['tp']}  FP={results['fp']}  FN={results['fn']}  TN={results['tn']}")
+    print(f"\nTop-1 legal:         {results['top1_legal']:.4%}")
+    print(f"Top-5 legal:         {results['top5_legal']:.4%}")
+    print(f"Perfect position:    {results['perfect_position']:.4%}")
+    print(f"N samples:           {results['n_samples']}")
