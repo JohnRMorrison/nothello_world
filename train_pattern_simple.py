@@ -186,6 +186,46 @@ def _get_cell_pat_index(pattern_to_cell, n_cells):
     return _cell_pat_cache[key]
 
 
+def to_signed_parity_input(X_tensor):
+    """60-d: +1 if played-on-even, -1 if played-on-odd, 0 if empty.
+    X_tensor is the raw 180-d features. [0:60]=played, [120:180]=even.
+    """
+    played = X_tensor[:, :60]
+    even = X_tensor[:, 120:180]
+    return played * (2.0 * even - 1.0)
+
+
+def to_mine_signed_input(Y_tensor, pos_tensor):
+    """60-d: +1 if played by current-turn color, -1 if opp, 0 if empty.
+    Collapses the full 192-d board state into one scalar per square.
+    """
+    is_black = (pos_tensor % 2 == 1).unsqueeze(-1)
+    mine_val = torch.where(is_black, torch.full_like(is_black, 2, dtype=Y_tensor.dtype),
+                           torch.full_like(is_black, 1, dtype=Y_tensor.dtype))
+    mine = (Y_tensor == mine_val).float()
+    opp = ((Y_tensor > 0) & (Y_tensor != mine_val)).float()
+    return mine - opp
+
+
+def to_board_state_input(Y_tensor, pos_tensor):
+    """Convert label tensor (N,64) + positions (N,) into (N,192) one-hot
+    [empty, mine, opp] per cell. Used for --features board_state (upper-bound).
+
+    Y labels use {0=empty, 1=white, 2=black}. Current turn is black when
+    position is odd (matches compute_pattern_labels_batch convention).
+    """
+    N = len(Y_tensor)
+    is_black = (pos_tensor % 2 == 1).unsqueeze(-1)  # (N, 1)
+    mine_val = torch.where(is_black, torch.full_like(is_black, 2, dtype=Y_tensor.dtype),
+                           torch.full_like(is_black, 1, dtype=Y_tensor.dtype))
+    opp_val = torch.where(is_black, torch.full_like(is_black, 1, dtype=Y_tensor.dtype),
+                          torch.full_like(is_black, 2, dtype=Y_tensor.dtype))
+    empty = (Y_tensor == 0).float()
+    mine = (Y_tensor == mine_val).float()
+    opp = (Y_tensor == opp_val).float()
+    return torch.stack([empty, mine, opp], dim=-1).view(N, -1)
+
+
 def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
     """(B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
 
@@ -216,7 +256,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
-          legal_weight=0.0, pattern_to_cell=None, loss_type="bce"):
+          legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
+          feature_fn=None):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -332,6 +373,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
+    elif feature_fn is not None:
+        ev_X = feature_fn(ev_X, ev_Y, ev_pos)
     n_eval = min(len(ev_X), 49 * 10000)
     rng = np.random.RandomState(0)
     sample_idx = np.sort(rng.choice(len(ev_X), n_eval, replace=False))
@@ -355,6 +398,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
+            elif feature_fn is not None:
+                tr_X = feature_fn(tr_X, tr_Y, tr_pos)
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
@@ -521,22 +566,42 @@ if __name__ == "__main__":
     parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
                         help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
     parser.add_argument("--features", default="when",
-                        choices=["when", "played+when", "when+even", "all"],
-                        help="Which of the 180-d feature groups to use. "
-                             "180-d layout: [0:60]=played, [60:120]=when, [120:180]=even.")
+                        choices=["when", "played+when", "when+even", "played+even",
+                                 "all", "board_state", "signed_parity", "mine_signed"],
+                        help="Input features. Slices/derivations of the 180-d base. "
+                             "signed_parity (60-d): +1/-1 per played color, 0 empty. "
+                             "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
+                             "board_state (192-d): ground-truth board (upper-bound experiment).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
+    # feature_cols = column-select mode; feature_fn = derived-features mode.
+    # Exactly one is used per run.
     _feat_cols = {
-        "when":        list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
-        "played+when": list(range(0, 2 * N_MOVES)),                 # 120-d
-        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
-        "all":         list(range(0, 3 * N_MOVES)),                  # 180-d
+        "when":         list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
+        "played+when":  list(range(0, 2 * N_MOVES)),                 # 120-d
+        "when+even":    list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
+        "played+even":  list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":          list(range(0, 3 * N_MOVES)),                  # 180-d
     }
-    feature_cols = _feat_cols[args.features]
-    input_dim = len(feature_cols)
+    feature_fn = None
+    if args.features in _feat_cols:
+        feature_cols = _feat_cols[args.features]
+        input_dim = len(feature_cols)
+    elif args.features == "signed_parity":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_signed_parity_input(X)
+        input_dim = N_MOVES
+    elif args.features == "mine_signed":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_mine_signed_input(Y, pos)
+        input_dim = N_MOVES
+    elif args.features == "board_state":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_board_state_input(Y, pos)
+        input_dim = 3 * 64
     print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
@@ -573,5 +638,5 @@ if __name__ == "__main__":
           proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
           single_model=args.single_model,
           legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell,
-          loss_type=args.loss)
+          loss_type=args.loss, feature_fn=feature_fn)
 
