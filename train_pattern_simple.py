@@ -163,33 +163,48 @@ def _strip_prefix(d, prefix):
     return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in d.items()}
 
 
-def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
-    """Aggregate (B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
+_cell_pat_cache = {}
 
-    Soft-max approximation of patterns_to_move_scores(...max-per-cell) used at eval time.
-    Gradient flows through all patterns covering each cell (softmax-weighted).
 
-    Loop over cells (60 iterations) for PyTorch-version portability.
+def _get_cell_pat_index(pattern_to_cell, n_cells):
+    """Build a (n_cells, max_per_cell) index + validity mask, cached by object id.
+
+    Lets aggregation run as a single gather + logsumexp instead of a 60-iter
+    Python loop. Caller is expected to reuse the same pattern_to_cell tensor.
     """
-    B = pat_logits.shape[0]
-    out = torch.full((B, n_cells), -float('inf'),
-                     dtype=pat_logits.dtype, device=pat_logits.device)
-    for c in range(n_cells):
-        mask = (pattern_to_cell == c)
-        if mask.any():
-            out[:, c] = torch.logsumexp(pat_logits[:, mask], dim=1)
-    return out
+    key = (id(pattern_to_cell), n_cells, str(pattern_to_cell.device))
+    if key not in _cell_pat_cache:
+        device = pattern_to_cell.device
+        groups = [torch.where(pattern_to_cell == c)[0] for c in range(n_cells)]
+        max_per_cell = max((len(g) for g in groups), default=0)
+        idx = torch.zeros((n_cells, max_per_cell), dtype=torch.long, device=device)
+        mask = torch.zeros((n_cells, max_per_cell), dtype=torch.bool, device=device)
+        for c, g in enumerate(groups):
+            idx[c, :len(g)] = g
+            mask[c, :len(g)] = True
+        _cell_pat_cache[key] = (idx, mask)
+    return _cell_pat_cache[key]
+
+
+def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
+    """(B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
+
+    Soft-max approximation of patterns_to_move_scores(...max-per-cell) used
+    at eval time. Gradient flows through all patterns covering each cell
+    (softmax-weighted). Single gather + masked logsumexp — no Python loop.
+    """
+    idx, mask = _get_cell_pat_index(pattern_to_cell, n_cells)
+    gathered = pat_logits[:, idx]                     # (B, n_cells, max_per_cell)
+    gathered = gathered.masked_fill(~mask, float('-inf'))
+    return torch.logsumexp(gathered, dim=-1)
 
 
 def pat_labels_to_cell_labels(y_pat, pattern_to_cell, n_cells=60):
-    """Aggregate (B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
-    B = y_pat.shape[0]
-    out = torch.zeros((B, n_cells), dtype=y_pat.dtype, device=y_pat.device)
-    for c in range(n_cells):
-        mask = (pattern_to_cell == c)
-        if mask.any():
-            out[:, c] = y_pat[:, mask].max(dim=1).values
-    return out
+    """(B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
+    idx, mask = _get_cell_pat_index(pattern_to_cell, n_cells)
+    gathered = y_pat[:, idx]
+    gathered = gathered.masked_fill(~mask, 0)
+    return gathered.max(dim=-1).values
 
 
 # ---------------------------------------------------------------------------

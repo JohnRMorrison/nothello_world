@@ -149,7 +149,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True, help="Path to saved checkpoint")
     parser.add_argument("--mode", required=True,
-                        choices=["direct", "emergent", "e2e", "two-stage"])
+                        choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--output-dir",
@@ -168,7 +168,7 @@ if __name__ == "__main__":
     from train_pattern_simple import DirectMLP, EndToEndMLP, TwoStageMLP
     n_patterns = ckpt.get('n_patterns', 960)
 
-    if args.mode == "direct":
+    if args.mode in ("direct", "randproj"):
         model_even = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
         model_odd = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
     elif args.mode == "two-stage":
