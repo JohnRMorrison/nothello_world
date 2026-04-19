@@ -168,27 +168,28 @@ def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
 
     Soft-max approximation of patterns_to_move_scores(...max-per-cell) used at eval time.
     Gradient flows through all patterns covering each cell (softmax-weighted).
+
+    Loop over cells (60 iterations) for PyTorch-version portability.
     """
     B = pat_logits.shape[0]
-    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
-
-    with torch.no_grad():
-        cell_max = torch.full((B, n_cells), -1e9, dtype=pat_logits.dtype, device=pat_logits.device)
-        cell_max.scatter_reduce_(1, idx, pat_logits, reduce='amax', include_self=True)
-
-    shifted = pat_logits - cell_max.gather(1, idx)
-    cell_sum = torch.zeros((B, n_cells), dtype=pat_logits.dtype, device=pat_logits.device)
-    cell_sum.scatter_add_(1, idx, torch.exp(shifted))
-    return cell_max + torch.log(cell_sum + 1e-10)
+    out = torch.full((B, n_cells), -float('inf'),
+                     dtype=pat_logits.dtype, device=pat_logits.device)
+    for c in range(n_cells):
+        mask = (pattern_to_cell == c)
+        if mask.any():
+            out[:, c] = torch.logsumexp(pat_logits[:, mask], dim=1)
+    return out
 
 
 def pat_labels_to_cell_labels(y_pat, pattern_to_cell, n_cells=60):
     """Aggregate (B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
     B = y_pat.shape[0]
-    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
-    legal = torch.zeros((B, n_cells), dtype=y_pat.dtype, device=y_pat.device)
-    legal.scatter_reduce_(1, idx, y_pat, reduce='amax', include_self=True)
-    return legal
+    out = torch.zeros((B, n_cells), dtype=y_pat.dtype, device=y_pat.device)
+    for c in range(n_cells):
+        mask = (pattern_to_cell == c)
+        if mask.any():
+            out[:, c] = y_pat[:, mask].max(dim=1).values
+    return out
 
 
 # ---------------------------------------------------------------------------
