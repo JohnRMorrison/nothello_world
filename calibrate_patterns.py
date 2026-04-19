@@ -108,18 +108,31 @@ if __name__ == "__main__":
         [MOVE_TO_IDX[p['target']] for p in patterns],
         dtype=torch.long, device=device)
 
-    # Calibration parameters: per-pattern scale and bias
-    s = nn.Parameter(torch.ones(960, device=device))
-    b = nn.Parameter(torch.zeros(960, device=device))
-    opt = torch.optim.Adam([s, b], lr=args.lr)
+    # Calibration parameters: per-pattern scale and bias.
+    # Use raw tensors + manual Adam to avoid torch.optim (py3.13 dynamo bug).
+    s = torch.ones(960, device=device, requires_grad=True)
+    b = torch.zeros(960, device=device, requires_grad=True)
+    # Adam state
+    s_m = torch.zeros_like(s); s_v = torch.zeros_like(s)
+    b_m = torch.zeros_like(b); b_v = torch.zeros_like(b)
+    adam_step = 0
+    adam_beta1, adam_beta2, adam_eps = 0.9, 0.999, 1e-8
     pw = torch.tensor([args.pos_weight], device=device)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
                          if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
-    eval_path = chunk_files[-1]
-    train_paths = chunk_files[:-1]
+    if len(chunk_files) == 1:
+        # Local-only: split the single chunk 80/20 for train/eval
+        eval_path = chunk_files[0]
+        train_paths = chunk_files
+        single_chunk_mode = True
+        print(f"Single-chunk mode: using {chunk_files[0]} with 80/20 split")
+    else:
+        eval_path = chunk_files[-1]
+        train_paths = chunk_files[:-1]
+        single_chunk_mode = False
 
     # Evaluate BEFORE calibration on random sample of the eval chunk
     print("\nBefore calibration (raw logits, max-per-cell):")
@@ -192,7 +205,19 @@ if __name__ == "__main__":
                 cell_logits = patterns_to_cell_logsumexp(calibrated, pattern_to_cell)
                 loss = nn.functional.binary_cross_entropy_with_logits(
                     cell_logits, legal, pos_weight=pw)
-                opt.zero_grad(); loss.backward(); opt.step()
+                if s.grad is not None: s.grad.zero_()
+                if b.grad is not None: b.grad.zero_()
+                loss.backward()
+                # Manual Adam step
+                adam_step += 1
+                with torch.no_grad():
+                    for p, m, v in [(s, s_m, s_v), (b, b_m, b_v)]:
+                        g = p.grad
+                        m.mul_(adam_beta1).add_(g, alpha=1 - adam_beta1)
+                        v.mul_(adam_beta2).addcmul_(g, g, value=1 - adam_beta2)
+                        m_hat = m / (1 - adam_beta1 ** adam_step)
+                        v_hat = v / (1 - adam_beta2 ** adam_step)
+                        p.sub_(args.lr * m_hat / (v_hat.sqrt() + adam_eps))
                 total_loss += loss.item(); total_batches += 1
             del tr_X, tr_Y, tr_pos
         avg = total_loss / max(total_batches, 1)
@@ -205,8 +230,9 @@ if __name__ == "__main__":
 
     # Save calibration params
     base = os.path.splitext(os.path.basename(args.ckpt))[0]
-    save_path = os.path.join(args.output_dir, "pattern_detector_checkpoints",
-                             f"calib_{base}.pt")
+    save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"calib_{base}.pt")
     torch.save({'scale': s.detach().cpu(), 'bias': b.detach().cpu(),
                 'source_ckpt': args.ckpt}, save_path)
     print(f"\nSaved calibration to {save_path}")

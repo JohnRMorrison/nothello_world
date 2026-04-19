@@ -24,7 +24,7 @@ from experiments.mathematical_transformation_experiments.heuristic_probe_experim
 def get_hidden(model, x, mode):
     """Extract H-d hidden activation (after first Linear + ReLU)."""
     with torch.no_grad():
-        if mode == "direct":
+        if mode in ("direct", "randproj"):
             return torch.relu(model.net[0](x))
         else:
             return torch.relu(model.backbone[0](x))
