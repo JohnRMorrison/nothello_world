@@ -85,23 +85,7 @@ if __name__ == "__main__":
     idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
     pw = torch.tensor([args.pos_weight], device=device)
 
-    # Manual Adam (py3.13 + torch 2.10 dynamo bug)
-    state = {id(p): {'m': torch.zeros_like(p), 'v': torch.zeros_like(p)} for p in trainable}
-    step = 0
-    b1, b2, eps = 0.9, 0.999, 1e-8
-
-    def adam_step():
-        global step
-        step += 1
-        with torch.no_grad():
-            for p in trainable:
-                st = state[id(p)]
-                g = p.grad
-                st['m'].mul_(b1).add_(g, alpha=1 - b1)
-                st['v'].mul_(b2).addcmul_(g, g, value=1 - b2)
-                mh = st['m'] / (1 - b1 ** step)
-                vh = st['v'] / (1 - b2 ** step)
-                p.sub_(args.lr * mh / (vh.sqrt() + eps))
+    optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -193,10 +177,9 @@ if __name__ == "__main__":
                     cell_logits = patterns_to_cell_logsumexp(pl, pattern_to_cell)
                     loss = loss + nn.functional.binary_cross_entropy_with_logits(
                         cell_logits, legal[msk], pos_weight=pw)
-                for p_ in trainable:
-                    if p_.grad is not None: p_.grad.zero_()
+                optimizer.zero_grad()
                 loss.backward()
-                adam_step()
+                optimizer.step()
                 total_loss += loss.item(); total_batches += 1
             del tr_X, tr_Y, tr_pos
         avg = total_loss / max(total_batches, 1)

@@ -105,24 +105,8 @@ if __name__ == "__main__":
 
     pw = torch.tensor([args.pos_weight], device=device)
 
-    # Manual Adam (py3.13 + torch 2.10 dynamo bug)
     params = list(readout_even.parameters()) + list(readout_odd.parameters())
-    state = {id(p): {'m': torch.zeros_like(p), 'v': torch.zeros_like(p)} for p in params}
-    step = 0
-    b1, b2, eps = 0.9, 0.999, 1e-8
-
-    def adam_step():
-        global step
-        step += 1
-        with torch.no_grad():
-            for p in params:
-                st = state[id(p)]
-                g = p.grad
-                st['m'].mul_(b1).add_(g, alpha=1 - b1)
-                st['v'].mul_(b2).addcmul_(g, g, value=1 - b2)
-                mh = st['m'] / (1 - b1 ** step)
-                vh = st['v'] / (1 - b2 ** step)
-                p.sub_(args.lr * mh / (vh.sqrt() + eps))
+    optimizer = torch.optim.Adam(params, lr=args.lr)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -224,10 +208,9 @@ if __name__ == "__main__":
                         # weight sq by pos_weight on positives
                         w = torch.where(gp[msk] > 0.5, pw, torch.ones_like(sq))
                         loss = loss + (w * sq).mean()
-                for p_ in params:
-                    if p_.grad is not None: p_.grad.zero_()
+                optimizer.zero_grad()
                 loss.backward()
-                adam_step()
+                optimizer.step()
                 total_loss += loss.item(); total_batches += 1
             del tr_X, tr_Y, tr_pos
         avg = total_loss / max(total_batches, 1)

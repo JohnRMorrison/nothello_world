@@ -48,10 +48,12 @@ def load_backbone(ckpt_path, device):
     lin_even = nn.Linear(D, H).to(device)
     lin_odd = nn.Linear(D, H).to(device)
     # _build_mlp uses nn.Sequential; first Linear is at index 0.
-    lin_even.weight.data = ckpt['even']['net.0.weight'].to(device)
-    lin_even.bias.data = ckpt['even']['net.0.bias'].to(device)
-    lin_odd.weight.data = ckpt['odd']['net.0.weight'].to(device)
-    lin_odd.bias.data = ckpt['odd']['net.0.bias'].to(device)
+    # _build_mlp uses nn.Sequential; state-dict keys are "0.weight",
+    # "0.bias", etc. (no "net." prefix).
+    lin_even.weight.data = ckpt['even']['0.weight'].to(device)
+    lin_even.bias.data = ckpt['even']['0.bias'].to(device)
+    lin_odd.weight.data = ckpt['odd']['0.weight'].to(device)
+    lin_odd.bias.data = ckpt['odd']['0.bias'].to(device)
     for p in lin_even.parameters(): p.requires_grad = False
     for p in lin_odd.parameters(): p.requires_grad = False
     return lin_even, lin_odd, H, D, ckpt.get('best_acc', None)
@@ -105,24 +107,8 @@ if __name__ == "__main__":
     idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
     pw = torch.tensor([args.pos_weight], device=device)
 
-    # Manual Adam (py3.13 + torch 2.10 dynamo bug — and also fine on older torch)
     params = list(readout_even.parameters()) + list(readout_odd.parameters())
-    state = {id(p): {'m': torch.zeros_like(p), 'v': torch.zeros_like(p)} for p in params}
-    step = 0
-    b1, b2, eps = 0.9, 0.999, 1e-8
-
-    def adam_step():
-        global step
-        step += 1
-        with torch.no_grad():
-            for p in params:
-                st = state[id(p)]
-                g = p.grad
-                st['m'].mul_(b1).add_(g, alpha=1 - b1)
-                st['v'].mul_(b2).addcmul_(g, g, value=1 - b2)
-                mh = st['m'] / (1 - b1 ** step)
-                vh = st['v'] / (1 - b2 ** step)
-                p.sub_(args.lr * mh / (vh.sqrt() + eps))
+    optimizer = torch.optim.Adam(params, lr=args.lr)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -228,10 +214,9 @@ if __name__ == "__main__":
                     pl = r_model(h)
                     loss = loss + nn.functional.binary_cross_entropy_with_logits(
                         pl, gp[msk], pos_weight=pw)
-                for p_ in params:
-                    if p_.grad is not None: p_.grad.zero_()
+                optimizer.zero_grad()
                 loss.backward()
-                adam_step()
+                optimizer.step()
                 total_loss += loss.item(); total_batches += 1
             del tr_X, tr_Y, tr_pos
         avg = total_loss / max(total_batches, 1)
