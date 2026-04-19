@@ -520,13 +520,24 @@ if __name__ == "__main__":
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
     parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
                         help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
+    parser.add_argument("--features", default="when",
+                        choices=["when", "played+when", "when+even", "all"],
+                        help="Which of the 180-d feature groups to use. "
+                             "180-d layout: [0:60]=played, [60:120]=when, [120:180]=even.")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))  # 60-d "when"
-    input_dim = N_MOVES
+    _feat_cols = {
+        "when":        list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
+        "played+when": list(range(0, 2 * N_MOVES)),                 # 120-d
+        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
+        "all":         list(range(0, 3 * N_MOVES)),                  # 180-d
+    }
+    feature_cols = _feat_cols[args.features]
+    input_dim = len(feature_cols)
+    print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
@@ -536,7 +547,9 @@ if __name__ == "__main__":
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
-    save_path = os.path.join(save_dir, f"pattern_simple_{args.mode}_H{args.hidden}.pt")
+    feat_tag = "" if args.features == "when" else f"_{args.features.replace('+', '')}"
+    save_path = os.path.join(save_dir,
+        f"pattern_simple_{args.mode}_H{args.hidden}{feat_tag}.pt")
 
     board_loss_weight = 0.5 if args.mode == "e2e" else 0.0
     if args.mode == "randproj":
