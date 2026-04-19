@@ -216,7 +216,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
-          legal_weight=0.0, pattern_to_cell=None):
+          legal_weight=0.0, pattern_to_cell=None, loss_type="bce"):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -240,6 +240,23 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
             raise ValueError("legal_weight > 0 requires pattern_to_cell tensor")
         pattern_to_cell = pattern_to_cell.to(device)
         print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
+
+    if loss_type not in ("bce", "mse"):
+        raise ValueError(f"loss_type must be 'bce' or 'mse', got {loss_type}")
+    print(f"  loss_type={loss_type}")
+
+    def pattern_loss(logits, targets):
+        """Compute per-pattern loss. BCE with logits or MSE on sigmoid."""
+        if loss_type == "bce":
+            return nn.functional.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pw_tensor)
+        # MSE on sigmoid output; weight positives by pos_weight to offset imbalance
+        prob = torch.sigmoid(logits)
+        sq = (prob - targets) ** 2
+        if pw_tensor is not None:
+            w = torch.where(targets > 0.5, pw_tensor, torch.ones_like(sq))
+            return (w * sq).mean()
+        return sq.mean()
 
     print(f"{mode} training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs, board_loss_weight={board_loss_weight}")
@@ -358,8 +375,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 if mode in ("direct", "randproj"):
                     if even_mask.any():
                         logits = model_even(x[even_mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[even_mask], pos_weight=pw_tensor)
+                        loss = loss + pattern_loss(logits, y_pat[even_mask])
                         if legal_weight > 0:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[even_mask], pattern_to_cell)
@@ -367,8 +383,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                                 cell_logits, cell_labels)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[odd_mask], pos_weight=pw_tensor)
+                        loss = loss + pattern_loss(logits, y_pat[odd_mask])
                         if legal_weight > 0:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[odd_mask], pattern_to_cell)
@@ -380,8 +395,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                         if not mask.any():
                             continue
                         pat_logits, board_logits = model(x[mask], pos[mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            pat_logits, y_pat[mask], pos_weight=pw_tensor)
+                        loss = loss + pattern_loss(pat_logits, y_pat[mask])
                         if board_loss_weight > 0:
                             loss = loss + board_loss_weight * nn.functional.cross_entropy(
                                 board_logits.reshape(-1, OPTIONS),
@@ -504,6 +518,8 @@ if __name__ == "__main__":
                         help="Use ONE model for all positions (no even/odd split)")
     parser.add_argument("--legal-weight", type=float, default=0.0,
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
+    parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
+                        help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -533,6 +549,8 @@ if __name__ == "__main__":
         save_path = save_path.replace('.pt', '_single.pt')
     if args.legal_weight > 0:
         save_path = save_path.replace('.pt', f'_lw{args.legal_weight:g}.pt')
+    if args.loss != "bce":
+        save_path = save_path.replace('.pt', f'_{args.loss}.pt')
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
@@ -541,5 +559,6 @@ if __name__ == "__main__":
           pos_weight=args.pos_weight,
           proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
           single_model=args.single_model,
-          legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell)
+          legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell,
+          loss_type=args.loss)
 
