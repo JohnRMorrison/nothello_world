@@ -1,24 +1,18 @@
-"""Two-layer readout on top of a frozen board-state MLP.
+"""Train 960 independent small networks, one per pattern.
 
-Motivation: the board-state MLP's hidden decodes cells at ~98.7%. But a
-single Linear(H, 960) output can't compute AND functions, which is what
-pattern firings require. Adding a second hidden layer + ReLU inside the
-readout gives the nonlinearity needed to compute ANDs of board facts.
+Each pattern gets its own (60 -> H_small -> 1) network. No hidden-unit
+sharing across patterns — if hidden-unit competition is the bottleneck,
+this should beat the shared-hidden model.
 
-Architecture:
-    x (60)
-      -> Linear_frozen + ReLU   (loaded from trained board-state MLP)
-           -> H_frozen hidden
-      -> Linear_new + ReLU      (trainable)
-           -> H_new hidden
-      -> Linear(H_new, 960)     (trainable)
+Implementation: a single batched forward pass with per-pattern weights,
+equivalent to 960 parallel networks:
+    h[b, j, :] = ReLU( x[b, :] @ W1[:, j, :] + b1[j, :] )       (B, 960, H_small)
+    y[b, j]    = sum_k h[b, j, k] * W2[j, k] + b2[j]            (B, 960)
 
-Only the last two layers are trained. Pattern BCE + pos_weight.
+Even/odd split (two sets of 960 networks). Pattern BCE + pos_weight.
 
 Usage:
-    python train_deep_readout.py \
-        --backbone experiments/.../mlp_checkpoints/mlp_when_H512_streaming.pt \
-        --new-hidden 512 --epochs 3 --pos-weight 5
+    python train_independent_patterns.py --hidden 16 --epochs 3 --pos-weight 5
 """
 import sys, os, argparse
 sys.path.insert(0, '.')
@@ -37,26 +31,29 @@ from train_pattern_simple import (
 )
 
 
-def load_backbone(ckpt_path, device):
-    """Load frozen first layer from a trained board-state MLP checkpoint.
+class IndependentPatterns(nn.Module):
+    """960 independent (D -> H -> 1) networks, computed in parallel."""
+    def __init__(self, input_dim, hidden_small, n_patterns=960):
+        super().__init__()
+        self.D = input_dim
+        self.H = hidden_small
+        self.P = n_patterns
+        # W1: (D, P, H), b1: (P, H), W2: (P, H), b2: (P,)
+        # Kaiming-style init
+        self.W1 = nn.Parameter(torch.randn(input_dim, n_patterns, hidden_small)
+                                * (2.0 / input_dim) ** 0.5)
+        self.b1 = nn.Parameter(torch.zeros(n_patterns, hidden_small))
+        self.W2 = nn.Parameter(torch.randn(n_patterns, hidden_small)
+                                * (2.0 / hidden_small) ** 0.5)
+        self.b2 = nn.Parameter(torch.zeros(n_patterns))
 
-    Returns (lin_even, lin_odd, H_frozen, input_dim).
-    """
-    ckpt = torch.load(ckpt_path, map_location=device)
-    H = ckpt['hidden_dim']
-    D = ckpt['input_dim']
-    lin_even = nn.Linear(D, H).to(device)
-    lin_odd = nn.Linear(D, H).to(device)
-    # _build_mlp uses nn.Sequential; first Linear is at index 0.
-    # _build_mlp uses nn.Sequential; state-dict keys are "0.weight",
-    # "0.bias", etc. (no "net." prefix).
-    lin_even.weight.data = ckpt['even']['0.weight'].to(device)
-    lin_even.bias.data = ckpt['even']['0.bias'].to(device)
-    lin_odd.weight.data = ckpt['odd']['0.weight'].to(device)
-    lin_odd.bias.data = ckpt['odd']['0.bias'].to(device)
-    for p in lin_even.parameters(): p.requires_grad = False
-    for p in lin_odd.parameters(): p.requires_grad = False
-    return lin_even, lin_odd, H, D, ckpt.get('best_acc', None)
+    def forward(self, x):
+        # x: (B, D). Contract over D -> (B, P, H)
+        h = torch.einsum('bd,dph->bph', x, self.W1) + self.b1  # (B, P, H)
+        h = torch.relu(h)
+        # Per-pattern: y[b, j] = sum_k h[b, j, k] * W2[j, k]
+        y = (h * self.W2).sum(dim=-1) + self.b2  # (B, P)
+        return y
 
 
 def prob_or_scores(pat_logits, idx, mask):
@@ -66,51 +63,44 @@ def prob_or_scores(pat_logits, idx, mask):
     return -gathered.sum(dim=-1)
 
 
-class DeepReadout(nn.Module):
-    """Optional middle Linear+ReLU, then a Linear to 960 patterns."""
-    def __init__(self, H_frozen, H_new, n_patterns=960, middle=True):
-        super().__init__()
-        self.middle = middle
-        if middle:
-            self.mid = nn.Linear(H_frozen, H_new)
-            self.out = nn.Linear(H_new, n_patterns)
-        else:
-            self.out = nn.Linear(H_frozen, n_patterns)
-
-    def forward(self, h_frozen):
-        # h_frozen is already ReLU'd
-        if self.middle:
-            return self.out(torch.relu(self.mid(h_frozen)))
-        return self.out(h_frozen)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backbone", required=True,
-                        help="Path to mlp_when_H{H}_streaming.pt (frozen)")
-    parser.add_argument("--new-hidden", type=int, default=512)
+    parser.add_argument("--hidden", type=int, default=16,
+                        help="Hidden size per small network")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--pos-weight", type=float, default=5.0)
-    parser.add_argument("--no-middle", action="store_true",
-                        help="Skip the middle Linear+ReLU (just frozen hidden -> Linear(H, 960))")
-    parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
-                        help="bce (default) or mse on sigmoid (uniform pattern scales)")
+    parser.add_argument("--features", default="when",
+                        choices=["when", "played+when", "when+even", "played+even",
+                                 "all", "mine_signed", "signed_parity"])
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))
+    _feat_cols = {
+        "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played+when": list(range(0, 2 * N_MOVES)),
+        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
+        "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":         list(range(0, 3 * N_MOVES)),
+    }
+    from train_pattern_simple import to_signed_parity_input, to_mine_signed_input
+    if args.features in _feat_cols:
+        feature_cols = _feat_cols[args.features]; feature_fn = None
+        input_dim = len(feature_cols)
+    elif args.features == "signed_parity":
+        feature_cols = None; feature_fn = lambda X, Y, p: to_signed_parity_input(X)
+        input_dim = N_MOVES
+    elif args.features == "mine_signed":
+        feature_cols = None; feature_fn = lambda X, Y, p: to_mine_signed_input(Y, p)
+        input_dim = N_MOVES
+    print(f"Features: {args.features} ({input_dim}-d), H_small={args.hidden}, pw={args.pos_weight}")
 
-    lin_even, lin_odd, H_frozen, D, backbone_acc = load_backbone(args.backbone, device)
-    assert D == N_MOVES, f"Expected 60-d backbone input, got {D}"
-    print(f"Loaded backbone {args.backbone} (H={H_frozen}, acc={backbone_acc})")
-
-    middle = not args.no_middle
-    readout_even = DeepReadout(H_frozen, args.new_hidden, middle=middle).to(device)
-    readout_odd = DeepReadout(H_frozen, args.new_hidden, middle=middle).to(device)
-    print(f"Architecture: middle_layer={middle}, loss={args.loss}")
+    model_even = IndependentPatterns(input_dim, args.hidden).to(device)
+    model_odd = IndependentPatterns(input_dim, args.hidden).to(device)
+    n_params = sum(p.numel() for p in model_even.parameters())
+    print(f"  params per model: {n_params:,}  (2x for even+odd)")
 
     patterns = enumerate_flanking_patterns()
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
@@ -120,7 +110,7 @@ if __name__ == "__main__":
     idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
     pw = torch.tensor([args.pos_weight], device=device)
 
-    params = list(readout_even.parameters()) + list(readout_odd.parameters())
+    params = list(model_even.parameters()) + list(model_odd.parameters())
     optimizer = torch.optim.Adam(params, lr=args.lr)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
@@ -133,13 +123,18 @@ if __name__ == "__main__":
     else:
         eval_path = chunk_files[-1]; train_paths = chunk_files[:-1]
 
+    def prep_batch(tr_X, tr_Y, tr_pos):
+        if feature_cols is not None:
+            return tr_X[:, feature_cols]
+        return feature_fn(tr_X, tr_Y, tr_pos)
+
     def eval_pass():
-        readout_even.eval(); readout_odd.eval()
+        model_even.eval(); model_odd.eval()
         totals_pat = {'tp': 0, 'fp': 0, 'fn': 0, 'tn': 0}
         agg = {a: {n: {'c': 0, 't': 0} for n in (1, 3, 5, 10)}
                for a in ('max', 'logsumexp', 'prob_or')}
         X, Y, pos_ = _load_features(eval_path)
-        X = X[:, feature_cols]
+        X = prep_batch(X, Y, pos_)
         n = min(len(X), 49 * 10000)
         rng = np.random.RandomState(0)
         si = np.sort(rng.choice(len(X), n, replace=False))
@@ -149,16 +144,11 @@ if __name__ == "__main__":
                 x = X[i:i+1024].to(device); yb = Y[i:i+1024]; p = pos_[i:i+1024]
                 em = (p % 2 == 0); om = ~em
                 pl = torch.zeros(len(x), 960, device=device)
-                if em.any():
-                    h = torch.relu(lin_even(x[em]))
-                    pl[em] = readout_even(h)
-                if om.any():
-                    h = torch.relu(lin_odd(x[om]))
-                    pl[om] = readout_odd(h)
+                if em.any(): pl[em] = model_even(x[em])
+                if om.any(): pl[om] = model_odd(x[om])
                 gp = torch.from_numpy(compute_pattern_labels_batch(
                     yb.numpy(), p.numpy(),
-                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-                ).to(device)
+                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)).to(device)
                 pred = (pl > 0); gt = (gp > 0.5)
                 totals_pat['tp'] += (pred & gt).sum().item()
                 totals_pat['fp'] += (pred & ~gt).sum().item()
@@ -189,8 +179,7 @@ if __name__ == "__main__":
         acc = (pat_t['tp'] + pat_t['tn']) / max(tot, 1)
         rec = pat_t['tp'] / max(pat_t['tp'] + pat_t['fn'], 1)
         pre = pat_t['tp'] / max(pat_t['tp'] + pat_t['fp'], 1)
-        print(f"  {label}")
-        print(f"    pattern: acc={acc:.4%} recall={rec:.4%} prec={pre:.4%}")
+        print(f"  {label}: acc={acc:.4%} recall={rec:.4%} prec={pre:.4%}")
         for name in ('max', 'logsumexp', 'prob_or'):
             row = [name]
             for k in (1, 3, 5, 10):
@@ -198,16 +187,15 @@ if __name__ == "__main__":
                 row.append(f"{d['c']/max(d['t'],1):.4%}")
             print(f"    {row[0]:10s} top-1={row[1]} top-3={row[2]} top-5={row[3]} top-10={row[4]}")
 
-    print(f"\nTraining: {len(train_paths)} chunks x {args.epochs} epochs, "
-          f"H_frozen={H_frozen}, H_new={args.new_hidden}, lr={args.lr}, pw={args.pos_weight}")
+    print(f"\nTraining: {len(train_paths)} chunks x {args.epochs} epochs, lr={args.lr}")
     for epoch in range(1, args.epochs + 1):
-        readout_even.train(); readout_odd.train()
+        model_even.train(); model_odd.train()
         rng = np.random.RandomState(epoch)
         order = rng.permutation(len(train_paths))
         total_loss = 0.0; total_batches = 0
         for ci in order:
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            tr_X = tr_X[:, feature_cols]
+            tr_X = prep_batch(tr_X, tr_Y, tr_pos)
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), 1024):
                 sel = perm[i:i + 1024]
@@ -215,24 +203,14 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     gp = torch.from_numpy(compute_pattern_labels_batch(
                         yb.numpy(), p.numpy(),
-                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-                    ).to(device)
+                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)).to(device)
                 em = (p % 2 == 0); om = ~em
                 loss = torch.tensor(0.0, device=device)
-                for msk, r_model, lin in [(em, readout_even, lin_even),
-                                          (om, readout_odd, lin_odd)]:
+                for msk, m in [(em, model_even), (om, model_odd)]:
                     if not msk.any(): continue
-                    with torch.no_grad():
-                        h = torch.relu(lin(x[msk]))
-                    pl = r_model(h)
-                    if args.loss == "bce":
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            pl, gp[msk], pos_weight=pw)
-                    else:
-                        prob = torch.sigmoid(pl)
-                        sq = (prob - gp[msk]) ** 2
-                        w = torch.where(gp[msk] > 0.5, pw, torch.ones_like(sq))
-                        loss = loss + (w * sq).mean()
+                    pl = m(x[msk])
+                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                        pl, gp[msk], pos_weight=pw)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -241,20 +219,13 @@ if __name__ == "__main__":
         avg = total_loss / max(total_batches, 1)
         pat_t, agg_t = eval_pass()
         print(f"\nEpoch {epoch}: loss={avg:.5f}", flush=True)
-        _print(pat_t, agg_t, "deep-readout")
+        _print(pat_t, agg_t, "independent")
 
-    base = os.path.splitext(os.path.basename(args.backbone))[0]
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
     os.makedirs(save_dir, exist_ok=True)
-    mid_tag = "" if middle else "_nomid"
-    loss_tag = "" if args.loss == "bce" else "_mse"
+    feat_tag = "" if args.features == "when" else f"_{args.features.replace('+', '')}"
     save_path = os.path.join(save_dir,
-        f"deepro_{base}_Hnew{args.new_hidden}_pw{int(args.pos_weight)}{mid_tag}{loss_tag}.pt")
-    torch.save({
-        'even': readout_even.state_dict(),
-        'odd': readout_odd.state_dict(),
-        'backbone_ckpt': args.backbone,
-        'H_frozen': H_frozen,
-        'H_new': args.new_hidden,
-    }, save_path)
+        f"indep_Hsmall{args.hidden}_pw{int(args.pos_weight)}{feat_tag}.pt")
+    torch.save({'even': model_even.state_dict(), 'odd': model_odd.state_dict(),
+                'input_dim': input_dim, 'hidden_small': args.hidden}, save_path)
     print(f"\nSaved to {save_path}")
