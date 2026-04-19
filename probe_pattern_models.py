@@ -195,10 +195,16 @@ if __name__ == "__main__":
         chunk_dir, device, model_even, model_odd, args.mode,
         feature_cols, args.hidden, epochs=args.epochs)
 
-    # Save probe weights
+    # Save probe weights. Derive suffix from source checkpoint filename so
+    # probes for variants (_single, _pw50, _lw1, etc.) don't overwrite each other.
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
     os.makedirs(save_dir, exist_ok=True)
-    probe_path = os.path.join(save_dir, f"probe_{args.mode}_H{args.hidden}.pt")
+    stem = os.path.basename(args.ckpt)
+    if stem.startswith("pattern_simple_"):
+        stem = stem[len("pattern_simple_"):]
+    if stem.endswith(".pt"):
+        stem = stem[:-3]
+    probe_path = os.path.join(save_dir, f"probe_{stem}.pt")
     torch.save({
         'even': best_probe_state['even'],
         'odd': best_probe_state['odd'],
