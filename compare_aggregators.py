@@ -90,6 +90,35 @@ def agg_prob_or(pat_logits, idx, mask):
     return -gathered.sum(dim=-1)                   # -log(1-P): higher = more likely legal
 
 
+def agg_count_above_zero(pat_logits, idx, mask):
+    # How many patterns per cell have logit > 0 (hard threshold).
+    counts = (pat_logits > 0).to(pat_logits.dtype)
+    gathered = counts[:, idx]
+    gathered = gathered.masked_fill(~mask, 0.0)
+    return gathered.sum(dim=-1)
+
+
+def agg_sum_sigmoid(pat_logits, idx, mask):
+    # Soft count: sum of per-pattern probabilities (0..max_per_cell).
+    probs = torch.sigmoid(pat_logits)
+    gathered = probs[:, idx]
+    gathered = gathered.masked_fill(~mask, 0.0)
+    return gathered.sum(dim=-1)
+
+
+def agg_ensemble_zscore(pat_logits, idx, mask):
+    # Combine max + logsumexp + prob_or after per-position z-score.
+    # Argmax should favor cells that rank high under multiple aggregators.
+    def zscore(x):
+        mu = x.mean(dim=-1, keepdim=True)
+        sd = x.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        return (x - mu) / sd
+    s1 = agg_max(pat_logits, idx, mask)
+    s2 = agg_logsumexp(pat_logits, idx, mask)
+    s3 = agg_prob_or(pat_logits, idx, mask)
+    return zscore(s1) + zscore(s2) + zscore(s3)
+
+
 def score(agg, pat_logits, idx, mask, legal, top_ns=(1, 3, 5, 10)):
     cs = agg(pat_logits, idx, mask).cpu().numpy()
     gl = (legal > 0.5).cpu().numpy()
@@ -165,6 +194,9 @@ if __name__ == "__main__":
         'topk_mean-3': agg_topk_mean(3),
         'topk_mean-5': agg_topk_mean(5),
         'prob_or':     agg_prob_or,
+        'count_pos':   agg_count_above_zero,
+        'sum_sigmoid': agg_sum_sigmoid,
+        'ensemble_z':  agg_ensemble_zscore,
     }
     totals = {name: {n: {'c': 0, 't': 0} for n in (1, 3, 5, 10)}
               for name in aggregators}
