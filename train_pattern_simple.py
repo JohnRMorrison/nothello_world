@@ -293,15 +293,20 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
-    # Load eval data — EXACTLY like train_streaming.py
+    # Load eval data. Chunks are position-sorted, so a head slice lands
+    # in one narrow position bucket (positions 5-6 in practice). Take a
+    # deterministic random sample across all positions so metrics are
+    # representative.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
     n_eval = min(len(ev_X), 49 * 10000)
-    ev_X = ev_X[:n_eval].clone()
-    ev_Y = ev_Y[:n_eval].clone()
-    ev_pos = ev_pos[:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)}")
+    rng = np.random.RandomState(0)
+    sample_idx = np.sort(rng.choice(len(ev_X), n_eval, replace=False))
+    ev_X = ev_X[sample_idx].clone()
+    ev_Y = ev_Y[sample_idx].clone()
+    ev_pos = ev_pos[sample_idx].clone()
+    print(f"  Eval samples: {len(ev_X)} (random across positions)")
 
     best_acc = 0.0
     best_state = None
