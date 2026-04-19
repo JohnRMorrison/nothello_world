@@ -72,6 +72,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--pos-weight", type=float, default=10.0)
+    parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
+                        help="bce: BCE with logits (unbounded). mse: MSE on sigmoid output (bounded 0/1 targets, uniform scales).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -205,18 +207,23 @@ if __name__ == "__main__":
                     ).to(device)
                 em = (p % 2 == 0); om = ~em
                 loss = torch.tensor(0.0, device=device)
-                if em.any():
+                for msk, r_model in [(em, readout_even), (om, readout_odd)]:
+                    if not msk.any(): continue
                     with torch.no_grad():
-                        h = hidden_activation(me, x[em])
-                    pl = readout_even(h)
-                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                        pl, gp[em], pos_weight=pw)
-                if om.any():
-                    with torch.no_grad():
-                        h = hidden_activation(mo, x[om])
-                    pl = readout_odd(h)
-                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                        pl, gp[om], pos_weight=pw)
+                        src = me if r_model is readout_even else mo
+                        h = hidden_activation(src, x[msk])
+                    pl = r_model(h)
+                    if args.loss == "bce":
+                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                            pl, gp[msk], pos_weight=pw)
+                    else:
+                        # MSE on sigmoid output; apply pos_weight to the positives
+                        # to counter class imbalance (so rare firings still train).
+                        prob = torch.sigmoid(pl)
+                        sq = (prob - gp[msk]) ** 2
+                        # weight sq by pos_weight on positives
+                        w = torch.where(gp[msk] > 0.5, pw, torch.ones_like(sq))
+                        loss = loss + (w * sq).mean()
                 for p_ in params:
                     if p_.grad is not None: p_.grad.zero_()
                 loss.backward()
@@ -233,7 +240,8 @@ if __name__ == "__main__":
     base = os.path.splitext(os.path.basename(args.ckpt))[0]
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
     os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir, f"readout_{base}_pw{int(args.pos_weight)}.pt")
+    save_path = os.path.join(save_dir,
+        f"readout_{base}_{args.loss}_pw{int(args.pos_weight)}.pt")
     torch.save({
         'even': readout_even.state_dict(),
         'odd': readout_odd.state_dict(),
