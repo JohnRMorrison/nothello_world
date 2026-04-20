@@ -96,6 +96,15 @@ def _apply_activation(x, name):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ogpt-ckpt", default="ckpts/gpt_nanda_synthetic.ckpt")
+    parser.add_argument("--random-embeddings", action="store_true",
+                        help="Instead of loading OGPT's learned tok_emb/pos_emb, "
+                             "use freshly-initialized random tables (Kaiming). "
+                             "Tests whether the sequence FORMAT carries enough info, "
+                             "independent of OGPT's specific learned representation.")
+    parser.add_argument("--n-embd", type=int, default=512,
+                        help="Embedding dim when using --random-embeddings.")
+    parser.add_argument("--vocab-size", type=int, default=61,
+                        help="Vocab size when using --random-embeddings.")
     parser.add_argument("--aggregation",
                         choices=["sequence", "last_token", "mean", "sum"],
                         required=True,
@@ -124,8 +133,16 @@ if __name__ == "__main__":
     print(f"Aggregation: {args.aggregation}  activation: {args.activation}  "
           f"add_pos_emb: {args.add_pos_emb}  seed: {args.seed}")
 
-    # Load OGPT embeddings (frozen)
-    tok_emb, pos_emb = load_ogpt_embeddings(args.ogpt_ckpt, device)
+    # Load OGPT embeddings (frozen) — or use random tables.
+    if args.random_embeddings:
+        torch.manual_seed(args.seed)
+        n_embd = args.n_embd
+        # Kaiming-ish random tables, shape matching OGPT conventions.
+        tok_emb = torch.randn(args.vocab_size, n_embd, device=device) * (1.0 / math.sqrt(n_embd))
+        pos_emb = torch.randn(MAX_MOVES, n_embd, device=device) * (1.0 / math.sqrt(n_embd))
+        print(f"Random embeddings: vocab={args.vocab_size}, n_embd={n_embd}, pos={MAX_MOVES}")
+    else:
+        tok_emb, pos_emb = load_ogpt_embeddings(args.ogpt_ckpt, device)
     n_embd = tok_emb.shape[1]
     assert pos_emb.shape[0] >= MAX_MOVES, \
         f"pos_emb has {pos_emb.shape[0]} positions but MAX_MOVES={MAX_MOVES}"
