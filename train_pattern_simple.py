@@ -186,6 +186,19 @@ def _get_cell_pat_index(pattern_to_cell, n_cells):
     return _cell_pat_cache[key]
 
 
+def to_color_split_input(X_tensor):
+    """120-d: [0:60]=played_by_white (played AND even), [60:120]=played_by_black.
+
+    Same info as 'played+even' but split into per-color channels.
+    Convention (from precompute code): step 0 = white, so even step = white move.
+    """
+    played = X_tensor[:, :60]
+    even = X_tensor[:, 120:180]
+    white_played = played * even
+    black_played = played * (1.0 - even)
+    return torch.cat([white_played, black_played], dim=-1)
+
+
 def to_signed_parity_input(X_tensor):
     """60-d: +1 if played-on-even, -1 if played-on-odd, 0 if empty.
     X_tensor is the raw 180-d features. [0:60]=played, [120:180]=even.
@@ -567,10 +580,12 @@ if __name__ == "__main__":
                         help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
     parser.add_argument("--features", default="when",
                         choices=["when", "played+when", "when+even", "played+even",
-                                 "all", "board_state", "signed_parity", "mine_signed"],
+                                 "all", "board_state", "signed_parity", "mine_signed",
+                                 "color_split"],
                         help="Input features. Slices/derivations of the 180-d base. "
                              "signed_parity (60-d): +1/-1 per played color, 0 empty. "
                              "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
+                             "color_split (120-d): separate channels for white and black placements. "
                              "board_state (192-d): ground-truth board (upper-bound experiment).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
@@ -602,6 +617,10 @@ if __name__ == "__main__":
         feature_cols = None
         feature_fn = lambda X, Y, pos: to_board_state_input(Y, pos)
         input_dim = 3 * 64
+    elif args.features == "color_split":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_color_split_input(X)
+        input_dim = 2 * N_MOVES
     print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()

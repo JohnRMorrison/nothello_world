@@ -149,7 +149,7 @@ if __name__ == "__main__":
     parser.add_argument("--features", default=None,
                         choices=[None, "when", "played+when", "when+even",
                                  "played+even", "all", "board_state",
-                                 "signed_parity", "mine_signed"],
+                                 "signed_parity", "mine_signed", "color_split"],
                         help="Feature set used during training (inferred from "
                              "checkpoint's input_dim if omitted).")
     parser.add_argument("--output-dir",
@@ -167,6 +167,7 @@ if __name__ == "__main__":
         if "board_state" in name: args.features = "board_state"
         elif "wheneven" in name: args.features = "when+even"
         elif "playedeven" in name: args.features = "played+even"
+        elif "color_split" in name: args.features = "color_split"
         elif "signed_parity" in name: args.features = "signed_parity"
         elif "mine_signed" in name: args.features = "mine_signed"
         elif input_dim == 120: args.features = "when+even"
@@ -198,8 +199,8 @@ if __name__ == "__main__":
     eval_path = chunk_files[-1]
     print(f"Eval: {os.path.basename(eval_path)} (random sample)")
 
-    from train_pattern_simple import (to_signed_parity_input,
-                                       to_mine_signed_input, to_board_state_input)
+    from train_pattern_simple import (to_signed_parity_input, to_mine_signed_input,
+                                       to_board_state_input, to_color_split_input)
     _feat_cols = {
         "when":        list(range(N_MOVES, 2 * N_MOVES)),
         "played+when": list(range(0, 2 * N_MOVES)),
@@ -216,6 +217,8 @@ if __name__ == "__main__":
         X = to_mine_signed_input(Y, pos)
     elif args.features == "board_state":
         X = to_board_state_input(Y, pos)
+    elif args.features == "color_split":
+        X = to_color_split_input(X)
     n = min(len(X), 49 * 10000)
     rng = np.random.RandomState(0)
     si = np.sort(rng.choice(len(X), n, replace=False))
