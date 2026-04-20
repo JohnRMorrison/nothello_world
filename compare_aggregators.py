@@ -146,20 +146,40 @@ if __name__ == "__main__":
     parser.add_argument("--mode", required=True,
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
+    parser.add_argument("--features", default=None,
+                        choices=[None, "when", "played+when", "when+even",
+                                 "played+even", "all", "board_state",
+                                 "signed_parity", "mine_signed"],
+                        help="Feature set used during training (inferred from "
+                             "checkpoint's input_dim if omitted).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))
-
     ckpt = torch.load(args.ckpt, map_location=device)
     n_patterns = ckpt.get('n_patterns', 960)
+    input_dim = ckpt.get('input_dim', N_MOVES)
+
+    # Infer features from input_dim if --features not specified
+    if args.features is None:
+        name = os.path.basename(args.ckpt)
+        if "board_state" in name: args.features = "board_state"
+        elif "wheneven" in name: args.features = "when+even"
+        elif "playedeven" in name: args.features = "played+even"
+        elif "signed_parity" in name: args.features = "signed_parity"
+        elif "mine_signed" in name: args.features = "mine_signed"
+        elif input_dim == 120: args.features = "when+even"
+        elif input_dim == 180: args.features = "all"
+        elif input_dim == 192: args.features = "board_state"
+        else: args.features = "when"
+    print(f"Features: {args.features} (input_dim={input_dim})")
+
     Cls = {"direct": DirectMLP, "randproj": DirectMLP,
            "two-stage": TwoStageMLP,
            "emergent": EndToEndMLP, "e2e": EndToEndMLP}[args.mode]
-    me = Cls(N_MOVES, args.hidden, n_patterns).to(device)
-    mo = Cls(N_MOVES, args.hidden, n_patterns).to(device)
+    me = Cls(input_dim, args.hidden, n_patterns).to(device)
+    mo = Cls(input_dim, args.hidden, n_patterns).to(device)
     me.load_state_dict(ckpt['even']); me.eval()
     mo.load_state_dict(ckpt['odd']); mo.eval()
     print(f"Loaded {args.ckpt} (pat_acc={ckpt.get('best_pat_acc', '?')})")
@@ -178,8 +198,24 @@ if __name__ == "__main__":
     eval_path = chunk_files[-1]
     print(f"Eval: {os.path.basename(eval_path)} (random sample)")
 
+    from train_pattern_simple import (to_signed_parity_input,
+                                       to_mine_signed_input, to_board_state_input)
+    _feat_cols = {
+        "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played+when": list(range(0, 2 * N_MOVES)),
+        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
+        "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":         list(range(0, 3 * N_MOVES)),
+    }
     X, Y, pos = _load_features(eval_path)
-    X = X[:, feature_cols]
+    if args.features in _feat_cols:
+        X = X[:, _feat_cols[args.features]]
+    elif args.features == "signed_parity":
+        X = to_signed_parity_input(X)
+    elif args.features == "mine_signed":
+        X = to_mine_signed_input(Y, pos)
+    elif args.features == "board_state":
+        X = to_board_state_input(Y, pos)
     n = min(len(X), 49 * 10000)
     rng = np.random.RandomState(0)
     si = np.sort(rng.choice(len(X), n, replace=False))
