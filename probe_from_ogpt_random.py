@@ -31,7 +31,9 @@ from experiments.mathematical_transformation_experiments.heuristic_probe_experim
 )
 
 
-MAX_MOVES = 60
+# Nanda's Othello-GPT uses block_size=59 (games are 60 moves but model predicts
+# the last; positions 0..58 are inputs). We pad/clip to this length.
+MAX_MOVES = 59
 
 
 def features_to_tokens(played, when, max_n=MAX_MOVES):
@@ -94,7 +96,15 @@ def _apply_activation(x, name):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ogpt-ckpt", default="ckpts/gpt_nanda_synthetic.ckpt")
-    parser.add_argument("--aggregation", choices=["sequence", "mean", "sum"], required=True)
+    parser.add_argument("--aggregation",
+                        choices=["sequence", "last_token", "mean", "sum"],
+                        required=True,
+                        help="sequence: flatten (59, 512) to 30192-d probe input; "
+                             "last_token: use only the final valid token's 512-d activation; "
+                             "mean/sum: pool over non-pad tokens first, then random project.")
+    parser.add_argument("--normalize-input", action="store_true", default=True,
+                        help="Divide embeddings by their std before random projection.")
+    parser.add_argument("--no-normalize-input", dest="normalize_input", action="store_false")
     parser.add_argument("--activation", choices=["relu", "swish"], default="relu")
     parser.add_argument("--add-pos-emb", action="store_true", default=True,
                         help="Include position embeddings (default True).")
@@ -117,18 +127,27 @@ if __name__ == "__main__":
     # Load OGPT embeddings (frozen)
     tok_emb, pos_emb = load_ogpt_embeddings(args.ogpt_ckpt, device)
     n_embd = tok_emb.shape[1]
+    assert pos_emb.shape[0] >= MAX_MOVES, \
+        f"pos_emb has {pos_emb.shape[0]} positions but MAX_MOVES={MAX_MOVES}"
+    pos_emb = pos_emb[:MAX_MOVES]   # trim if longer
     print(f"OGPT: vocab={tok_emb.shape[0]}, n_embd={n_embd}, block_size={pos_emb.shape[0]}")
 
     # Decide probe input_dim based on aggregation
-    if args.aggregation == "sequence":
-        proj_in = n_embd
-        proj_out = args.hidden
-        probe_in = MAX_MOVES * proj_out
-    else:
-        proj_in = n_embd
-        proj_out = args.hidden
-        probe_in = proj_out
+    proj_in = n_embd
+    proj_out = args.hidden
+    probe_in = MAX_MOVES * proj_out if args.aggregation == "sequence" else proj_out
     print(f"proj: {proj_in} -> {proj_out}  probe_in: {probe_in}")
+
+    # Input-normalization stats: std of the real move embeddings (excluding
+    # token 0) plus pos_emb averaged over positions. Rough but stable.
+    input_std = None
+    if args.normalize_input:
+        # Build a few (token + pos) vectors: one per valid token at one pos.
+        tok_sample = tok_emb[1:]                          # (60, 512)
+        pos_sample = pos_emb.mean(dim=0, keepdim=True)    # (1, 512)
+        sample = tok_sample + pos_sample                   # (60, 512)
+        input_std = sample.flatten().std().item()
+        print(f"input normalization: dividing by std={input_std:.4f}")
 
     proj_W, proj_b = build_random_projection(proj_in, proj_out, args.seed, device)
 
@@ -150,33 +169,41 @@ if __name__ == "__main__":
     when_cols = list(range(N_MOVES, 2 * N_MOVES))
 
     def compute_features(X, n_moves, tokens):
-        """X: (B, 180) or sliced; we only use played+when to get tokens.
-        Returns probe-ready input, shape (B, probe_in)."""
+        """tokens: (B, MAX_MOVES) with 0 = padding. Returns (B, probe_in)."""
         B = len(tokens)
-        # Embed: (B, 60, n_embd)
-        tok_vecs = tok_emb[tokens]     # (B, 60, n_embd) — rows with token=0 give padding embedding
+        # Embed: (B, MAX_MOVES, n_embd). tok_emb[0] = padding embedding (unused).
+        tok_vecs = tok_emb[tokens]
         if args.add_pos_emb:
-            tok_vecs = tok_vecs + pos_emb.unsqueeze(0)   # broadcast (1, 60, n_embd)
-        # Zero out padding positions (where token == 0)
-        pad_mask = (tokens == 0)  # (B, 60)
+            tok_vecs = tok_vecs + pos_emb.unsqueeze(0)   # (1, MAX_MOVES, n_embd)
+        # Zero out padding positions so they contribute nothing downstream.
+        pad_mask = (tokens == 0)  # (B, MAX_MOVES)
         tok_vecs = tok_vecs.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        if input_std is not None:
+            tok_vecs = tok_vecs / input_std
 
         if args.aggregation == "sequence":
-            # Per-token random projection, then flatten
-            flat = tok_vecs.reshape(-1, n_embd)          # (B*60, n_embd)
+            flat = tok_vecs.reshape(-1, n_embd)
             h = _apply_activation(flat @ proj_W + proj_b, args.activation)
-            # Zero-out ReLU-positive activation at pad positions (so padding contributes nothing)
             h = h.view(B, MAX_MOVES, proj_out)
             h = h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
             return h.reshape(B, -1)
-        elif args.aggregation == "mean":
-            # Average across non-pad positions
+
+        if args.aggregation == "last_token":
+            # Index of last valid token = n_moves - 1 (clamp to ≥ 0 if sample has no moves).
+            last_idx = (torch.from_numpy(n_moves).to(tokens.device) - 1).clamp(min=0)
+            # Gather per-sample last-token embedding
+            gather_idx = last_idx.view(B, 1, 1).expand(-1, 1, n_embd)
+            last_vec = tok_vecs.gather(1, gather_idx).squeeze(1)   # (B, n_embd)
+            return _apply_activation(last_vec @ proj_W + proj_b, args.activation)
+
+        if args.aggregation == "mean":
             counts = (~pad_mask).sum(dim=-1, keepdim=True).clamp(min=1).to(tok_vecs.dtype)
             agg = tok_vecs.sum(dim=1) / counts
             return _apply_activation(agg @ proj_W + proj_b, args.activation)
-        else:  # sum
-            agg = tok_vecs.sum(dim=1)
-            return _apply_activation(agg @ proj_W + proj_b, args.activation)
+
+        # sum
+        agg = tok_vecs.sum(dim=1)
+        return _apply_activation(agg @ proj_W + proj_b, args.activation)
 
     def eval_pass():
         probe_even.eval(); probe_odd.eval()
