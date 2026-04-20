@@ -32,7 +32,8 @@ def _add_spatial(X):
 
 def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
                                   feature_cols, seed, lr=1e-3, epochs=1,
-                                  batch_size=1024, save_path=None):
+                                  batch_size=1024, save_path=None,
+                                  activation="relu"):
     """Train linear output on top of a frozen random projection.
 
     Architecture per even/odd split:
@@ -53,6 +54,14 @@ def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
     torch.manual_seed(seed)
     proj_W = torch.randn(input_dim, hidden_dim, device=device) * math.sqrt(2.0 / input_dim)
     proj_b = torch.zeros(hidden_dim, device=device)
+    if activation == "relu":
+        _act = torch.relu
+    elif activation == "swish":
+        # Swish = x * sigmoid(x), also known as SiLU in PyTorch.
+        _act = torch.nn.functional.silu
+    else:
+        raise ValueError(f"unknown activation: {activation}")
+    print(f"  activation: {activation}")
 
     # Trainable output layers only
     out_even = nn.Linear(hidden_dim, 64 * OPTIONS).to(device)
@@ -99,12 +108,12 @@ def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
 
                 loss = torch.tensor(0.0, device=device)
                 if even_mask.any():
-                    h = torch.relu(x[even_mask] @ proj_W + proj_b)
+                    h = _act(x[even_mask] @ proj_W + proj_b)
                     logits = out_even(h).view(-1, 64, OPTIONS)
                     loss = loss + nn.functional.cross_entropy(
                         logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1))
                 if odd_mask.any():
-                    h = torch.relu(x[odd_mask] @ proj_W + proj_b)
+                    h = _act(x[odd_mask] @ proj_W + proj_b)
                     logits = out_odd(h).view(-1, 64, OPTIONS)
                     loss = loss + nn.functional.cross_entropy(
                         logits.reshape(-1, OPTIONS), y[odd_mask].reshape(-1))
@@ -132,13 +141,13 @@ def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
 
                 preds = torch.zeros_like(y)
                 if even_mask.any():
-                    h = torch.relu(x[even_mask] @ proj_W + proj_b)
+                    h = _act(x[even_mask] @ proj_W + proj_b)
                     logits = out_even(h).view(-1, 64, OPTIONS)
                     preds[even_mask] = logits.argmax(-1)
                     losses.append(nn.functional.cross_entropy(
                         logits.reshape(-1, OPTIONS), y[even_mask].reshape(-1)).item())
                 if odd_mask.any():
-                    h = torch.relu(x[odd_mask] @ proj_W + proj_b)
+                    h = _act(x[odd_mask] @ proj_W + proj_b)
                     logits = out_odd(h).view(-1, 64, OPTIONS)
                     preds[odd_mask] = logits.argmax(-1)
                     losses.append(nn.functional.cross_entropy(
@@ -185,6 +194,8 @@ parser.add_argument("--random-proj", action="store_true",
                     help="Freeze first layer (random projection), only train output layer")
 parser.add_argument("--seed", type=int, default=0,
                     help="Random seed for random projection initialization")
+parser.add_argument("--activation", choices=["relu", "swish"], default="relu",
+                    help="Activation after the random projection")
 parser.add_argument("--output-dir",
                     default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
 args = parser.parse_args()
@@ -223,13 +234,15 @@ if args.random_proj:
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     save_dir = os.path.join(args.output_dir, "mlp_checkpoints")
     os.makedirs(save_dir, exist_ok=True)
+    act_tag = "" if args.activation == "relu" else f"_{args.activation}"
     save_path = os.path.join(save_dir,
-        f"mlp_{args.features}_randproj_s{args.seed}_H{args.hidden}_streaming.pt")
+        f"mlp_{args.features}_randproj_s{args.seed}_H{args.hidden}{act_tag}_streaming.pt")
 
     acc = _train_random_proj_streaming(
         chunk_dir, device, input_dim, args.hidden,
         feature_cols=feature_cols, seed=args.seed,
         epochs=args.epochs, save_path=save_path,
+        activation=args.activation,
     )
     print(f"\nFinal: {args.features} randproj(s={args.seed}) H={args.hidden}: {acc:.4%}")
 
