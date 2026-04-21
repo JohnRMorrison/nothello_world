@@ -147,9 +147,10 @@ if __name__ == "__main__":
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--features", default=None,
-                        choices=[None, "when", "played+when", "when+even",
+                        choices=[None, "when", "played", "played+when", "when+even",
                                  "played+even", "all", "board_state",
-                                 "signed_parity", "mine_signed", "color_split"],
+                                 "signed_parity", "mine_signed", "color_split",
+                                 "played+halfmask", "played+bit"],
                         help="Feature set used during training (inferred from "
                              "checkpoint's input_dim if omitted).")
     parser.add_argument("--output-dir",
@@ -168,8 +169,11 @@ if __name__ == "__main__":
         elif "wheneven" in name: args.features = "when+even"
         elif "playedeven" in name: args.features = "played+even"
         elif "color_split" in name: args.features = "color_split"
+        elif "halfmask" in name: args.features = "played+halfmask"
+        elif "played_bit" in name or "playedbit" in name: args.features = "played+bit"
         elif "signed_parity" in name: args.features = "signed_parity"
         elif "mine_signed" in name: args.features = "mine_signed"
+        elif input_dim == 62: args.features = "played+bit"
         elif input_dim == 120: args.features = "when+even"
         elif input_dim == 180: args.features = "all"
         elif input_dim == 192: args.features = "board_state"
@@ -200,9 +204,11 @@ if __name__ == "__main__":
     print(f"Eval: {os.path.basename(eval_path)} (random sample)")
 
     from train_pattern_simple import (to_signed_parity_input, to_mine_signed_input,
-                                       to_board_state_input, to_color_split_input)
+                                       to_board_state_input, to_color_split_input,
+                                       to_played_halfmask_input, to_played_bit_input)
     _feat_cols = {
         "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played":      list(range(0, N_MOVES)),
         "played+when": list(range(0, 2 * N_MOVES)),
         "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
         "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
@@ -219,6 +225,10 @@ if __name__ == "__main__":
         X = to_board_state_input(Y, pos)
     elif args.features == "color_split":
         X = to_color_split_input(X)
+    elif args.features == "played+halfmask":
+        X = to_played_halfmask_input(X)
+    elif args.features == "played+bit":
+        X = to_played_bit_input(X)
     n = min(len(X), 49 * 10000)
     rng = np.random.RandomState(0)
     si = np.sort(rng.choice(len(X), n, replace=False))

@@ -186,6 +186,34 @@ def _get_cell_pat_index(pattern_to_cell, n_cells):
     return _cell_pat_cache[key]
 
 
+def to_played_halfmask_input(X_tensor):
+    """120-d: [0:60]=played, [60:90]=all ones, [90:120]=all zeros.
+
+    Control for "played+even": the last 60 dims are a FIXED vector
+    (same for every sample), so they carry zero game-specific info.
+    If this matches played+even performance, the win from 'even' is
+    from having extra dims, not from color info.
+    """
+    played = X_tensor[:, :60]
+    B = played.shape[0]
+    ones = torch.ones(B, 30, device=played.device, dtype=played.dtype)
+    zeros = torch.zeros(B, 30, device=played.device, dtype=played.dtype)
+    return torch.cat([played, ones, zeros], dim=-1)
+
+
+def to_played_bit_input(X_tensor):
+    """62-d: [0:60]=played, [60]=1, [61]=0.
+
+    Further control: a single '1' and a single '0' appended to played.
+    Essentially just a bias trick — zero new info per sample.
+    """
+    played = X_tensor[:, :60]
+    B = played.shape[0]
+    ones = torch.ones(B, 1, device=played.device, dtype=played.dtype)
+    zeros = torch.zeros(B, 1, device=played.device, dtype=played.dtype)
+    return torch.cat([played, ones, zeros], dim=-1)
+
+
 def to_color_split_input(X_tensor):
     """120-d: [0:60]=played_by_white (played AND even), [60:120]=played_by_black.
 
@@ -579,9 +607,10 @@ if __name__ == "__main__":
     parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
                         help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
     parser.add_argument("--features", default="when",
-                        choices=["when", "played+when", "when+even", "played+even",
-                                 "all", "board_state", "signed_parity", "mine_signed",
-                                 "color_split"],
+                        choices=["when", "played", "played+when", "when+even",
+                                 "played+even", "all", "board_state",
+                                 "signed_parity", "mine_signed", "color_split",
+                                 "played+halfmask", "played+bit"],
                         help="Input features. Slices/derivations of the 180-d base. "
                              "signed_parity (60-d): +1/-1 per played color, 0 empty. "
                              "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
@@ -596,6 +625,7 @@ if __name__ == "__main__":
     # Exactly one is used per run.
     _feat_cols = {
         "when":         list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
+        "played":       list(range(0, N_MOVES)),                     # 60-d
         "played+when":  list(range(0, 2 * N_MOVES)),                 # 120-d
         "when+even":    list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
         "played+even":  list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
@@ -621,6 +651,14 @@ if __name__ == "__main__":
         feature_cols = None
         feature_fn = lambda X, Y, pos: to_color_split_input(X)
         input_dim = 2 * N_MOVES
+    elif args.features == "played+halfmask":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_halfmask_input(X)
+        input_dim = 2 * N_MOVES
+    elif args.features == "played+bit":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_bit_input(X)
+        input_dim = N_MOVES + 2
     print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()

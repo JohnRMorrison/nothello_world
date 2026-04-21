@@ -170,6 +170,7 @@ if __name__ == "__main__":
     from train_pattern_simple import (
         DirectMLP, EndToEndMLP, TwoStageMLP,
         to_signed_parity_input, to_mine_signed_input, to_board_state_input,
+        to_color_split_input, to_played_halfmask_input, to_played_bit_input,
     )
     n_patterns = ckpt.get('n_patterns', 960)
     input_dim = ckpt.get('input_dim', N_MOVES)
@@ -178,6 +179,7 @@ if __name__ == "__main__":
     name = os.path.basename(args.ckpt)
     _feat_cols_map = {
         "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played":      list(range(0, N_MOVES)),
         "played+when": list(range(0, 2 * N_MOVES)),
         "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
         "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
@@ -197,10 +199,24 @@ if __name__ == "__main__":
     elif "mine_signed" in name:
         feature_cols = None
         feature_fn = lambda X, Y, pos: to_mine_signed_input(Y, pos)
+    elif "color_split" in name:
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_color_split_input(X)
+    elif "halfmask" in name:
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_halfmask_input(X)
+    elif "bit" in name and "played" in name:
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_bit_input(X)
+    elif input_dim == 62:
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_bit_input(X)
     elif input_dim == 180:
         feature_cols = _feat_cols_map["all"]
     elif input_dim == 120:
         feature_cols = _feat_cols_map["when+even"]   # best guess
+    elif input_dim == 60 and "played" in name:
+        feature_cols = _feat_cols_map["played"]
     else:
         feature_cols = _feat_cols_map["when"]
     print(f"  input_dim={input_dim}")
