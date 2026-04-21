@@ -53,12 +53,40 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))
+    from train_pattern_simple import (
+        to_signed_parity_input, to_mine_signed_input, to_board_state_input,
+        to_color_split_input, to_played_halfmask_input, to_played_bit_input,
+        to_move_grid_input, to_move_grid_onehot_input,
+    )
+    _feat_cols_map = {
+        "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played":      list(range(0, N_MOVES)),
+        "played+when": list(range(0, 2 * N_MOVES)),
+        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
+        "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":         list(range(0, 3 * N_MOVES)),
+    }
 
     ckpt = torch.load(args.ckpt, map_location=device)
     n_patterns = ckpt.get('n_patterns', 960)
-    me = DirectMLP(N_MOVES, args.hidden, n_patterns).to(device)
-    mo = DirectMLP(N_MOVES, args.hidden, n_patterns).to(device)
+    input_dim = ckpt.get('input_dim', N_MOVES)
+
+    # Infer feature preprocessing from ckpt filename / input_dim
+    name = os.path.basename(args.ckpt)
+    feature_cols, feature_fn = None, None
+    if "wheneven" in name: feature_cols = _feat_cols_map["when+even"]
+    elif "playedeven" in name: feature_cols = _feat_cols_map["played+even"]
+    elif "color_split" in name: feature_fn = lambda X, Y, p: to_color_split_input(X)
+    elif "signed_parity" in name: feature_fn = lambda X, Y, p: to_signed_parity_input(X)
+    elif "move_grid_onehot" in name: feature_fn = lambda X, Y, p: to_move_grid_onehot_input(X)
+    elif "move_grid" in name: feature_fn = lambda X, Y, p: to_move_grid_input(X)
+    elif input_dim == 120: feature_cols = _feat_cols_map["when+even"]
+    elif input_dim == 180: feature_cols = _feat_cols_map["all"]
+    else: feature_cols = _feat_cols_map["when"]
+    print(f"input_dim={input_dim}, feature inferred from {name}")
+
+    me = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
+    mo = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
     me.load_state_dict(ckpt['even'])
     mo.load_state_dict(ckpt['odd'])
     print(f"Loaded {args.ckpt} (pat_acc={ckpt.get('best_pat_acc', '?')})")
@@ -102,7 +130,10 @@ if __name__ == "__main__":
         results = {agg: {n: {'c': 0, 't': 0} for n in (1, 3, 5, 10)}
                    for agg in ('max', 'logsumexp', 'prob_or')}
         X, Y, pos_ = _load_features(eval_path)
-        X = X[:, feature_cols]
+        if feature_cols is not None:
+            X = X[:, feature_cols]
+        elif feature_fn is not None:
+            X = feature_fn(X, Y, pos_)
         n = min(len(X), 49 * 10000)
         rng = np.random.RandomState(0)
         si = np.sort(rng.choice(len(X), n, replace=False))
@@ -158,11 +189,16 @@ if __name__ == "__main__":
         total_loss = 0.0; total_batches = 0
         for ci in order:
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
-            tr_X = tr_X[:, feature_cols]
+            if feature_cols is not None:
+                tr_X = tr_X[:, feature_cols]
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), 1024):
                 sel = perm[i:i + 1024]
-                x = tr_X[sel].to(device); yb = tr_Y[sel]; p = tr_pos[sel]
+                X_raw = tr_X[sel]; yb = tr_Y[sel]; p = tr_pos[sel]
+                if feature_fn is not None:
+                    x = feature_fn(X_raw, yb, p).to(device)
+                else:
+                    x = X_raw.to(device)
                 with torch.no_grad():
                     gp = torch.from_numpy(compute_pattern_labels_batch(
                         yb.numpy(), p.numpy(),

@@ -324,6 +324,17 @@ def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
     return torch.logsumexp(gathered, dim=-1)
 
 
+def pairwise_cell_hinge(cell_logits, cell_labels, margin=1.0):
+    """Pairwise hinge: for each (legal, illegal) pair, max(0, margin - s[l] + s[i])."""
+    # cell_logits: (B, 60), cell_labels: (B, 60) binary
+    s = cell_logits
+    delta = s.unsqueeze(-1) - s.unsqueeze(1)                # (B, 60, 60)
+    hinge = torch.clamp(margin - delta, min=0.0)
+    mask = cell_labels.unsqueeze(-1) * (1.0 - cell_labels).unsqueeze(1)
+    total = mask.sum().clamp(min=1.0)
+    return (mask * hinge).sum() / total
+
+
 def pat_labels_to_cell_labels(y_pat, pattern_to_cell, n_cells=60):
     """(B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
     idx, mask = _get_cell_pat_index(pattern_to_cell, n_cells)
@@ -342,7 +353,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
           legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
-          feature_fn=None):
+          feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
+          pos_weight_end=None):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -355,17 +367,26 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     train_paths = chunk_files[:-1]
     n_patterns = len(pat_targets)
 
-    # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%)
+    # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%).
+    # Optionally schedule to an end-value linearly across epochs.
     pw_tensor = None
+    pw_start = pos_weight
+    pw_end = pos_weight_end if pos_weight_end is not None else pos_weight
     if pos_weight is not None:
         pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-        print(f"  pos_weight={pos_weight:.1f}")
+        if pw_end != pw_start:
+            print(f"  pos_weight schedule: {pw_start:.2f} -> {pw_end:.2f} over {epochs} epochs")
+        else:
+            print(f"  pos_weight={pos_weight:.1f}")
+    if pairwise_weight > 0:
+        print(f"  pairwise_weight={pairwise_weight:.2f} (margin={pairwise_margin})")
 
-    if legal_weight > 0:
+    if legal_weight > 0 or pairwise_weight > 0:
         if pattern_to_cell is None:
-            raise ValueError("legal_weight > 0 requires pattern_to_cell tensor")
+            raise ValueError("legal/pairwise loss requires pattern_to_cell tensor")
         pattern_to_cell = pattern_to_cell.to(device)
-        print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
+        if legal_weight > 0:
+            print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
 
     if loss_type not in ("bce", "mse"):
         raise ValueError(f"loss_type must be 'bce' or 'mse', got {loss_type}")
@@ -477,6 +498,12 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     best_state = None
 
     for epoch in range(1, epochs + 1):
+        # Scheduled pos_weight (linear from pw_start to pw_end)
+        if pos_weight is not None and pw_end != pw_start:
+            frac = (epoch - 1) / max(epochs - 1, 1)
+            cur_pw = pw_start + frac * (pw_end - pw_start)
+            pw_tensor = torch.tensor([cur_pw], dtype=torch.float32, device=device)
+            print(f"  epoch {epoch}: pos_weight={cur_pw:.2f}")
         model_even.train(); model_odd.train()
         rng = np.random.RandomState(epoch)
         chunk_order = rng.permutation(len(train_paths))
@@ -516,19 +543,27 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                     if even_mask.any():
                         logits = model_even(x[even_mask])
                         loss = loss + pattern_loss(logits, y_pat[even_mask])
-                        if legal_weight > 0:
+                        if legal_weight > 0 or pairwise_weight > 0:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[even_mask], pattern_to_cell)
-                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
-                                cell_logits, cell_labels)
+                            if legal_weight > 0:
+                                loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                    cell_logits, cell_labels)
+                            if pairwise_weight > 0:
+                                loss = loss + pairwise_weight * pairwise_cell_hinge(
+                                    cell_logits, cell_labels, pairwise_margin)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
                         loss = loss + pattern_loss(logits, y_pat[odd_mask])
-                        if legal_weight > 0:
+                        if legal_weight > 0 or pairwise_weight > 0:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[odd_mask], pattern_to_cell)
-                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
-                                cell_logits, cell_labels)
+                            if legal_weight > 0:
+                                loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                    cell_logits, cell_labels)
+                            if pairwise_weight > 0:
+                                loss = loss + pairwise_weight * pairwise_cell_hinge(
+                                    cell_logits, cell_labels, pairwise_margin)
                 else:
                     y_board_gpu = y_board.to(device)
                     for mask, model in [(even_mask, model_even), (odd_mask, model_odd)]:
@@ -658,6 +693,11 @@ if __name__ == "__main__":
                         help="Use ONE model for all positions (no even/odd split)")
     parser.add_argument("--legal-weight", type=float, default=0.0,
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
+    parser.add_argument("--pairwise-weight", type=float, default=0.0,
+                        help="Weight on cell-level pairwise hinge loss (legal > illegal + margin)")
+    parser.add_argument("--pairwise-margin", type=float, default=1.0)
+    parser.add_argument("--pos-weight-end", type=float, default=None,
+                        help="If set, linearly interpolate pos_weight from --pos-weight to this value across epochs")
     parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
                         help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
     parser.add_argument("--features", default="when",
@@ -758,5 +798,7 @@ if __name__ == "__main__":
           proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
           single_model=args.single_model,
           legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell,
-          loss_type=args.loss, feature_fn=feature_fn)
+          loss_type=args.loss, feature_fn=feature_fn,
+          pairwise_weight=args.pairwise_weight, pairwise_margin=args.pairwise_margin,
+          pos_weight_end=args.pos_weight_end)
 
