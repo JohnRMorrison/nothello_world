@@ -166,6 +166,7 @@ if __name__ == "__main__":
     if args.features is None:
         name = os.path.basename(args.ckpt)
         if "board_state" in name: args.features = "board_state"
+        elif "move_grid_onehot" in name: args.features = "move_grid_onehot"
         elif "move_grid" in name: args.features = "move_grid"
         elif "wheneven" in name: args.features = "when+even"
         elif "playedeven" in name: args.features = "played+even"
@@ -179,6 +180,7 @@ if __name__ == "__main__":
         elif input_dim == 180: args.features = "all"
         elif input_dim == 192: args.features = "board_state"
         elif input_dim == 3600: args.features = "move_grid"
+        elif input_dim == 10800: args.features = "move_grid_onehot"
         else: args.features = "when"
     print(f"Features: {args.features} (input_dim={input_dim})")
 
@@ -208,7 +210,7 @@ if __name__ == "__main__":
     from train_pattern_simple import (to_signed_parity_input, to_mine_signed_input,
                                        to_board_state_input, to_color_split_input,
                                        to_played_halfmask_input, to_played_bit_input,
-                                       to_move_grid_input)
+                                       to_move_grid_input, to_move_grid_onehot_input)
     _feat_cols = {
         "when":        list(range(N_MOVES, 2 * N_MOVES)),
         "played":      list(range(0, N_MOVES)),
@@ -234,6 +236,8 @@ if __name__ == "__main__":
         X = to_played_bit_input(X)
     elif args.features == "move_grid":
         X = to_move_grid_input(X)
+    elif args.features == "move_grid_onehot":
+        X = to_move_grid_onehot_input(X)
     n = min(len(X), 49 * 10000)
     rng = np.random.RandomState(0)
     si = np.sort(rng.choice(len(X), n, replace=False))

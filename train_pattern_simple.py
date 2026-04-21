@@ -186,6 +186,24 @@ def _get_cell_pat_index(pattern_to_cell, n_cells):
     return _cell_pat_cache[key]
 
 
+def to_move_grid_onehot_input(X_tensor):
+    """60x60x3 one-hot, flattened to 10800-d.
+
+    For each (cell, move) pair: one-hot over {black_placed_here,
+    white_placed_here, neither}. "Neither" dominates (most slots).
+
+    Same info as move_grid but with independent weights per color
+    (not forced to be antisymmetric).
+    """
+    B = X_tensor.shape[0]
+    signed = to_move_grid_input(X_tensor).view(B, 60, 60)
+    black = (signed > 0.5).float()
+    white = (signed < -0.5).float()
+    empty = (signed.abs() < 0.5).float()
+    grid = torch.stack([black, white, empty], dim=-1)   # (B, 60, 60, 3)
+    return grid.reshape(B, -1)
+
+
 def to_move_grid_input(X_tensor):
     """3600-d (60 cells x 60 move-numbers), flattened.
 
@@ -636,7 +654,8 @@ if __name__ == "__main__":
                         choices=["when", "played", "played+when", "when+even",
                                  "played+even", "all", "board_state",
                                  "signed_parity", "mine_signed", "color_split",
-                                 "played+halfmask", "played+bit", "move_grid"],
+                                 "played+halfmask", "played+bit", "move_grid",
+                                 "move_grid_onehot"],
                         help="Input features. Slices/derivations of the 180-d base. "
                              "signed_parity (60-d): +1/-1 per played color, 0 empty. "
                              "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
@@ -689,6 +708,10 @@ if __name__ == "__main__":
         feature_cols = None
         feature_fn = lambda X, Y, pos: to_move_grid_input(X)
         input_dim = 60 * 60
+    elif args.features == "move_grid_onehot":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_move_grid_onehot_input(X)
+        input_dim = 60 * 60 * 3
     print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
