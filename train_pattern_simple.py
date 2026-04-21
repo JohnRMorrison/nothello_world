@@ -458,14 +458,19 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
-    elif feature_fn is not None:
-        ev_X = feature_fn(ev_X, ev_Y, ev_pos)
+    # For feature_fn (e.g. move_grid), DELAY expansion until sampled indices
+    # are chosen so we don't materialize a (N_chunk, 3600-10800) tensor.
     n_eval = min(len(ev_X), 49 * 10000)
     rng = np.random.RandomState(0)
     sample_idx = np.sort(rng.choice(len(ev_X), n_eval, replace=False))
-    ev_X = ev_X[sample_idx].clone()
+    ev_X_raw = ev_X[sample_idx].clone()
     ev_Y = ev_Y[sample_idx].clone()
     ev_pos = ev_pos[sample_idx].clone()
+    if feature_fn is not None:
+        # Apply feature_fn on the sampled rows only (fits in memory).
+        ev_X = feature_fn(ev_X_raw, ev_Y, ev_pos)
+    else:
+        ev_X = ev_X_raw
     print(f"  Eval samples: {len(ev_X)} (random across positions)")
 
     best_acc = 0.0
@@ -483,15 +488,20 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
-            elif feature_fn is not None:
-                tr_X = feature_fn(tr_X, tr_Y, tr_pos)
+            # For feature_fn, defer application to per-batch to avoid materializing
+            # a (chunk_size, high_dim) tensor that can OOM (e.g. move_grid=3600-d,
+            # move_grid_onehot=10800-d on 14.5M-row chunks).
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
+                x_raw = tr_X[idx]
                 y_board = tr_Y[idx]  # keep on CPU for pattern computation
                 pos = tr_pos[idx]
+                if feature_fn is not None:
+                    x = feature_fn(x_raw, y_board, pos).to(device)
+                else:
+                    x = x_raw.to(device)
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
