@@ -186,6 +186,32 @@ def _get_cell_pat_index(pattern_to_cell, n_cells):
     return _cell_pat_cache[key]
 
 
+def to_move_grid_input(X_tensor):
+    """3600-d (60 cells x 60 move-numbers), flattened.
+
+    grid[cell, move_num] = +1 if black played `cell` at `move_num`,
+                           -1 if white,
+                           0 otherwise.
+
+    Convention (from our precompute code): step 0 is white, step 1 black,
+    so 'even' step = white. +1 for black = played AND NOT even.
+    """
+    B = X_tensor.shape[0]
+    played = X_tensor[:, :60]
+    when = X_tensor[:, 60:120]
+    even = X_tensor[:, 120:180]
+
+    # Move number at which each cell was played (0..59); 0 for unplayed
+    # (value there will be 0 because 'played' is 0, so harmless).
+    move_num = torch.clamp((when * 60.0 - 1.0).round().long(), 0, 59)   # (B, 60)
+    # Color: +1 black, -1 white, 0 if not played
+    color_pm = (1.0 - 2.0 * even) * played                               # (B, 60)
+
+    grid = torch.zeros(B, 60, 60, device=X_tensor.device, dtype=X_tensor.dtype)
+    grid.scatter_(2, move_num.unsqueeze(-1), color_pm.unsqueeze(-1))
+    return grid.reshape(B, 60 * 60)
+
+
 def to_played_halfmask_input(X_tensor):
     """120-d: [0:60]=played, [60:90]=all ones, [90:120]=all zeros.
 
@@ -610,7 +636,7 @@ if __name__ == "__main__":
                         choices=["when", "played", "played+when", "when+even",
                                  "played+even", "all", "board_state",
                                  "signed_parity", "mine_signed", "color_split",
-                                 "played+halfmask", "played+bit"],
+                                 "played+halfmask", "played+bit", "move_grid"],
                         help="Input features. Slices/derivations of the 180-d base. "
                              "signed_parity (60-d): +1/-1 per played color, 0 empty. "
                              "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
@@ -659,6 +685,10 @@ if __name__ == "__main__":
         feature_cols = None
         feature_fn = lambda X, Y, pos: to_played_bit_input(X)
         input_dim = N_MOVES + 2
+    elif args.features == "move_grid":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_move_grid_input(X)
+        input_dim = 60 * 60
     print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
