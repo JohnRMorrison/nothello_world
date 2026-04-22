@@ -222,14 +222,17 @@ if __name__ == "__main__":
         print(f"\nEpoch {epoch}: loss={avg:.5f}", flush=True)
         _print_results(eval_topk(), "finetuned")
 
-    # Save
-    base = os.path.splitext(os.path.basename(args.ckpt))[0]
-    save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
-    os.makedirs(save_dir, exist_ok=True)
-    save_path = os.path.join(save_dir,
-        f"ftlegal_{base}_{args.finetune}_pw{int(args.pos_weight)}.pt")
-    torch.save({
-        'even': me.state_dict(), 'odd': mo.state_dict(),
-        'source_ckpt': args.ckpt, 'finetune': args.finetune,
-    }, save_path)
-    print(f"\nSaved to {save_path}")
+        # Save after every epoch so time-outs don't lose progress.
+        base = os.path.splitext(os.path.basename(args.ckpt))[0]
+        save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir,
+            f"ftlegal_{base}_{args.finetune}_pw{int(args.pos_weight)}.pt")
+        # Also save input_dim so compare_aggregators / probe can reload.
+        torch.save({
+            'even': me.state_dict(), 'odd': mo.state_dict(),
+            'source_ckpt': args.ckpt, 'finetune': args.finetune,
+            'input_dim': input_dim, 'hidden_dim': args.hidden,
+            'n_patterns': n_patterns, 'epoch': epoch,
+        }, save_path)
+        print(f"  Saved {save_path}", flush=True)
