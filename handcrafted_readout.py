@@ -92,7 +92,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))
+    # Pick feature columns matching the backbone's input dim
+    _feat_cols_map = {
+        60:  list(range(N_MOVES, 2 * N_MOVES)),      # when
+        120: list(range(N_MOVES, 3 * N_MOVES)),      # when + even
+        180: list(range(0, 3 * N_MOVES)),             # all
+    }
+    feature_cols = _feat_cols_map.get(D, list(range(N_MOVES, 2 * N_MOVES)))
+    print(f"  Using {len(feature_cols)}-d features (D={D})")
 
     mlp_even, mlp_odd, H, D, backbone_acc = load_board_mlp(args.backbone, device)
     assert H == args.hidden
