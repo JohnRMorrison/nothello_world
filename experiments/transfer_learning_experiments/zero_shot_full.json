@@ -1,0 +1,619 @@
+{
+  "meta": {
+    "ckpt": "../../ckpts/gpt_synthetic.ckpt",
+    "configs_dir": "runs/2x2_20260417_120057/configs/",
+    "eval_games": 1000,
+    "seeds": 2,
+    "structural": true,
+    "n_quadrants": 2,
+    "device": "mps"
+  },
+  "per_seed": {
+    "seed_0": {
+      "B1": {
+        "top1_legal": 0.851324,
+        "top1_prob": 0.178177,
+        "legal_mass": 0.812338,
+        "violation_rate": 0.157948,
+        "fire_rate": 0.560921,
+        "top1_legal_when_fires": 0.735396,
+        "violation_rate_when_fires": 0.281587,
+        "n_positions": 58994,
+        "n_fires": 33091
+      },
+      "B2": {
+        "top1_legal": 0.792674,
+        "top1_prob": 0.17766,
+        "legal_mass": 0.818912,
+        "violation_rate": 0.2147,
+        "fire_rate": 0.560921,
+        "top1_legal_when_fires": 0.630836,
+        "violation_rate_when_fires": 0.382763,
+        "n_positions": 58994,
+        "n_fires": 33091
+      },
+      "B3": {
+        "top1_legal": 0.855629,
+        "top1_prob": 0.178218,
+        "legal_mass": 0.820812,
+        "violation_rate": 0.152558,
+        "fire_rate": 0.568871,
+        "top1_legal_when_fires": 0.746722,
+        "violation_rate_when_fires": 0.268176,
+        "n_positions": 58994,
+        "n_fires": 33560
+      },
+      "C": {
+        "top1_legal": 0.794115,
+        "top1_prob": 0.177709,
+        "legal_mass": 0.821449,
+        "violation_rate": 0.212157,
+        "fire_rate": 0.568871,
+        "top1_legal_when_fires": 0.638588,
+        "violation_rate_when_fires": 0.372944,
+        "n_positions": 58994,
+        "n_fires": 33560
+      },
+      "A1_no_diagonal": {
+        "top1_legal": 0.664508,
+        "top1_prob": 0.177302,
+        "legal_mass": 0.649518,
+        "violation_rate": 0.334966,
+        "fire_rate": 0.896769,
+        "top1_legal_when_fires": 0.626153,
+        "violation_rate_when_fires": 0.373526,
+        "n_positions": 58994,
+        "n_fires": 52904
+      },
+      "A2_quadrant": {
+        "top1_legal": 0.673526,
+        "top1_prob": 0.176988,
+        "legal_mass": 0.691245,
+        "violation_rate": 0.325948,
+        "fire_rate": 0.714886,
+        "top1_legal_when_fires": 0.5437,
+        "violation_rate_when_fires": 0.455944,
+        "n_positions": 58994,
+        "n_fires": 42174
+      }
+    },
+    "seed_1": {
+      "B1": {
+        "top1_legal": 0.8436,
+        "top1_prob": 0.177582,
+        "legal_mass": 0.808956,
+        "violation_rate": 0.165435,
+        "fire_rate": 0.567225,
+        "top1_legal_when_fires": 0.7246,
+        "violation_rate_when_fires": 0.291657,
+        "n_positions": 58996,
+        "n_fires": 33464
+      },
+      "B2": {
+        "top1_legal": 0.790732,
+        "top1_prob": 0.177127,
+        "legal_mass": 0.817089,
+        "violation_rate": 0.216489,
+        "fire_rate": 0.567225,
+        "top1_legal_when_fires": 0.631395,
+        "violation_rate_when_fires": 0.381664,
+        "n_positions": 58996,
+        "n_fires": 33464
+      },
+      "B3": {
+        "top1_legal": 0.853973,
+        "top1_prob": 0.177734,
+        "legal_mass": 0.820187,
+        "violation_rate": 0.154265,
+        "fire_rate": 0.567886,
+        "top1_legal_when_fires": 0.743307,
+        "violation_rate_when_fires": 0.271647,
+        "n_positions": 58996,
+        "n_fires": 33503
+      },
+      "C": {
+        "top1_legal": 0.796342,
+        "top1_prob": 0.177251,
+        "legal_mass": 0.823191,
+        "violation_rate": 0.209862,
+        "fire_rate": 0.567886,
+        "top1_legal_when_fires": 0.641823,
+        "violation_rate_when_fires": 0.369549,
+        "n_positions": 58996,
+        "n_fires": 33503
+      },
+      "A1_no_diagonal": {
+        "top1_legal": 0.666503,
+        "top1_prob": 0.176815,
+        "legal_mass": 0.647759,
+        "violation_rate": 0.332938,
+        "fire_rate": 0.900027,
+        "top1_legal_when_fires": 0.629741,
+        "violation_rate_when_fires": 0.36992,
+        "n_positions": 58996,
+        "n_fires": 53098
+      },
+      "A2_quadrant": {
+        "top1_legal": 0.672435,
+        "top1_prob": 0.176373,
+        "legal_mass": 0.690897,
+        "violation_rate": 0.327005,
+        "fire_rate": 0.71576,
+        "top1_legal_when_fires": 0.542828,
+        "violation_rate_when_fires": 0.456864,
+        "n_positions": 58996,
+        "n_fires": 42227
+      }
+    }
+  },
+  "summary": {
+    "B1": {
+      "top1_legal": {
+        "mean": 0.847462,
+        "std": 0.005462,
+        "sem": 0.003862,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.729998,
+        "std": 0.007634,
+        "sem": 0.005398,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.161691,
+        "std": 0.005294,
+        "sem": 0.003743,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.286622,
+        "std": 0.007121,
+        "sem": 0.005035,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.564073,
+        "std": 0.004458,
+        "sem": 0.003152,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.810647,
+        "std": 0.002391,
+        "sem": 0.001691,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.177879,
+        "std": 0.000421,
+        "sem": 0.000298,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 33277.5,
+        "std": 263.750829,
+        "sem": 186.5,
+        "n": 2
+      }
+    },
+    "B2": {
+      "top1_legal": {
+        "mean": 0.791703,
+        "std": 0.001373,
+        "sem": 0.000971,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.631115,
+        "std": 0.000395,
+        "sem": 0.00028,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.215594,
+        "std": 0.001265,
+        "sem": 0.000894,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.382213,
+        "std": 0.000777,
+        "sem": 0.00055,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.564073,
+        "std": 0.004458,
+        "sem": 0.003152,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.818,
+        "std": 0.001289,
+        "sem": 0.000912,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.177394,
+        "std": 0.000377,
+        "sem": 0.000267,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 33277.5,
+        "std": 263.750829,
+        "sem": 186.5,
+        "n": 2
+      }
+    },
+    "B3": {
+      "top1_legal": {
+        "mean": 0.854801,
+        "std": 0.001171,
+        "sem": 0.000828,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.745015,
+        "std": 0.002415,
+        "sem": 0.001707,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.153412,
+        "std": 0.001207,
+        "sem": 0.000854,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.269912,
+        "std": 0.002454,
+        "sem": 0.001736,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.568379,
+        "std": 0.000697,
+        "sem": 0.000493,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.820499,
+        "std": 0.000442,
+        "sem": 0.000312,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.177976,
+        "std": 0.000342,
+        "sem": 0.000242,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 33531.5,
+        "std": 40.305087,
+        "sem": 28.5,
+        "n": 2
+      }
+    },
+    "C": {
+      "top1_legal": {
+        "mean": 0.795229,
+        "std": 0.001575,
+        "sem": 0.001113,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.640205,
+        "std": 0.002287,
+        "sem": 0.001617,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.21101,
+        "std": 0.001623,
+        "sem": 0.001148,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.371247,
+        "std": 0.002401,
+        "sem": 0.001697,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.568379,
+        "std": 0.000697,
+        "sem": 0.000493,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.82232,
+        "std": 0.001232,
+        "sem": 0.000871,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.17748,
+        "std": 0.000324,
+        "sem": 0.000229,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 33531.5,
+        "std": 40.305087,
+        "sem": 28.5,
+        "n": 2
+      }
+    },
+    "A1_no_diagonal": {
+      "top1_legal": {
+        "mean": 0.665505,
+        "std": 0.001411,
+        "sem": 0.000997,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.627947,
+        "std": 0.002537,
+        "sem": 0.001794,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.333952,
+        "std": 0.001434,
+        "sem": 0.001014,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.371723,
+        "std": 0.00255,
+        "sem": 0.001803,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.898398,
+        "std": 0.002304,
+        "sem": 0.001629,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.648639,
+        "std": 0.001244,
+        "sem": 0.00088,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.177059,
+        "std": 0.000344,
+        "sem": 0.000243,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 53001.0,
+        "std": 137.178716,
+        "sem": 97.0,
+        "n": 2
+      }
+    },
+    "A2_quadrant": {
+      "top1_legal": {
+        "mean": 0.67298,
+        "std": 0.000771,
+        "sem": 0.000545,
+        "n": 2
+      },
+      "top1_legal_when_fires": {
+        "mean": 0.543264,
+        "std": 0.000617,
+        "sem": 0.000436,
+        "n": 2
+      },
+      "violation_rate": {
+        "mean": 0.326477,
+        "std": 0.000747,
+        "sem": 0.000528,
+        "n": 2
+      },
+      "violation_rate_when_fires": {
+        "mean": 0.456404,
+        "std": 0.000651,
+        "sem": 0.00046,
+        "n": 2
+      },
+      "fire_rate": {
+        "mean": 0.715323,
+        "std": 0.000618,
+        "sem": 0.000437,
+        "n": 2
+      },
+      "legal_mass": {
+        "mean": 0.691071,
+        "std": 0.000246,
+        "sem": 0.000174,
+        "n": 2
+      },
+      "top1_prob": {
+        "mean": 0.176681,
+        "std": 0.000435,
+        "sem": 0.000308,
+        "n": 2
+      },
+      "n_positions": {
+        "mean": 58995.0,
+        "std": 1.414214,
+        "sem": 1.0,
+        "n": 2
+      },
+      "n_fires": {
+        "mean": 42200.5,
+        "std": 37.476659,
+        "sem": 26.5,
+        "n": 2
+      }
+    }
+  },
+  "base_rate_diagnostic": {
+    "B1": {
+      "base_rate": 0.682555,
+      "n_forbidden_squares": 45,
+      "n_positions": 58996
+    },
+    "B2": {
+      "base_rate": 0.736033,
+      "n_forbidden_squares": 44,
+      "n_positions": 58996
+    },
+    "B3": {
+      "base_rate": 0.682555,
+      "n_forbidden_squares": 45,
+      "n_positions": 58996
+    },
+    "C": {
+      "base_rate": 0.736033,
+      "n_forbidden_squares": 44,
+      "n_positions": 58996
+    }
+  },
+  "per_restriction_diagnostic": {
+    "B1": {
+      "avg_conditional": 0.224392,
+      "avg_counterfactual": 0.23458,
+      "ratio": 0.9566,
+      "per_restriction": [
+        {
+          "conditional": 0.190125,
+          "counterfactual": 0.207741
+        },
+        {
+          "conditional": 0.239407,
+          "counterfactual": 0.234451
+        },
+        {
+          "conditional": 0.18452,
+          "counterfactual": 0.183605
+        },
+        {
+          "conditional": 0.273446,
+          "counterfactual": 0.273718
+        },
+        {
+          "conditional": 0.234463,
+          "counterfactual": 0.273388
+        }
+      ]
+    },
+    "B2": {
+      "avg_conditional": 0.285086,
+      "avg_counterfactual": 0.281174,
+      "ratio": 1.0139,
+      "per_restriction": [
+        {
+          "conditional": 0.291083,
+          "counterfactual": 0.284547
+        },
+        {
+          "conditional": 0.277542,
+          "counterfactual": 0.2656
+        },
+        {
+          "conditional": 0.320647,
+          "counterfactual": 0.320335
+        },
+        {
+          "conditional": 0.250847,
+          "counterfactual": 0.273631
+        },
+        {
+          "conditional": 0.285311,
+          "counterfactual": 0.261758
+        }
+      ]
+    },
+    "B3": {
+      "avg_conditional": 0.267718,
+      "avg_counterfactual": 0.234693,
+      "ratio": 1.1407,
+      "per_restriction": [
+        {
+          "conditional": 0.200782,
+          "counterfactual": 0.207422
+        },
+        {
+          "conditional": 0.305085,
+          "counterfactual": 0.233993
+        },
+        {
+          "conditional": 0.181875,
+          "counterfactual": 0.185769
+        },
+        {
+          "conditional": 0.320339,
+          "counterfactual": 0.273242
+        },
+        {
+          "conditional": 0.330508,
+          "counterfactual": 0.273039
+        }
+      ]
+    },
+    "C": {
+      "avg_conditional": 0.275734,
+      "avg_counterfactual": 0.282865,
+      "ratio": 0.9748,
+      "per_restriction": [
+        {
+          "conditional": 0.281617,
+          "counterfactual": 0.284738
+        },
+        {
+          "conditional": 0.256659,
+          "counterfactual": 0.26576
+        },
+        {
+          "conditional": 0.311581,
+          "counterfactual": 0.328021
+        },
+        {
+          "conditional": 0.198305,
+          "counterfactual": 0.274047
+        },
+        {
+          "conditional": 0.330508,
+          "counterfactual": 0.261762
+        }
+      ]
+    }
+  }
+}

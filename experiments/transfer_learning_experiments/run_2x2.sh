@@ -108,7 +108,11 @@ fi
 echo
 echo "[2/4] Generating restricted games..."
 for C in B1 B2 B3 C; do
-    PICKLE_COUNT=$(find "${DATA_DIR}/${C}" -name '*.pickle' 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+    if [[ -d "${DATA_DIR}/${C}" ]]; then
+        PICKLE_COUNT=$(find "${DATA_DIR}/${C}" -name '*.pickle' | wc -l | tr -d ' ')
+    else
+        PICKLE_COUNT=0
+    fi
     if [[ "${PICKLE_COUNT}" -gt 0 ]]; then
         echo "  -> condition ${C}: ${PICKLE_COUNT} pickle files found — skipping."
     else

@@ -542,6 +542,54 @@ partial or ablated variant.
 
 ---
 
+## 8a. Preliminary results (K=5, N_FORBIDDEN=15, 1000 games × 10 seeds)
+
+### Zero-shot violation rates
+
+| Condition | Type | `viol_fires` | `fire_rate` |
+|---|---|---|---|
+| **B₃** | random-ant, aligned-cons | **0.270 ± 0.002** | 0.568 |
+| **B₁** | aligned-ant, aligned-cons | **0.287 ± 0.005** | 0.564 |
+| **C** | random both | 0.371 ± 0.002 | 0.568 |
+| **A₁** | no-diagonal captures | 0.372 ± 0.002 | 0.898 |
+| **B₂** | aligned-ant, random-cons | 0.382 ± 0.001 | 0.564 |
+| **A₂** | quadrant dominance | 0.456 ± 0.001 | 0.715 |
+
+### Key findings
+
+**1. The effect is entirely consequent-driven, not antecedent-driven.**
+- B₁ ≈ B₃ (both ~0.28): antecedent alignment has no effect.
+- B₂ ≈ C (both ~0.37): same conclusion from the random-consequent side.
+- B₁ vs B₂ (~0.28 vs ~0.38): consequent alignment provides ~10 points of advantage.
+
+**2. Structural controls match random, not aligned.**
+A₁ (no-diagonal) = 0.372 ≈ C = 0.371. The model's general directional
+knowledge provides zero advantage. A₂ (quadrant dominance) = 0.456 > C —
+the model actively prefers playing in opponent territory, so this rule
+is *harder* than random.
+
+**3. Interpretation caveat: target selection bias.**
+The aligned consequent consists of DLA-promoted squares — squares the neuron
+pushes probability toward via `W_out @ W_U`. However, the model predicts
+these squares less often overall (base rate 0.68 vs 0.74 for random). This
+raises the question: is the lower violation rate simply because DLA targets
+are unpopular predictions, not because of causal heuristic engagement?
+
+The base-rate gap (7% relative) is much smaller than the conditioned violation
+gap (26% relative), suggesting target selection alone doesn't fully explain
+the result. A per-restriction conditional-vs-counterfactual analysis
+(`P(argmax ∈ S | fires)` vs `P(argmax ∈ S | ¬fires)`) is needed to
+conclusively disambiguate — see `zero_shot_eval.py --structural`.
+
+### Transfer learning results (K=5, N_FORBIDDEN=15, 200 steps)
+
+Fine-tuning converges too fast to show inter-condition differences — all
+ft conditions reach `top1_legal_when_fires ≈ 1.0` within ~50 gradient steps,
+regardless of alignment. The zero-shot (step-0) measurement is more
+informative than the adaptation curves for this parameter regime.
+
+---
+
 ## 9. Known limitations
 
 - **No structural-rule control (Condition A).** The original design envisioned
@@ -564,7 +612,74 @@ partial or ablated variant.
 
 ---
 
-## 10. Zero-shot evaluation
+## 10. Structural controls (A₁, A₂)
+
+Two human-understandable rule changes serve as controls to test whether the
+pretrained model's advantage on heuristic-aligned restrictions (B₁) is specific
+to the extracted neurons, or a generic property of general Othello knowledge.
+
+### A₁: No diagonal captures
+
+Standard Othello allows captures along 8 directions (N, S, E, W, NE, NW, SE,
+SW). A₁ restricts legality to **cardinal directions only** — a move is legal
+only if it captures at least one opponent piece along a horizontal or vertical
+line. Diagonal-only captures are disallowed.
+
+This is a **game mechanics change**, not a conditional forbiddance rule. The
+set of forbidden moves varies per position depending on the board state —
+structurally similar to B₁ but derived from game geometry rather than model
+internals.
+
+### A₂: Quadrant dominance
+
+The board is divided into four quadrants (top-left, top-right, bottom-left,
+bottom-right, each ~16 squares). When the **opponent has more pieces than you**
+in a quadrant, all moves in that quadrant are forbidden. By default, 2 of the
+4 quadrants are used (configurable via `--n-quadrants`).
+
+This is a **conditional forbiddance rule** with:
+- Board-state-dependent antecedent (opponent dominates quadrant)
+- ~12–16 forbidden squares per quadrant when it fires
+- Fire rate ~40–60% depending on game phase
+
+Structurally parallel to B₁ but tests spatial knowledge the model has no
+dedicated neuron circuitry for.
+
+### Running the comparison
+
+```bash
+# Quick check:
+python zero_shot_eval.py \
+    --configs-dir runs/2x2_20260417_120057/configs/ \
+    --structural --eval-games 50 --seeds 2
+
+# Full run for paper:
+python zero_shot_eval.py \
+    --configs-dir runs/2x2_20260417_120057/configs/ \
+    --structural --eval-games 1000 --seeds 10 \
+    --output zero_shot_with_structural.json
+```
+
+### Expected results and interpretation
+
+| Condition | Type | Observed `viol_fires` | Interpretation |
+|---|---|---|---|
+| B₁ | Heuristic-aligned | 0.287 ± 0.005 | Low — DLA targets are avoided |
+| B₃ | Cons-aligned only | 0.270 ± 0.002 | Low — confirms consequent drives the effect |
+| C | Random both | 0.371 ± 0.002 | Baseline |
+| A₁ | No-diagonal | 0.372 ± 0.002 | ≈ C — directional knowledge doesn't help |
+| B₂ | Ant-aligned only | 0.382 ± 0.001 | ≈ C — antecedent alone doesn't help |
+| A₂ | Quadrant dominance | 0.456 ± 0.001 | > C — model prefers opponent-dominated territory |
+
+**Observed:** A₁ ≈ C > B₁. The model's general directional knowledge does not
+produce the same advantage as DLA-aligned consequents. A₂ > C shows the model
+actively prefers playing in opponent-dominated quadrants (to flip pieces),
+making this rule harder than random — further evidence the B₁ advantage is
+specific, not generic.
+
+---
+
+## 11. Zero-shot evaluation (pretrained model, no training)
 
 The strongest result from early experiments is that the pretrained model
 already shows differential performance at **step 0** — before any fine-tuning.
@@ -591,7 +706,7 @@ lower than for B₂/C, the pretrained model's DLA circuitry is causally aligned
 with the restriction conditions. This is the cleanest version of the causal
 claim — no training confound, no LR sensitivity, no convergence issues.
 
-## 10a. Fine-grained early dynamics
+## 11a. Fine-grained early dynamics
 
 The `--eval-every-early` flag captures the first ~200 steps at high resolution
 (every 5 steps by default) to trace the convergence curves. This shows whether
@@ -609,7 +724,7 @@ then 250, 300, ..., 5000.
 
 ---
 
-## 11. References
+## 12. References
 
 - Li et al. (2023), *Emergent World Representations: Exploring a Sequence
   Model Trained on a Synthetic Task*, ICLR.
