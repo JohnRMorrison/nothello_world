@@ -16,9 +16,9 @@ Produces two PNG files, one per task:
     Default output: figs/new_squares.png
 
 Usage:
-    python plot_fig1ef.py
+    python plot_fig.py
     # or with custom paths:
-    python plot_fig1ef.py --rules-output X.png --squares-output Y.png
+    python plot_fig.py --rules-output X.png --squares-output Y.png
 """
 import argparse
 import glob

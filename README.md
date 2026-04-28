@@ -6,20 +6,22 @@ Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on a 
 
 ### Probability mass
 
-Sum of softmax probabilities over a category of cells, averaged over
+Sum of softmax probabilities over a target set of cells, averaged over
 evaluation positions.
 
-Computed on the LL / IL / LI test sets (held-out positions where the named
-category is non-empty):
+**Categorized positions.** Curated test sets sampled from corrupted-rule
+games, taking one position per game where the named category is non-empty.
+Probability is summed over:
 
-- **LL_prob** — mass on cells legal under both standard and corrupted rules
-- **IL_prob** — mass on cells illegal under standard rules but legal under corrupted rules
-- **LI_prob** — mass on cells legal under standard rules but illegal under corrupted rules
+- **LL_prob** — cells legal under both standard and corrupted rules
+- **IL_prob** — cells illegal under standard rules but legal under corrupted rules
+- **LI_prob** — cells legal under standard rules but illegal under corrupted rules
 
-Computed on held-out games:
+**Full held-out games.** Every move position is evaluated. Probability is
+summed over the *full legal set* at each position:
 
-- **STD_prob** — mass on standard-legal cells, on standard Othello games
-- **COR_prob** — mass on corrupted-legal cells, on corrupted-rule games
+- **STD_prob** — held-out standard Othello games; sum over standard-legal cells
+- **COR_prob** — held-out corrupted-rule games; sum over corrupted-legal cells
 
 ### Accuracy
 
@@ -75,7 +77,7 @@ transfer_utils.py                    shared helpers: rule eval / game gen
 data/othello.py                      OthelloBoardState
 mingpt/                              Karpathy's minGPT (model + training)
 ckpts/gpt_synthetic.ckpt             pretrained Othello-GPT (97 MB)
-plot_fig1ef.py                       reads JSON outputs, plots Fig 1e,f
+plot_fig.py                          reads JSON outputs, plots both tasks' curves
 ```
 
 ## Running on SLURM
@@ -87,7 +89,7 @@ sbatch --array=0-1 new_squares_experiment.sh
 # Task B: one (variant, n_rules) pair per submission
 sbatch incoherent_rules_experiment.sh coherent 100
 sbatch incoherent_rules_experiment.sh incoherent 100
-# To sweep scales for Fig 1e:
+# To sweep scales:
 for n in 25 75 100 125 150 175; do
     sbatch incoherent_rules_experiment.sh coherent   $n
     sbatch incoherent_rules_experiment.sh incoherent $n
@@ -106,7 +108,7 @@ for `LL_prob`, `LL_acc`, `IL_prob`, `IL_acc`, `LI_prob`, `LI_acc`, `STD_prob`,
 ## Plotting
 
 ```bash
-python plot_fig1ef.py
+python plot_fig.py
 # writes figs/rule_corruption.png and figs/new_squares.png
 ```
 
