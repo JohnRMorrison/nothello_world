@@ -1,14 +1,5 @@
 """Shared helpers for the transfer-task experiments (Tasks A and B).
 
-Combines:
-  - rule-evaluation / game-generation helpers extracted from the larger
-    sensitivity_param_search.py sweep (precompute_pattern_arrays_extended,
-    generate_games_extended, collect_three_test_sets, evaluate_on_test_sets,
-    build_standard_lpm_test, prepare_lpm_test, evaluate_lpm,
-    place_piece_no_flip)
-  - finetune-eval primitives inlined from the (now-deleted) finetune_corruption
-    module (build_legal_mask, evaluate)
-  - model and game-shard loading (load_model, load_shard_games)
 """
 import os
 import glob

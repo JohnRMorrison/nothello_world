@@ -6,22 +6,25 @@ Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on a 
 
 ### Probability mass
 
-Sum of softmax probabilities over a target set of cells, averaged over
-evaluation positions.
+The model outputs a probability for every possible move. For each of the following metrics we add up the probabilities on a chosen set of cells, then average across many positions.
 
-**Categorized positions.** Curated test sets sampled from corrupted-rule
-games, taking one position per game where the named category is non-empty.
-Probability is summed over:
+For these three, we use positions from games played under the corrupted rules:
 
-- **LL_prob** — cells legal under both standard and corrupted rules
-- **IL_prob** — cells illegal under standard rules but legal under corrupted rules
-- **LI_prob** — cells legal under standard rules but illegal under corrupted rules
+- **LL_prob** — probability on cells legal under both standard and
+  corrupted rules
+- **IL_prob** — probability on cells that became legal under the
+  corrupted rules
+- **LI_prob** — probability on cells that became illegal under the
+  corrupted rules
 
-**Full held-out games.** Every move position is evaluated. Probability is
-summed over the *full legal set* at each position:
+Ideally, LL_prob should remain flat, IL_prob should increase, and LI_prob should decrease as it learns the new game.
 
-- **STD_prob** — held-out standard Othello games; sum over standard-legal cells
-- **COR_prob** — held-out corrupted-rule games; sum over corrupted-legal cells
+Two metrics measured on full games:
+
+- **STD_prob** — total probability on legal moves, on standard Othello games
+- **COR_prob** — total probability on legal moves, on corrupted-rule games
+
+Ideally, STD_prob should decrease and COR_prob should increase as it learns the new game.
 
 ### Accuracy
 
@@ -47,9 +50,7 @@ The model's vocab is expanded from 61 → 69 (8 new randomly-initialized token e
 ### Task B — `incoherent_rules_experiment.py` (Fig 1e)
 
 Replaces N existing flanking rules with spatially-transformed versions. The
-script takes `--variant` and `--n-rules` (default 100). The headline Fig 1e
-result compares `coherent` vs `incoherent`; `proximal_nonlinear` and
-`distal_linear` are available for follow-up analyses.
+script takes `--variant` and `--n-rules` (default 100). The main analysis is `coherent` vs `incoherent`; `proximal_nonlinear` and `distal_linear` are available for follow-up analyses.
 
 - **`--variant coherent`**: shift opponents and terminal by `(+1, +1)`, keeping the target cell fixed. Rules stay locally consistent — they describe a flanking line in a shifted location.
 - **`--variant incoherent`**: cross-wire opponents and terminal between distant rule pairs. Same target cell, but the line of opponents and terminal comes from a spatially unrelated rule.
@@ -116,13 +117,3 @@ Two figures:
 - **Rule corruption** — coherent vs incoherent at `n_rules=100`
   (use `--all-scales` to draw every n_rules level)
 - **New squares** — coherent (ninth row) vs incoherent (random neighbors)
-
-Y-axis is `IL_acc` — the fraction of held-out positions where the model's top-1
-predicted move is legal under the corrupted rules. Lower = the model learned
-the new rules less.
-
-## Reference (parent repo)
-
-`experiments/experiment_log.txt` in the parent `othello_world` repo
-documents the broader sensitivity / parameter-search experiments (section A7)
-and the coherent-scale sweep (section A10) that this branch focuses on.
