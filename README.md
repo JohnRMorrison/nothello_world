@@ -1,64 +1,112 @@
-### Update 02/13/2023 :fire::fire::fire:
+# Transfer-tasks branch
 
-Neel Nanda just released a [TransformerLens](https://github.com/neelnanda-io/TransformerLens) version of Othello-GPT ([Colab](https://colab.research.google.com/github/neelnanda-io/TransformerLens/blob/main/demos/Othello_GPT.ipynb), [Repo Notebook](https://github.com/neelnanda-io/TransformerLens/blob/main/demos/Othello_GPT.ipynb)), boosting the mechanistic interpretability research of it. Based on his work, a tool was made to inspect each MLP neuron in Othello-GPT, e.g. see the differing activation for [neuron 255 in layer 3](https://kran.ai/othelloscope/L2/N255) and [neuron 250 in layer 8](https://kran.ai/othelloscope/L7/N250).
+This is a focused subset of the `othello_world` repository containing only
+the code needed to run the two transfer-task experiments shown in **Fig 1e,f**
+of the paper.
 
-# Othello World
+## What the experiments test
 
-This repository provides the code for training, probing and intervening the Othello-GPT in [Emergent World Representations: Exploring a Sequence Model Trained on a Synthetic Task](https://arxiv.org/abs/2210.13382), to be present at ICLR 2023.  
-The implementation is based on [minGPT](https://github.com/karpathy/minGPT), thanks to Andrej Karpathy.
+> If [the model] maintained an internal board representation, it should learn
+> variants with spatially **coherent** rules faster than variants with spatially
+> **incoherent** rules. It should also learn variants that add new squares in
+> spatially coherent ways (e.g., a ninth row) faster than variants that add
+> them in spatially incoherent ways (e.g., with random neighbors in each
+> direction). We found the **opposite** (Fig. 1e,f).
 
-## Abstract
+Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on
+a corrupted variant of Othello and tracks four behaviours over training:
 
-> Language models show a surprising range of capabilities, but the source of their apparent competence is unclear. Do these networks just memorize a collection of surface statistics, or do they rely on internal representations of the process that generates the sequences they see? We investigate this question by applying a variant of the GPT model to the task of predicting legal moves in a simple board game, Othello. Although the network has no a priori knowledge of the game or its rules, we uncover evidence of an emergent nonlinear internal representation of the board state. Interventional experiments indicate this representation can be used to control the output of the network and create "latent saliency maps" that can help explain predictions in human terms.
+- **LL** — Legal training, Legal test (probability mass on standard Othello legal moves)
+- **IL** — Impossible (corrupted) training, Legal test (forgetting of legal moves)
+- **LI** — Legal training, Impossible test (mass on the now-illegal cells under corruption)
+- **II** — Impossible training, Impossible test (mass on the cells legal under the new variant)
 
-## Table of Contents
+## Tasks
 
-1. [Installation](#installation)
-2. [Training Othello-GPT](#training-othello-gpt)
-3. [Probing Othello-GPT](#probing-othello-gpt)
-4. [Intervening Othello-GPT](#intervening-othello-gpt)
-5. [Attribution via Intervention Plots](#attribution-via-intervention-plots)
-6. [How to Cite](#how-to-cite)
+### Task A — `new_squares_experiment.py` (Fig 1f)
 
-## Installation
+Adds eight new squares to the Othello board, each with five new flanking rules.
 
-Some plotting functions require Latex on your machine: check [this FAQ](https://github.com/garrettj403/SciencePlots/wiki/FAQ#installing-latex) for how to install.  
-Then use these commands to set up: 
+- **Coherent** (`--condition-id 0`): the eight new squares form a *ninth row*
+  (A9–H9). Their five rules use standard Othello geometry extended into the
+  new row.
+- **Incoherent** (`--condition-id 1`): the eight new squares get random
+  neighbors in each direction. Same number of new rules; spatial structure
+  destroyed.
+
+The model's vocab is expanded from 61 → 69 (8 new randomly-initialized token
+embeddings) for both conditions.
+
+### Task B — `incoherent_rules_experiment.py` (Fig 1e)
+
+Replaces N existing flanking rules with spatially-transformed versions:
+
+- **Coherent** (conditions 0–5): shift opponents and terminal by `(+1, +1)`,
+  keeping the target cell fixed. Rules stay locally consistent — they describe
+  a flanking line in a shifted location.
+- **Incoherent** (conditions 6–11): cross-wire opponents and terminal between
+  distant rule pairs. Same target cell, but the line of opponents and terminal
+  comes from a spatially unrelated rule.
+
+12 conditions = 6 N values (`[25, 75, 100, 125, 150, 175]`) × {coherent,
+incoherent}. The 100-rule condition is the headline result.
+
+## Layout
+
 ```
-conda env create -f environment.yml
-conda activate othello
-python -m ipykernel install --user --name othello --display-name "othello"
-mkdir -p ckpts/battery_othello
+new_squares_experiment.py            Task A
+new_squares_experiment.sh            SLURM array job (0–1)
+incoherent_rules_experiment.py       Task B
+incoherent_rules_experiment.sh       SLURM array job (0–11)
+hand_crafted_flanking.py             enumerates 960 flanking patterns
+sensitivity_param_search.py          shared helpers (rule selection,
+                                      corruption application, training,
+                                      LL/IL/LI evaluation, LPM helpers)
+behavioral_utils.py                  load_model, basic constants
+data/othello.py                      OthelloBoardState
+mingpt/                              Karpathy's minGPT (model + training)
+ckpts/gpt_synthetic.ckpt             pretrained Othello-GPT (97 MB)
+plot_fig1ef.py                       reads JSON outputs, plots Fig 1e,f
 ```
 
-## Training Othello-GPT
+`sensitivity_param_search.py` is included as-is for now. A follow-up commit
+will extract just the helpers used by `incoherent_rules_experiment.py`
+(`precompute_pattern_arrays_extended`, `generate_games_extended`,
+`collect_three_test_sets`, `evaluate_on_test_sets`, `build_standard_lpm_test`,
+`prepare_lpm_test`, `evaluate_lpm`, `apply_spatial_corruption`,
+`select_rules_for_group`, `place_piece_no_flip`) into a thin
+`transfer_utils.py` and drop the unused 80% of the file.
 
-Download the [championship dataset](https://drive.google.com/drive/folders/1KFtP7gfrjmaoCV-WFC4XrdVeOxy1KmXe?usp=sharing) and the [synthetic dataset](https://drive.google.com/drive/folders/1pDMdMrnxMRiDnUd-CNfRNvZCi7VXFRtv?usp=sharing) and save them in `data` subfolder.  
-Then see `train_gpt_othello.ipynb` for the training and validation. Alternatively, checkpoints can be downloaded from [here](https://drive.google.com/drive/folders/1bpnwJnccpr9W-N_hzXSm59hT7Lij4HxZ?usp=sharing) to skip this step.  
-The default experiment setting requires $8$ GPU's and takes up to roughly $12$ Gigabytes memory on each. Once you set up the code, we can use `jupyter nbconvert --execute --to notebook --allow-errors --ExecutePreprocessor.timeout=-1 train_gpt_othello.ipynb --inplace --output ckpts/checkpoint.ipynb` to run it in background.  
+## Running on SLURM
 
-## Probing Othello-GPT
-
-Then we will use `train_probe_othello.py` to train probes.  
-For example, if we want to train a nonlinear probe with hidden size $64$ on internal representations extracted from layer $6$ of the Othello-GPT trained on the championship dataset, we can use the command `python train_probe_othello.py --layer 6 --twolayer --mid_dim 64 --championship`.  
-Checkpoints will be saved to `ckpts/battery_othello` or can be alternatively downloaded from [here](https://drive.google.com/drive/folders/1uvj_M9ekHDJVdVOvMq828Z23AE7jZ01H?usp=sharing). What produces the these checkpoints are `produce_probes.sh`.  
-
-## Intervening Othello-GPT
-
-See `intervening_probe_interact_column.ipynb` for the intervention experiment, where we can customize (1) which model to intervene on, (2) the pre-intervention board state (3) which square(s) to intervene on.
-
-## Attribution via Intervention Plots
-
-See `plot_attribution_via_intervention_othello.ipynb` for the attribution via intervention experiment, where we can also customize (1) which model to intervene on, (2) the pre-intervention board state (3) which square(s) to attribute.
-
-## How to Cite
+```bash
+sbatch --array=0-1  new_squares_experiment.sh        # Task A: coherent vs incoherent
+sbatch --array=0-11 incoherent_rules_experiment.sh   # Task B: 6 scales × 2 variants
 ```
-@inproceedings{
-li2023emergent,
-title={Emergent World Representations: Exploring a Sequence Model Trained on a Synthetic Task},
-author={Kenneth Li and Aspen K Hopkins and David Bau and Fernanda Vi{\'e}gas and Hanspeter Pfister and Martin Wattenberg},
-booktitle={The Eleventh International Conference on Learning Representations },
-year={2023},
-url={https://openreview.net/forum?id=DeG07_TcZvT}
-}
+
+Each condition takes ~6 hours on a single GPU. Outputs land in
+`experiments/new_squares/cond_*.json` and
+`experiments/incoherent_rules/cond_*.json` respectively. Each JSON contains
+the eval schedule (`eval_steps`) and parallel time series for `LL_prob`,
+`LL_acc`, `IL_prob`, `IL_acc`, `LI_prob`, `LI_acc`, `std_lpm`, `cor_lpm`.
+
+## Plotting
+
+```bash
+python plot_fig1ef.py --output figs/fig1ef.png
 ```
+
+Two panels:
+- **(e)** Coherent vs incoherent rule corruption at `n_rules=100`
+  (use `--all-scales` to draw every n_rules level)
+- **(f)** Coherent (ninth row) vs incoherent (random neighbors) for new squares
+
+Y-axis is `IL_acc` — the fraction of held-out positions where the model's top-1
+predicted move is legal under the corrupted rules. Lower = the model learned
+the new rules less.
+
+## Reference (parent repo)
+
+`experiments/experiment_log.txt` in the parent `othello_world` repo
+documents the broader sensitivity / parameter-search experiments (section A7)
+and the coherent-scale sweep (section A10) that this branch focuses on.
