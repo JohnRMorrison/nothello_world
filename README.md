@@ -4,21 +4,31 @@ This is a focused subset of the `othello_world` repository containing only the c
 
 Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on a corrupted variant of Othello and tracks the following metrics during training:
 
-Probability mass on cells of each category (averaged over the test set's positions):
+### Probability mass
 
-- **LL_prob** — cells legal under both standard and corrupted rules
-- **IL_prob** — cells illegal under standard rules but legal under corrupted rules 
-- **LI_prob** — cells legal under standard rules but illegal under corrupted rules 
-- **STD_prob** — cells legal under standard rules
-- **COR_prob** — cells legal under corrupted rules
+Sum of softmax probabilities over a category of cells, averaged over
+evaluation positions.
 
+Computed on the LL / IL / LI test sets (held-out positions where the named
+category is non-empty):
 
+- **LL_prob** — mass on cells legal under both standard and corrupted rules
+- **IL_prob** — mass on cells illegal under standard rules but legal under corrupted rules
+- **LI_prob** — mass on cells legal under standard rules but illegal under corrupted rules
 
-Top-1 accuracy: fraction of positions where the argmax cell is legal under
-the corrupted rules. Computed on each test-set's positions:
+Computed on held-out games:
 
-- **LL_acc**, **IL_acc**, **LI_acc**
+- **STD_prob** — mass on standard-legal cells, on standard Othello games
+- **COR_prob** — mass on corrupted-legal cells, on corrupted-rule games
 
+### Accuracy
+
+Fraction of positions where the argmax cell is legal under the corrupted
+rules. Computed on each test set's positions:
+
+- **LL_acc** — on LL test positions
+- **IL_acc** — on IL test positions
+- **LI_acc** — on LI test positions
 
 
 ## Tasks
@@ -34,17 +44,14 @@ The model's vocab is expanded from 61 → 69 (8 new randomly-initialized token e
 
 ### Task B — `incoherent_rules_experiment.py` (Fig 1e)
 
-Replaces N existing flanking rules with spatially-transformed versions. The script takes `--variant` and `--n-rules` (default 100):
+Replaces N existing flanking rules with spatially-transformed versions. The
+script takes `--variant` and `--n-rules` (default 100). The headline Fig 1e
+result compares `coherent` vs `incoherent`; `proximal_nonlinear` and
+`distal_linear` are available for follow-up analyses.
 
-- **`--variant coherent`**: shift opponents and terminal by `(+1, +1)`,  keeping the target cell fixed. Rules stay locally consistent — they describe a flanking line in a shifted location.
-- **`--variant incoherent`**: cross-wire opponents and terminal between  distant rule pairs. Same target cell, but the line of opponents and terminal comes from a spatially unrelated rule.
-
-#### Further experiments
-
-Two additional variants are available for follow-up analyses:
-
+- **`--variant coherent`**: shift opponents and terminal by `(+1, +1)`, keeping the target cell fixed. Rules stay locally consistent — they describe a flanking line in a shifted location.
+- **`--variant incoherent`**: cross-wire opponents and terminal between distant rule pairs. Same target cell, but the line of opponents and terminal comes from a spatially unrelated rule.
 - **`--variant proximal_nonlinear`**: replace each rule's opponents and terminal with random king-move neighbors of the target. Tests proximity without linearity.
-
 - **`--variant distal_linear`**: donate opponents and terminal from a valid flanking line whose target is far away (Manhattan distance ≥ 3). Tests linearity without proximity.
 
 ## Layout
@@ -99,13 +106,14 @@ for `LL_prob`, `LL_acc`, `IL_prob`, `IL_acc`, `LI_prob`, `LI_acc`, `STD_prob`,
 ## Plotting
 
 ```bash
-python plot_fig1ef.py --output figs/fig1ef.png
+python plot_fig1ef.py
+# writes figs/rule_corruption.png and figs/new_squares.png
 ```
 
-Two panels:
-- **(e)** Coherent vs incoherent rule corruption at `n_rules=100`
+Two figures:
+- **Rule corruption** — coherent vs incoherent at `n_rules=100`
   (use `--all-scales` to draw every n_rules level)
-- **(f)** Coherent (ninth row) vs incoherent (random neighbors) for new squares
+- **New squares** — coherent (ninth row) vs incoherent (random neighbors)
 
 Y-axis is `IL_acc` — the fraction of held-out positions where the model's top-1
 predicted move is legal under the corrupted rules. Lower = the model learned

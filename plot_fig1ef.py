@@ -1,26 +1,24 @@
-"""Reproduce paper Fig 1e,f from the JSON output of the two transfer experiments.
+"""Plot training-curve figures for the two transfer-task experiments.
 
 Reads:
   experiments/incoherent_rules/{variant}_n{n_rules}.json   (Task B)
   experiments/new_squares/cond_*.json                      (Task A)
 
-Produces a single PNG with two panels:
+Produces two PNG files, one per task:
 
-  Panel e — Coherent vs Incoherent rule corruption
-    For each n_rules level we plot IL_acc (probability mass on now-illegal
-    cells under the corrupted rule set, at fine-tune step k) over training
-    steps. Coherent vs incoherent are plotted as paired curves at each
-    n_rules.
+  Rule corruption — IL_acc over fine-tune steps for Task B. Coherent vs
+    incoherent are drawn as paired curves; default n_rules level is 100
+    (use --all-scales to draw every level instead).
+    Default output: figs/rule_corruption.png
 
-  Panel f — Coherent vs Incoherent ninth row (new squares)
-    Two curves: coherent ninth-row vs incoherent random-neighbor placement.
+  New squares — IL_acc over fine-tune steps for Task A. Two curves:
+    coherent ninth-row vs incoherent random-neighbor placement.
+    Default output: figs/new_squares.png
 
 Usage:
-    python plot_fig1ef.py --output figs/fig1ef.png
-
-Defaults pick n_rules=100 as the representative scale for panel e (matches
-the 100-rules condition emphasized in the paper). Pass --rules-scale to
-override or --all-scales to draw every n_rules level.
+    python plot_fig1ef.py
+    # or with custom paths:
+    python plot_fig1ef.py --rules-output X.png --squares-output Y.png
 """
 import argparse
 import glob
@@ -41,7 +39,7 @@ def load_dir(path, pattern="*.json"):
 
 
 def panel_rules(ax, conds, scale_filter=None):
-    """Panel (e). One pair of curves per n_rules level (or just `scale_filter`)."""
+    """Rule-corruption panel. One pair of curves per n_rules level (or just `scale_filter`)."""
     by_scale = defaultdict(dict)  # n_rules -> {coherent: cond, incoherent: cond}
     for c in conds:
         by_scale[c["n_rules"]][c["variant"]] = c
@@ -60,13 +58,13 @@ def panel_rules(ax, conds, scale_filter=None):
     ax.set_xscale("symlog", linthresh=1)
     ax.set_xlabel("Fine-tune step")
     ax.set_ylabel("IL accuracy")
-    ax.set_title("(e) Rule corruption")
+    ax.set_title("Rule corruption")
     ax.legend(fontsize=8, loc="best")
     ax.grid(alpha=0.3)
 
 
 def panel_squares(ax, conds):
-    """Panel (f). Two curves: coherent ninth row vs incoherent random neighbors."""
+    """New-squares panel. Two curves: coherent ninth row vs incoherent random neighbors."""
     by_name = {c["condition_name"]: c for c in conds}
     for variant, color, ls in [("coherent", "tab:green", "-"),
                                ("incoherent", "tab:red", "--")]:
@@ -78,9 +76,15 @@ def panel_squares(ax, conds):
     ax.set_xscale("symlog", linthresh=1)
     ax.set_xlabel("Fine-tune step")
     ax.set_ylabel("IL accuracy")
-    ax.set_title("(f) New squares (ninth row)")
+    ax.set_title("New squares (ninth row)")
     ax.legend(fontsize=9, loc="best")
     ax.grid(alpha=0.3)
+
+
+def _save(fig, path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=150)
+    print(f"Saved {path}")
 
 
 def main():
@@ -88,23 +92,24 @@ def main():
     p.add_argument("--rules-dir", default="experiments/incoherent_rules")
     p.add_argument("--squares-dir", default="experiments/new_squares")
     p.add_argument("--rules-scale", type=int, default=100,
-                   help="n_rules level to plot in panel (e). Use --all-scales to override.")
+                   help="n_rules level to plot for rule corruption. Use --all-scales to override.")
     p.add_argument("--all-scales", action="store_true",
-                   help="Draw every available n_rules level in panel (e).")
-    p.add_argument("--output", default="figs/fig1ef.png")
+                   help="Draw every available n_rules level for rule corruption.")
+    p.add_argument("--rules-output", default="figs/rule_corruption.png")
+    p.add_argument("--squares-output", default="figs/new_squares.png")
     args = p.parse_args()
 
     rules_conds = load_dir(args.rules_dir)
     squares_conds = load_dir(args.squares_dir)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), constrained_layout=True)
-    panel_rules(axes[0], rules_conds,
+    fig_r, ax_r = plt.subplots(figsize=(6, 4.2), constrained_layout=True)
+    panel_rules(ax_r, rules_conds,
                 scale_filter=None if args.all_scales else args.rules_scale)
-    panel_squares(axes[1], squares_conds)
+    _save(fig_r, args.rules_output)
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    fig.savefig(args.output, dpi=150)
-    print(f"Saved {args.output}")
+    fig_s, ax_s = plt.subplots(figsize=(6, 4.2), constrained_layout=True)
+    panel_squares(ax_s, squares_conds)
+    _save(fig_s, args.squares_output)
 
 
 if __name__ == "__main__":
