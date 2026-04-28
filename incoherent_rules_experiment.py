@@ -25,7 +25,7 @@ import torch
 import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
-from hand_crafted_flanking import enumerate_flanking_patterns
+from rules_960 import enumerate_flanking_patterns, N_MOVES, VALID_MOVES, CENTER_CELLS
 from transfer_utils import (
     precompute_pattern_arrays_extended,
     generate_games_extended,
@@ -34,9 +34,8 @@ from transfer_utils import (
     build_standard_lpm_test,
     prepare_lpm_test,
     evaluate_lpm,
-    CENTER_CELLS,
+    load_model,
 )
-from behavioral_utils import load_model, N_MOVES, VALID_MOVES
 from mingpt.dataset import CharDataset
 from torch.utils.data import DataLoader
 
@@ -183,7 +182,7 @@ def train_and_evaluate_scale(model, train_games, train_legal, test_sets,
                              device, std_loader, std_mask, cor_loader, cor_mask,
                              lr=5e-5, bs=16):
     """Train for 1 epoch and evaluate at schedule points."""
-    from finetune_corruption import evaluate, build_legal_mask
+    from transfer_utils import evaluate, build_legal_mask
 
     train_dataset = CharDataset(train_games)
     train_loader = DataLoader(train_dataset, batch_size=bs, shuffle=True,
@@ -331,7 +330,7 @@ def main():
 
     # Build LPM test sets
     print("Building standard LPM test set...", flush=True)
-    from finetune_corruption import build_legal_mask
+    from transfer_utils import build_legal_mask
     std_games_test, std_legal_test = build_standard_lpm_test(n_games=10000, seed=args.seed+2)
     ref_dataset = CharDataset(train_games[:100])
     std_loader, std_mask = prepare_lpm_test(

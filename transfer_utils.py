@@ -1,14 +1,26 @@
-"""Pruned helpers used by incoherent_rules_experiment.py.
+"""Shared helpers for the transfer-task experiments (Tasks A and B).
 
-Extracted from sensitivity_param_search.py (the larger 84-condition
-parameter sweep) — kept just the ~10 functions Task B actually calls.
+Combines:
+  - rule-evaluation / game-generation helpers extracted from the larger
+    sensitivity_param_search.py sweep (precompute_pattern_arrays_extended,
+    generate_games_extended, collect_three_test_sets, evaluate_on_test_sets,
+    build_standard_lpm_test, prepare_lpm_test, evaluate_lpm,
+    place_piece_no_flip)
+  - finetune-eval primitives inlined from the (now-deleted) finetune_corruption
+    module (build_legal_mask, evaluate)
+  - model and game-shard loading (load_model, load_shard_games)
 """
+import os
+import glob
+import pickle
 import numpy as np
 import torch
 from copy import deepcopy
+from torch.utils.data import DataLoader
 
-from hand_crafted_flanking import CENTER_CELLS
+from rules_960 import CENTER_CELLS
 from data.othello import OthelloBoardState
+from mingpt.dataset import CharDataset
 
 CENTER_SET = np.array(sorted(CENTER_CELLS))
 
@@ -444,8 +456,134 @@ def prepare_lpm_test(games, legal_moves, ref_dataset, device, bs=64):
 
 def evaluate_lpm(model, loader, mask, device):
     """Evaluate LPM using pre-built loader and mask."""
-    from finetune_corruption import evaluate
     loss, acc, rank, lpm = evaluate(model, loader, device, mask)
     return {'loss': loss, 'acc': acc, 'rank': rank, 'lpm': lpm}
+
+
+def evaluate(model, loader, device, legal_mask=None):
+    """Evaluate on test set.
+
+    Returns (loss, legal_acc, mean_rank, legal_prob_mass).
+    legal_mask: np.ndarray (N, V) boolean mask from build_legal_mask().
+    If None, legal_acc falls back to exact-match accuracy and
+    legal_prob_mass is returned as 0.0.
+    """
+    model.eval()
+    total_loss = 0.0
+    total_legal = 0
+    total_rank = 0.0
+    total_legal_prob = 0.0
+    n_tokens = 0
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits, loss = model(x, y)
+        B, T, V = logits.shape
+
+        # Loss — token 0 is the padding token (stoi[-100] = 0)
+        mask = (y != 0)
+        n_valid = mask.sum().item()
+        total_loss += loss.mean().item() * n_valid
+
+        preds_flat = logits.argmax(dim=-1)[mask].cpu().numpy()
+        y_flat = y[mask].cpu().numpy()
+
+        logits_flat = logits[mask]
+        probs_flat = torch.softmax(logits_flat, dim=-1)
+
+        if legal_mask is not None:
+            end = n_tokens + len(preds_flat)
+            if end <= len(legal_mask):
+                legal_slice = legal_mask[n_tokens:end]
+                total_legal += legal_slice[np.arange(len(preds_flat)), preds_flat].sum()
+                legal_torch = torch.from_numpy(legal_slice).to(probs_flat.device)
+                total_legal_prob += (probs_flat * legal_torch).sum().item()
+        else:
+            total_legal += (preds_flat == y_flat).sum()
+
+        y_tok = y[mask]
+        correct_logit = logits_flat[torch.arange(len(y_tok)), y_tok].unsqueeze(-1)
+        ranks = (logits_flat > correct_logit).sum(dim=-1) + 1
+        total_rank += ranks.float().sum().item()
+
+        n_tokens += len(preds_flat)
+
+    model.train()
+    return (total_loss / n_tokens,
+            total_legal / n_tokens,
+            total_rank / n_tokens,
+            total_legal_prob / n_tokens if legal_mask is not None else 0.0)
+
+
+def load_model(ckpt_path="./ckpts/gpt_synthetic.ckpt"):
+    """Load OthelloGPT model and dataset.
+
+    Returns:
+        model: GPT model in eval mode
+        dataset: CharDataset with stoi/itos mappings
+        device: torch device
+    """
+    from data import get_othello
+    from mingpt.model import GPT, GPTConfig
+
+    # Load a small number of games just to build the vocabulary
+    othello = get_othello(ood_num=100)
+
+    dataset = CharDataset(othello)
+    mconf = GPTConfig(dataset.vocab_size, dataset.block_size,
+                      n_layer=8, n_head=8, n_embd=512)
+    model = GPT(mconf)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model = model.to(device)
+    model.eval()
+
+    return model, dataset, device
+
+
+def load_shard_games(shard_id, games_per_shard=100000,
+                     pickle_dir="data/othello_synthetic"):
+    """Load games for a specific shard from on-disk pickle files.
+
+    Each shard loads a different subset of the available pickle files.
+    With ~237 files of ~100K games each, we have ~23.7M games total.
+    20 shards x 100K = 2M games used.
+    """
+    files = sorted(glob.glob(os.path.join(pickle_dir, "gen10e5*.pickle")))
+    if not files:
+        raise FileNotFoundError(f"No gen10e5*.pickle files in {pickle_dir}")
+
+    games = []
+    skip = shard_id * games_per_shard
+    loaded = 0
+
+    for f in files:
+        with open(f, 'rb') as fh:
+            batch = pickle.load(fh)
+
+        if skip >= len(batch):
+            skip -= len(batch)
+            continue
+
+        start = skip
+        skip = 0
+        needed = games_per_shard - loaded
+        games.extend(batch[start:start + needed])
+        loaded = len(games)
+
+        if loaded >= games_per_shard:
+            break
+
+    if len(games) < games_per_shard:
+        print(f"Warning: shard {shard_id} only loaded {len(games)}/{games_per_shard} games")
+
+    return games[:games_per_shard]
 
 

@@ -1,20 +1,8 @@
 # Transfer-tasks branch
 
-This is a focused subset of the `othello_world` repository containing only
-the code needed to run the two transfer-task experiments shown in **Fig 1e,f**
-of the paper.
+This is a focused subset of the `othello_world` repository containing only the code needed to run two transfer-task experiments, described below.
 
-## What the experiments test
-
-> If [the model] maintained an internal board representation, it should learn
-> variants with spatially **coherent** rules faster than variants with spatially
-> **incoherent** rules. It should also learn variants that add new squares in
-> spatially coherent ways (e.g., a ninth row) faster than variants that add
-> them in spatially incoherent ways (e.g., with random neighbors in each
-> direction). We found the **opposite** (Fig. 1e,f).
-
-Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on
-a corrupted variant of Othello and tracks four behaviours over training:
+Each task fine-tunes a pretrained Othello-GPT (`ckpts/gpt_synthetic.ckpt`) on a corrupted variant of Othello and tracks four probabilities during training:
 
 - **LL** — Legal training, Legal test (probability mass on standard Othello legal moves)
 - **IL** — Impossible (corrupted) training, Legal test (forgetting of legal moves)
@@ -27,15 +15,10 @@ a corrupted variant of Othello and tracks four behaviours over training:
 
 Adds eight new squares to the Othello board, each with five new flanking rules.
 
-- **Coherent** (`--condition-id 0`): the eight new squares form a *ninth row*
-  (A9–H9). Their five rules use standard Othello geometry extended into the
-  new row.
-- **Incoherent** (`--condition-id 1`): the eight new squares get random
-  neighbors in each direction. Same number of new rules; spatial structure
-  destroyed.
+- **Coherent** (`--condition-id 0`): the eight new squares form a *ninth row* (A9–H9). Their five rules use standard Othello geometry extended into the new row.
+- **Incoherent** (`--condition-id 1`): the eight new squares get random neighbors in each direction. Same number of new rules; spatial structure destroyed.
 
-The model's vocab is expanded from 61 → 69 (8 new randomly-initialized token
-embeddings) for both conditions.
+The model's vocab is expanded from 61 → 69 (8 new randomly-initialized token embeddings) for both conditions.
 
 ### Task B — `incoherent_rules_experiment.py` (Fig 1e)
 
@@ -49,7 +32,7 @@ Replaces N existing flanking rules with spatially-transformed versions:
   comes from a spatially unrelated rule.
 
 12 conditions = 6 N values (`[25, 75, 100, 125, 150, 175]`) × {coherent,
-incoherent}. The 100-rule condition is the headline result.
+incoherent}.
 
 ## Layout
 
@@ -58,16 +41,17 @@ new_squares_experiment.py            Task A
 new_squares_experiment.sh            SLURM array job (0–1)
 incoherent_rules_experiment.py       Task B
 incoherent_rules_experiment.sh       SLURM array job (0–11)
-hand_crafted_flanking.py             enumerates 960 flanking patterns
-transfer_utils.py                    shared helpers used by Task B:
-                                      precompute_pattern_arrays_extended,
+rules_960.py                         enumerates 960 flanking patterns + board constants
+transfer_utils.py                    shared helpers: rule eval / game gen
+                                      (precompute_pattern_arrays_extended,
                                       generate_games_extended,
                                       collect_three_test_sets,
                                       evaluate_on_test_sets,
                                       build_standard_lpm_test,
                                       prepare_lpm_test, evaluate_lpm,
-                                      place_piece_no_flip, build_legal_mask
-behavioral_utils.py                  load_model, basic constants
+                                      place_piece_no_flip), finetune-eval
+                                      primitives (build_legal_mask, evaluate),
+                                      and load_model / load_shard_games
 data/othello.py                      OthelloBoardState
 mingpt/                              Karpathy's minGPT (model + training)
 ckpts/gpt_synthetic.ckpt             pretrained Othello-GPT (97 MB)

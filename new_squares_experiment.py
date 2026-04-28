@@ -27,8 +27,8 @@ import torch.nn as nn
 import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
-from hand_crafted_flanking import enumerate_flanking_patterns
-from behavioral_utils import load_model, N_MOVES, VALID_MOVES
+from rules_960 import enumerate_flanking_patterns, N_MOVES, VALID_MOVES
+from transfer_utils import load_model
 from mingpt.dataset import CharDataset
 from mingpt.model import GPT, GPTConfig
 from torch.utils.data import DataLoader
@@ -648,8 +648,7 @@ def main():
 
     # Build standard LPM test
     print("Building standard test set...", flush=True)
-    from finetune_corruption import build_legal_mask
-    from behavioral_utils import load_shard_games
+    from transfer_utils import build_legal_mask, load_shard_games
     std_games_raw = load_shard_games(0, games_per_shard=2000)
     std_legal_raw = []
     for g in std_games_raw:
