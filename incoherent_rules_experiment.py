@@ -26,7 +26,7 @@ import torch.optim as optim
 
 sys.path.insert(0, os.path.dirname(__file__))
 from hand_crafted_flanking import enumerate_flanking_patterns
-from sensitivity_param_search import (
+from transfer_utils import (
     precompute_pattern_arrays_extended,
     generate_games_extended,
     collect_three_test_sets,

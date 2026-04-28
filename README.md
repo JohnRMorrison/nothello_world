@@ -59,23 +59,20 @@ new_squares_experiment.sh            SLURM array job (0–1)
 incoherent_rules_experiment.py       Task B
 incoherent_rules_experiment.sh       SLURM array job (0–11)
 hand_crafted_flanking.py             enumerates 960 flanking patterns
-sensitivity_param_search.py          shared helpers (rule selection,
-                                      corruption application, training,
-                                      LL/IL/LI evaluation, LPM helpers)
+transfer_utils.py                    shared helpers used by Task B:
+                                      precompute_pattern_arrays_extended,
+                                      generate_games_extended,
+                                      collect_three_test_sets,
+                                      evaluate_on_test_sets,
+                                      build_standard_lpm_test,
+                                      prepare_lpm_test, evaluate_lpm,
+                                      place_piece_no_flip, build_legal_mask
 behavioral_utils.py                  load_model, basic constants
 data/othello.py                      OthelloBoardState
 mingpt/                              Karpathy's minGPT (model + training)
 ckpts/gpt_synthetic.ckpt             pretrained Othello-GPT (97 MB)
 plot_fig1ef.py                       reads JSON outputs, plots Fig 1e,f
 ```
-
-`sensitivity_param_search.py` is included as-is for now. A follow-up commit
-will extract just the helpers used by `incoherent_rules_experiment.py`
-(`precompute_pattern_arrays_extended`, `generate_games_extended`,
-`collect_three_test_sets`, `evaluate_on_test_sets`, `build_standard_lpm_test`,
-`prepare_lpm_test`, `evaluate_lpm`, `apply_spatial_corruption`,
-`select_rules_for_group`, `place_piece_no_flip`) into a thin
-`transfer_utils.py` and drop the unused 80% of the file.
 
 ## Running on SLURM
 
