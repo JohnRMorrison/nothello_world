@@ -1,8 +1,8 @@
 """Reproduce paper Fig 1e,f from the JSON output of the two transfer experiments.
 
 Reads:
-  experiments/incoherent_rules/cond_*.json   (Task B: coherent vs incoherent rules)
-  experiments/new_squares/cond_*.json        (Task A: ninth-row coherent vs incoherent)
+  experiments/incoherent_rules/{variant}_n{n_rules}.json   (Task B)
+  experiments/new_squares/cond_*.json                      (Task A)
 
 Produces a single PNG with two panels:
 
@@ -31,10 +31,10 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 
 
-def load_dir(path):
-    """Return list of dicts loaded from cond_*.json in `path`, sorted by condition_id."""
+def load_dir(path, pattern="*.json"):
+    """Return list of dicts loaded from JSON files in `path`."""
     out = []
-    for f in sorted(glob.glob(os.path.join(path, "cond_*.json"))):
+    for f in sorted(glob.glob(os.path.join(path, pattern))):
         with open(f) as fh:
             out.append(json.load(fh))
     return out
@@ -44,7 +44,7 @@ def panel_rules(ax, conds, scale_filter=None):
     """Panel (e). One pair of curves per n_rules level (or just `scale_filter`)."""
     by_scale = defaultdict(dict)  # n_rules -> {coherent: cond, incoherent: cond}
     for c in conds:
-        by_scale[c["n_rules"]][c["group_name"]] = c
+        by_scale[c["n_rules"]][c["variant"]] = c
     scales = sorted(by_scale.keys()) if scale_filter is None else [scale_filter]
 
     for n_rules in scales:

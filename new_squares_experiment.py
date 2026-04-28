@@ -706,7 +706,7 @@ def main():
         'eval_steps': [],
         'IL_prob': [], 'IL_acc': [],
         'LL_prob': [], 'LL_acc': [],
-        'std_lpm': [], 'cor_lpm': [],
+        'STD_prob': [], 'COR_prob': [],
         'std_top': [], 'cor_top': [],
     }
 
@@ -719,10 +719,10 @@ def main():
         metrics = evaluate_on_test_sets(model, test_sets, train_ds, device)
 
         # Standard LPM
-        std_lpm, std_top = evaluate_standard_lpm(model, std_loader, std_mask, device)
+        std_prob, std_top = evaluate_standard_lpm(model, std_loader, std_mask, device)
 
         # Corrupted LPM
-        cor_lpm, cor_top = evaluate_standard_lpm(model, cor_loader, cor_mask, device)
+        cor_prob, cor_top = evaluate_standard_lpm(model, cor_loader, cor_mask, device)
 
         elapsed = time.time() - t0
 
@@ -731,14 +731,14 @@ def main():
         results['IL_acc'].append(metrics.get('IL_acc', 0.0))
         results['LL_prob'].append(metrics.get('LL_prob', 0.0))
         results['LL_acc'].append(metrics.get('LL_acc', 0.0))
-        results['std_lpm'].append(std_lpm)
+        results['STD_prob'].append(std_prob)
         results['std_top'].append(std_top)
-        results['cor_lpm'].append(cor_lpm)
+        results['COR_prob'].append(cor_prob)
         results['cor_top'].append(cor_top)
 
         print(f"  Step {step}: IL_prob={metrics.get('IL_prob',0):.4f} "
               f"LL_prob={metrics.get('LL_prob',0):.4f} "
-              f"std_lpm={std_lpm:.4f} cor_lpm={cor_lpm:.4f} "
+              f"STD_prob={std_prob:.4f} COR_prob={cor_prob:.4f} "
               f"elapsed={elapsed:.0f}s", flush=True)
 
         model.train()

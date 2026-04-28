@@ -1,11 +1,7 @@
 """
-Enumeration of all 960 valid Othello flanking patterns and shared board
-conventions used by the transfer-task experiments.
+Enumeration of all 960 valid Othello flanking patterns and shared board conventions used by the transfer-task experiments.
 
-Each pattern is (target_cell, [opponent_cells], terminal_cell, direction,
-length): a flanking line that legalizes `target_cell` for the side to move.
-Task B (`incoherent_rules_experiment.py`) selects subsets of these patterns
-and applies spatial corruptions to them.
+Each pattern is (target_cell, [opponent_cells], terminal_cell, direction, length): a flanking line that legalizes `target_cell` for the side to move. Task B (`incoherent_rules_experiment.py`) selects subsets of these patterns and applies spatial corruptions to them.
 """
 
 # Board conventions

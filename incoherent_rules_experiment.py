@@ -1,15 +1,22 @@
-"""Coherent vs Incoherent at Multiple Scales (No Additional Corruption)
+"""Coherent vs Incoherent rule corruption (Task B, paper Fig 1e).
 
-Tests whether the model benefits from spatial coherence of corrupted rules.
-The spatial transformation (shift or cross-wire) IS the corruption — no
-flip_color, drop_third, etc. on top.
+Fine-tunes Othello-GPT on games generated under a corrupted rule set, where
+N existing flanking rules have been spatially transformed. The transformation
+is the only source of corruption.
 
-12 conditions: 6 n_rules × 2 (coherent/incoherent)
-  0-5: coherent at [25, 75, 100, 125, 150, 175] rules
-  6-11: incoherent at [25, 75, 100, 125, 150, 175] rules
+Variants (--variant):
+  coherent           shift opponents+terminal by a diagonal offset; rules stay
+                     locally consistent (a flanking line in a shifted location)
+  incoherent         cross-wire opponents+terminal between distant rule pairs
+                     (same target, but spatially unrelated supporting cells)
+  proximal_nonlinear replace each rule's opponents+terminal with random king-move
+                     neighbors of the target — proximity without linearity
+  distal_linear      donate opponents+terminal from a valid flanking line whose
+                     target is far away — linearity without proximity
 
 Usage:
-    python incoherent_rules_experiment.py --condition-id 0 --output-dir experiments/incoherent_rules
+    python incoherent_rules_experiment.py --variant coherent --n-rules 100 \\
+        --output-dir experiments/incoherent_rules
 """
 
 import argparse
@@ -39,8 +46,7 @@ from transfer_utils import (
 from mingpt.dataset import CharDataset
 from torch.utils.data import DataLoader
 
-# Condition mapping
-N_RULES_LEVELS = [25, 75, 100, 125, 150, 175]
+VARIANTS = ['coherent', 'incoherent', 'proximal_nonlinear', 'distal_linear']
 EVAL_SCHEDULE = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000,
                  10000, 20000, 50000, 100000]
 
@@ -197,26 +203,26 @@ def train_and_evaluate_scale(model, train_games, train_legal, test_sets,
     results = {
         'eval_steps': [], 'LL_prob': [], 'LL_acc': [],
         'IL_prob': [], 'IL_acc': [], 'LI_prob': [], 'LI_acc': [],
-        'std_lpm': [], 'cor_lpm': [],
+        'STD_prob': [], 'COR_prob': [],
     }
 
     def do_eval(step):
         model.eval()
         metrics = evaluate_on_test_sets(model, test_sets, train_dataset, device)
-        std_loss, std_acc, std_rank, std_lpm = evaluate(model, std_loader, device, std_mask)
-        cor_loss, cor_acc, cor_rank, cor_lpm = evaluate(model, cor_loader, device, cor_mask)
+        std_loss, std_acc, std_rank, std_prob = evaluate(model, std_loader, device, std_mask)
+        cor_loss, cor_acc, cor_rank, cor_prob = evaluate(model, cor_loader, device, cor_mask)
 
         results['eval_steps'].append(step)
         for k in ['LL', 'IL', 'LI']:
             results[f'{k}_prob'].append(metrics.get(f'{k}_prob', 0.0))
             results[f'{k}_acc'].append(metrics.get(f'{k}_acc', 0.0))
-        results['std_lpm'].append(float(std_lpm))
-        results['cor_lpm'].append(float(cor_lpm))
+        results['STD_prob'].append(float(std_prob))
+        results['COR_prob'].append(float(cor_prob))
 
         print(f"  Step {step}: LL_prob={metrics.get('LL_prob',0):.4f} "
               f"IL_prob={metrics.get('IL_prob',0):.4f} "
               f"LI_prob={metrics.get('LI_prob',0):.4f} "
-              f"std_lpm={std_lpm:.4f} cor_lpm={cor_lpm:.4f} "
+              f"STD_prob={std_prob:.4f} COR_prob={cor_prob:.4f} "
               f"elapsed={time.time()-t0:.0f}s", flush=True)
         model.train()
 
@@ -243,7 +249,8 @@ def train_and_evaluate_scale(model, train_games, train_legal, test_sets,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--condition-id", type=int, required=True)
+    parser.add_argument("--variant", type=str, default="coherent", choices=VARIANTS)
+    parser.add_argument("--n-rules", type=int, default=100)
     parser.add_argument("--output-dir", type=str, default="experiments/incoherent_rules")
     parser.add_argument("--n-train", type=int, default=2000000)
     parser.add_argument("--lr", type=float, default=5e-5)
@@ -251,24 +258,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    cid = args.condition_id
-    # 0-5: coherent, 6-11: incoherent, 12-17: proximal_nonlinear, 18-23: distal_linear
-    if cid < 6:
-        group_name = 'coherent'
-        n_rules = N_RULES_LEVELS[cid]
-    elif cid < 12:
-        group_name = 'incoherent'
-        n_rules = N_RULES_LEVELS[cid - 6]
-    elif cid < 18:
-        group_name = 'proximal_nonlinear'
-        n_rules = N_RULES_LEVELS[cid - 12]
-    elif cid < 24:
-        group_name = 'distal_linear'
-        n_rules = N_RULES_LEVELS[cid - 18]
-    else:
-        raise ValueError(f"Invalid condition-id: {cid}")
+    variant = args.variant
+    n_rules = args.n_rules
 
-    print(f"Condition {cid}: {group_name} with {n_rules} rules")
+    print(f"Variant: {variant}, n_rules: {n_rules}")
     print(f"Started at: {time.strftime('%c')}", flush=True)
 
     rng = np.random.RandomState(args.seed)
@@ -284,11 +277,13 @@ def main():
     # Apply spatial transformation only
     base_patterns = enumerate_flanking_patterns()
     corrupted_patterns, n_modified = apply_spatial_only(
-        group_name, base_patterns, rule_ids, rng)
-    print(f"Modified {n_modified} rules (type={group_name})", flush=True)
+        variant, base_patterns, rule_ids, rng)
+    print(f"Modified {n_modified} rules (type={variant})", flush=True)
+
+    run_tag = f"{variant}_n{n_rules}"
 
     # Generate or load games
-    games_dir = os.path.join(args.output_dir, "games", f"cond_{cid:03d}")
+    games_dir = os.path.join(args.output_dir, "games", run_tag)
     os.makedirs(games_dir, exist_ok=True)
     games_path = os.path.join(games_dir, "train_games.pickle")
     legal_path = os.path.join(games_dir, "train_legal.pickle")
@@ -352,8 +347,7 @@ def main():
 
     # Save
     output = {
-        'condition_id': cid,
-        'group_name': group_name,
+        'variant': variant,
         'n_rules': n_rules,
         'n_rules_modified': n_modified,
         'rule_ids': rule_ids,
@@ -362,7 +356,7 @@ def main():
     }
 
     os.makedirs(args.output_dir, exist_ok=True)
-    out_path = os.path.join(args.output_dir, f"cond_{cid:03d}.json")
+    out_path = os.path.join(args.output_dir, f"{run_tag}.json")
     with open(out_path, 'w') as f:
         json.dump(output, f, indent=2)
     print(f"Saved {out_path}", flush=True)
