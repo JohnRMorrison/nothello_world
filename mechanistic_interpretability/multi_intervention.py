@@ -320,10 +320,15 @@ def apply_intervention(x, flip_dirs, pos, scale, per_cell_scales=None):
 
     x: (batch, seq, d_model)
     per_cell_scales: if provided, list of per-cell scales (one per flip_dir).
-                     Overrides `scale` for each cell.
+                     Each per-cell scale is MULTIPLIED by `scale` (default 1.0
+                     when only per-cell scales are used). This lets you sweep
+                     a scale multiplier on top of the cd0 calibrated direction.
     """
     for i, flip_dir in enumerate(flip_dirs):
-        s = per_cell_scales[i] if per_cell_scales is not None else scale
+        if per_cell_scales is not None:
+            s = per_cell_scales[i] * scale
+        else:
+            s = scale
         coeff = x[0, pos] @ flip_dir / flip_dir.norm()
         x[0, pos] -= s * coeff * flip_dir / flip_dir.norm()
     return x
