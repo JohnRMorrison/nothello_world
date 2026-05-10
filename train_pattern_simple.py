@@ -324,6 +324,18 @@ def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
     return torch.logsumexp(gathered, dim=-1)
 
 
+def listwise_cell_ce(cell_logits, cell_labels):
+    """Listwise softmax CE: target distribution is uniform over legal cells.
+    cell_logits: (B, 60), cell_labels: (B, 60) binary float (1 if legal cell).
+    Returns scalar: -mean over batch of (1/K_b) * sum_{c legal} log_softmax(cell_logits)[c].
+    Equivalent to KL(uniform-over-legal || softmax(cell_logits)).
+    """
+    log_probs = nn.functional.log_softmax(cell_logits, dim=-1)
+    legal_mask = (cell_labels > 0.5).float()
+    K = legal_mask.sum(dim=-1).clamp(min=1)
+    return -(log_probs * legal_mask).sum(dim=-1).div(K).mean()
+
+
 def pairwise_cell_hinge(cell_logits, cell_labels, margin=1.0):
     """Pairwise hinge: for each (legal, illegal) pair, max(0, margin - s[l] + s[i])."""
     # cell_logits: (B, 60), cell_labels: (B, 60) binary
@@ -354,7 +366,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
           legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
           feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
-          pos_weight_end=None):
+          pos_weight_end=None, listwise_weight=0.0):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -381,12 +393,15 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     if pairwise_weight > 0:
         print(f"  pairwise_weight={pairwise_weight:.2f} (margin={pairwise_margin})")
 
-    if legal_weight > 0 or pairwise_weight > 0:
+    if legal_weight > 0 or pairwise_weight > 0 or listwise_weight > 0:
         if pattern_to_cell is None:
-            raise ValueError("legal/pairwise loss requires pattern_to_cell tensor")
+            raise ValueError("legal/pairwise/listwise loss requires pattern_to_cell tensor")
         pattern_to_cell = pattern_to_cell.to(device)
         if legal_weight > 0:
             print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
+        if listwise_weight > 0:
+            print(f"  listwise_weight={listwise_weight:.2f} "
+                  f"(logsumexp aggregator → softmax CE vs uniform-over-legal)")
 
     if loss_type not in ("bce", "mse"):
         raise ValueError(f"loss_type must be 'bce' or 'mse', got {loss_type}")
@@ -540,10 +555,12 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
                 loss = torch.tensor(0.0, device=device)
                 if mode in ("direct", "randproj"):
+                    use_cell = (legal_weight > 0 or pairwise_weight > 0
+                                or listwise_weight > 0)
                     if even_mask.any():
                         logits = model_even(x[even_mask])
                         loss = loss + pattern_loss(logits, y_pat[even_mask])
-                        if legal_weight > 0 or pairwise_weight > 0:
+                        if use_cell:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[even_mask], pattern_to_cell)
                             if legal_weight > 0:
@@ -552,10 +569,13 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                             if pairwise_weight > 0:
                                 loss = loss + pairwise_weight * pairwise_cell_hinge(
                                     cell_logits, cell_labels, pairwise_margin)
+                            if listwise_weight > 0:
+                                loss = loss + listwise_weight * listwise_cell_ce(
+                                    cell_logits, cell_labels)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
                         loss = loss + pattern_loss(logits, y_pat[odd_mask])
-                        if legal_weight > 0 or pairwise_weight > 0:
+                        if use_cell:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[odd_mask], pattern_to_cell)
                             if legal_weight > 0:
@@ -564,6 +584,9 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                             if pairwise_weight > 0:
                                 loss = loss + pairwise_weight * pairwise_cell_hinge(
                                     cell_logits, cell_labels, pairwise_margin)
+                            if listwise_weight > 0:
+                                loss = loss + listwise_weight * listwise_cell_ce(
+                                    cell_logits, cell_labels)
                 else:
                     y_board_gpu = y_board.to(device)
                     for mask, model in [(even_mask, model_even), (odd_mask, model_odd)]:
@@ -696,6 +719,9 @@ if __name__ == "__main__":
     parser.add_argument("--pairwise-weight", type=float, default=0.0,
                         help="Weight on cell-level pairwise hinge loss (legal > illegal + margin)")
     parser.add_argument("--pairwise-margin", type=float, default=1.0)
+    parser.add_argument("--listwise-weight", type=float, default=0.0,
+                        help="Weight on listwise softmax-CE vs uniform-over-legal target "
+                             "(logsumexp-aggregated). Directly minimizes recall@K loss.")
     parser.add_argument("--pos-weight-end", type=float, default=None,
                         help="If set, linearly interpolate pos_weight from --pos-weight to this value across epochs")
     parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
@@ -787,6 +813,8 @@ if __name__ == "__main__":
         save_path = save_path.replace('.pt', '_single.pt')
     if args.legal_weight > 0:
         save_path = save_path.replace('.pt', f'_lw{args.legal_weight:g}.pt')
+    if args.listwise_weight > 0:
+        save_path = save_path.replace('.pt', f'_listw{args.listwise_weight:g}.pt')
     if args.loss != "bce":
         save_path = save_path.replace('.pt', f'_{args.loss}.pt')
 
@@ -800,5 +828,6 @@ if __name__ == "__main__":
           legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell,
           loss_type=args.loss, feature_fn=feature_fn,
           pairwise_weight=args.pairwise_weight, pairwise_margin=args.pairwise_margin,
-          pos_weight_end=args.pos_weight_end)
+          pos_weight_end=args.pos_weight_end,
+          listwise_weight=args.listwise_weight)
 

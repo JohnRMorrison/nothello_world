@@ -28,6 +28,7 @@ from generate_rule_games import precompute_pattern_arrays
 from train_pattern_simple import (
     DirectMLP, compute_pattern_labels_batch,
     patterns_to_cell_logsumexp, pat_labels_to_cell_labels, _get_cell_pat_index,
+    listwise_cell_ce,
 )
 
 
@@ -48,6 +49,10 @@ if __name__ == "__main__":
     parser.add_argument("--pos-weight", type=float, default=5.0,
                         help="pos_weight on cell BCE (legal cells ~16%)")
     parser.add_argument("--finetune", choices=["output", "full"], default="output")
+    parser.add_argument("--loss", choices=["bce", "listwise"], default="bce",
+                        help="bce: cell-aggregated BCE (legacy). listwise: softmax CE over "
+                             "60 cells against uniform-over-legal target — directly "
+                             "optimizes recall@K.")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -211,8 +216,11 @@ if __name__ == "__main__":
                     if not msk.any(): continue
                     pl = m(x[msk])
                     cell_logits = patterns_to_cell_logsumexp(pl, pattern_to_cell)
-                    loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                        cell_logits, legal[msk], pos_weight=pw)
+                    if args.loss == "listwise":
+                        loss = loss + listwise_cell_ce(cell_logits, legal[msk])
+                    else:
+                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
+                            cell_logits, legal[msk], pos_weight=pw)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -226,8 +234,9 @@ if __name__ == "__main__":
         base = os.path.splitext(os.path.basename(args.ckpt))[0]
         save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
         os.makedirs(save_dir, exist_ok=True)
+        loss_tag = "listw" if args.loss == "listwise" else f"pw{int(args.pos_weight)}"
         save_path = os.path.join(save_dir,
-            f"ftlegal_{base}_{args.finetune}_pw{int(args.pos_weight)}.pt")
+            f"ftlegal_{base}_{args.finetune}_{loss_tag}.pt")
         # Also save input_dim so compare_aggregators / probe can reload.
         torch.save({
             'even': me.state_dict(), 'odd': mo.state_dict(),
