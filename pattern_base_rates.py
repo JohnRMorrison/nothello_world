@@ -175,7 +175,8 @@ if __name__ == "__main__":
             pb = pos[i:i + batch].numpy()
             labels = compute_pattern_labels_batch(
                 yb, pb, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
-            counts += labels.sum(axis=0)
+            lbl = labels.astype(np.int64)
+            counts += lbl.sum(axis=0)
 
             if use_model:
                 xb = feat_X[i:i + batch].to(device)
@@ -191,7 +192,6 @@ if __name__ == "__main__":
                         logits, _ = m(xb[msk], p[msk])
                         preds[msk] = logits
                 pos_pred = (preds > args.threshold).cpu().numpy().astype(np.int64)
-                lbl = labels.astype(np.int64)
                 tp += (pos_pred & lbl).sum(axis=0)
                 fp += (pos_pred & (1 - lbl)).sum(axis=0)
                 fn += ((1 - pos_pred) & lbl).sum(axis=0)
