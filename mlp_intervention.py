@@ -223,6 +223,13 @@ if __name__ == "__main__":
     eps_by_scale = {s: [] for s in scales}
     delta_by_scale = {s: [] for s in scales}
     cross_by_scale = {s: [] for s in scales}
+    # Per-intervention metadata so we can stratify later: position-level
+    # baseline recall@K, the position's turn number, and whether target was
+    # ranked in top-K after intervention (Li's strict metric).
+    pos_recall_by_scale = {s: [] for s in scales}
+    pos_turn_by_scale   = {s: [] for s in scales}
+    li_topk_by_scale    = {s: [] for s in scales}
+    li_topkplus1_by_scale = {s: [] for s in scales}   # also save top-(K+1)
 
     batch = 256
     with torch.no_grad():
@@ -262,6 +269,14 @@ if __name__ == "__main__":
                 legal_cells = torch.where(legal[b])[0].cpu().numpy()
                 if len(legal_cells) == 0: continue
 
+                # Position-level baseline recall@K: fraction of legal cells
+                # that appear in the top-K (where K = # legal moves) of the
+                # baseline cell-prob ranking.
+                K = len(legal_cells)
+                base_ranks = torch.argsort(-base_cell_p[b]).cpu().numpy()
+                base_topK = set(base_ranks[:K].tolist())
+                pos_recall = sum(1 for c in legal_cells if c in base_topK) / K
+
                 for c in target_cells:
                     d = torch.from_numpy(directions[int(c)]).to(device)
                     if d.norm() == 0: continue
@@ -282,6 +297,17 @@ if __name__ == "__main__":
                         min_legal = float(cell_p[legal_cells].min())
                         eps = p_target - max_other_illegal
                         delta = p_target - min_legal
+                        # Li-style strict metrics: does target appear in
+                        # the post-intervention top-K (K = # legal moves)?
+                        ranks = torch.argsort(-cell_p).cpu().numpy()
+                        topK   = set(ranks[:K].tolist())
+                        topKp1 = set(ranks[:K + 1].tolist())
+                        li_topk    = 1 if int(c) in topK   else 0
+                        li_topkp1  = 1 if int(c) in topKp1 else 0
+                        pos_recall_by_scale[s].append(pos_recall)
+                        pos_turn_by_scale[s].append(int(pb[b]))
+                        li_topk_by_scale[s].append(li_topk)
+                        li_topkplus1_by_scale[s].append(li_topkp1)
                         # Crosstalk: mean |Delta P| on non-target cells
                         non_target_mask = torch.ones(60, dtype=torch.bool, device=device)
                         non_target_mask[c] = False
@@ -311,10 +337,28 @@ if __name__ == "__main__":
               f"{(e > 0.1).mean():>8.2%} "
               f"{e.mean():>10.4f} {d.mean():>12.4f} {c.mean():>16.4f}")
 
+    # Also print Li-style top-K and top-(K+1) intervention success rates
+    print()
+    print("Li-style top-K and top-(K+1) hit rates (per-intervention):")
+    print(f"{'scale':>6s} {'n':>8s} {'top-K%':>9s} {'top-K+1%':>11s} "
+          f"{'mean pos-recall':>18s}")
+    for s in scales:
+        n = len(li_topk_by_scale[s])
+        if n == 0: continue
+        tk  = np.mean(li_topk_by_scale[s])
+        tkp = np.mean(li_topkplus1_by_scale[s])
+        pr  = np.mean(pos_recall_by_scale[s])
+        print(f"{s:>6.2f} {n:>8d} {tk:>8.2%} {tkp:>10.2%} {pr:>18.4f}")
+
     if args.output:
-        np.savez(args.output,
-                 probe_accs=probe_accs,
-                 **{f"eps_s{s}": np.array(eps_by_scale[s]) for s in scales},
-                 **{f"delta_s{s}": np.array(delta_by_scale[s]) for s in scales},
-                 **{f"cross_s{s}": np.array(cross_by_scale[s]) for s in scales})
+        save_dict = {'probe_accs': probe_accs}
+        for s in scales:
+            save_dict[f"eps_s{s}"]        = np.array(eps_by_scale[s])
+            save_dict[f"delta_s{s}"]      = np.array(delta_by_scale[s])
+            save_dict[f"cross_s{s}"]      = np.array(cross_by_scale[s])
+            save_dict[f"pos_recall_s{s}"] = np.array(pos_recall_by_scale[s])
+            save_dict[f"pos_turn_s{s}"]   = np.array(pos_turn_by_scale[s])
+            save_dict[f"li_topk_s{s}"]    = np.array(li_topk_by_scale[s])
+            save_dict[f"li_topkp1_s{s}"]  = np.array(li_topkplus1_by_scale[s])
+        np.savez(args.output, **save_dict)
         print(f"\nSaved raw samples to {args.output}")
