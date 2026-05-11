@@ -82,9 +82,16 @@ if __name__ == "__main__":
     parser.add_argument("--scales", default="1,2,3,5,8",
                         help="Comma-separated intervention scale multipliers.")
     parser.add_argument("--n-train-probe", type=int, default=20000,
-                        help="Positions used to train the Ridge probe per cell.")
+                        help="Positions used to train the inline Ridge probe per "
+                             "cell (only when --probe-path NOT set).")
     parser.add_argument("--n-test", type=int, default=5000,
                         help="Held-out positions on which to test interventions.")
+    parser.add_argument("--probe-path", default=None,
+                        help="If set, load a saved Nanda-style probe from this "
+                             "path instead of fitting Ridge inline. The saved "
+                             "probe is the dict produced by probe_pattern_models.py "
+                             "with keys 'even' / 'odd' / 'hidden_dim' / 'best_acc'. "
+                             "Each value is a state_dict for nn.Linear(H, 64*3).")
     parser.add_argument("--max-cells-per-pos", type=int, default=5,
                         help="At most this many illegal-target cells per position.")
     parser.add_argument("--output", default=None)
@@ -154,13 +161,7 @@ if __name__ == "__main__":
     train_slice = slice(0, args.n_train_probe)
     test_slice  = slice(args.n_train_probe, n_total)
 
-    print("\nFitting per-cell Ridge probes on training half...")
-    scaler = StandardScaler().fit(H_all[train_slice])
-    H_train_s = scaler.transform(H_all[train_slice])
-    # Note: we'll need raw-space directions, so we'll undo the scaler later.
-
-    # Per cell c in [0, 60), train probe predicting Y_np[:, c64] where c64 is
-    # the 64-cell board index (skipping centers).
+    # Map 60-cell-index (MOVE_TO_IDX) to 64-cell board index.
     def m60_to_b64(m):
         skip = [27, 28, 35, 36]
         j = 0
@@ -170,37 +171,67 @@ if __name__ == "__main__":
             j += 1
         raise ValueError(m)
 
-    # Direction per cell: coef_[empty] - mean(coef_[other])
-    # We map empty class to index 0 (Y_np uses 0=empty in compare_aggregators
-    # encoding -- check).
     directions = np.zeros((60, args.hidden), dtype=np.float32)
     probe_accs = np.zeros(60, dtype=np.float32)
-    for m in range(60):
-        b = m60_to_b64(m)
-        y_tr = Y_np[train_slice, b]
-        if len(np.unique(y_tr)) < 2:
-            continue
-        clf = RidgeClassifier(alpha=1.0)
-        clf.fit(H_train_s, y_tr)
-        probe_accs[m] = clf.score(scaler.transform(H_all[test_slice]),
-                                  Y_np[test_slice, b])
-        classes = clf.classes_
-        coef = clf.coef_   # (k, H) where k <= 3 for the classes present
-        # Map class 0 (empty) to its row if present; else skip
-        if 0 in classes:
-            empty_row = coef[list(classes).index(0)]
-            other = np.mean(np.delete(coef, list(classes).index(0), axis=0),
-                            axis=0) if coef.shape[0] > 1 else np.zeros_like(empty_row)
-            d = empty_row - other
-            # Undo scaler to get direction in raw hidden space:
-            # x_s = (x - mu) / sigma   ->   coef_s @ x_s = (coef_s / sigma) @ x + const
-            # so the direction in raw space is coef / sigma (per-feature scaling).
-            d_raw = d / np.maximum(scaler.scale_, 1e-8)
-            # Normalize to unit L2.
-            n = np.linalg.norm(d_raw)
+
+    if args.probe_path is not None:
+        # Load Nanda-style probe trained by probe_pattern_models.py.
+        # Saved as {'even': sd, 'odd': sd, 'hidden_dim': H, 'best_acc': ...}
+        # Each sd is the state_dict of nn.Linear(H, 64*3).
+        probe_ck = torch.load(args.probe_path, map_location='cpu')
+        if probe_ck.get('hidden_dim') != args.hidden:
+            raise ValueError(
+                f"Probe hidden_dim={probe_ck.get('hidden_dim')} != "
+                f"--hidden={args.hidden}")
+        print(f"\nLoaded saved probe from {args.probe_path}")
+        print(f"  Reported best_acc: {probe_ck.get('best_acc')}")
+        # The probe is one head per parity. weight shape: (64*3, H).
+        # Mean direction per cell: coef[empty] - mean(coef[other classes]).
+        # We average the directions from the even and odd probes (the model
+        # tends to put the same board axis in similar positions across heads).
+        w_even = probe_ck['even']['weight'].numpy().reshape(64, 3, args.hidden)
+        w_odd  = probe_ck['odd']['weight'].numpy().reshape(64, 3, args.hidden)
+        for m in range(60):
+            b64 = m60_to_b64(m)
+            # class 0 = empty for both probes
+            d_e = w_even[b64, 0, :] - 0.5 * (w_even[b64, 1, :] + w_even[b64, 2, :])
+            d_o = w_odd [b64, 0, :] - 0.5 * (w_odd [b64, 1, :] + w_odd [b64, 2, :])
+            # Average across parities; the model's hidden is unified for both
+            # parities here since me/mo are separate networks but the probe was
+            # trained jointly. Using the matching parity per position would be
+            # ideal; this average is a reasonable proxy.
+            d = 0.5 * (d_e + d_o)
+            n = float(np.linalg.norm(d))
             if n > 0:
-                directions[m] = d_raw / n
-    print(f"  Mean probe accuracy across 60 cells: {probe_accs.mean():.4f}")
+                directions[m] = (d / n).astype(np.float32)
+        probe_accs[:] = probe_ck.get('best_acc', float('nan'))
+        # We don't need scaling/Ridge fitting; skip to interventions.
+    else:
+        # Fall back: fit Ridge probes inline (legacy path).
+        print("\nFitting per-cell Ridge probes on training half (no --probe-path)...")
+        scaler = StandardScaler().fit(H_all[train_slice])
+        H_train_s = scaler.transform(H_all[train_slice])
+        for m in range(60):
+            b = m60_to_b64(m)
+            y_tr = Y_np[train_slice, b]
+            if len(np.unique(y_tr)) < 2:
+                continue
+            clf = RidgeClassifier(alpha=1.0)
+            clf.fit(H_train_s, y_tr)
+            probe_accs[m] = clf.score(scaler.transform(H_all[test_slice]),
+                                      Y_np[test_slice, b])
+            classes = clf.classes_
+            coef = clf.coef_
+            if 0 in classes:
+                empty_row = coef[list(classes).index(0)]
+                other = np.mean(np.delete(coef, list(classes).index(0), axis=0),
+                                axis=0) if coef.shape[0] > 1 else np.zeros_like(empty_row)
+                d = empty_row - other
+                d_raw = d / np.maximum(scaler.scale_, 1e-8)
+                n = float(np.linalg.norm(d_raw))
+                if n > 0:
+                    directions[m] = (d_raw / n).astype(np.float32)
+        print(f"  Mean Ridge probe accuracy across 60 cells: {probe_accs.mean():.4f}")
 
     # Now run interventions on the test slice.
     out_layer_me = get_output_layer(me)
