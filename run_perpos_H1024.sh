@@ -8,7 +8,7 @@
 #SBATCH --job-name=perpos_h1024
 #SBATCH -c 4
 #SBATCH --time=00:30:00
-#SBATCH --mem=16GB
+#SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/perpos_h1024_%j.out
 #SBATCH --account=nklab
