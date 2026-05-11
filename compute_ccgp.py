@@ -38,6 +38,7 @@ sys.path.insert(0, '.')
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 
 
 # ---------------------------------------------------------------------------
@@ -157,20 +158,42 @@ def _balance(idx, y, rng):
     return np.concatenate([pos, neg])
 
 
-def _probe_acc(h_train, y_train, h_test, y_test, C=1.0, max_iter=200):
-    """Train logistic regression, return test accuracy."""
+def _probe_acc(h_train, y_train, h_test, y_test, C=1.0, max_iter=1000):
+    """Train logistic regression, return test accuracy.
+
+    Standardizes features (StandardScaler fit on train) before LR so lbfgs
+    converges in tens of iterations instead of thousands.
+    """
     if len(h_train) < 20 or len(h_test) < 10:
         return None
     if len(np.unique(y_train)) < 2 or len(np.unique(y_test)) < 2:
         return None
+    scaler = StandardScaler()
+    h_train = scaler.fit_transform(h_train)
+    h_test = scaler.transform(h_test)
     clf = LogisticRegression(max_iter=max_iter, C=C, solver='lbfgs')
     clf.fit(h_train, y_train)
     return float(clf.score(h_test, y_test))
 
 
+def _subsample(idx, n_target, rng):
+    """Without-replacement subsample if too many, else return idx unchanged."""
+    if len(idx) <= n_target:
+        return idx
+    return rng.choice(idx, n_target, replace=False)
+
+
 def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
-               cells=range(64), seed=0, min_per_bin=200):
-    """Option A: leave-one-bin-out CCGP across game-phase bins."""
+               cells=range(64), seed=0, min_per_bin=200,
+               train_size=None):
+    """Option A: leave-one-bin-out CCGP across game-phase bins.
+
+    For each fold, both CCGP and Within use the SAME train_size (after
+    class balancing). Within is k-fold CV inside ONE bin, with the same
+    train_size taken from the (k-1) train-folds of that bin pooled together.
+    If train_size is None, it's auto-set to the smaller of (CCGP train pool,
+    Within train pool) so the two are matched per cell × class.
+    """
     rng = np.random.RandomState(seed)
     quantiles = np.quantile(pos, np.linspace(0, 1, n_bins + 1))
     quantiles[0] -= 0.5; quantiles[-1] += 0.5
@@ -180,38 +203,60 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
     for cell in cells:
         for cls in classes:
             y = (board[:, cell] == cls).astype(np.int32)
-            # need both classes present
             if y.sum() < 100 or (1 - y).sum() < 100:
                 continue
 
-            # CCGP: leave-one-bin-out
-            fold_acc = []
-            for held in range(n_bins):
-                tr_idx = np.where(bins != held)[0]
-                te_idx = np.where(bins == held)[0]
-                if len(tr_idx) < min_per_bin or len(te_idx) < 50:
+            # Per-bin balanced index pools
+            per_bin = []
+            for b in range(n_bins):
+                idx = np.where(bins == b)[0]
+                if len(idx) < min_per_bin:
+                    per_bin.append(None)
                     continue
-                tr_idx = _balance(tr_idx, y, rng)
-                te_idx = _balance(te_idx, y, rng)
+                per_bin.append(_balance(idx, y, rng))
+
+            valid_bins = [b for b in range(n_bins) if per_bin[b] is not None]
+            if len(valid_bins) < 2:
+                continue
+
+            # Match train size between CCGP (n-1 bins pooled) and Within
+            # (n-1 folds of one bin pooled).
+            ccgp_train_pool = min(sum(len(per_bin[b]) for b in valid_bins if b != h_b)
+                                  for h_b in valid_bins)
+            within_train_pool = min(int(len(per_bin[b]) * (len(valid_bins) - 1) / len(valid_bins))
+                                    for b in valid_bins)
+            t = train_size or min(ccgp_train_pool, within_train_pool)
+            t = max(t, 50)
+
+            # CCGP: leave-one-bin-out, subsample to t for training
+            fold_acc = []
+            for held_b in valid_bins:
+                tr_pool = np.concatenate([per_bin[b] for b in valid_bins if b != held_b])
+                te_idx = per_bin[held_b]
+                tr_idx = _subsample(tr_pool, t, rng)
                 a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx])
                 if a is not None:
                     fold_acc.append(a)
             if fold_acc:
                 ccgp_per.append(np.mean(fold_acc))
 
-            # Within-condition: split each bin 50/50
+            # Within: k-fold CV inside each bin. k = len(valid_bins) so the
+            # held-out fraction matches CCGP (1/n of one bin).
             wf = []
-            for b in range(n_bins):
-                idx = np.where(bins == b)[0]
-                if len(idx) < min_per_bin:
-                    continue
-                idx = _balance(idx, y, rng)
+            n_folds = len(valid_bins)
+            for b in valid_bins:
+                idx = per_bin[b].copy()
                 rng.shuffle(idx)
-                half = len(idx) // 2
-                a = _probe_acc(h[idx[:half]], y[idx[:half]],
-                               h[idx[half:]], y[idx[half:]])
-                if a is not None:
-                    wf.append(a)
+                fold_size = len(idx) // n_folds
+                if fold_size < 20:
+                    continue
+                for f in range(n_folds):
+                    te = idx[f * fold_size:(f + 1) * fold_size]
+                    tr = np.concatenate([idx[:f * fold_size], idx[(f + 1) * fold_size:]])
+                    tr = _subsample(tr, t, rng)
+                    a = _probe_acc(h[tr], y[tr], h[te], y[te])
+                    if a is not None:
+                        wf.append(a)
             if wf:
                 within_per.append(np.mean(wf))
 
@@ -227,10 +272,12 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
 
 
 def ccgp_context(h, board, pos, classes=(1, 2),
-                 cells=range(64), seed=0, min_per_cond=200):
+                 cells=range(64), seed=0, min_per_cond=200,
+                 train_size=None):
     """Option B: cross-context-cell CCGP. Pair each cell C with diagonal cell D
     (D = 63 - C). Split positions by D's occupancy. Train on D-empty, test on
-    D-occupied (and vice versa)."""
+    D-occupied (and vice versa). Within = 2-fold CV inside each context
+    state, with the same per-fit training set size as CCGP."""
     rng = np.random.RandomState(seed)
     ccgp_per, within_per = [], []
     for cell in cells:
@@ -243,32 +290,47 @@ def ccgp_context(h, board, pos, classes=(1, 2),
             if y.sum() < 100 or (1 - y).sum() < 100:
                 continue
 
+            # balanced index per context state
+            per_state = []
+            for s in (0, 1):
+                idx = np.where(ctx_state == s)[0]
+                if len(idx) < min_per_cond:
+                    per_state.append(None)
+                    continue
+                per_state.append(_balance(idx, y, rng))
+            if any(p is None for p in per_state):
+                continue
+
+            # Match training size: CCGP trains on one state, tests on the other.
+            # Within trains on half of one state, tests on the other half.
+            ccgp_train_pool = min(len(per_state[0]), len(per_state[1]))
+            within_train_pool = min(len(per_state[0]) // 2, len(per_state[1]) // 2)
+            t = train_size or min(ccgp_train_pool, within_train_pool)
+            t = max(t, 50)
+
+            # CCGP: train on state 0, test on state 1 (and vice versa)
             fold_acc = []
             for held in (0, 1):
-                tr_idx = np.where(ctx_state != held)[0]
-                te_idx = np.where(ctx_state == held)[0]
-                if len(tr_idx) < min_per_cond or len(te_idx) < 50:
-                    continue
-                tr_idx = _balance(tr_idx, y, rng)
-                te_idx = _balance(te_idx, y, rng)
+                tr_idx = _subsample(per_state[1 - held], t, rng)
+                te_idx = per_state[held]
                 a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx])
                 if a is not None:
                     fold_acc.append(a)
             if fold_acc:
                 ccgp_per.append(np.mean(fold_acc))
 
+            # Within: 2-fold CV within each state, same train_size
             wf = []
-            for state in (0, 1):
-                idx = np.where(ctx_state == state)[0]
-                if len(idx) < min_per_cond:
-                    continue
-                idx = _balance(idx, y, rng)
+            for s in (0, 1):
+                idx = per_state[s].copy()
                 rng.shuffle(idx)
                 half = len(idx) // 2
-                a = _probe_acc(h[idx[:half]], y[idx[:half]],
-                               h[idx[half:]], y[idx[half:]])
-                if a is not None:
-                    wf.append(a)
+                for tr_part, te_part in [(idx[:half], idx[half:]),
+                                          (idx[half:], idx[:half])]:
+                    tr = _subsample(tr_part, t, rng)
+                    a = _probe_acc(h[tr], y[tr], h[te_part], y[te_part])
+                    if a is not None:
+                        wf.append(a)
             if wf:
                 within_per.append(np.mean(wf))
 
