@@ -87,10 +87,27 @@ if __name__ == "__main__":
     pat_terminals_np = np.asarray(pat_terminals, dtype=np.int64)
     pat_opp_cells_np = np.asarray(pat_opp_cells, dtype=np.int64)
     pat_opp_mask_np  = np.asarray(pat_opp_mask, dtype=bool)
-    # Padded entries use cell index 60 (out of range); clamp to 0 since the
-    # mask zeros out their contribution to the flip count.
+    # pat_opp_cells indexes the 64-cell board (0..63). Padded entries use
+    # cell index 64 or similar; clamp invalid entries to 0 since the mask
+    # zeros out their contribution to the flip count.
     pat_opp_cells_safe = np.where(pat_opp_mask_np, pat_opp_cells_np, 0)
+    pat_opp_cells_safe = np.clip(pat_opp_cells_safe, 0, 63)
     pattern_length = pat_opp_mask_np.sum(axis=1).astype(np.int64)
+
+    # Build mapping: 64-cell board index -> 60-move index (or -1 for center).
+    CENTER_64 = {27, 28, 35, 36}   # d4, e4, d5, e5
+    m60_of_c64 = np.full(64, -1, dtype=np.int64)
+    non_center_c64 = []
+    j = 0
+    for c in range(64):
+        if c not in CENTER_64:
+            m60_of_c64[c] = j
+            non_center_c64.append(c)
+            j += 1
+    non_center_c64 = np.asarray(non_center_c64, dtype=np.int64)
+    # Center cell initial colors (standard Othello starting position):
+    #   d4=W, e4=B, d5=B, e5=W
+    center_init_is_black = {27: False, 28: True, 35: True, 36: False}
     max_len = int(pattern_length.max())
     print(f"Total patterns: {len(patterns)}, max length: {max_len}")
     print(f"pat_opp_cells shape: {pat_opp_cells_np.shape}, "
@@ -180,17 +197,29 @@ if __name__ == "__main__":
                     preds[msk] = logits
             pos_pred = (preds > args.threshold).cpu().numpy().astype(np.int64)
 
-            # Compute flip count per (B, 960)
-            ev_b = even_s[i:i + batch]   # (B, 60)
-            tp_b = (pb % 2).astype(np.int8)   # (B,)
-            # Opp cells: flipped iff parity_cell != parity_turn
-            opp_parity = ev_b[:, pat_opp_cells_safe]               # (B, 960, max_L)
-            flipped_opp = (opp_parity != tp_b[:, None, None]) & pat_opp_mask_np[None]
-            n_flip_opp = flipped_opp.sum(-1)                       # (B, 960)
-            # Terminal cells: flipped iff parity_cell == parity_turn
-            term_parity = ev_b[:, pat_terminals_np]                # (B, 960)
-            flipped_term = (term_parity == tp_b[:, None])          # (B, 960)
-            flip_count = n_flip_opp + flipped_term.astype(np.int64)  # (B, 960)
+            # Compute flip count per (B, 960) using initial-color logic on a
+            # 64-cell board. For non-center cells, played-on-even-turn means
+            # black starts the cell (+even == 1 -> init black). For the 4
+            # center cells, use the known fixed Othello starting position.
+            ev_b = even_s[i:i + batch]              # (B, 60) -- 0/1
+            tp_b = (pb % 2).astype(np.int8)         # (B,)
+            init_black_64 = np.zeros((B, 64), dtype=bool)
+            init_black_64[:, non_center_c64] = (ev_b == 1)
+            for c64, is_blk in center_init_is_black.items():
+                init_black_64[:, c64] = is_blk
+            # Required current colors:
+            #   At turn t, "my" = black iff t even, "opp" = black iff t odd.
+            req_opp_is_black = (tp_b == 1)          # (B,)
+            req_my_is_black  = (tp_b == 0)          # (B,)
+            # Opponent cells: flipped iff init_black[C] != req_opp_is_black
+            opp_init_black = init_black_64[:, pat_opp_cells_safe]        # (B, 960, max_L)
+            flipped_opp = (opp_init_black != req_opp_is_black[:, None, None]) \
+                          & pat_opp_mask_np[None]
+            n_flip_opp = flipped_opp.sum(-1)                              # (B, 960)
+            # Terminal cells: flipped iff init_black[T] != req_my_is_black
+            term_init_black = init_black_64[:, pat_terminals_np]          # (B, 960)
+            flipped_term = (term_init_black != req_my_is_black[:, None])  # (B, 960)
+            flip_count = n_flip_opp + flipped_term.astype(np.int64)       # (B, 960)
 
             # Accumulate
             for L in range(1, max_len + 1):
