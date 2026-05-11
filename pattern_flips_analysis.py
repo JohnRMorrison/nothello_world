@@ -87,6 +87,9 @@ if __name__ == "__main__":
     pat_terminals_np = np.asarray(pat_terminals, dtype=np.int64)
     pat_opp_cells_np = np.asarray(pat_opp_cells, dtype=np.int64)
     pat_opp_mask_np  = np.asarray(pat_opp_mask, dtype=bool)
+    # Padded entries use cell index 60 (out of range); clamp to 0 since the
+    # mask zeros out their contribution to the flip count.
+    pat_opp_cells_safe = np.where(pat_opp_mask_np, pat_opp_cells_np, 0)
     pattern_length = pat_opp_mask_np.sum(axis=1).astype(np.int64)
     max_len = int(pattern_length.max())
     print(f"Total patterns: {len(patterns)}, max length: {max_len}")
@@ -181,7 +184,7 @@ if __name__ == "__main__":
             ev_b = even_s[i:i + batch]   # (B, 60)
             tp_b = (pb % 2).astype(np.int8)   # (B,)
             # Opp cells: flipped iff parity_cell != parity_turn
-            opp_parity = ev_b[:, pat_opp_cells_np]                 # (B, 960, max_L)
+            opp_parity = ev_b[:, pat_opp_cells_safe]               # (B, 960, max_L)
             flipped_opp = (opp_parity != tp_b[:, None, None]) & pat_opp_mask_np[None]
             n_flip_opp = flipped_opp.sum(-1)                       # (B, 960)
             # Terminal cells: flipped iff parity_cell == parity_turn
