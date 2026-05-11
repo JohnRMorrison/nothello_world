@@ -2,7 +2,7 @@
 #SBATCH --job-name=dead_relu
 #SBATCH -c 2
 #SBATCH --time=00:15:00
-#SBATCH --mem=20GB
+#SBATCH --mem=60GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/dead_relu_%j.out
 #SBATCH --account=nklab
