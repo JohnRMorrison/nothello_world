@@ -1054,3 +1054,60 @@ structural simulation. The intervention experiments (which work on the
 world modeling -- it requires linear decodability + downstream sensitivity
 to that axis. Both architectures have those.
 
+
+================================================================================
+FUTURE WORK / DEFERRED EXPERIMENTS
+================================================================================
+
+These were noted during analysis but deferred to keep current experiments
+focused. Revisit if/when prior results warrant.
+
+F1. Forfeit exclusion in turn-specialist training
+--------------------------------------------------------------------------------
+The current per-turn specialist training (exp_turn_specialists.sh) runs with
+--no-exclude-forfeit because inline OthelloBoardState replay would add ~17h
+per training run. Forfeit contamination is <1% at turns 5-45 and ~5% at
+turn 50. If turn-50 results look anomalous OR if a careful methodology is
+required, follow up by:
+  (a) Writing precompute_forfeit_mask.py (one-time ~5h job over all chunks)
+  (b) Loading the precomputed mask in train_turn_specialist.py
+  (c) Re-running specialists with --exclude-forfeit
+
+F2. Turn-specialist with RICHER INPUT
+--------------------------------------------------------------------------------
+Current turn-specialist training uses when+even (120-d). To disentangle
+"specialization helps" from "richer input helps," run a follow-up:
+  - Turn specialists with move_grid (3600-d) input, same H=512
+  - Compare to wheneven specialists at the same turn
+  - If move_grid specialists outperform wheneven specialists -> richer input
+    helps independently of specialization
+  - If they don't outperform -> specialization captures most of what's
+    available; richer input is redundant given a per-turn distribution
+
+F3. Per-turn ENSEMBLE for unified inference
+--------------------------------------------------------------------------------
+If specialists outperform unified at their own turn, build a meta-MLP that
+routes each test position to its turn-specialist. Aggregate top-1/recall@K
+across the meta-model and compare to unified MLP. This gives the "what does
+a panel of 10 specialized MLPs achieve" upper bound, informing whether the
+OGPT-MLP gap is explainable by ensemble-style decomposition.
+
+F4. Board decoding from the 960 PATTERN OUTPUTS (not hidden)
+--------------------------------------------------------------------------------
+Train a linear probe on the 960 pattern logits (the output of the pattern
+detector, not its hidden) -> 64x3 board state. Compare per-cell accuracy
+to:
+  - Hidden probe (~91% mean, 76% center)
+  - 60-d cell-prob probe (lossy)
+If output probe approaches hidden probe -> pattern outputs preserve most of
+the board info despite the 1024 -> 960 projection. If much lower -> the
+pattern detector's projection loses board-state structure.
+
+F5. Pattern-level redundancy schemes (multi-instance per pattern)
+--------------------------------------------------------------------------------
+Test whether output-level redundancy decorrelates pattern errors:
+  - 5x output instances per pattern with sub-space splitting of hidden
+  - Hidden-dropout-bagged training (each instance sees a random hidden mask)
+If recall@K improves by >3pp -> output redundancy was a real lever and
+scale up. If <1pp -> bottleneck is at the shared hidden, not the output.
+
