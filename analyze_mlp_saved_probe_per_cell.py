@@ -147,3 +147,50 @@ if __name__ == "__main__":
     print("Best 10 cells:")
     for c in order[-10:][::-1]:
         print(f"  {cell_alg(int(c)):>3s} ({cell_class(int(c)):>6s})  acc={acc[c]:.4f}")
+
+    # -------------------------- Turn stratification --------------------------
+    print("\n" + "=" * 64)
+    print("Per-cell accuracy stratified by game turn")
+    print("=" * 64)
+    bins = [(5, 10), (10, 15), (15, 20), (20, 25),
+            (25, 30), (30, 35), (35, 40), (40, 45), (45, 54)]
+    # Per-cell correct counts per bin
+    correct_bin = np.zeros((len(bins), 64), dtype=np.int64)
+    total_bin   = np.zeros((len(bins),), dtype=np.int64)
+    batch2 = 4096
+    with torch.no_grad():
+        for i in range(0, n, batch2):
+            xb = feat_X[i:i + batch2].to(device)
+            yb = Y_np[i:i + batch2]
+            pb = pos_np[i:i + batch2]
+            em = (pb % 2 == 0); om = ~em
+            preds = np.zeros((len(xb), 64), dtype=np.int64)
+            if em.any():
+                xs = xb[em]
+                h = torch.relu(me.net[0](xs))
+                preds[em] = probe_even(h).view(-1, 64, 3).argmax(dim=-1).cpu().numpy()
+            if om.any():
+                xs = xb[om]
+                h = torch.relu(mo.net[0](xs))
+                preds[om] = probe_odd(h).view(-1, 64, 3).argmax(dim=-1).cpu().numpy()
+            for bi, (lo, hi) in enumerate(bins):
+                m = (pb >= lo) & (pb < hi)
+                if not m.any(): continue
+                correct_bin[bi] += (preds[m] == yb[m]).sum(axis=0)
+                total_bin[bi]   += int(m.sum())
+
+    print(f"\n{'turn':>10s} {'n':>8s} {'overall':>9s} "
+          f"{'corner':>9s} {'edge':>9s} {'inner':>9s} {'center':>9s}")
+    for bi, (lo, hi) in enumerate(bins):
+        n_pos = int(total_bin[bi])
+        if n_pos == 0: continue
+        acc_b = correct_bin[bi] / n_pos
+        # Region means
+        def _mean_region(label):
+            cells = [c for c in range(64) if cell_class(c) == label]
+            return acc_b[cells].mean()
+        print(f"  {lo:>3d}-{hi-1:<3d} {n_pos:>8d} {acc_b.mean():>9.4f} "
+              f"{_mean_region('corner'):>9.4f} "
+              f"{_mean_region('edge'):>9.4f} "
+              f"{_mean_region('inner'):>9.4f} "
+              f"{_mean_region('center'):>9.4f}")
