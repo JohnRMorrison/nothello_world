@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=rf_poc
 #SBATCH -c 4
-#SBATCH --time=01:30:00
-#SBATCH --mem=60GB
+#SBATCH --time=04:00:00
+#SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/rf_poc_%A_%a.out
 #SBATCH --account=nklab
@@ -28,4 +28,4 @@ fi
 echo "Rule-firings POC: $LBL encoding"
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python rule_firings_poc.py \
-    --n-games 20000 --max-files 4 --hidden 512 --epochs 20 $EXTRA
+    --n-games 1000000 --max-files 20 --hidden 512 --epochs 30 $EXTRA
