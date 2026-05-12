@@ -201,6 +201,8 @@ if __name__ == "__main__":
     p.add_argument("--pos-end",   type=int, default=50)
     p.add_argument("--max-targets-per-direction", type=int, default=2)
     p.add_argument("--output", default="logs/compare_interventions.npz")
+    p.add_argument("--checkpoint-every", type=int, default=5000,
+                   help="Save partial npz every N games processed.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -415,6 +417,19 @@ if __name__ == "__main__":
                 print(f"  game {gi+1}/{len(games_raw)}: "
                       f"{interventions_done} interventions so far",
                       flush=True)
+            if (gi + 1) % args.checkpoint_every == 0 and records:
+                # Partial save (overwrites prior partial). Survives timeouts.
+                keys = list(records[0].keys())
+                out_partial = {}
+                for k in keys:
+                    if k == 'intv_type':
+                        out_partial[k] = np.array([r[k] for r in records], dtype='<U10')
+                    else:
+                        out_partial[k] = np.array([r[k] for r in records])
+                out_partial['games_processed'] = np.array([gi + 1])
+                np.savez_compressed(args.output, **out_partial)
+                print(f"  [checkpoint] saved {len(records)} rows "
+                      f"after game {gi+1}", flush=True)
 
     print(f"\nTotal interventions: {interventions_done}")
     if interventions_done == 0:
