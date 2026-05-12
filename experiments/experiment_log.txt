@@ -954,3 +954,103 @@ SLURM jobs: 5857200 (when H=1024), 5857201 (when+even H=1024),
             5868559 (when H=512), 5868560 (when+even H=512)
 Checkpoints: heuristic_probe_results/mlp_checkpoints/mlp_{when,when+even}_H{512,1024}_streaming.pt
 
+
+================================================================================
+D. PER-CELL TURN-STRATIFIED ANALYSIS (2026-05-12)
+================================================================================
+
+Followup to the 99.25% probe accuracy on H=512 wheneven pattern detector
+(probe_direct_H512_wheneven.pt, trained by probe_pattern_models.py).
+
+Discovery: the 99.25% was biased by chunks being SORTED by `pos` and the
+probe-training eval using the first 490k positions (= almost entirely turns
+5-6, the easy early game). Across uniform sampling of turns 5-53, the true
+per-cell mean is 91.25% with a 24pp range (76% at center cells, ~100% at
+corners). Likely affects all probe accuracies reported via
+probe_pattern_models.py.
+
+Scripts:
+  - analyze_mlp_saved_probe_per_cell.py  (per-cell grid + turn stratification)
+  - analyze_nanda_probe_per_cell.py      (OGPT counterpart, Nanda probe L=6)
+  - ogpt_recall_by_turn.py               (OGPT recall@K by turn)
+
+D1. Per-cell accuracy by turn (H=512 wheneven MLP, saved 99.25% probe)
+--------------------------------------------------------------------------------
+
+       turn      n   overall   corner     edge    inner   center
+       5-9   5054   0.9878   1.0000   0.9999   0.9899   0.8852
+     10-14   5049   0.9734   1.0000   0.9997   0.9693   0.8221
+     15-19   5037   0.9583   0.9999   0.9985   0.9438   0.7911
+     20-24   4988   0.9420   0.9998   0.9959   0.9170   0.7612
+     25-29   5106   0.9256   0.9997   0.9899   0.8901   0.7505
+     30-34   5189   0.9074   0.9996   0.9810   0.8616   0.7400
+     35-39   5237   0.8893   0.9998   0.9679   0.8358   0.7352
+     40-44   5136   0.8663   0.9992   0.9463   0.8092   0.7093
+     45-53   9204   0.8316   0.9982   0.9012   0.7751   0.6987
+
+All non-corner cells degrade monotonically with turn count. Center cells
+drop 18.6pp end-to-end, inner cells drop 21.5pp, edges drop 10pp. Corners
+~100% throughout (never played). Interpretation: 1-layer MLP can't track
+flips through a single nonlinearity; cells encoded worse the more they've
+been flipped during the game.
+
+D2. OGPT counterpart at layer 6 (Nanda main_linear_probe, mode 2)
+--------------------------------------------------------------------------------
+
+       turn      n   overall   corner     edge    inner   center
+       5-9   5000   1.0000   0.9999   0.9999   1.0000   1.0000
+     10-14   5000   0.9998   0.9993   0.9996   1.0000   1.0000
+     15-19   5000   0.9996   0.9986   0.9992   0.9999   1.0000
+     20-24   5000   0.9993   0.9978   0.9988   0.9997   1.0000
+     25-29   5000   0.9989   0.9969   0.9982   0.9995   0.9997
+     30-34   5000   0.9984   0.9950   0.9982   0.9991   0.9980
+     35-39   5000   0.9972   0.9935   0.9978   0.9976   0.9939
+     40-44   5000   0.9960   0.9933   0.9981   0.9953   0.9911
+     45-53   9000   0.9918   0.9948   0.9977   0.9886   0.9788
+
+OGPT keeps every cell class at >=97% across all turns. End-to-end drops:
+corner 0.5pp, edge 0.2pp, inner 1.1pp, center 2.1pp.
+
+D3. OGPT recall@K by turn (vs MLP recall@K from analyze_perpos.py)
+--------------------------------------------------------------------------------
+
+      turn          MLP recall@K     OGPT recall@K     gap
+       5-9            0.9427           1.0000          5.7pp
+      15-19           0.8559           1.0000         14.4pp
+      25-29           0.8471           0.9997         15.3pp
+      35-39           0.8540           0.9985         14.4pp
+      45-49           0.8749           0.9967         12.2pp
+      all (uniform)   ~0.89            0.9991         ~11pp
+
+MLP recall@K is U-shaped with mid-game dip; OGPT is monotonically slight
+decline ending at 99.67%.
+
+D4. Synthesis
+--------------------------------------------------------------------------------
+
+Three matched measurements all point to the same architectural advantage of
+OGPT over the 1-layer MLP:
+
+  Metric                          | MLP early | MLP late | OGPT early | OGPT late
+  --------------------------------+-----------+----------+------------+----------
+  Per-cell probe (center cells)   |   88.5%   |  69.9%   |  100.0%    |  97.9%
+  Per-cell probe (inner cells)    |   99.0%   |  77.5%   |  100.0%    |  98.9%
+  recall@K (output)               |   94.3%   |  87.5%   |  100.0%    |  99.7%
+
+OGPT maintains uniform board encoding and output performance throughout the
+game. The MLP loses internal representation steadily; OR-aggregation across
+the 960 patterns hides some but not all of the loss in the output.
+
+Interpretation: depth/attention is necessary for stable cross-turn board
+encoding -- presumably because flip-tracking requires iterating
+"current color = initial color XOR (number of flips mod 2)" which a single
+Linear -> ReLU -> Linear cannot represent for cells with K > 2 flips.
+
+Caveat: this establishes that depth gives OGPT a measurable representational
+advantage, but does NOT establish that OGPT is doing "world modeling" in any
+strong sense. It could be "more capacity to compute flip parity" without any
+structural simulation. The intervention experiments (which work on the
+1-layer MLP at 92% Li-top-K) show intervention success doesn't require
+world modeling -- it requires linear decodability + downstream sensitivity
+to that axis. Both architectures have those.
+
