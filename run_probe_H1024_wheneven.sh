@@ -8,7 +8,7 @@
 
 #SBATCH --job-name=probe_h1024_we
 #SBATCH -c 4
-#SBATCH --time=01:00:00
+#SBATCH --time=06:00:00
 #SBATCH --mem=80GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/probe_h1024_we_%j.out
