@@ -31,4 +31,11 @@ T=${TURNS[$SLURM_ARRAY_TASK_ID]}
 echo "Specialist for turn=$T (array task $SLURM_ARRAY_TASK_ID)"
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_turn_specialist.py \
-    --turn "$T" --hidden 512 --epochs 3
+    --turn "$T" --hidden 512 --epochs 3 --no-exclude-forfeit
+
+# Note: --no-exclude-forfeit disables inline forfeit checking because
+# replaying each position's prefix would add ~17h per training run.
+# Forfeit contamination is <1% at turns <=50 (T50 specialist sees ~5%),
+# so the effect should be small. If results warrant, follow up with a
+# precomputed forfeit mask (precompute_forfeit_mask.py, ~5h once) and
+# re-run with forfeit exclusion enabled.
