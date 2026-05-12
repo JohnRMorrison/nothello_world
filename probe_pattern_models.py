@@ -54,12 +54,12 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
-    # Load eval data
+    # Load eval data. For column-slice features we slice up front; for
+    # derived features (e.g. move_grid expanding 180 -> 3600/10800-d) we
+    # apply the transform per-batch later to avoid OOM on the full chunk.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
-    elif feature_fn is not None:
-        ev_X = feature_fn(ev_X, ev_Y, ev_pos)
     n_eval = min(len(ev_X), 49 * 10000)
     ev_X = ev_X[:n_eval].clone()
     ev_Y = ev_Y[:n_eval].clone()
@@ -79,15 +79,19 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
-            elif feature_fn is not None:
-                tr_X = feature_fn(tr_X, tr_Y, tr_pos)
+            # NB: do NOT apply feature_fn here -- derived features like
+            # move_grid expand 180-d -> 3600-d which OOMs on full chunks.
+            # We apply feature_fn per-batch below.
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
+                x_raw = tr_X[idx]
                 y = tr_Y[idx].to(device)
                 pos = tr_pos[idx]
+                if feature_fn is not None:
+                    x_raw = feature_fn(x_raw, tr_Y[idx], pos)
+                x = x_raw.to(device)
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -117,9 +121,13 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
         total = 0
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
-                x = ev_X[i:i + batch_size].to(device)
-                y = ev_Y[i:i + batch_size].to(device)
+                x_raw = ev_X[i:i + batch_size]
+                y_raw = ev_Y[i:i + batch_size]
                 pos = ev_pos[i:i + batch_size]
+                if feature_fn is not None:
+                    x_raw = feature_fn(x_raw, y_raw, pos)
+                x = x_raw.to(device)
+                y = y_raw.to(device)
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
                 preds = torch.zeros_like(y)
