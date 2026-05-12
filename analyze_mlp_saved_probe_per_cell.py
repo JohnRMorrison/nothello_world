@@ -85,6 +85,13 @@ if __name__ == "__main__":
     print(f"Loading {eval_path}")
 
     X, Y, pos = _load_features(eval_path)
+    N = len(Y)
+    # Subsample FIRST (before applying any feature expansion). For move_grid,
+    # expanding the full 14.5M-position chunk to 3600-d goes OOM (~210 GB).
+    n = min(args.n_positions, N)
+    rng = np.random.RandomState(0)
+    si = np.sort(rng.choice(N, n, replace=False))
+    X = X[si]; Y_np = Y[si].numpy(); pos_np = pos[si].numpy()
     if args.features in _FEAT_COLS:
         feat_X = X[:, _FEAT_COLS[args.features]]
     elif args.features == "move_grid":
@@ -96,12 +103,7 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unknown features: {args.features}")
     del X
-    N = len(Y)
-    n = min(args.n_positions, N)
-    rng = np.random.RandomState(0)
-    si = np.sort(rng.choice(N, n, replace=False))
-    feat_X = feat_X[si]; Y_np = Y[si].numpy(); pos_np = pos[si].numpy()
-    print(f"Sampled {n} positions")
+    print(f"Sampled {n} positions, feat_X.shape={tuple(feat_X.shape)}")
 
     # Forward + apply probe, accumulate per-cell hits
     correct = np.zeros(64, dtype=np.int64)
