@@ -5,9 +5,9 @@
 # Usage: sbatch run_precompute_by_black.sh
 
 #SBATCH --job-name=by_black
-#SBATCH -c 4
-#SBATCH --time=02:00:00
-#SBATCH --mem=80GB
+#SBATCH -c 32
+#SBATCH --time=12:00:00
+#SBATCH --mem=120GB
 #SBATCH --output=logs/by_black_%j.out
 #SBATCH --account=nklab
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
@@ -18,4 +18,4 @@ conda activate othello
 mkdir -p logs
 cd $SLURM_SUBMIT_DIR
 
-PYTHONUNBUFFERED=1 python precompute_by_black.py
+PYTHONUNBUFFERED=1 python precompute_by_black.py --workers 32
