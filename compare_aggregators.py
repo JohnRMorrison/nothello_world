@@ -155,7 +155,8 @@ if __name__ == "__main__":
                         choices=[None, "when", "played", "played+when", "when+even",
                                  "played+even", "all", "board_state",
                                  "signed_parity", "mine_signed", "color_split",
-                                 "played+halfmask", "played+bit"],
+                                 "played+halfmask", "played+bit",
+                                 "move_grid", "move_grid_onehot"],
                         help="Feature set used during training (inferred from "
                              "checkpoint's input_dim if omitted).")
     parser.add_argument("--output-dir",
