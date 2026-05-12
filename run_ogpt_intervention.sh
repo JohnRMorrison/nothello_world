@@ -25,4 +25,5 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python ogpt_intervention.py \
     --n-games 1000 \
     --test-positions-per-game 5 \
     --max-cells-per-pos 5 \
-    --output "logs/ogpt_intervention_L${LAYER}.npz"
+    --nanda-probe mechanistic_interpretability/main_linear_probe.pth \
+    --output "logs/ogpt_intervention_L${LAYER}_nanda.npz"

@@ -133,6 +133,12 @@ if __name__ == "__main__":
     parser.add_argument("--test-positions-per-game", type=int, default=5)
     parser.add_argument("--max-cells-per-pos", type=int, default=5)
     parser.add_argument("--output", default=None)
+    parser.add_argument("--nanda-probe", default=None,
+                        help="If set, load Nanda's pre-trained probe from this "
+                             "path (e.g. mechanistic_interpretability/main_linear_probe.pth). "
+                             "Probe shape (3, 512, 8, 8, 3); we extract the "
+                             "'empty' direction at each cell from the mode-2 "
+                             "(all positions) head and skip Ridge fitting.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -176,39 +182,58 @@ if __name__ == "__main__":
     H_probe = np.concatenate(acts_probe, axis=0)
     print(f"  H_probe: {H_probe.shape}")
 
-    # Train per-cell Ridge probes on flattened (G*T, d_model) with restricted
-    # turn range.
-    Y_probe = states_probe[:, args.probe_pos_start:args.probe_pos_end, :].reshape(-1, 64)
-    H_flat  = H_probe[:, args.probe_pos_start:args.probe_pos_end, :].reshape(
-        -1, d_model)
-    print(f"  Probe-train flattened: H {H_flat.shape}, Y {Y_probe.shape}")
-    scaler = StandardScaler().fit(H_flat)
-    H_scaled = scaler.transform(H_flat)
-
     skip = sorted(CENTER_64)
     movable_64 = [c for c in range(64) if c not in CENTER_64]
 
     directions = np.zeros((60, d_model), dtype=np.float32)
     probe_accs = np.zeros(60, dtype=np.float32)
-    for m, c64 in enumerate(movable_64):
-        y = Y_probe[:, c64]
-        if len(np.unique(y)) < 2: continue
-        clf = RidgeClassifier(alpha=1.0)
-        clf.fit(H_scaled, y)
-        probe_accs[m] = clf.score(H_scaled, y)  # training accuracy (proxy)
-        classes = clf.classes_
-        coef = clf.coef_
-        if 0 in classes:
-            empty_row = coef[list(classes).index(0)]
-            other = (np.mean(np.delete(coef, list(classes).index(0), axis=0),
-                             axis=0)
-                     if coef.shape[0] > 1 else np.zeros_like(empty_row))
+
+    if args.nanda_probe is not None:
+        # Load Nanda's probe: shape (3, 512, 8, 8, 3) = (modes, d, rows, cols, classes)
+        # class 0 = empty, class 1 = white, class 2 = black.
+        probe = torch.load(args.nanda_probe, map_location='cpu')
+        print(f"Loaded Nanda probe from {args.nanda_probe}, shape {tuple(probe.shape)}")
+        # Use mode 2 ("all positions") so we have a single direction per cell
+        # that doesn't depend on turn parity.
+        W_all = probe[2].numpy()   # (512, 8, 8, 3)
+        for m, c64 in enumerate(movable_64):
+            r, c = c64 // 8, c64 % 8
+            # W[r, c, :] gives (512, 3) per cell; we want the empty direction.
+            empty_row = W_all[:, r, c, 0]
+            other = 0.5 * (W_all[:, r, c, 1] + W_all[:, r, c, 2])
             d = empty_row - other
-            d_raw = d / np.maximum(scaler.scale_, 1e-8)
-            n = np.linalg.norm(d_raw)
+            n = float(np.linalg.norm(d))
             if n > 0:
-                directions[m] = d_raw / n
-    print(f"  Mean (training) probe acc: {probe_accs.mean():.4f}")
+                directions[m] = (d / n).astype(np.float32)
+        probe_accs[:] = float('nan')   # we don't have a per-cell accuracy here
+    else:
+        # Fall back: train inline Ridge probes (conservative methodology).
+        Y_probe = states_probe[:, args.probe_pos_start:args.probe_pos_end, :].reshape(-1, 64)
+        H_flat  = H_probe[:, args.probe_pos_start:args.probe_pos_end, :].reshape(
+            -1, d_model)
+        print(f"  Probe-train flattened: H {H_flat.shape}, Y {Y_probe.shape}")
+        scaler = StandardScaler().fit(H_flat)
+        H_scaled = scaler.transform(H_flat)
+
+        for m, c64 in enumerate(movable_64):
+            y = Y_probe[:, c64]
+            if len(np.unique(y)) < 2: continue
+            clf = RidgeClassifier(alpha=1.0)
+            clf.fit(H_scaled, y)
+            probe_accs[m] = clf.score(H_scaled, y)  # training accuracy (proxy)
+            classes = clf.classes_
+            coef = clf.coef_
+            if 0 in classes:
+                empty_row = coef[list(classes).index(0)]
+                other = (np.mean(np.delete(coef, list(classes).index(0), axis=0),
+                                 axis=0)
+                         if coef.shape[0] > 1 else np.zeros_like(empty_row))
+                d = empty_row - other
+                d_raw = d / np.maximum(scaler.scale_, 1e-8)
+                n = np.linalg.norm(d_raw)
+                if n > 0:
+                    directions[m] = d_raw / n
+        print(f"  Mean (training) probe acc: {probe_accs.mean():.4f}")
 
     # Cell -> OGPT token mapping (token id for each movable cell).
     cell_tokens = get_cell_token_indices()   # list of 60
