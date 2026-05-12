@@ -233,6 +233,12 @@ if __name__ == "__main__":
         "all":         list(range(0, 3 * N_MOVES)),
     }
     X, Y, pos = _load_features(eval_path)
+    # Subsample FIRST so feature expansions (e.g., move_grid 180->3600) don't
+    # blow memory when applied to the full chunk.
+    n = min(len(X), 49 * 10000)
+    rng = np.random.RandomState(0)
+    si = np.sort(rng.choice(len(X), n, replace=False))
+    X, Y, pos = X[si], Y[si], pos[si]
     if args.features in _feat_cols:
         X = X[:, _feat_cols[args.features]]
     elif args.features == "signed_parity":
@@ -251,10 +257,6 @@ if __name__ == "__main__":
         X = to_move_grid_input(X)
     elif args.features == "move_grid_onehot":
         X = to_move_grid_onehot_input(X)
-    n = min(len(X), 49 * 10000)
-    rng = np.random.RandomState(0)
-    si = np.sort(rng.choice(len(X), n, replace=False))
-    X, Y, pos = X[si], Y[si], pos[si]
 
     aggregators = {
         'max':         agg_max,
