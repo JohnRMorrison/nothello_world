@@ -195,7 +195,7 @@ if __name__ == "__main__":
         print(f"Loaded Nanda probe from {args.nanda_probe}, shape {tuple(probe.shape)}")
         # Use mode 2 ("all positions") so we have a single direction per cell
         # that doesn't depend on turn parity.
-        W_all = probe[2].numpy()   # (512, 8, 8, 3)
+        W_all = probe[2].detach().cpu().numpy()   # (512, 8, 8, 3)
         for m, c64 in enumerate(movable_64):
             r, c = c64 // 8, c64 % 8
             # W[r, c, :] gives (512, 3) per cell; we want the empty direction.
