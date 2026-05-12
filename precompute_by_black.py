@@ -25,6 +25,7 @@ sys.path.insert(0, '.')
 
 import numpy as np
 from data.othello import OthelloBoardState
+from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import _load_features
 
 N_MOVES = 60
 CENTER_64 = {27, 28, 35, 36}
@@ -70,9 +71,9 @@ def replay_game_and_collect_by_black(when_at_last_pos, last_pos):
 
 def process_chunk(chunk_path):
     print(f"Processing {chunk_path}")
-    data = np.load(chunk_path)
-    X = data['X']      # (N, 180+) features
-    pos = data['pos']  # (N,) turn numbers
+    X_t, Y_t, pos_t = _load_features(chunk_path)
+    X = X_t.numpy() if hasattr(X_t, 'numpy') else np.asarray(X_t)
+    pos = pos_t.numpy() if hasattr(pos_t, 'numpy') else np.asarray(pos_t)
     N = X.shape[0]
     when_ch = X[:, N_MOVES:2 * N_MOVES]   # columns 60..120
 
