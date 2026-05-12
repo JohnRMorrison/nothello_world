@@ -153,7 +153,7 @@ def mlp_directions(probe_ck, hidden):
 def ogpt_directions(probe, d_model):
     """Nanda probe (3, 512, 8, 8, 3). Use mode 2 (all positions). Return
     (60, 3, d_model) directions for class indices 0=empty, 1=white, 2=black."""
-    W = probe[2].numpy()   # (512, 8, 8, 3)
+    W = probe[2].detach().cpu().numpy()   # (512, 8, 8, 3)
     dirs = np.zeros((60, 3, d_model), dtype=np.float32)
     for m, c64 in enumerate(_movable_64):
         r, c = c64 // 8, c64 % 8
