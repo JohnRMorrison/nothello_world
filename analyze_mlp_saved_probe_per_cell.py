@@ -29,6 +29,7 @@ from train_pattern_simple import DirectMLP
 
 _FEAT_COLS = {
     "when":      list(range(N_MOVES, 2 * N_MOVES)),
+    "played":    list(range(0, N_MOVES)),
     "when+even": list(range(N_MOVES, 3 * N_MOVES)),
     "all":       list(range(0, 3 * N_MOVES)),
 }
@@ -84,7 +85,16 @@ if __name__ == "__main__":
     print(f"Loading {eval_path}")
 
     X, Y, pos = _load_features(eval_path)
-    feat_X = X[:, _FEAT_COLS[args.features]]
+    if args.features in _FEAT_COLS:
+        feat_X = X[:, _FEAT_COLS[args.features]]
+    elif args.features == "move_grid":
+        from train_pattern_simple import to_move_grid_input
+        feat_X = to_move_grid_input(X)
+    elif args.features == "move_grid_onehot":
+        from train_pattern_simple import to_move_grid_onehot_input
+        feat_X = to_move_grid_onehot_input(X)
+    else:
+        raise ValueError(f"Unknown features: {args.features}")
     del X
     N = len(Y)
     n = min(args.n_positions, N)
