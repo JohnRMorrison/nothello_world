@@ -2,10 +2,11 @@
 # Train random projection models: frozen random first layer, train output only.
 #
 # Usage:
-#   sbatch --array=0-19 train_random_proj.sh
+#   sbatch --array=0-14 train_random_proj.sh
 #
-# Tasks 0-9:  H=512,  seeds 0-9
-# Tasks 10-19: H=1024, seeds 0-9
+# Tasks 0-4:   H=512,  seeds 0-4
+# Tasks 5-9:   H=1024, seeds 0-4
+# Tasks 10-14: H=4096, seeds 0-4
 
 #SBATCH --job-name=randproj
 #SBATCH -c 4
@@ -26,11 +27,14 @@ cd $SLURM_SUBMIT_DIR
 
 TASK=${SLURM_ARRAY_TASK_ID:-0}
 
-if [ $TASK -lt 10 ]; then
+if [ $TASK -lt 5 ]; then
     HIDDEN=512
     SEED=$TASK
-else
+elif [ $TASK -lt 10 ]; then
     HIDDEN=1024
+    SEED=$((TASK - 5))
+else
+    HIDDEN=4096
     SEED=$((TASK - 10))
 fi
 

@@ -62,13 +62,19 @@ def _train_random_proj_streaming(chunk_dir, device, input_dim, hidden_dim,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
-    # Load eval data
+    # Load eval data. Chunks are sorted by turn, so taking the first N
+    # positions biases the eval toward early turns. Shuffle first.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
     n_eval = min(len(ev_X), 49 * 10000)
-    ev_X, ev_Y, ev_pos = ev_X[:n_eval].clone(), ev_Y[:n_eval].clone(), ev_pos[:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)}")
+    sample_gen = torch.Generator()
+    sample_gen.manual_seed(0)
+    eval_idx = torch.randperm(len(ev_X), generator=sample_gen)[:n_eval]
+    ev_X = ev_X[eval_idx].clone()
+    ev_Y = ev_Y[eval_idx].clone()
+    ev_pos = ev_pos[eval_idx].clone()
+    print(f"  Eval samples: {len(ev_X)} (random across turns 5-53)")
 
     best_acc = 0.0
     best_state = None
