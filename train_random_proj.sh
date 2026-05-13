@@ -11,7 +11,7 @@
 #SBATCH --job-name=randproj
 #SBATCH -c 4
 #SBATCH --time=8:00:00
-#SBATCH --mem=60GB
+#SBATCH --mem=100GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/randproj_%A_%a.out
 #SBATCH --account=nklab
@@ -45,7 +45,7 @@ echo "Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
-CUDA_VISIBLE_DEVICES=0 python train_streaming.py \
+PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_streaming.py \
     --features when \
     --hidden $HIDDEN \
     --epochs 1 \
