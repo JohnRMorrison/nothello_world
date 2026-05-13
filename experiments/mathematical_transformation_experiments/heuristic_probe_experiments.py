@@ -1551,9 +1551,10 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
     transform_fn: optional function(X) -> X' applied after column selection.
     """
     chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir) if f.endswith(".npz"))
+                         for f in os.listdir(chunk_dir)
+                         if f.startswith("chunk_") and f.endswith(".npz"))
     if not chunk_files:
-        raise ValueError(f"No chunk files in {chunk_dir}")
+        raise ValueError(f"No chunk_*.npz files in {chunk_dir}")
     print(f"Streaming training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs")
 
