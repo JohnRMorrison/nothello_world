@@ -154,7 +154,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", required=True,
                         help="Path to pattern detector checkpoint")
     parser.add_argument("--features", required=True,
-                        choices=["when+by_black", "when+even+by_black"])
+                        choices=["when+by_black", "when+even+by_black",
+                                 "played+by_black"])
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--output-dir",
@@ -167,7 +168,9 @@ if __name__ == "__main__":
 
     ckpt = torch.load(args.ckpt, map_location=device)
     input_dim = ckpt.get('input_dim',
-                          120 if args.features == "when+by_black" else 180)
+                          120 if args.features in ("when+by_black",
+                                                    "played+by_black")
+                          else 180)
 
     model_even = DirectMLP(input_dim, args.hidden, ckpt.get('n_patterns', 960)).to(device)
     model_odd = DirectMLP(input_dim, args.hidden, ckpt.get('n_patterns', 960)).to(device)
@@ -182,6 +185,7 @@ if __name__ == "__main__":
     feat_tag = {
         "when+even+by_black": "wheneven_byblack",
         "when+by_black":      "when_byblack",
+        "played+by_black":    "played_byblack",
     }[args.features]
     save_path = os.path.join(save_dir,
         f"probe_direct_H{args.hidden}_{feat_tag}_uniform.pt")

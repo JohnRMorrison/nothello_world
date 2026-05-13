@@ -31,6 +31,7 @@ def load_chunk_with_by_black(chunk_path, features="when+even+by_black"):
     features:
       when+even+by_black (default, 180-d)
       when+by_black      (120-d, drops the `even` channel)
+      played+by_black    (120-d, minimal: was-played + which-color-placed)
     """
     X, Y, pos = _load_features(chunk_path)
     by_black_path = chunk_path.replace('.npz', '_by_black.npy')
@@ -38,7 +39,10 @@ def load_chunk_with_by_black(chunk_path, features="when+even+by_black"):
         raise FileNotFoundError(
             f"Missing {by_black_path}. Run precompute_by_black.py first.")
     by_black = torch.from_numpy(np.load(by_black_path).astype(np.float32))
-    if features == "when+by_black":
+    if features == "played+by_black":
+        played = X[:, :N_MOVES]                          # 60-d (binary)
+        feat = torch.cat([played, by_black], dim=1)      # 120-d
+    elif features == "when+by_black":
         when = X[:, N_MOVES:2 * N_MOVES]                # 60-d
         feat = torch.cat([when, by_black], dim=1)        # 120-d
     elif features == "when+even+by_black":
@@ -59,7 +63,7 @@ def train(chunk_dir, device, hidden_dim, epochs, save_path, features,
     train_paths = chunk_files[:-1]
     print(f"Train chunks: {len(train_paths)}, eval chunk: {os.path.basename(eval_path)}")
 
-    input_dim = 120 if features == "when+by_black" else 180
+    input_dim = 120 if features in ("when+by_black", "played+by_black") else 180
     me = DirectMLP(input_dim, hidden_dim, 960).to(device)
     mo = DirectMLP(input_dim, hidden_dim, 960).to(device)
     optimizer = torch.optim.Adam(
@@ -165,14 +169,18 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--features",
                         default="when+even+by_black",
-                        choices=["when+even+by_black", "when+by_black"],
-                        help="Feature combo (180-d default, or 120-d w/o even)")
+                        choices=["when+even+by_black",
+                                 "when+by_black",
+                                 "played+by_black"],
+                        help="Feature combo: 180-d default; 120-d variants drop "
+                             "the even channel; played+by_black uses only the "
+                             "played indicator (no timing).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
-    input_dim = 120 if args.features == "when+by_black" else 180
+    input_dim = 120 if args.features in ("when+by_black", "played+by_black") else 180
     print(f"Device: {device}, H={args.hidden}, {args.epochs} epochs")
     print(f"Features: {args.features} ({input_dim}-d)")
 
@@ -188,6 +196,7 @@ if __name__ == "__main__":
     feat_tag = {
         "when+even+by_black": "wheneven_byblack",
         "when+by_black":      "when_byblack",
+        "played+by_black":    "played_byblack",
     }[args.features]
     save_path = os.path.join(save_dir,
         f"pattern_simple_direct_H{args.hidden}_{feat_tag}.pt")
