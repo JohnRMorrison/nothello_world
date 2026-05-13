@@ -292,15 +292,17 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
-    # Load eval data — EXACTLY like train_streaming.py
+    # Load eval data. Chunks are sorted by turn; stride-slice for uniform
+    # turn coverage (otherwise first 49*10000 = turns 5-6 only).
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
     n_eval = min(len(ev_X), 49 * 10000)
-    ev_X = ev_X[:n_eval].clone()
-    ev_Y = ev_Y[:n_eval].clone()
-    ev_pos = ev_pos[:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)}")
+    stride = max(1, len(ev_X) // n_eval)
+    ev_X = ev_X[::stride][:n_eval].clone()
+    ev_Y = ev_Y[::stride][:n_eval].clone()
+    ev_pos = ev_pos[::stride][:n_eval].clone()
+    print(f"  Eval samples: {len(ev_X)} (stride={stride} across turns 5-53)")
 
     best_acc = 0.0
     best_state = None

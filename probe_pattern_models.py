@@ -57,14 +57,16 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
     # Load eval data. For column-slice features we slice up front; for
     # derived features (e.g. move_grid expanding 180 -> 3600/10800-d) we
     # apply the transform per-batch later to avoid OOM on the full chunk.
+    # Chunks are sorted by turn; stride-slice for uniform turn coverage.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
     n_eval = min(len(ev_X), 49 * 10000)
-    ev_X = ev_X[:n_eval].clone()
-    ev_Y = ev_Y[:n_eval].clone()
-    ev_pos = ev_pos[:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)}")
+    stride = max(1, len(ev_X) // n_eval)
+    ev_X = ev_X[::stride][:n_eval].clone()
+    ev_Y = ev_Y[::stride][:n_eval].clone()
+    ev_pos = ev_pos[::stride][:n_eval].clone()
+    print(f"  Eval samples: {len(ev_X)} (stride={stride} across turns 5-53)")
 
     best_acc = 0.0
 
