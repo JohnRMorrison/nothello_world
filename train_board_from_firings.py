@@ -63,6 +63,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--chunk-glob", default="rule_firings_*.npz")
     parser.add_argument("--use-mod2", action="store_true")
+    parser.add_argument("--max-chunks", type=int, default=0,
+                        help="If >0, only use this many chunks total (last is eval).")
+    parser.add_argument("--train-frac", type=float, default=1.0,
+                        help="Per-epoch random fraction of each training chunk to use.")
+    parser.add_argument("--eval-sample", type=int, default=500_000,
+                        help="Subsample this many positions from the eval chunk.")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -75,19 +81,27 @@ if __name__ == "__main__":
     chunk_files = sorted(glob.glob(os.path.join(chunk_dir, args.chunk_glob)))
     if not chunk_files:
         raise FileNotFoundError(f"No chunks matching {args.chunk_glob}")
+    if args.max_chunks and args.max_chunks > 0:
+        chunk_files = chunk_files[:args.max_chunks]
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
     print(f"Train chunks: {len(train_paths)}, eval: {os.path.basename(eval_path)}")
 
-    # Load eval chunk once
+    # Load eval chunk once, subsample, keep features as uint8 on CPU.
     ev_X, ev_Y, ev_pos = load_chunk(eval_path)
-    print(f"  Eval samples: {len(ev_X)}, features dim: {ev_X.shape[1]}")
+    print(f"  Eval samples available: {len(ev_X)}, features dim: {ev_X.shape[1]}")
     in_dim = ev_X.shape[1]
+    if args.eval_sample and args.eval_sample < len(ev_X):
+        rng = np.random.RandomState(0)
+        idx = rng.choice(len(ev_X), size=args.eval_sample, replace=False)
+        idx.sort()
+        ev_X = ev_X[idx]; ev_Y = ev_Y[idx]; ev_pos = ev_pos[idx]
+        print(f"  Eval subsampled to: {len(ev_X)}")
     if args.use_mod2:
         ev_X = (ev_X % 2).astype(np.uint8)
-    ev_Xt = torch.from_numpy(ev_X.astype(np.float32)).to(device)
-    ev_Yt = torch.from_numpy(ev_Y.astype(np.int64)).to(device)
-    ev_post = torch.from_numpy(ev_pos.astype(np.int64)).to(device)
+    # Keep uint8 on CPU; convert per-batch on GPU.
+    ev_X_cpu = torch.from_numpy(ev_X)           # uint8
+    ev_Y_cpu = torch.from_numpy(ev_Y.astype(np.int64))
 
     model = BoardFromFiringsMLP(in_dim=in_dim, hidden=args.hidden).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -109,12 +123,17 @@ if __name__ == "__main__":
             X, Y, _ = load_chunk(train_paths[ci])
             if args.use_mod2:
                 X = (X % 2).astype(np.uint8)
-            X = X.astype(np.float32)
             Y = Y.astype(np.int64)
-            perm = torch.randperm(len(X))
-            for i in range(0, len(X), args.batch_size):
+            n = len(X)
+            if args.train_frac < 1.0:
+                k = int(n * args.train_frac)
+                sub = rng.choice(n, size=k, replace=False)
+                perm = sub[np.random.RandomState(epoch * 7919 + ci).permutation(k)]
+            else:
+                perm = np.random.RandomState(epoch * 7919 + ci).permutation(n)
+            for i in range(0, len(perm), args.batch_size):
                 idx = perm[i:i + args.batch_size]
-                x = torch.from_numpy(X[idx]).to(device)
+                x = torch.from_numpy(X[idx]).to(device).float()
                 y = torch.from_numpy(Y[idx]).to(device)
                 logits = model(x)
                 loss = F.cross_entropy(
@@ -124,15 +143,15 @@ if __name__ == "__main__":
                 epoch_loss += float(loss.item()); n_batches += 1
             del X, Y
 
-        # Eval (batched to fit in memory)
+        # Eval (batched, uint8 on CPU -> float32 on GPU per batch).
         model.eval()
         correct = 0; total = 0
         per_cell_correct = np.zeros(64, dtype=np.int64)
         per_cell_total = 0
         with torch.no_grad():
-            for i in range(0, len(ev_Xt), args.batch_size):
-                xb = ev_Xt[i:i + args.batch_size]
-                yb = ev_Yt[i:i + args.batch_size]
+            for i in range(0, len(ev_X_cpu), args.batch_size):
+                xb = ev_X_cpu[i:i + args.batch_size].to(device).float()
+                yb = ev_Y_cpu[i:i + args.batch_size].to(device)
                 preds = model(xb).argmax(dim=-1)
                 correct += (preds == yb).sum().item()
                 total += yb.numel()
@@ -171,12 +190,13 @@ if __name__ == "__main__":
     bins = [(5, 10), (10, 15), (15, 20), (20, 25),
             (25, 30), (30, 35), (35, 40), (40, 45), (45, 54)]
     model.eval()
+    all_preds_np = np.zeros((len(ev_X_cpu), 64), dtype=np.int64)
     with torch.no_grad():
-        all_preds = torch.zeros_like(ev_Yt)
-        for i in range(0, len(ev_Xt), args.batch_size):
-            all_preds[i:i + args.batch_size] = model(ev_Xt[i:i + args.batch_size]).argmax(dim=-1)
+        for i in range(0, len(ev_X_cpu), args.batch_size):
+            xb = ev_X_cpu[i:i + args.batch_size].to(device).float()
+            all_preds_np[i:i + args.batch_size] = model(xb).argmax(dim=-1).cpu().numpy()
     pos_np = ev_pos.astype(np.int64)
-    match = (all_preds == ev_Yt).cpu().numpy()
+    match = (all_preds_np == ev_Y_cpu.numpy())
     for lo, hi in bins:
         m = (pos_np >= lo) & (pos_np < hi)
         if m.sum() == 0: continue
