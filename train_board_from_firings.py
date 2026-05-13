@@ -51,8 +51,8 @@ class BoardFromFiringsMLP(nn.Module):
 
 
 def load_chunk(path):
-    d = np.load(path)
-    return d['features'], d['labels'], d['positions']
+    with np.load(path) as d:
+        return d['features'][:], d['labels'][:], d['positions'][:]
 
 
 if __name__ == "__main__":
@@ -120,9 +120,12 @@ if __name__ == "__main__":
         epoch_loss = 0.0; n_batches = 0
         t0 = time.time()
         for ci in chunk_order:
-            X, Y, _ = load_chunk(train_paths[ci])
-            if args.use_mod2:
-                X = (X % 2).astype(np.uint8)
+            try:
+                X, Y, _ = load_chunk(train_paths[ci])
+            except Exception as e:
+                print(f"  WARNING: failed to load {train_paths[ci]}: {e}",
+                      flush=True)
+                continue
             Y = Y.astype(np.int64)
             n = len(X)
             if args.train_frac < 1.0:
@@ -133,7 +136,10 @@ if __name__ == "__main__":
                 perm = np.random.RandomState(epoch * 7919 + ci).permutation(n)
             for i in range(0, len(perm), args.batch_size):
                 idx = perm[i:i + args.batch_size]
-                x = torch.from_numpy(X[idx]).to(device).float()
+                xb = X[idx]
+                if args.use_mod2:
+                    xb = xb & 1  # cheap mod-2 on uint8
+                x = torch.from_numpy(xb).to(device).float()
                 y = torch.from_numpy(Y[idx]).to(device)
                 logits = model(x)
                 loss = F.cross_entropy(
