@@ -1565,12 +1565,18 @@ def _train_mlp_streaming(chunk_dir, device, input_dim, hidden_dim,
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
-    # Cap eval BEFORE transform to save memory
-    n_eval = min(len(ev_X), 49 * 10000)  # ~10K games worth
-    ev_X, ev_Y, ev_pos = ev_X[:n_eval].clone(), ev_Y[:n_eval].clone(), ev_pos[:n_eval].clone()
+    # Cap eval BEFORE transform to save memory. Chunks are sorted by turn,
+    # so shuffle before truncating; otherwise eval is almost entirely turn 5-6.
+    n_eval = min(len(ev_X), 49 * 10000)
+    sample_gen = torch.Generator()
+    sample_gen.manual_seed(0)
+    eval_idx = torch.randperm(len(ev_X), generator=sample_gen)[:n_eval]
+    ev_X = ev_X[eval_idx].clone()
+    ev_Y = ev_Y[eval_idx].clone()
+    ev_pos = ev_pos[eval_idx].clone()
     if transform_fn is not None:
         ev_X = transform_fn(ev_X)
-    print(f"  Eval samples: {len(ev_X)}")
+    print(f"  Eval samples: {len(ev_X)} (random across turns 5-53)")
 
     mlp_even = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS).to(device)
     mlp_odd = _build_mlp(input_dim, hidden_dim, 64 * OPTIONS).to(device)
