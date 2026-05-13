@@ -95,6 +95,11 @@ if __name__ == "__main__":
     parser.add_argument("--max-cells-per-pos", type=int, default=5,
                         help="At most this many illegal-target cells per position.")
     parser.add_argument("--output", default=None)
+    parser.add_argument("--save-probs", action="store_true",
+                        help="Also save baseline + per-scale post-intervention "
+                             "60-d cell probability vectors per intervention, "
+                             "plus the target cell index and the legal mask. "
+                             "Lets us compute rank-based metrics post hoc.")
     args = parser.parse_args()
 
     scales = [float(s) for s in args.scales.split(",")]
@@ -261,6 +266,12 @@ if __name__ == "__main__":
     pos_turn_by_scale   = {s: [] for s in scales}
     li_topk_by_scale    = {s: [] for s in scales}
     li_topkplus1_by_scale = {s: [] for s in scales}   # also save top-(K+1)
+    # Full per-intervention probability vectors for rank-based analysis.
+    # Only populated when --save-probs is set.
+    base_probs_list   = []                       # (n_interventions, 60)
+    target_cell_list  = []                       # (n_interventions,)
+    legal_mask_list   = []                       # (n_interventions, 60) bool
+    intv_probs_by_scale = {s: [] for s in scales}  # (n_interventions, 60)
 
     batch = 256
     with torch.no_grad():
@@ -311,6 +322,12 @@ if __name__ == "__main__":
                 for c in target_cells:
                     d = torch.from_numpy(directions[int(c)]).to(device)
                     if d.norm() == 0: continue
+                    # Cache baseline cell probs + target + legal mask once
+                    # per (position, target_cell). Same across scales.
+                    if args.save_probs:
+                        base_probs_list.append(base_cell_p[b].cpu().numpy().astype(np.float32))
+                        target_cell_list.append(int(c))
+                        legal_mask_list.append(legal[b].cpu().numpy())
                     for s in scales:
                         h_new = hb[b:b+1] + s * d
                         if em[b]:
@@ -348,6 +365,9 @@ if __name__ == "__main__":
                         eps_by_scale[s].append(eps)
                         delta_by_scale[s].append(delta)
                         cross_by_scale[s].append(cross)
+                        if args.save_probs:
+                            intv_probs_by_scale[s].append(
+                                cell_p.cpu().numpy().astype(np.float32))
 
     print()
     print("=" * 70)
@@ -391,5 +411,12 @@ if __name__ == "__main__":
             save_dict[f"pos_turn_s{s}"]   = np.array(pos_turn_by_scale[s])
             save_dict[f"li_topk_s{s}"]    = np.array(li_topk_by_scale[s])
             save_dict[f"li_topkp1_s{s}"]  = np.array(li_topkplus1_by_scale[s])
+        if args.save_probs:
+            save_dict["base_probs"]   = np.stack(base_probs_list, axis=0)
+            save_dict["target_cell"]  = np.array(target_cell_list, dtype=np.int32)
+            save_dict["legal_mask"]   = np.stack(legal_mask_list, axis=0)
+            for s in scales:
+                save_dict[f"intv_probs_s{s}"] = np.stack(
+                    intv_probs_by_scale[s], axis=0)
         np.savez(args.output, **save_dict)
         print(f"\nSaved raw samples to {args.output}")
