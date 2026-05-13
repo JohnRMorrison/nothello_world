@@ -249,7 +249,7 @@ def analyze_one_dataset(results_dir, output_dir, label="OthelloGPT", n=1):
 
     return {
         "label": label,
-        "n_interventions": len(samples_n1),
+        "n_interventions": len(samples_n),
         "n_newly_legal": len(promo),
         "n_newly_illegal": len(suppress),
         "mean_promo_prob": float(np.mean(promo)) if len(promo) > 0 else None,
