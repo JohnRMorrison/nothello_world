@@ -542,6 +542,12 @@ def run_with_intervention(model, input_tokens, modifications, linear_probe,
                 h, linear_probe, modifications, mode
             )
             flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
+
+        # If `scale` is also provided alongside calibration, multiply the
+        # calibrated per-cell magnitudes by it (e.g. --scale 3 with --calibrate
+        # --cal-depth 0 gives K=3 magnitudes on top of cd0 calibration).
+        if scale is not None and scale != 1.0:
+            per_cell_scales = [float(s) * scale for s in per_cell_scales]
     else:
         flip_dirs = compute_flip_dirs(linear_probe, modifications, mode)
 
