@@ -1504,3 +1504,56 @@ to flip-count (E4) suggest a clean mechanistic story: depth is required
 to compute the XOR-of-K-flips operation for cells with many transitions
 per game.
 
+
+
+================================================================================
+E12. NANDA PROBE TURN-RANGE COVERAGE (2026-05-14)
+================================================================================
+
+Hypothesis: Nanda's probe (main_linear_probe.pth) was trained on the same
+position range as our chunks (5..53). If so, its accuracy should degrade
+on positions outside that range. Test: run probe on turn ranges that
+straddle position 53.
+
+Setup: analyze_nanda_probe_per_cell.py with --pos-start/--pos-end, 500 games,
+parity mode, layer 6.
+
+Results:
+
+  Turn range  | Overall | Corner | Edge   | Inner  | Center
+  ------------+---------+--------+--------+--------+--------
+  5-9    (D2) | 100.00% | 99.99% | 99.99% | 100.0% | 100.0%
+  45-53  (D2) |  99.18% | 99.48% | 99.77% | 98.86% |  97.88%
+  49-53  (E12)|  99.09% | 99.42% | 99.82% | 98.70% |  97.51%
+  55-58  (E12)|  95.24% | 98.20% | 97.75% | 94.12% |  86.18%
+
+Key observation: the boundary is sharp. Turns 5-53 hold at ~99%, then turn
+55-58 drops to 95% (overall) / 86% (center). Center accuracy loses 11.7pp
+crossing the boundary at turn 53. This is essentially the edge of Nanda's
+probe's training distribution. Note: 55-58 is also where OGPT itself sees
+less training signal (block_size=59 means position 58 has only 1
+next-token prediction left), so degradation is plausibly joint:
+under-trained probe AND under-trained model on those positions.
+
+CONSEQUENCES FOR INTERPRETATION:
+
+1. The "99% probe accuracy" headline for OGPT is conditional on the
+   evaluation being inside Nanda's probe's training range. Outside that
+   range, OGPT's probe accuracy drops materially.
+
+2. The "OGPT-vs-1-layer-MLP gap" is largest under matched eval (probe
+   training range = MLP training range = 5..53). At turn 55-58:
+     OGPT center  = 86.18%
+     1-layer MLP  = N/A on this range; would need to retrain MLP with
+                    chunks extending past turn 53.
+   We'd predict 1-layer MLP at turn 55-58 to be roughly similar to or
+   slightly worse than its 70% at turn 45-53, given the per-cell flip
+   count for centers is even higher near the very end of games.
+   So even on the "fair" eval range, OGPT center likely still beats the
+   MLP — but by 16pp not 30pp.
+
+3. The 4-turn step from 49-53 -> 55-58 is the clearest place to study
+   "what happens when the probe's training and OGPT's training distributions
+   both run out." Could be a useful future experiment to characterize
+   distributional generalization of probe-based world-model claims.
+
