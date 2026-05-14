@@ -163,32 +163,196 @@ def _strip_prefix(d, prefix):
     return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in d.items()}
 
 
-def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
-    """Aggregate (B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
+_cell_pat_cache = {}
 
-    Soft-max approximation of patterns_to_move_scores(...max-per-cell) used at eval time.
-    Gradient flows through all patterns covering each cell (softmax-weighted).
+
+def _get_cell_pat_index(pattern_to_cell, n_cells):
+    """Build a (n_cells, max_per_cell) index + validity mask, cached by object id.
+
+    Lets aggregation run as a single gather + logsumexp instead of a 60-iter
+    Python loop. Caller is expected to reuse the same pattern_to_cell tensor.
     """
-    B = pat_logits.shape[0]
-    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
+    key = (id(pattern_to_cell), n_cells, str(pattern_to_cell.device))
+    if key not in _cell_pat_cache:
+        device = pattern_to_cell.device
+        groups = [torch.where(pattern_to_cell == c)[0] for c in range(n_cells)]
+        max_per_cell = max((len(g) for g in groups), default=0)
+        idx = torch.zeros((n_cells, max_per_cell), dtype=torch.long, device=device)
+        mask = torch.zeros((n_cells, max_per_cell), dtype=torch.bool, device=device)
+        for c, g in enumerate(groups):
+            idx[c, :len(g)] = g
+            mask[c, :len(g)] = True
+        _cell_pat_cache[key] = (idx, mask)
+    return _cell_pat_cache[key]
 
-    with torch.no_grad():
-        cell_max = torch.full((B, n_cells), -1e9, dtype=pat_logits.dtype, device=pat_logits.device)
-        cell_max.scatter_reduce_(1, idx, pat_logits, reduce='amax', include_self=True)
 
-    shifted = pat_logits - cell_max.gather(1, idx)
-    cell_sum = torch.zeros((B, n_cells), dtype=pat_logits.dtype, device=pat_logits.device)
-    cell_sum.scatter_add_(1, idx, torch.exp(shifted))
-    return cell_max + torch.log(cell_sum + 1e-10)
+def to_move_grid_onehot_input(X_tensor):
+    """60x60x3 one-hot, flattened to 10800-d.
+
+    For each (cell, move) pair: one-hot over {black_placed_here,
+    white_placed_here, neither}. "Neither" dominates (most slots).
+
+    Same info as move_grid but with independent weights per color
+    (not forced to be antisymmetric).
+    """
+    B = X_tensor.shape[0]
+    signed = to_move_grid_input(X_tensor).view(B, 60, 60)
+    black = (signed > 0.5).float()
+    white = (signed < -0.5).float()
+    empty = (signed.abs() < 0.5).float()
+    grid = torch.stack([black, white, empty], dim=-1)   # (B, 60, 60, 3)
+    return grid.reshape(B, -1)
+
+
+def to_move_grid_input(X_tensor):
+    """3600-d (60 cells x 60 move-numbers), flattened.
+
+    grid[cell, move_num] = +1 if black played `cell` at `move_num`,
+                           -1 if white,
+                           0 otherwise.
+
+    Convention (from our precompute code): step 0 is white, step 1 black,
+    so 'even' step = white. +1 for black = played AND NOT even.
+    """
+    B = X_tensor.shape[0]
+    played = X_tensor[:, :60]
+    when = X_tensor[:, 60:120]
+    even = X_tensor[:, 120:180]
+
+    # Move number at which each cell was played (0..59); 0 for unplayed
+    # (value there will be 0 because 'played' is 0, so harmless).
+    move_num = torch.clamp((when * 60.0 - 1.0).round().long(), 0, 59)   # (B, 60)
+    # Color: +1 black, -1 white, 0 if not played
+    color_pm = (1.0 - 2.0 * even) * played                               # (B, 60)
+
+    grid = torch.zeros(B, 60, 60, device=X_tensor.device, dtype=X_tensor.dtype)
+    grid.scatter_(2, move_num.unsqueeze(-1), color_pm.unsqueeze(-1))
+    return grid.reshape(B, 60 * 60)
+
+
+def to_played_halfmask_input(X_tensor):
+    """120-d: [0:60]=played, [60:90]=all ones, [90:120]=all zeros.
+
+    Control for "played+even": the last 60 dims are a FIXED vector
+    (same for every sample), so they carry zero game-specific info.
+    If this matches played+even performance, the win from 'even' is
+    from having extra dims, not from color info.
+    """
+    played = X_tensor[:, :60]
+    B = played.shape[0]
+    ones = torch.ones(B, 30, device=played.device, dtype=played.dtype)
+    zeros = torch.zeros(B, 30, device=played.device, dtype=played.dtype)
+    return torch.cat([played, ones, zeros], dim=-1)
+
+
+def to_played_bit_input(X_tensor):
+    """62-d: [0:60]=played, [60]=1, [61]=0.
+
+    Further control: a single '1' and a single '0' appended to played.
+    Essentially just a bias trick — zero new info per sample.
+    """
+    played = X_tensor[:, :60]
+    B = played.shape[0]
+    ones = torch.ones(B, 1, device=played.device, dtype=played.dtype)
+    zeros = torch.zeros(B, 1, device=played.device, dtype=played.dtype)
+    return torch.cat([played, ones, zeros], dim=-1)
+
+
+def to_color_split_input(X_tensor):
+    """120-d: [0:60]=played_by_white (played AND even), [60:120]=played_by_black.
+
+    Same info as 'played+even' but split into per-color channels.
+    Convention (from precompute code): step 0 = white, so even step = white move.
+    """
+    played = X_tensor[:, :60]
+    even = X_tensor[:, 120:180]
+    white_played = played * even
+    black_played = played * (1.0 - even)
+    return torch.cat([white_played, black_played], dim=-1)
+
+
+def to_signed_parity_input(X_tensor):
+    """60-d: +1 if played-on-even, -1 if played-on-odd, 0 if empty.
+    X_tensor is the raw 180-d features. [0:60]=played, [120:180]=even.
+    """
+    played = X_tensor[:, :60]
+    even = X_tensor[:, 120:180]
+    return played * (2.0 * even - 1.0)
+
+
+def to_mine_signed_input(Y_tensor, pos_tensor):
+    """60-d: +1 if played by current-turn color, -1 if opp, 0 if empty.
+    Collapses the full 192-d board state into one scalar per square.
+    """
+    is_black = (pos_tensor % 2 == 1).unsqueeze(-1)
+    mine_val = torch.where(is_black, torch.full_like(is_black, 2, dtype=Y_tensor.dtype),
+                           torch.full_like(is_black, 1, dtype=Y_tensor.dtype))
+    mine = (Y_tensor == mine_val).float()
+    opp = ((Y_tensor > 0) & (Y_tensor != mine_val)).float()
+    return mine - opp
+
+
+def to_board_state_input(Y_tensor, pos_tensor):
+    """Convert label tensor (N,64) + positions (N,) into (N,192) one-hot
+    [empty, mine, opp] per cell. Used for --features board_state (upper-bound).
+
+    Y labels use {0=empty, 1=white, 2=black}. Current turn is black when
+    position is odd (matches compute_pattern_labels_batch convention).
+    """
+    N = len(Y_tensor)
+    is_black = (pos_tensor % 2 == 1).unsqueeze(-1)  # (N, 1)
+    mine_val = torch.where(is_black, torch.full_like(is_black, 2, dtype=Y_tensor.dtype),
+                           torch.full_like(is_black, 1, dtype=Y_tensor.dtype))
+    opp_val = torch.where(is_black, torch.full_like(is_black, 1, dtype=Y_tensor.dtype),
+                          torch.full_like(is_black, 2, dtype=Y_tensor.dtype))
+    empty = (Y_tensor == 0).float()
+    mine = (Y_tensor == mine_val).float()
+    opp = (Y_tensor == opp_val).float()
+    return torch.stack([empty, mine, opp], dim=-1).view(N, -1)
+
+
+def patterns_to_cell_logsumexp(pat_logits, pattern_to_cell, n_cells=60):
+    """(B, n_pat) pattern logits → (B, 60) cell logits via per-cell logsumexp.
+
+    Soft-max approximation of patterns_to_move_scores(...max-per-cell) used
+    at eval time. Gradient flows through all patterns covering each cell
+    (softmax-weighted). Single gather + masked logsumexp — no Python loop.
+    """
+    idx, mask = _get_cell_pat_index(pattern_to_cell, n_cells)
+    gathered = pat_logits[:, idx]                     # (B, n_cells, max_per_cell)
+    gathered = gathered.masked_fill(~mask, float('-inf'))
+    return torch.logsumexp(gathered, dim=-1)
+
+
+def listwise_cell_ce(cell_logits, cell_labels):
+    """Listwise softmax CE: target distribution is uniform over legal cells.
+    cell_logits: (B, 60), cell_labels: (B, 60) binary float (1 if legal cell).
+    Returns scalar: -mean over batch of (1/K_b) * sum_{c legal} log_softmax(cell_logits)[c].
+    Equivalent to KL(uniform-over-legal || softmax(cell_logits)).
+    """
+    log_probs = nn.functional.log_softmax(cell_logits, dim=-1)
+    legal_mask = (cell_labels > 0.5).float()
+    K = legal_mask.sum(dim=-1).clamp(min=1)
+    return -(log_probs * legal_mask).sum(dim=-1).div(K).mean()
+
+
+def pairwise_cell_hinge(cell_logits, cell_labels, margin=1.0):
+    """Pairwise hinge: for each (legal, illegal) pair, max(0, margin - s[l] + s[i])."""
+    # cell_logits: (B, 60), cell_labels: (B, 60) binary
+    s = cell_logits
+    delta = s.unsqueeze(-1) - s.unsqueeze(1)                # (B, 60, 60)
+    hinge = torch.clamp(margin - delta, min=0.0)
+    mask = cell_labels.unsqueeze(-1) * (1.0 - cell_labels).unsqueeze(1)
+    total = mask.sum().clamp(min=1.0)
+    return (mask * hinge).sum() / total
 
 
 def pat_labels_to_cell_labels(y_pat, pattern_to_cell, n_cells=60):
-    """Aggregate (B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
-    B = y_pat.shape[0]
-    idx = pattern_to_cell.unsqueeze(0).expand(B, -1)
-    legal = torch.zeros((B, n_cells), dtype=y_pat.dtype, device=y_pat.device)
-    legal.scatter_reduce_(1, idx, y_pat, reduce='amax', include_self=True)
-    return legal
+    """(B, n_pat) binary labels → (B, 60) legal-cell labels (max over patterns)."""
+    idx, mask = _get_cell_pat_index(pattern_to_cell, n_cells)
+    gathered = y_pat[:, idx]
+    gathered = gathered.masked_fill(~mask, 0)
+    return gathered.max(dim=-1).values
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +364,9 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           board_loss_weight=0.0, lr=1e-3, epochs=3, batch_size=1024,
           save_path=None, mlp_ckpt_dir=None, seed=0, pos_weight=None,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
-          legal_weight=0.0, pattern_to_cell=None):
+          legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
+          feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
+          pos_weight_end=None, listwise_weight=0.0):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -208,23 +374,52 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                          if f.startswith("chunk_") and f.endswith(".npz")
                          and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
-        raise ValueError(f"No chunks in {chunk_dir}")
+        raise ValueError(f"No chunk_*.npz in {chunk_dir}")
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
     n_patterns = len(pat_targets)
 
-    # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%)
+    # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%).
+    # Optionally schedule to an end-value linearly across epochs.
     pw_tensor = None
+    pw_start = pos_weight
+    pw_end = pos_weight_end if pos_weight_end is not None else pos_weight
     if pos_weight is not None:
         pw_tensor = torch.tensor([pos_weight], dtype=torch.float32, device=device)
-        print(f"  pos_weight={pos_weight:.1f}")
+        if pw_end != pw_start:
+            print(f"  pos_weight schedule: {pw_start:.2f} -> {pw_end:.2f} over {epochs} epochs")
+        else:
+            print(f"  pos_weight={pos_weight:.1f}")
+    if pairwise_weight > 0:
+        print(f"  pairwise_weight={pairwise_weight:.2f} (margin={pairwise_margin})")
 
-    if legal_weight > 0:
+    if legal_weight > 0 or pairwise_weight > 0 or listwise_weight > 0:
         if pattern_to_cell is None:
-            raise ValueError("legal_weight > 0 requires pattern_to_cell tensor")
+            raise ValueError("legal/pairwise/listwise loss requires pattern_to_cell tensor")
         pattern_to_cell = pattern_to_cell.to(device)
-        print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
+        if legal_weight > 0:
+            print(f"  legal_weight={legal_weight:.2f} (logsumexp aggregator → 60-d legal BCE)")
+        if listwise_weight > 0:
+            print(f"  listwise_weight={listwise_weight:.2f} "
+                  f"(logsumexp aggregator → softmax CE vs uniform-over-legal)")
+
+    if loss_type not in ("bce", "mse"):
+        raise ValueError(f"loss_type must be 'bce' or 'mse', got {loss_type}")
+    print(f"  loss_type={loss_type}")
+
+    def pattern_loss(logits, targets):
+        """Compute per-pattern loss. BCE with logits or MSE on sigmoid."""
+        if loss_type == "bce":
+            return nn.functional.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pw_tensor)
+        # MSE on sigmoid output; weight positives by pos_weight to offset imbalance
+        prob = torch.sigmoid(logits)
+        sq = (prob - targets) ** 2
+        if pw_tensor is not None:
+            w = torch.where(targets > 0.5, pw_tensor, torch.ones_like(sq))
+            return (w * sq).mean()
+        return sq.mean()
 
     print(f"{mode} training: {len(chunk_files)} chunks, H={hidden_dim}, "
           f"input={input_dim}, {epochs} epochs, board_loss_weight={board_loss_weight}")
@@ -293,22 +488,38 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
-    # Load eval data. Chunks are sorted by turn; stride-slice for uniform
-    # turn coverage (otherwise first 49*10000 = turns 5-6 only).
+    # Load eval data. Chunks are position-sorted, so a head slice lands
+    # in one narrow position bucket (positions 5-6 in practice). Take a
+    # deterministic random sample across all positions so metrics are
+    # representative.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
+    # For feature_fn (e.g. move_grid), DELAY expansion until sampled indices
+    # are chosen so we don't materialize a (N_chunk, 3600-10800) tensor.
     n_eval = min(len(ev_X), 49 * 10000)
-    stride = max(1, len(ev_X) // n_eval)
-    ev_X = ev_X[::stride][:n_eval].clone()
-    ev_Y = ev_Y[::stride][:n_eval].clone()
-    ev_pos = ev_pos[::stride][:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)} (stride={stride} across turns 5-53)")
+    rng = np.random.RandomState(0)
+    sample_idx = np.sort(rng.choice(len(ev_X), n_eval, replace=False))
+    ev_X_raw = ev_X[sample_idx].clone()
+    ev_Y = ev_Y[sample_idx].clone()
+    ev_pos = ev_pos[sample_idx].clone()
+    if feature_fn is not None:
+        # Apply feature_fn on the sampled rows only (fits in memory).
+        ev_X = feature_fn(ev_X_raw, ev_Y, ev_pos)
+    else:
+        ev_X = ev_X_raw
+    print(f"  Eval samples: {len(ev_X)} (random across positions)")
 
     best_acc = 0.0
     best_state = None
 
     for epoch in range(1, epochs + 1):
+        # Scheduled pos_weight (linear from pw_start to pw_end)
+        if pos_weight is not None and pw_end != pw_start:
+            frac = (epoch - 1) / max(epochs - 1, 1)
+            cur_pw = pw_start + frac * (pw_end - pw_start)
+            pw_tensor = torch.tensor([cur_pw], dtype=torch.float32, device=device)
+            print(f"  epoch {epoch}: pos_weight={cur_pw:.2f}")
         model_even.train(); model_odd.train()
         rng = np.random.RandomState(epoch)
         chunk_order = rng.permutation(len(train_paths))
@@ -320,13 +531,20 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
             tr_X, tr_Y, tr_pos = _load_features(train_paths[ci])
             if feature_cols is not None:
                 tr_X = tr_X[:, feature_cols]
+            # For feature_fn, defer application to per-batch to avoid materializing
+            # a (chunk_size, high_dim) tensor that can OOM (e.g. move_grid=3600-d,
+            # move_grid_onehot=10800-d on 14.5M-row chunks).
 
             perm = torch.randperm(len(tr_X))
             for i in range(0, len(tr_X), batch_size):
                 idx = perm[i:i + batch_size]
-                x = tr_X[idx].to(device)
+                x_raw = tr_X[idx]
                 y_board = tr_Y[idx]  # keep on CPU for pattern computation
                 pos = tr_pos[idx]
+                if feature_fn is not None:
+                    x = feature_fn(x_raw, y_board, pos).to(device)
+                else:
+                    x = x_raw.to(device)
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
@@ -338,32 +556,45 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
                 loss = torch.tensor(0.0, device=device)
                 if mode in ("direct", "randproj"):
+                    use_cell = (legal_weight > 0 or pairwise_weight > 0
+                                or listwise_weight > 0)
                     if even_mask.any():
                         logits = model_even(x[even_mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[even_mask], pos_weight=pw_tensor)
-                        if legal_weight > 0:
+                        loss = loss + pattern_loss(logits, y_pat[even_mask])
+                        if use_cell:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[even_mask], pattern_to_cell)
-                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
-                                cell_logits, cell_labels)
+                            if legal_weight > 0:
+                                loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                    cell_logits, cell_labels)
+                            if pairwise_weight > 0:
+                                loss = loss + pairwise_weight * pairwise_cell_hinge(
+                                    cell_logits, cell_labels, pairwise_margin)
+                            if listwise_weight > 0:
+                                loss = loss + listwise_weight * listwise_cell_ce(
+                                    cell_logits, cell_labels)
                     if odd_mask.any():
                         logits = model_odd(x[odd_mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            logits, y_pat[odd_mask], pos_weight=pw_tensor)
-                        if legal_weight > 0:
+                        loss = loss + pattern_loss(logits, y_pat[odd_mask])
+                        if use_cell:
                             cell_logits = patterns_to_cell_logsumexp(logits, pattern_to_cell)
                             cell_labels = pat_labels_to_cell_labels(y_pat[odd_mask], pattern_to_cell)
-                            loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
-                                cell_logits, cell_labels)
+                            if legal_weight > 0:
+                                loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
+                                    cell_logits, cell_labels)
+                            if pairwise_weight > 0:
+                                loss = loss + pairwise_weight * pairwise_cell_hinge(
+                                    cell_logits, cell_labels, pairwise_margin)
+                            if listwise_weight > 0:
+                                loss = loss + listwise_weight * listwise_cell_ce(
+                                    cell_logits, cell_labels)
                 else:
                     y_board_gpu = y_board.to(device)
                     for mask, model in [(even_mask, model_even), (odd_mask, model_odd)]:
                         if not mask.any():
                             continue
                         pat_logits, board_logits = model(x[mask], pos[mask])
-                        loss = loss + nn.functional.binary_cross_entropy_with_logits(
-                            pat_logits, y_pat[mask], pos_weight=pw_tensor)
+                        loss = loss + pattern_loss(pat_logits, y_pat[mask])
                         if board_loss_weight > 0:
                             loss = loss + board_loss_weight * nn.functional.cross_entropy(
                                 board_logits.reshape(-1, OPTIONS),
@@ -486,13 +717,79 @@ if __name__ == "__main__":
                         help="Use ONE model for all positions (no even/odd split)")
     parser.add_argument("--legal-weight", type=float, default=0.0,
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
+    parser.add_argument("--pairwise-weight", type=float, default=0.0,
+                        help="Weight on cell-level pairwise hinge loss (legal > illegal + margin)")
+    parser.add_argument("--pairwise-margin", type=float, default=1.0)
+    parser.add_argument("--listwise-weight", type=float, default=0.0,
+                        help="Weight on listwise softmax-CE vs uniform-over-legal target "
+                             "(logsumexp-aggregated). Directly minimizes recall@K loss.")
+    parser.add_argument("--pos-weight-end", type=float, default=None,
+                        help="If set, linearly interpolate pos_weight from --pos-weight to this value across epochs")
+    parser.add_argument("--loss", choices=["bce", "mse"], default="bce",
+                        help="Pattern-level loss: bce (default) or mse on sigmoid (uniform scales)")
+    parser.add_argument("--features", default="when",
+                        choices=["when", "played", "played+when", "when+even",
+                                 "played+even", "all", "board_state",
+                                 "signed_parity", "mine_signed", "color_split",
+                                 "played+halfmask", "played+bit", "move_grid",
+                                 "move_grid_onehot"],
+                        help="Input features. Slices/derivations of the 180-d base. "
+                             "signed_parity (60-d): +1/-1 per played color, 0 empty. "
+                             "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
+                             "color_split (120-d): separate channels for white and black placements. "
+                             "board_state (192-d): ground-truth board (upper-bound experiment).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))  # 60-d "when"
-    input_dim = N_MOVES
+    # feature_cols = column-select mode; feature_fn = derived-features mode.
+    # Exactly one is used per run.
+    _feat_cols = {
+        "when":         list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
+        "played":       list(range(0, N_MOVES)),                     # 60-d
+        "played+when":  list(range(0, 2 * N_MOVES)),                 # 120-d
+        "when+even":    list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
+        "played+even":  list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":          list(range(0, 3 * N_MOVES)),                  # 180-d
+    }
+    feature_fn = None
+    if args.features in _feat_cols:
+        feature_cols = _feat_cols[args.features]
+        input_dim = len(feature_cols)
+    elif args.features == "signed_parity":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_signed_parity_input(X)
+        input_dim = N_MOVES
+    elif args.features == "mine_signed":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_mine_signed_input(Y, pos)
+        input_dim = N_MOVES
+    elif args.features == "board_state":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_board_state_input(Y, pos)
+        input_dim = 3 * 64
+    elif args.features == "color_split":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_color_split_input(X)
+        input_dim = 2 * N_MOVES
+    elif args.features == "played+halfmask":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_halfmask_input(X)
+        input_dim = 2 * N_MOVES
+    elif args.features == "played+bit":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_played_bit_input(X)
+        input_dim = N_MOVES + 2
+    elif args.features == "move_grid":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_move_grid_input(X)
+        input_dim = 60 * 60
+    elif args.features == "move_grid_onehot":
+        feature_cols = None
+        feature_fn = lambda X, Y, pos: to_move_grid_onehot_input(X)
+        input_dim = 60 * 60 * 3
+    print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
@@ -502,7 +799,9 @@ if __name__ == "__main__":
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
-    save_path = os.path.join(save_dir, f"pattern_simple_{args.mode}_H{args.hidden}.pt")
+    feat_tag = "" if args.features == "when" else f"_{args.features.replace('+', '')}"
+    save_path = os.path.join(save_dir,
+        f"pattern_simple_{args.mode}_H{args.hidden}{feat_tag}.pt")
 
     board_loss_weight = 0.5 if args.mode == "e2e" else 0.0
     if args.mode == "randproj":
@@ -515,6 +814,10 @@ if __name__ == "__main__":
         save_path = save_path.replace('.pt', '_single.pt')
     if args.legal_weight > 0:
         save_path = save_path.replace('.pt', f'_lw{args.legal_weight:g}.pt')
+    if args.listwise_weight > 0:
+        save_path = save_path.replace('.pt', f'_listw{args.listwise_weight:g}.pt')
+    if args.loss != "bce":
+        save_path = save_path.replace('.pt', f'_{args.loss}.pt')
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
@@ -523,5 +826,9 @@ if __name__ == "__main__":
           pos_weight=args.pos_weight,
           proj_scale=args.proj_scale, proj_half_normal=args.proj_half_normal,
           single_model=args.single_model,
-          legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell)
+          legal_weight=args.legal_weight, pattern_to_cell=pattern_to_cell,
+          loss_type=args.loss, feature_fn=feature_fn,
+          pairwise_weight=args.pairwise_weight, pairwise_margin=args.pairwise_margin,
+          pos_weight_end=args.pos_weight_end,
+          listwise_weight=args.listwise_weight)
 
