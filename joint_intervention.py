@@ -61,9 +61,8 @@ def compute_legal_moves(board_state, is_black_turn):
     """Returns set of cell-index 0..63 where the given player can legally play."""
     b = OthelloBoardState()
     b.state = np.copy(board_state)
-    color = 1 if is_black_turn else -1
-    legal = b.get_valid_moves(color=color)
-    return set(legal)
+    b.next_hand_color = 1 if is_black_turn else -1
+    return set(b.get_valid_moves())
 
 
 # --------- OGPT intervention ---------
