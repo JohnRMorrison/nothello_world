@@ -93,8 +93,9 @@ if __name__ == "__main__":
         games = games[:args.n_games]
     print(f"Using {len(games)} games")
 
-    # Tokenize once
-    tokens = tokenize_games(games).to(device)   # (G, GAME_LEN)
+    # Tokenize once. OGPT block_size=59, so drop the last token (Nanda's
+    # tl_probing_v1.py does the same: games_int[:, :-1]).
+    tokens = tokenize_games(games).to(device)[:, :-1]   # (G, GAME_LEN - 1)
     # Compute board states once (CPU)
     print("Replaying games for ground truth...")
     t0 = time.time()
