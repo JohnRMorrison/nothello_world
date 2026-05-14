@@ -32,15 +32,15 @@ def get_hidden(model, x, mode):
 
 def train_probe(chunk_dir, device, model_even, model_odd, mode,
                 feature_cols, hidden_dim, epochs=10, lr=1e-3, batch_size=1024,
-                feature_fn=None):
+                feature_fn=None, chunk_prefix="chunk_"):
     """Train linear probe streaming through all chunks."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.startswith("chunk_") and f.endswith(".npz")
+                         if f.startswith(chunk_prefix) and f.endswith(".npz")
                          and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
-        raise ValueError(f"No chunks in {chunk_dir}")
+        raise ValueError(f"No chunks matching {chunk_prefix}*.npz in {chunk_dir}")
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
@@ -174,6 +174,9 @@ if __name__ == "__main__":
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--chunk-prefix", default="chunk_",
+                        help="Filename prefix for chunks to use (e.g. "
+                             "'chunk_ext_' for extended-range chunks).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -276,7 +279,8 @@ if __name__ == "__main__":
 
     best_acc, best_probe_state = train_probe(
         chunk_dir, device, model_even, model_odd, args.mode,
-        feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn)
+        feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn,
+        chunk_prefix=args.chunk_prefix)
 
     # Save probe weights. Derive suffix from source checkpoint filename so
     # probes for variants (_single, _pw50, _lw1, etc.) don't overwrite each other.

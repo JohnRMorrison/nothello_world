@@ -366,15 +366,16 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           proj_scale=0.183, proj_half_normal=False, single_model=False,
           legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
           feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
-          pos_weight_end=None, listwise_weight=0.0):
+          pos_weight_end=None, listwise_weight=0.0,
+          chunk_prefix="chunk_"):
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.startswith("chunk_") and f.endswith(".npz")
+                         if f.startswith(chunk_prefix) and f.endswith(".npz")
                          and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
-        raise ValueError(f"No chunk_*.npz in {chunk_dir}")
+        raise ValueError(f"No {chunk_prefix}*.npz in {chunk_dir}")
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
@@ -738,6 +739,9 @@ if __name__ == "__main__":
                              "mine_signed (60-d): +1/-1 relative to current turn, 0 empty. "
                              "color_split (120-d): separate channels for white and black placements. "
                              "board_state (192-d): ground-truth board (upper-bound experiment).")
+    parser.add_argument("--chunk-prefix", default="chunk_",
+                        help="Filename prefix for chunks (e.g. chunk_ext_ for "
+                             "extended-range chunks covering turns 5-58).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -830,5 +834,6 @@ if __name__ == "__main__":
           loss_type=args.loss, feature_fn=feature_fn,
           pairwise_weight=args.pairwise_weight, pairwise_margin=args.pairwise_margin,
           pos_weight_end=args.pos_weight_end,
-          listwise_weight=args.listwise_weight)
+          listwise_weight=args.listwise_weight,
+          chunk_prefix=args.chunk_prefix)
 
