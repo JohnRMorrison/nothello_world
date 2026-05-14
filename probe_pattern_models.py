@@ -122,6 +122,8 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
         probe_even.eval(); probe_odd.eval()
         correct = 0
         total = 0
+        per_cell_correct = np.zeros(64, dtype=np.int64)
+        n_eval_rows = 0
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
                 x_raw = ev_X[i:i + batch_size]
@@ -144,13 +146,17 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
 
                 correct += (preds == y).sum().item()
                 total += y.numel()
+                per_cell_correct += (preds == y).sum(dim=0).cpu().numpy()
+                n_eval_rows += len(y)
 
         acc = correct / total
+        per_cell_acc = per_cell_correct / max(n_eval_rows, 1)
         if acc > best_acc:
             best_acc = acc
             best_probe_state = {
                 'even': {k: v.cpu().clone() for k, v in probe_even.state_dict().items()},
                 'odd': {k: v.cpu().clone() for k, v in probe_odd.state_dict().items()},
+                'per_cell_acc': per_cell_acc,
             }
         scheduler.step(epoch_loss / max(epoch_batches, 1))
         cur_lr = optimizer.param_groups[0]['lr']
@@ -285,6 +291,7 @@ if __name__ == "__main__":
     torch.save({
         'even': best_probe_state['even'],
         'odd': best_probe_state['odd'],
+        'per_cell_acc': best_probe_state.get('per_cell_acc'),
         'hidden_dim': args.hidden,
         'best_acc': best_acc,
         'mode': args.mode,
