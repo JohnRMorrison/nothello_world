@@ -205,7 +205,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
+                         if f.startswith("chunk_") and f.endswith(".npz")
+                         and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
         raise ValueError(f"No chunks in {chunk_dir}")
 
