@@ -144,7 +144,7 @@ def aggregate_cell_probs(pat_logits, idx_t, mask_t):
 
 def mlp_forward_and_intervene(features_180, board_state, pos, mod, scale,
                                model_e, model_o, probe_e, probe_o,
-                               idx_t, mask_t, device):
+                               idx_t, mask_t, device, negate=False):
     """Run MLP intervention, return (orig_probs_60, intv_probs_60) NORMALIZED."""
     # Build 3600-d move_grid input
     x180 = features_180.unsqueeze(0).to(device)   # (1, 180)
@@ -173,7 +173,8 @@ def mlp_forward_and_intervene(features_180, board_state, pos, mod, scale,
         w_tgt = probe.weight[cell * 3 + tgt]       # (H,)
         direction = w_tgt - w_src
         direction = direction / direction.norm().clamp_min(1e-8)
-        h_intv = h + scale * direction.unsqueeze(0)
+        sign = -1.0 if negate else 1.0
+        h_intv = h + sign * scale * direction.unsqueeze(0)
 
         pat_logits_post = out_layer(h_intv)
         cell_probs_post = aggregate_cell_probs(pat_logits_post, idx_t, mask_t)
@@ -196,6 +197,9 @@ if __name__ == "__main__":
     parser.add_argument("--turn-min", type=int, default=20)
     parser.add_argument("--turn-max", type=int, default=50)
     parser.add_argument("--scale", type=float, default=3.0)
+    parser.add_argument("--mlp-negate-direction", action="store_true",
+                        help="Negate the MLP intervention direction "
+                             "(sign-flipped sanity check).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="logs/joint_intervention.npz")
     args = parser.parse_args()
@@ -298,7 +302,8 @@ if __name__ == "__main__":
             mlp_orig, mlp_intv = mlp_forward_and_intervene(
                 features_180, board_2d, turn, mod, args.scale,
                 model_e, model_o, probe_e, probe_o,
-                idx_t, mask_t, device)
+                idx_t, mask_t, device,
+                negate=args.mlp_negate_direction)
         except Exception as e:
             print(f"  game {gi}: MLP failed: {e}")
             continue
