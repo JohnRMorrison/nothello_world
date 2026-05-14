@@ -242,7 +242,8 @@ if __name__ == "__main__":
     games = load_games(max_files=args.max_files)
     games = [g for g in games if len(g) == GAME_LEN][:args.n_games]
     print(f"Using {len(games)} games")
-    tokens_all = tokenize_games(games).to(device)   # (G, 60)
+    # OGPT block_size=59, so drop the last token (same as Nanda's training).
+    tokens_all = tokenize_games(games).to(device)[:, :-1]   # (G, 59)
 
     # For each game, pick one (turn, mod) and run both interventions
     samples = []
