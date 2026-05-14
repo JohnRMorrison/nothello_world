@@ -1111,3 +1111,396 @@ Test whether output-level redundancy decorrelates pattern errors:
 If recall@K improves by >3pp -> output redundancy was a real lever and
 scale up. If <1pp -> bottleneck is at the shared hidden, not the output.
 
+
+
+================================================================================
+E. WIDTH SWEEP + INPUT-FORMAT SWEEP + INTERVENTION RE-RUNS (2026-05-13/14)
+================================================================================
+
+This block re-evaluates the 1-layer MLP probe ceiling under a corrected
+(uniform-turn) eval methodology and extends the comparison across input
+formats and widths. Plus an intervention re-run with new K=3 cd0 data and
+saved probability vectors, and a "next-rule prediction" experiment.
+
+E0. Bias-fix sweep
+--------------------------------------------------------------------------------
+
+Earlier scripts (train_streaming.py, _train_mlp_streaming, train_pattern_simple,
+probe_pattern_models, mlp_intervention) all took the FIRST 49*10000 positions
+from the eval chunk. Because chunks are sorted by turn, this gave a sample
+that was almost entirely turns 5-6 — inflating reported accuracies. The
+universal fix: stride-slice the eval chunk so the sample is uniform across
+turns 5-53. Commits across multiple files (b5760dd, bb245bb, f163d9c,
+0064b98, 313e5ae, 7d2399c). Also patched the same scripts to glob
+`chunk_*.npz` only, excluding the much-larger `rule_firings_*.npz` chunks
+that were causing OOM at 80-100GB.
+
+Affected metrics: probe board-state accuracy was ~99% under biased eval but
+drops to ~91% under uniform eval. Across-chunk multi-chunk variance
+(analyze_probe_multi_chunk.py) is <0.3pp on center cells, so the corrected
+numbers are statistically tight.
+
+E1. Random projection re-eval with uniform turns (5952813 -> 5952843)
+--------------------------------------------------------------------------------
+
+Same architecture as 5869925 (April): frozen Linear(60->H)+ReLU random
+projection, trained Nanda-style even/odd Linear(H, 64*3) head, when 60-d
+input, 1 epoch, 24M-game training set.
+
+Bias-corrected results (5 seeds each):
+
+  H    | Mean   | SD     | Range
+  -----|--------|--------|----------------
+  512  | 75.31% | 0.07%  | 75.20 - 75.38
+  1024 | 75.75% | 0.05%  | 75.71 - 75.83
+  4096 | 76.03% | 0.06%  | 75.95 - 76.10
+
+Compared to old (biased) numbers (93.20% / 94.27% / 94.94%), the bias
+correction subtracted ~18pp. The trained-MLP wheneven H=512 baseline by
+contrast dropped ~8pp under the same correction (98.68% biased -> 91.25%
+uniform). Random projection regressed harder, meaning the learned first
+layer of the trained MLP is doing more substantive work than the previous
+biased numbers suggested. Width scaling 512 -> 4096 only buys 0.72pp.
+
+Code/scripts: train_streaming.py (--random-proj), train_random_proj.sh
+Jobs: 5952813 (failed: chunk_glob picked up rule_firings); 5952828 (failed:
+OOM same reason); 5952843 (succeeded after chunk_*.npz filter).
+
+E2. Trained-MLP width sweep on board decoding (uniform eval)
+--------------------------------------------------------------------------------
+
+Probe = Nanda-style parity-split Linear(H, 64*3) on a trained pattern
+detector's hidden state, trained for 5 epochs on uniform-turn eval.
+
+  Pattern detector input          | dim   | H     | Probe board acc | Jobs
+  --------------------------------+-------+-------+-----------------+--------
+  wheneven (when+even)            |  120  |  512  | 91.25% (D1)     | -
+  wheneven                        |  120  | 1024  | 92.66%          | 5956139_0
+  move_grid                       | 3600  |  512  | 91.99% (E)*     | 5956140†
+  move_grid                       | 3600  | 1024  | not run         | -
+  move_grid                       | 3600  | 4096  | 93.41%          | 5956139_1
+  move_grid                       | 3600  | 8192  | TBD             | 5956145/6
+  wheneven+by_black               |  180  |  512  | 75.04%          | 5952860_0
+  when+by_black                   |  120  |  512  | 75.16%          | 5952864_1
+  played+by_black                 |  120  |  512  | TBD (probe ran  | 5953158/
+                                  |       |       | but ckpt 0-byte | 5953166
+                                  |       |       | -- needs rerun) |
+  (next-rule task) wheneven       |  120  |  512  | 91.14% **       | 5956091
+
+  *  H=512 move_grid probe timed out at 4 epochs (acc=91.97% by then);
+     resubmitted under 5956147 for clean 5-epoch run with per_cell_acc.
+  ** Trained on per-turn fired patterns instead of all-available patterns;
+     hidden ends up with the same board info regardless of task variant.
+  †  5956140 was a failed --wrap submission (bash quoting bug); see 5956147.
+
+Pattern: width scaling is very shallow (~0.5-1pp per doubling) and richer
+input format gives modest gains (~1-2pp from 60 -> 3600 dim). The 1-layer
+ceiling for board decoding is consistently 91-94%, well below OGPT's ~99%.
+
+E3. The by_black input degrades probe-readable board state
+--------------------------------------------------------------------------------
+
+Adding the forfeit-correct by_black channel (1.0 if cell c was originally
+placed by black; precompute_by_black.py) actively hurts board decoding.
+Probe accuracy drops from 91.25% baseline -> ~75% with by_black, and
+center-cell accuracy drops from ~78% -> ~55%.
+
+Per-region (uniform eval, H=512):
+
+                                | corner | edge  | inner | center
+  ------------------------------+--------+-------+-------+--------
+  wheneven      (60-d baseline) |  100%  |  96%  |  88%  |  78%
+  wheneven+by_black (180-d)     |  80.7% | 84.0% | 70.1% | 54.9%
+  when+by_black     (120-d)     |  89.6% | 84.0% | 69.3% | 54.8%
+
+Reading: by_black tells the model who PLACED each piece, which is correct
+for cells that never flip (corners) but increasingly misleading for cells
+that flip frequently (centers flip ~6x per game). The pattern detector
+picks up by_black as a shortcut for "current color" and stops encoding the
+full board structure in its hidden state. So the by_black-input variants
+have HIGHER pat_acc (99.80% vs 99.71%) but LOWER probe-readable board
+state.
+
+Implication: "the MLP's hidden encodes board state at 91%" is partly
+task-dependent. When the model has a non-board input shortcut, it uses it
+and the hidden state degrades. This weakens the "MLP probe achieves 91% =
+evidence of world model" interpretation -- the 91% is specifically
+contingent on the model needing to compute the board internally.
+
+E4. Per-cell transition counter (count_cell_transitions.py)
+--------------------------------------------------------------------------------
+
+For each cell, average number of times its category (empty/white/black)
+changes across a game, measured over 1M games (job 5953275, 35 min, CPU
+only).
+
+Per-region mean transitions/game:
+
+  Region | Mean | Min  | Max
+  -------+------+------+------
+  corner | 1.00 | 1.00 | 1.00
+  edge   | 1.58 | 1.45 | 1.69
+  inner  | 4.01 | 3.10 | 5.06
+  center | 6.16 | 5.96 | 6.36
+
+The 4 center cells (27/28/35/36) flip ~6 times per game on average.
+Corners flip once (essentially just the initial placement, almost never
+re-flipped). The 8x8 grid shows perfectly symmetric concentric rings.
+
+Quantitative diagnostic: the 1-layer MLP's per-cell decoding accuracy is
+monotonically inverse to flip count.
+
+  Region | Transitions/game | MLP center decode acc | Decode error
+  -------+------------------+-----------------------+-------------
+  corner |    1.00          |     ~100%             |    ~0%
+  edge   |    1.58          |     ~90%              |    ~10%
+  inner  |    4.01          |     ~78%              |    ~22%
+  center |    6.16          |     ~70%              |    ~30%
+
+Consistent with the XOR-of-K-bits depth requirement: 1-layer can handle
+K=1-2 (corners, edges) reliably but degrades for K=4-6 (inner, center).
+Output: experiments/.../cell_transitions.npz
+
+E5. Per-cell decoding shows concentric rings (analyze_probe_per_cell.py)
+--------------------------------------------------------------------------------
+
+Per-cell accuracy on the H=512 wheneven probe (next-rule trained MLP,
+job 5956091), shown as 8x8 grid:
+
+         0      1      2      3      4      5      6      7
+    0   99.9%  97.5%  96.8%  96.0%  95.7%  96.5%  97.8%  99.9%
+    1   97.4%  93.0%  90.0%  88.5%  88.9%  90.6%  93.8%  97.8%
+    2   96.5%  90.0%  84.3%  81.9%  82.4%  86.0%  90.7%  96.9%
+    3   95.9%  88.6%  82.0%  75.9%  75.8%  82.7%  89.0%  97.1%
+    4   96.4%  88.6%  82.3%  75.9%  75.7%  82.0%  88.6%  96.3%
+    5   96.6%  90.6%  86.2%  82.5%  82.1%  84.3%  89.8%  96.9%
+    6   97.7%  93.8%  90.6%  88.9%  88.7%  89.9%  92.7%  97.7%
+    7   99.9%  98.1%  96.9%  96.7%  96.2%  97.0%  97.5%  99.9%
+
+Perfectly symmetric concentric rings — accuracy highest at corners (99.9%)
+and drops toward the centers (75.7-75.9%). Aligns exactly with the
+transition-count diagnostic from E4.
+
+E6. Cumulative rule-firings -> board state (REFUTED, jobs 5952575/5952644)
+--------------------------------------------------------------------------------
+
+Hypothesis: reformat 60-cell move history as cumulative 960-d firing
+counts (which pattern fired at each prior move), and train a 1-layer MLP
+to predict board state. If accuracy approaches 100%, the bottleneck is
+the input format, not architectural depth.
+
+Result: REFUTED.
+
+  H=512, 3 epochs, 36 train chunks, eval=14.5M positions, both raw + mod-2
+
+  Encoding | Board acc | corner | edge  | inner | center
+  ---------+-----------+--------+-------+-------+--------
+  raw      |  80.11%   |  92.0% | 86.2% | 75.4% |  69.0%
+  mod-2    |  80.11%   |  92.0% | 86.2% | 75.4% |  69.0%
+
+Raw and mod-2 are identical because EACH PATTERN FIRES 0 OR 1 TIMES per
+game (a move can be played at most once, and a pattern with that target
+either fires or doesn't on that turn). So the cumulative count is binary;
+mod-2 == raw.
+
+The cumulative-firings input is WORSE than the 60-d move history (91.25%).
+The 960-d binary vector tells you WHICH patterns fired in the game but
+not WHEN — order is lost. Without order, the 1-layer MLP cannot recover
+which flips applied after each placement. Confirms the bottleneck is
+order-dependence, not depth alone.
+
+Scripts: precompute_rule_firings.py, train_board_from_firings.py,
+run_precompute_rule_firings.sh, run_train_board_from_firings.sh
+Output: experiments/.../feature_chunks/rule_firings_NNNN.npz
+        experiments/.../pattern_detector_checkpoints/board_from_firings_H512.pt
+
+E7. Next-rule prediction experiment (jobs 5956069/5956090/5956091)
+--------------------------------------------------------------------------------
+
+Reformulation: train a 1-layer MLP to predict WHICH OF THE 961 CLASSES
+(960 patterns + 1 "no-pattern" for forfeits) fires on the NEXT move,
+instead of which of the 960 patterns AVAILABLE this turn would fire if
+played. Loss = soft-target cross-entropy with target = uniform over fired
+patterns. 
+
+Three-stage pipeline:
+  1. Precompute: per-turn fired-pattern chunks (fired_patterns_NNNN.npz)
+  2. Train: train_next_rule.py at H=512 wheneven (120-d), 3 epochs
+  3. Probe: probe_next_rule.py — Nanda-style parity-split board decoder
+
+Training (5956090) plateaued early:
+  Epoch 1: train_loss=2.32, eval_loss=2.29, top1_in_fired=7.02%
+  Epoch 2: train_loss=2.29, eval_loss=2.29, top1_in_fired=7.02%
+(timed out at 6h after 2 epochs)
+
+7% top1_in_fired is 20x random baseline (~0.3% over 961 classes) but the
+model didn't converge. The soft target moves a lot per-position, which
+makes optimization harder than single-label CE.
+
+Probe (5956091) ran 5 epochs successfully:
+  Final probe acc: 91.14%
+  corner=99.89%  edge=96.92%  inner=87.62%  center=75.82%
+
+CRITICAL FINDING: the hidden state of an MLP trained for next-rule
+prediction decodes board state at essentially the same level as the
+standard pattern-availability MLP (91.25%). Two different training
+objectives produce essentially the same probe-readable board state.
+
+Implication: the probe-readable board state in 1-layer MLP hidden states
+is a feature of the architecture/data, not the specific task. Training
+task doesn't move the probe ceiling.
+
+Scripts: precompute_fired_patterns.py, train_next_rule.py, probe_next_rule.py
+Sbatch: run_precompute_fired_patterns.sh, run_train_next_rule.sh,
+        run_probe_next_rule.sh
+
+E8. K=3 cd0 OGPT intervention (job 5952859)
+--------------------------------------------------------------------------------
+
+Extending B1's calibration-depth analysis: same multi-cell intervention
+setup, but instead of cd0/cd1/cd2 calibration depths, applied a K=3
+multiplier on top of cd0 magnitudes (the new --scale arg composing with
+--calibrate, commit e398af3). N=1 (single cell), 200 games, 5 conditions.
+
+Results (BM = boundary margin, Frac+ = fraction crossing BM=0):
+
+  Condition         | BM     | Frac+ | TopN Acc | Crosstalk
+  ------------------+--------+-------+----------+----------
+  flip_nonint       | +2.44  |  70%  |  100%    |  0.269
+  flip_int          | +2.37  |  74%  |  100%    |  0.274
+  add_nonint        | +5.64  |  84%  |  100%    |  0.375
+  add_int           | +5.24  |  81%  |  100%    |  0.375
+  mixed             | +3.67  |  80%  |   98.4%  |  0.320
+
+Compared to cd0 K=1 (all margins were ~−0.5), K=3 cd0 produces strongly
+positive margins (+2.4 to +5.6 logits) and top-1 strict legal goes to
+100%. Crosstalk is 3-4x higher than K=1 (0.27-0.38 vs 0.09-0.13) but does
+NOT cause downstream errors — top-1 legal still 100%.
+
+E-D analysis (plot_intervention_thresholds.py, with --n flag for K=3):
+
+  Setting              | δ=0 newly-legal | δ=0 newly-illegal
+  ---------------------+-----------------+-------------------
+  cd0 K=1, N=1         |     65.3%       |       45.6%
+  cd0 K=3, N=1         |     95.0%       |       96.1%
+  cd2 default K=1, N=1 |     89.8%       |       94.3%
+  cd2 default K=1, N=3 |     85.8%       |       89.3%
+  cd0 K=1, N=3         |     63.9%       |       45.6%
+
+K=3 cd0 beats default cd2 K=1 on both δ=0 crossings. Under local
+calibration with tripled magnitude, the boundary-crossings happen
+decisively (long right tails in the δ-survival curve), not just barely.
+
+Output: experiments/multi_intervention_probs_cd0_K3/raw_samples.json,
+        experiments/intervention_threshold_analysis/{eps,delta}_curves_*.png
+
+E9. MLP intervention re-run with --save-probs (5952879 -> 5956091 -> 5952867)
+--------------------------------------------------------------------------------
+
+Original `logs/mlp_intervention.npz` came from a run where the chunk_glob
+matched rule_firings_0039.npz as the eval chunk (29M positions). With the
+corrected chunk_*.npz filter (commit 313e5ae), the eval changes to
+chunk_0039.npz (14.5M positions), and np.random.choice(N, ...) with the
+same seed but different N produces a different test position sample.
+
+Corrected MLP intervention numbers (H=1024 wheneven, n=24940 interventions):
+
+  K    | eps>0%  | delta>0%  | li_topk  | li_topkp1 | mean pos_recall@K
+  -----+---------+-----------+----------+-----------+------------------
+  1.0  | 61.26%  | 62.05%    | 55.94%   | 67.57%    | 0.866
+  2.0  | 78.87%  | 88.36%    | 81.87%   | 88.40%    | 0.866
+  3.0  | 85.05%  | 96.90%    | 92.31%   | 94.29%    | 0.866
+  5.0  | 76.16%  | 99.25%    | 94.70%   | 95.56%    | 0.866
+  8.0  | 47.59%  | 98.54%    | 90.27%   | 92.86%    | 0.866
+
+Peak li_topk = 94.70% at K=5 (was 99.11% at K=3 under biased data). Still
+exceeds OGPT cd2 = 82% by 12.7pp.
+
+CALIBRATION CAVEAT: mean pos_recall@K (baseline, no intervention) = 0.866
+means that pre-intervention, the MLP's top-N predictions already contain
+87% of legal moves. So "delta>0" (target outranks min(P_legal)) is easy
+to clear because some legal cells already sit at very low probabilities.
+"li_topk" is the cleaner, calibration-free metric.
+
+Added --save-probs flag to mlp_intervention.py (commit a21dffd). The
+saved npz now contains full per-intervention probability vectors:
+  base_probs: (24940, 60) baseline cell probs per intervention
+  intv_probs_s{K}: (24940, 60) post-intervention per scale
+  target_cell: (24940,) target cell index
+  legal_mask: (24940, 60) bool of which cells were legal
+
+This enables proper baseline-conditional rank metrics (e.g. "newly-legal
+cell entered top-N because of intervention, not because it was already
+there"). Equivalent to OGPT's "NL Above Min-Legal" which the log Section
+B1 reports at 0-7% — i.e. most apparent OGPT intervention success is
+target outranking always-illegal cells, NOT outranking still-legal cells.
+The MLP almost certainly shows the same pattern; analysis script to be
+written.
+
+Output: logs/mlp_intervention_H512_wheneven_probs.npz
+
+E10. Width × input-format ceiling for board decoding (in flight)
+--------------------------------------------------------------------------------
+
+Sweeping pattern detector hidden width + input format to characterize the
+1-layer ceiling under uniform eval:
+
+  Pattern detector          | dim   | H     | Probe acc (uniform)
+  --------------------------+-------+-------+--------------------
+  wheneven                  |  120  |  512  | 91.25%
+  wheneven                  |  120  | 1024  | 92.66%
+  move_grid                 | 3600  |  512  | 91.99%*
+  move_grid                 | 3600  | 4096  | 93.41%
+  move_grid                 | 3600  | 8192  | TBD (5956145/6)
+
+  * H=512 move_grid value from a probe that timed out at epoch 4.
+    Resubmitted under 5956147.
+
+The relative pattern accuracy difference between signed move_grid (3600-d)
+and one-hot move_grid (10800-d) on the SAME H=512 pattern detector:
+  - 3600-d signed:    pat_acc = 99.07%
+  - 10800-d one-hot:  pat_acc = 98.74%
+The antisymmetric 3600-d encoding edges out 10800-d, suggesting the color
+symmetry of Othello rules is a useful inductive bias, not a constraint.
+
+In-flight pattern detector training:
+  5956145 = H=8192 movegrid pattern detector (3 epochs, ~12-18h)
+  5956146 = H=8192 movegrid probe (depends on 5956145)
+
+Width scaling stays shallow: 512 -> 4096 is +1.4pp; expecting 8192 to be
++0.3-0.5pp on top of that. Even at infinite width, the 1-layer ceiling is
+unlikely to break through ~94-95%.
+
+================================================================================
+E11. SYNTHESIS — STATE OF THE 1-LAYER VS OGPT COMPARISON (2026-05-14)
+================================================================================
+
+The 1-layer MLP shows the same intervention phenomenology as OGPT despite
+having no internal recurrence or attention. Key data points from this
+session:
+
+  Metric                                      | MLP             | OGPT
+  --------------------------------------------+-----------------+--------
+  Probe board acc (uniform, H=512 wheneven)   |   91.25%        | ~99%
+  Probe board acc center cells                |   75.8%         | ~99%
+  Per-cell transition count diagnostic        |  Yes (E4)       |   -
+  Random projection probe acc                 |   75-76%        |   -
+  Intervention success (rank-based li_topk)   |   94.7% peak    |  82%
+    (no calibration distortion)               |                 |
+  Intervention boundary margin (cd0 K=3)      |   +2 to +5.6    |   -
+  per-cell flip-count predictability          |   yes (E5)      |   -
+
+The "world model" framing rests on probe accuracy + intervention success,
+and both metrics distinguish neither qualitatively nor by a wide margin:
+  - Probe gap (~5pp on mean, ~23pp on center cells) is consistent with
+    "depth gives more XOR-of-flip-count capacity," not with a categorical
+    "has world model vs doesn't."
+  - Intervention success is HIGHER for the MLP than OGPT under the
+    calibration-free rank metric.
+
+The empirical width sweep (E10) shows the 1-layer ceiling is structural,
+not capacity-limited. The per-cell pattern (E5) and the inverse correlation
+to flip-count (E4) suggest a clean mechanistic story: depth is required
+to compute the XOR-of-K-flips operation for cells with many transitions
+per game.
+
