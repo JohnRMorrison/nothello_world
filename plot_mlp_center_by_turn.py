@@ -62,6 +62,9 @@ def main():
                                  "move_grid_onehot"])
     parser.add_argument("--chunk-path",
         default="experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks/chunk_0039.npz")
+    parser.add_argument("--extra-chunks", nargs="*", default=[],
+                        help="Additional chunk paths to load (e.g. late_turns_eval.npz "
+                             "for turns 54-58).")
     parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--output",
                         default="experiments/plots/mlp_center_by_turn.png")
@@ -93,9 +96,18 @@ def main():
     probe_even.eval(); probe_odd.eval()
     print(f"Loaded probe (best_acc reported: {probe_ckpt.get('best_acc', '?')})")
 
-    # Load eval chunk
-    ev_X, ev_Y, ev_pos = _load_features(args.chunk_path)
-    print(f"Loaded chunk: {len(ev_X)} positions, dim={ev_X.shape[1]}")
+    # Load eval chunks (primary + optional extras for late-game turns)
+    chunks = [args.chunk_path] + list(args.extra_chunks)
+    Xs, Ys, Ps = [], [], []
+    for cp in chunks:
+        x, y, p = _load_features(cp)
+        Xs.append(x); Ys.append(y); Ps.append(p)
+        print(f"Loaded {os.path.basename(cp)}: {len(x)} positions, "
+              f"turns {sorted(np.unique(p.numpy()))[:3]}...{sorted(np.unique(p.numpy()))[-3:]}")
+    ev_X = torch.cat(Xs, dim=0)
+    ev_Y = torch.cat(Ys, dim=0)
+    ev_pos = torch.cat(Ps, dim=0)
+    print(f"Total: {len(ev_X)} positions, dim={ev_X.shape[1]}")
 
     # For each turn, evaluate
     turns = sorted(np.unique(ev_pos.numpy()).tolist())
