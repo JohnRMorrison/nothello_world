@@ -93,10 +93,12 @@ def main():
     gt[states_s == 1]  = 2
     gt_t = torch.from_numpy(gt)   # (G, T, 8, 8)
 
-    # Apply probe per turn (parity mode: slice-idx 0,2,... -> mode 0; 1,3,... -> mode 1)
+    # Apply probe per turn (parity mode: ODD pos -> mode 0, EVEN pos -> mode 1).
+    # Use absolute position parity so this is robust to arbitrary pos_start.
     per_turn_center = np.zeros(T, dtype=np.float64)
     for ti in range(T):
-        m = 0 if ti % 2 == 0 else 1
+        pos = ti + args.pos_start
+        m = 0 if pos % 2 == 1 else 1
         W = probe[m]                  # (512, 8, 8, 3)
         h = acts[:, ti, :]            # (G, 512)
         logits = torch.einsum('nd,drco->nrco', h, W)

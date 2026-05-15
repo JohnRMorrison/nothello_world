@@ -104,10 +104,12 @@ if __name__ == "__main__":
     # Apply probe
     print(f"\nApplying probe with mode = {args.mode} ...")
     if args.mode == "parity":
-        # Slice-index 0,2,4,... -> mode 0; slice-index 1,3,5,... -> mode 1
+        # Absolute-position parity. mode 0 trained on positions 5,7,9,...
+        # (ODD positions); mode 1 on 6,8,10,... (EVEN positions).
         preds = torch.zeros((G, T, 8, 8), dtype=torch.long)
         for ti in range(T):
-            m = 0 if ti % 2 == 0 else 1
+            pos = ti + args.pos_start
+            m = 0 if pos % 2 == 1 else 1
             W = probe[m]                # (512, 8, 8, 3)
             h = acts[:, ti, :]          # (G, 512)
             logits = torch.einsum('nd,drco->nrco', h, W)
@@ -195,7 +197,8 @@ if __name__ == "__main__":
         if args.mode == "parity":
             preds_bin = torch.zeros((G, ti_hi - ti_lo, 8, 8), dtype=torch.long)
             for ti in range(ti_lo, ti_hi):
-                m = 0 if ti % 2 == 0 else 1
+                pos = ti + args.pos_start
+                m = 0 if pos % 2 == 1 else 1
                 W = probe[m]
                 h = acts[:, ti, :]
                 logits = torch.einsum('nd,drco->nrco', h, W)
