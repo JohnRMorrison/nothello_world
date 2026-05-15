@@ -61,7 +61,8 @@ def main():
     games = [g for g in games if len(g) == GAME_LEN][:args.n_games]
     print(f"Using {len(games)} games")
 
-    tokens = tokenize_games(games).to(device)
+    # OGPT block_size=59; drop the last token to match model context.
+    tokens = tokenize_games(games).to(device)[:, :-1]
     states = np.zeros((len(games), GAME_LEN, 8, 8), dtype=np.int8)
     for gi, g in enumerate(games):
         board = OthelloBoardState()
