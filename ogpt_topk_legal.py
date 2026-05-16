@@ -72,26 +72,29 @@ if __name__ == "__main__":
 
     for g_idx, game in enumerate(games):
         board = OthelloBoardState()
-        for t in range(args.pos_end):
-            if t >= args.pos_start:
-                # Compute legal moves at this pre-move state
-                legal_64 = board.get_valid_moves()
-                legal_m60 = [c64_to_m60[c] for c in legal_64 if c in c64_to_m60]
-                if not legal_m60:
-                    pass
-                else:
-                    legal_set = set(legal_m60)
-                    K = len(legal_set)
-                    cl = all_cell_logits[g_idx, t, :].numpy()  # (60,)
-                    order = np.argsort(-cl)
-                    for n in top_ns:
-                        k = min(n, K)
-                        results[n]['c'] += len(set(order[:k].tolist()) & legal_set)
-                        results[n]['t'] += k
+        for t in range(min(len(game), args.pos_end)):
+            # Step 1: play move t. Board becomes post-turn-t state.
             try:
                 board.umpire(game[t])
             except Exception:
                 break
+            # Step 2: OGPT's logits at position t predict move t+1.
+            # Score them against the legal moves for turn t+1 on this board.
+            t_next = t + 1
+            if t_next < args.pos_start or t_next >= args.pos_end:
+                continue
+            legal_64 = board.get_valid_moves()
+            legal_m60 = [c64_to_m60[c] for c in legal_64 if c in c64_to_m60]
+            if not legal_m60:
+                continue
+            legal_set = set(legal_m60)
+            K = len(legal_set)
+            cl = all_cell_logits[g_idx, t, :].numpy()  # logits predicting move t+1
+            order = np.argsort(-cl)
+            for n in top_ns:
+                k = min(n, K)
+                results[n]['c'] += len(set(order[:k].tolist()) & legal_set)
+                results[n]['t'] += k
 
     print()
     print(f"{'metric':>12s}  {'top-1':>9s}  {'top-3':>9s}  {'top-5':>9s}  {'top-10':>9s}")
