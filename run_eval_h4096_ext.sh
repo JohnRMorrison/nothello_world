@@ -29,7 +29,7 @@ CKPT_DIR=experiments/mathematical_transformation_experiments/heuristic_probe_res
 CHUNK_DIR=experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks
 
 PAT="$CKPT_DIR/pattern_simple_direct_H4096_move_grid_ext.pt"
-PROBE="$CKPT_DIR/probe_direct_H4096_move_grid_ext_5_58.pt"
+PROBE="$CKPT_DIR/probe_direct_H4096_move_grid_ext_3ep.pt"
 EVAL="$CHUNK_DIR/chunk_0039.npz"
 EXTRA="$CHUNK_DIR/late_turns_eval.npz"
 
