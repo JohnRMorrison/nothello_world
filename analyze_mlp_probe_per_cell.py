@@ -54,6 +54,8 @@ def main():
                             "move_grid_onehot"])
     p.add_argument("--chunk-path",
         default="experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks/chunk_0039.npz")
+    p.add_argument("--extra-chunks", nargs="*", default=[],
+                   help="Additional chunk paths (e.g. late_turns_eval.npz for turns 54-58).")
     p.add_argument("--pos-start", type=int, default=5)
     p.add_argument("--pos-end", type=int, default=54)
     p.add_argument("--batch-size", type=int, default=1024)
@@ -84,7 +86,15 @@ def main():
     probe_e.eval(); probe_o.eval()
     print(f"  Loaded pat (pat_acc={ckpt.get('best_pat_acc', '?')}) and probe")
 
-    ev_X, ev_Y, ev_pos = _load_features(args.chunk_path)
+    chunks = [args.chunk_path] + list(args.extra_chunks)
+    Xs, Ys, Ps = [], [], []
+    for cp in chunks:
+        x, y, pos = _load_features(cp)
+        Xs.append(x); Ys.append(y); Ps.append(pos)
+    import torch as _torch
+    ev_X  = _torch.cat(Xs, dim=0)
+    ev_Y  = _torch.cat(Ys, dim=0)
+    ev_pos = _torch.cat(Ps, dim=0)
     mask = (ev_pos >= args.pos_start) & (ev_pos < args.pos_end)
     ev_X = ev_X[mask]; ev_Y = ev_Y[mask]; ev_pos = ev_pos[mask]
     print(f"Positions in range [{args.pos_start}, {args.pos_end}): {len(ev_X)}")
