@@ -102,13 +102,12 @@ def main():
         print("No positions in this range — try a different chunk or range.")
         return
 
-    Xf = feature_slice(ev_X, args.features)
-
     correct_per_cell = np.zeros(64, dtype=np.int64)
     total = 0
     with torch.no_grad():
-        for i in range(0, len(Xf), args.batch_size):
-            x = Xf[i:i + args.batch_size].to(device)
+        for i in range(0, len(ev_X), args.batch_size):
+            x_raw = ev_X[i:i + args.batch_size].to(device)
+            x = feature_slice(x_raw, args.features)
             y = ev_Y[i:i + args.batch_size].to(device)
             pos = ev_pos[i:i + args.batch_size]
             em = (pos % 2 == 0); om = ~em
