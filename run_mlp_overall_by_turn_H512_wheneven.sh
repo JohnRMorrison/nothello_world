@@ -26,5 +26,5 @@ CKPT_DIR=experiments/mathematical_transformation_experiments/heuristic_probe_res
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python plot_mlp_overall_by_turn.py \
     --pat-ckpt   "$CKPT_DIR/pattern_detector_checkpoints/pattern_simple_direct_H512_wheneven.pt" \
-    --probe-ckpt "$CKPT_DIR/probe_direct_H512_wheneven.pt" \
+    --probe-ckpt "$CKPT_DIR/pattern_detector_checkpoints/probe_direct_H512_wheneven.pt" \
     --hidden 512 --features when+even
