@@ -19,16 +19,19 @@ cd $SLURM_SUBMIT_DIR
 # Optional positional args:
 #   $1 = layer (default 6)
 #   $2 = n_games (default 500)
+#   $3 = mode (default empty): 'empty' or 'flip'
 LAYER=${1:-6}
 N_GAMES=${2:-500}
+MODE=${3:-empty}
 OUT_DIR="experiments/intervention_alpha_sweep"
-TAG="L${LAYER}_n${N_GAMES}"
+TAG="L${LAYER}_n${N_GAMES}_${MODE}"
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python sweep_intervention_alpha.py \
     --ckpt ckpts/gpt_nanda_synthetic.ckpt \
     --probe mechanistic_interpretability/main_linear_probe.pth \
     --layer "$LAYER" \
     --n-games "$N_GAMES" \
+    --mode "$MODE" \
     --alphas 0,1,2,4,6,8,12,16,24 \
     --squares 3,3 0,3 2,3 \
     --output "${OUT_DIR}/results_${TAG}.json" \
