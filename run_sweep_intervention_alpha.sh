@@ -37,7 +37,12 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python sweep_intervention_alpha.py \
     --output "${OUT_DIR}/results_${TAG}.json" \
     --raw-npz "${OUT_DIR}/raw_flips_${TAG}.npz"
 
-# Plot inline so the PDF lands next to the JSON without a separate job.
+# Plot inline so the PDFs land next to the JSON without a separate job.
 python plot_intervention_alpha_vs_errors.py \
     --results "${OUT_DIR}/results_${TAG}.json" \
     --out     "${OUT_DIR}/alpha_vs_errors_${TAG}.pdf"
+
+python plot_intervention_alpha_cellmaps.py \
+    --raw     "${OUT_DIR}/raw_flips_${TAG}.npz" \
+    --results "${OUT_DIR}/results_${TAG}.json" \
+    --out     "${OUT_DIR}/cellmaps_${TAG}.pdf"

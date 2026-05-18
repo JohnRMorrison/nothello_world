@@ -256,6 +256,9 @@ if __name__ == "__main__":
         per_alpha = {"alpha": [], "flips_mean": [], "flips_std": [],
                      "flips_median": [], "flips_q25": [], "flips_q75": []}
         raw_flip_matrix = np.zeros((len(alphas), n_keep), dtype=np.int32)
+        # Per-cell flip counts: how often each cell flips across positions.
+        # (Divide by n_keep downstream to get a frequency per cell.)
+        per_cell_counts = np.zeros((len(alphas), 8, 8), dtype=np.int32)
 
         with torch.no_grad():
             for a_i, alpha in enumerate(alphas):
@@ -264,9 +267,12 @@ if __name__ == "__main__":
                 else:
                     h_intv = h_subset + (alpha * signs) * direction    # (n_keep, D)
                 preds = decode_all_cells(h_intv, probe_mode2)      # (n_keep, 8, 8)
-                # Flip count per position (any of 64 cells different from baseline).
-                flips = (preds != baseline_subset).sum(dim=(1, 2)).cpu().numpy()
+                # Per-position flip count (any of 64 cells different from baseline).
+                flip_mask = (preds != baseline_subset)             # bool (n_keep, 8, 8)
+                flips = flip_mask.sum(dim=(1, 2)).cpu().numpy()
                 raw_flip_matrix[a_i] = flips
+                # Per-cell flip count across positions at this alpha.
+                per_cell_counts[a_i] = flip_mask.sum(dim=0).cpu().numpy()
                 per_alpha["alpha"].append(float(alpha))
                 per_alpha["flips_mean"].append(float(np.mean(flips)))
                 per_alpha["flips_std"].append(float(np.std(flips)))
@@ -280,6 +286,7 @@ if __name__ == "__main__":
         per_alpha["n_positions"] = n_keep
         results["squares"][key] = per_alpha
         raw_per_square[key] = raw_flip_matrix
+        raw_per_square[f"{key}_percell"] = per_cell_counts
 
     # --- Save ---
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
