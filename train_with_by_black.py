@@ -25,34 +25,45 @@ from train_pattern_simple import (
 )
 
 
-def load_chunk_with_by_black(chunk_path):
-    """Returns (feat_X (N, 180), Y (N, 64), pos (N,)) where feat_X is
-    when+even concatenated with the precomputed by_black channel."""
+def load_chunk_with_by_black(chunk_path, features="when+even+by_black"):
+    """Returns (feat_X, Y, pos).
+
+    features:
+      when+even+by_black (default, 180-d)
+      when+by_black      (120-d, drops the `even` channel)
+      played+by_black    (120-d, minimal: was-played + which-color-placed)
+    """
     X, Y, pos = _load_features(chunk_path)
     by_black_path = chunk_path.replace('.npz', '_by_black.npy')
     if not os.path.exists(by_black_path):
         raise FileNotFoundError(
             f"Missing {by_black_path}. Run precompute_by_black.py first.")
     by_black = torch.from_numpy(np.load(by_black_path).astype(np.float32))
-    when_even = X[:, N_MOVES:3 * N_MOVES]   # 120-d
-    feat = torch.cat([when_even, by_black], dim=1)   # 180-d
+    if features == "played+by_black":
+        played = X[:, :N_MOVES]                          # 60-d (binary)
+        feat = torch.cat([played, by_black], dim=1)      # 120-d
+    elif features == "when+by_black":
+        when = X[:, N_MOVES:2 * N_MOVES]                # 60-d
+        feat = torch.cat([when, by_black], dim=1)        # 120-d
+    elif features == "when+even+by_black":
+        when_even = X[:, N_MOVES:3 * N_MOVES]            # 120-d
+        feat = torch.cat([when_even, by_black], dim=1)   # 180-d
+    else:
+        raise ValueError(f"Unknown features: {features}")
     return feat, Y, pos
 
 
-def train(chunk_dir, device, hidden_dim, epochs, save_path,
+def train(chunk_dir, device, hidden_dim, epochs, save_path, features,
           pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
           lr=1e-3, batch_size=1024):
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz")
-                         and "_patterns" not in f
-                         and "_when60" not in f
-                         and not f.endswith("_by_black.npy"))
+                         if f.startswith("chunk_") and f.endswith(".npz"))
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
     print(f"Train chunks: {len(train_paths)}, eval chunk: {os.path.basename(eval_path)}")
 
-    input_dim = 180
+    input_dim = 120 if features in ("when+by_black", "played+by_black") else 180
     me = DirectMLP(input_dim, hidden_dim, 960).to(device)
     mo = DirectMLP(input_dim, hidden_dim, 960).to(device)
     optimizer = torch.optim.Adam(
@@ -61,11 +72,14 @@ def train(chunk_dir, device, hidden_dim, epochs, save_path,
         optimizer, mode='min', factor=0.75, patience=1)
     bce = nn.BCEWithLogitsLoss()
 
-    # Load eval chunk once
-    ev_feat, ev_Y, ev_pos = load_chunk_with_by_black(eval_path)
+    # Load eval chunk once, stride-slice for uniform turn coverage.
+    ev_feat, ev_Y, ev_pos = load_chunk_with_by_black(eval_path, features)
     n_eval = min(len(ev_feat), 49 * 10000)
-    ev_feat = ev_feat[:n_eval]; ev_Y = ev_Y[:n_eval]; ev_pos = ev_pos[:n_eval]
-    print(f"  Eval samples: {n_eval}")
+    stride = max(1, len(ev_feat) // n_eval)
+    ev_feat = ev_feat[::stride][:n_eval]
+    ev_Y = ev_Y[::stride][:n_eval]
+    ev_pos = ev_pos[::stride][:n_eval]
+    print(f"  Eval samples: {len(ev_feat)} (stride={stride} across turns 5-53)")
 
     best_acc = 0.0
     best_state = None
@@ -78,7 +92,7 @@ def train(chunk_dir, device, hidden_dim, epochs, save_path,
         t_epoch = time.time()
 
         for ci in chunk_order:
-            feat, Y, pos = load_chunk_with_by_black(train_paths[ci])
+            feat, Y, pos = load_chunk_with_by_black(train_paths[ci], features)
             perm = torch.randperm(len(feat))
             for i in range(0, len(feat), batch_size):
                 idx = perm[i:i + batch_size]
@@ -153,13 +167,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=512)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--features",
+                        default="when+even+by_black",
+                        choices=["when+even+by_black",
+                                 "when+by_black",
+                                 "played+by_black"],
+                        help="Feature combo: 180-d default; 120-d variants drop "
+                             "the even channel; played+by_black uses only the "
+                             "played indicator (no timing).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
 
     device = get_device()
+    input_dim = 120 if args.features in ("when+by_black", "played+by_black") else 180
     print(f"Device: {device}, H={args.hidden}, {args.epochs} epochs")
-    print(f"Features: when+even+by_black (180-d)")
+    print(f"Features: {args.features} ({input_dim}-d)")
 
     patterns = enumerate_flanking_patterns()
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = \
@@ -167,9 +190,18 @@ if __name__ == "__main__":
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
     os.makedirs(save_dir, exist_ok=True)
+    # Match existing naming: pattern_simple_direct_H512_wheneven_byblack.pt
+    # "when+even+by_black" -> "wheneven_byblack"
+    # "when+by_black"      -> "when_byblack"
+    feat_tag = {
+        "when+even+by_black": "wheneven_byblack",
+        "when+by_black":      "when_byblack",
+        "played+by_black":    "played_byblack",
+    }[args.features]
     save_path = os.path.join(save_dir,
-        f"pattern_simple_direct_H{args.hidden}_wheneven_byblack.pt")
+        f"pattern_simple_direct_H{args.hidden}_{feat_tag}.pt")
     print(f"Save path: {save_path}")
 
     train(chunk_dir, device, args.hidden, args.epochs, save_path,
+          args.features,
           pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)

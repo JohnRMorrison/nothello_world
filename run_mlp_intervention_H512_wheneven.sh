@@ -30,4 +30,5 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python mlp_intervention.py \
     --probe-path "$PROBE" \
     --scales 1,2,3,5,8 \
     --n-test 5000 \
-    --output logs/mlp_intervention_H512_wheneven.npz
+    --save-probs \
+    --output logs/mlp_intervention_H512_wheneven_probs.npz

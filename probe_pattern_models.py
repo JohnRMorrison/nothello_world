@@ -32,14 +32,15 @@ def get_hidden(model, x, mode):
 
 def train_probe(chunk_dir, device, model_even, model_odd, mode,
                 feature_cols, hidden_dim, epochs=10, lr=1e-3, batch_size=1024,
-                feature_fn=None):
+                feature_fn=None, chunk_prefix="chunk_"):
     """Train linear probe streaming through all chunks."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
+                         if f.startswith(chunk_prefix) and f.endswith(".npz")
+                         and "_patterns" not in f and "_when60" not in f)
     if not chunk_files:
-        raise ValueError(f"No chunks in {chunk_dir}")
+        raise ValueError(f"No chunks matching {chunk_prefix}*.npz in {chunk_dir}")
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
@@ -57,14 +58,16 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
     # Load eval data. For column-slice features we slice up front; for
     # derived features (e.g. move_grid expanding 180 -> 3600/10800-d) we
     # apply the transform per-batch later to avoid OOM on the full chunk.
+    # Chunks are sorted by turn; stride-slice for uniform turn coverage.
     ev_X, ev_Y, ev_pos = _load_features(eval_path)
     if feature_cols is not None:
         ev_X = ev_X[:, feature_cols]
     n_eval = min(len(ev_X), 49 * 10000)
-    ev_X = ev_X[:n_eval].clone()
-    ev_Y = ev_Y[:n_eval].clone()
-    ev_pos = ev_pos[:n_eval].clone()
-    print(f"  Eval samples: {len(ev_X)}")
+    stride = max(1, len(ev_X) // n_eval)
+    ev_X = ev_X[::stride][:n_eval].clone()
+    ev_Y = ev_Y[::stride][:n_eval].clone()
+    ev_pos = ev_pos[::stride][:n_eval].clone()
+    print(f"  Eval samples: {len(ev_X)} (stride={stride} across turns 5-53)")
 
     best_acc = 0.0
 
@@ -119,6 +122,8 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
         probe_even.eval(); probe_odd.eval()
         correct = 0
         total = 0
+        per_cell_correct = np.zeros(64, dtype=np.int64)
+        n_eval_rows = 0
         with torch.no_grad():
             for i in range(0, len(ev_X), batch_size):
                 x_raw = ev_X[i:i + batch_size]
@@ -141,13 +146,17 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
 
                 correct += (preds == y).sum().item()
                 total += y.numel()
+                per_cell_correct += (preds == y).sum(dim=0).cpu().numpy()
+                n_eval_rows += len(y)
 
         acc = correct / total
+        per_cell_acc = per_cell_correct / max(n_eval_rows, 1)
         if acc > best_acc:
             best_acc = acc
             best_probe_state = {
                 'even': {k: v.cpu().clone() for k, v in probe_even.state_dict().items()},
                 'odd': {k: v.cpu().clone() for k, v in probe_odd.state_dict().items()},
+                'per_cell_acc': per_cell_acc,
             }
         scheduler.step(epoch_loss / max(epoch_batches, 1))
         cur_lr = optimizer.param_groups[0]['lr']
@@ -165,6 +174,9 @@ if __name__ == "__main__":
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--chunk-prefix", default="chunk_",
+                        help="Filename prefix for chunks to use (e.g. "
+                             "'chunk_ext_' for extended-range chunks).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -267,7 +279,8 @@ if __name__ == "__main__":
 
     best_acc, best_probe_state = train_probe(
         chunk_dir, device, model_even, model_odd, args.mode,
-        feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn)
+        feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn,
+        chunk_prefix=args.chunk_prefix)
 
     # Save probe weights. Derive suffix from source checkpoint filename so
     # probes for variants (_single, _pw50, _lw1, etc.) don't overwrite each other.
@@ -282,6 +295,7 @@ if __name__ == "__main__":
     torch.save({
         'even': best_probe_state['even'],
         'odd': best_probe_state['odd'],
+        'per_cell_acc': best_probe_state.get('per_cell_acc'),
         'hidden_dim': args.hidden,
         'best_acc': best_acc,
         'mode': args.mode,

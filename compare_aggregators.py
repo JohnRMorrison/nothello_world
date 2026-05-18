@@ -217,7 +217,8 @@ if __name__ == "__main__":
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
+                         if f.startswith("chunk_0") and f.endswith(".npz")
+                         and "_patterns" not in f and "_when60" not in f)
     eval_path = chunk_files[-1]
     print(f"Eval: {os.path.basename(eval_path)} (random sample)")
 
