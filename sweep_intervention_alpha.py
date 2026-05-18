@@ -79,6 +79,19 @@ def build_empty_direction(probe_mode2, r, c):
     return (d / n) if n > 0 else d
 
 
+def build_flip_direction(probe_mode2, r, c):
+    """Color-flip direction for cell (r,c): black - white, normalized.
+
+    Applied with a per-position sign: +1 when current state is white
+    (push toward black), -1 when current state is black (push toward white).
+    Empty positions are filtered out before this is used.
+    """
+    w = probe_mode2[:, r, c, :]                      # (d_model, 3)
+    d = w[:, 2] - w[:, 1]                            # black - white
+    n = float(np.linalg.norm(d))
+    return (d / n) if n > 0 else d
+
+
 def decode_all_cells(h_flat, probe_mode2):
     """Decode every cell from activations.
 
@@ -111,6 +124,12 @@ if __name__ == "__main__":
                         default=["3,3", "0,3", "2,3"],
                         help="Target squares as 'row,col' pairs. Default: "
                              "(3,3) center, (0,3) edge, (2,3) intermediate.")
+    parser.add_argument("--mode", choices=["empty", "flip"], default="empty",
+                        help="empty: push toward 'empty' direction "
+                             "(filter to occupied positions). "
+                             "flip: push toward opposite color per position "
+                             "(also filtered to occupied positions, since "
+                             "'flip' is undefined on empty squares).")
     parser.add_argument("--output",
                         default="experiments/intervention_alpha_sweep/results.json")
     parser.add_argument("--raw-npz", default=None,
@@ -190,6 +209,7 @@ if __name__ == "__main__":
             "pos_start": args.pos_start, "pos_end": args.pos_end,
             "alphas": alphas, "squares": [list(s) for s in squares],
             "probe_mode": 2,
+            "mode": args.mode,
             "n_positions_total": int(N_total),
         },
         "squares": {},
@@ -199,14 +219,18 @@ if __name__ == "__main__":
 
     for (r, c) in squares:
         key = f"{r},{c}"
-        print(f"\n=== Target square ({r},{c}) ===")
+        print(f"\n=== Target square ({r},{c}) [mode={args.mode}] ===")
 
         # Build intervention direction for this square.
-        d_np = build_empty_direction(probe_mode2_np, r, c)
+        if args.mode == "empty":
+            d_np = build_empty_direction(probe_mode2_np, r, c)
+        else:  # flip
+            d_np = build_flip_direction(probe_mode2_np, r, c)
         direction = torch.from_numpy(d_np).to(device)   # (D,)
         print(f"  ||direction|| = {float(torch.linalg.norm(direction)):.4f}")
 
-        # Filter positions to those where this square is currently occupied.
+        # Filter positions to those where this square is currently occupied
+        # (both modes require this; 'flip' is undefined on empty squares).
         occupied_mask = (gt_slice[:, :, r, c] != 0).reshape(N_total)   # (N,)
         idx = np.flatnonzero(occupied_mask)
         n_keep = int(idx.size)
@@ -219,6 +243,15 @@ if __name__ == "__main__":
         h_subset = acts_flat[idx_t]                              # (n_keep, D)
         baseline_subset = baseline_preds[idx_t]                  # (n_keep, 8, 8)
 
+        # For flip mode: per-position sign. +1 if white (push -> black),
+        # -1 if black (push -> white). Norm is preserved since |+/-1| = 1.
+        if args.mode == "flip":
+            current_states = gt_slice[:, :, r, c].reshape(N_total)[idx]   # (n_keep,)
+            signs_np = np.where(current_states == 1, 1.0, -1.0).astype(np.float32)
+            signs = torch.from_numpy(signs_np).to(device).unsqueeze(1)    # (n_keep, 1)
+        else:
+            signs = None
+
         # Per-alpha flips.
         per_alpha = {"alpha": [], "flips_mean": [], "flips_std": [],
                      "flips_median": [], "flips_q25": [], "flips_q75": []}
@@ -226,7 +259,10 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             for a_i, alpha in enumerate(alphas):
-                h_intv = h_subset + alpha * direction              # (n_keep, D)
+                if signs is None:
+                    h_intv = h_subset + alpha * direction              # (n_keep, D)
+                else:
+                    h_intv = h_subset + (alpha * signs) * direction    # (n_keep, D)
                 preds = decode_all_cells(h_intv, probe_mode2)      # (n_keep, 8, 8)
                 # Flip count per position (any of 64 cells different from baseline).
                 flips = (preds != baseline_subset).sum(dim=(1, 2)).cpu().numpy()
