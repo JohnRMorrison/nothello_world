@@ -1,0 +1,8 @@
+Li top-N aggregate (n=29234, cal_depth=0, alpha=2.0, mode=fixed)
+================================================================
+
+| metric                            |   value |    std |
+|-----------------------------------|---------|--------|
+| mean Li top-N before intervention |  0.8822 | 0.0801 |
+| mean Li top-N after  intervention |  0.9315 | 0.1340 |
+| mean Li top-N shift               |  0.0493 |        |

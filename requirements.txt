@@ -1,0 +1,8 @@
+# Additional packages needed for the intervention experiments notebook
+# (notebooks/intervention_experiments.ipynb), on top of the base `othello`
+# conda environment (environment.yml).
+#
+# Install into the active env with:
+#   pip install -r requirements.txt
+tabulate>=0.9       # pretty ASCII tables for output saved to Intervention Results/
+nbformat>=5.0       # used by scripts/build_intervention_notebook.py to regenerate the notebook

@@ -1,0 +1,11 @@
+Mass-shift metrics aggregate (n=29235, cal_depth=0, alpha=2.0)
+==============================================================
+
+| metric                |    mean |    std |
+|-----------------------|---------|--------|
+| abs_dP_legal          |  0.0191 | 0.1319 |
+| P_before_newly_legal  |  0.0002 | 0.0039 |
+| abs_dP_newly_legal    |  0.0245 | 0.0549 |
+| abs_dP_newly_illegal  | -0.0399 | 0.0602 |
+| P_after_newly_illegal |  0.0396 | 0.0686 |
+| redistribution        |  0.0074 | 0.0272 |
