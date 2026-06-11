@@ -24,8 +24,18 @@ import torch.nn as nn
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
 )
-from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
+from hand_crafted_flanking import (
+    enumerate_flanking_patterns,
+    enumerate_flanking_patterns_color_specific,
+    MOVE_TO_IDX,
+)
 from generate_rule_games import precompute_pattern_arrays
+
+
+def precompute_movers_array(patterns):
+    """For color-specific patterns, extract the (n_patterns,) `mover` array
+    in {+1, -1}. Returns int8 numpy array."""
+    return np.array([p['mover'] for p in patterns], dtype=np.int8)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +68,43 @@ def compute_pattern_labels_batch(board_labels, positions,
         pattern_labels[idx] = fires.astype(np.float32)
 
     return pattern_labels
+
+
+def compute_pattern_labels_color_specific_batch(
+        board_labels, targets, terminals, opp_cells, opp_mask, movers):
+    """Vectorized labels for the 1920 color-specific patterns.
+
+    No parity used — patterns fire purely as a function of the absolute board
+    state. `movers` (1920,) ∈ {+1, -1} tags each pattern with its mover color.
+
+    A pattern with mover m fires when:
+      - target cell empty
+      - terminal cell holds an m piece
+      - all opponent cells hold (-m) pieces
+
+    board_labels: (N, 64) with values in {0=empty, 1=white, 2=black}.
+    Returns (N, len(targets)) float32.
+    """
+    n = len(board_labels)
+    # Convert labels to signed board: 0=empty, +1=black, -1=white.
+    flat = np.zeros((n, 64), dtype=np.int8)
+    flat[board_labels == 1] = -1
+    flat[board_labels == 2] = 1
+
+    target_empty = (flat[:, targets] == 0)             # (N, P)
+    terminal_val = flat[:, terminals]                   # (N, P)
+    opp_val = flat[:, opp_cells]                        # (N, P, max_opp)
+
+    # Per-pattern m and -m (broadcast over batch).
+    m = movers[None, :].astype(np.int8)                 # (1, P)
+    neg_m = (-m).astype(np.int8)                        # (1, P)
+
+    terminal_ok = (terminal_val == m)                   # (N, P)
+    # Opponent slots: either the slot is masked out OR holds -m.
+    opp_ok = ((opp_val == neg_m[:, :, None]) | ~opp_mask[None, :, :]).all(axis=2)  # (N, P)
+
+    fires = target_empty & terminal_ok & opp_ok
+    return fires.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +414,14 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           legal_weight=0.0, pattern_to_cell=None, loss_type="bce",
           feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
           pos_weight_end=None, listwise_weight=0.0,
-          chunk_prefix="chunk_"):
+          chunk_prefix="chunk_",
+          movers=None):
+    # When `movers` is provided we're in color-specific mode: labels are
+    # computed against absolute board state (no parity), patterns number
+    # 2 * 960, and the training is single-model regardless of `single_model`.
+    color_specific = movers is not None
+    if color_specific:
+        single_model = True
 
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -550,9 +604,14 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 odd_mask = ~even_mask
 
                 # Compute pattern labels per-batch (~6ms)
-                y_pat_np = compute_pattern_labels_batch(
-                    y_board.numpy(), pos.numpy(),
-                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+                if color_specific:
+                    y_pat_np = compute_pattern_labels_color_specific_batch(
+                        y_board.numpy(), pat_targets, pat_terminals,
+                        pat_opp_cells, pat_opp_mask, movers)
+                else:
+                    y_pat_np = compute_pattern_labels_batch(
+                        y_board.numpy(), pos.numpy(),
+                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
                 y_pat = torch.from_numpy(y_pat_np).to(device)
 
                 loss = torch.tensor(0.0, device=device)
@@ -631,9 +690,14 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
-                y_pat_np = compute_pattern_labels_batch(
-                    y_board.numpy(), pos.numpy(),
-                    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
+                if color_specific:
+                    y_pat_np = compute_pattern_labels_color_specific_batch(
+                        y_board.numpy(), pat_targets, pat_terminals,
+                        pat_opp_cells, pat_opp_mask, movers)
+                else:
+                    y_pat_np = compute_pattern_labels_batch(
+                        y_board.numpy(), pos.numpy(),
+                        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask)
                 y_pat = torch.from_numpy(y_pat_np).to(device)
 
                 if mode in ("direct", "randproj"):
@@ -690,6 +754,7 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 'best_pat_acc': best_acc,
                 'mode': mode,
                 'epoch': epoch,
+                'color_specific': color_specific,
             }, save_path)
             print(f"  Saved {save_path}", flush=True)
 
@@ -716,6 +781,11 @@ if __name__ == "__main__":
                         help="Use positive-only (half-normal) weights for random projection")
     parser.add_argument("--single-model", action="store_true",
                         help="Use ONE model for all positions (no even/odd split)")
+    parser.add_argument("--color-specific", action="store_true",
+                        help="Use 1920 color-specific patterns (absolute color "
+                             "encoding) instead of the 960 mine/yours patterns. "
+                             "Forces --single-model. Tests whether color-relative "
+                             "encoding is actually harder to learn.")
     parser.add_argument("--legal-weight", type=float, default=0.0,
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
     parser.add_argument("--pairwise-weight", type=float, default=0.0,
@@ -795,7 +865,14 @@ if __name__ == "__main__":
         input_dim = 60 * 60 * 3
     print(f"Features: {args.features} ({input_dim}-d)")
 
-    patterns = enumerate_flanking_patterns()
+    if args.color_specific:
+        patterns = enumerate_flanking_patterns_color_specific()
+        movers = precompute_movers_array(patterns)
+        print(f"  color-specific mode: 1920 patterns, single model, "
+              f"labels computed against absolute board state")
+    else:
+        patterns = enumerate_flanking_patterns()
+        movers = None
     pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
     pattern_to_cell = torch.tensor([MOVE_TO_IDX[p['target']] for p in patterns], dtype=torch.long)
     print(f"Device: {device}, Mode: {args.mode}, H={args.hidden}, {args.epochs} epochs")
@@ -814,6 +891,8 @@ if __name__ == "__main__":
             f"pattern_simple_randproj_s{args.seed}_H{args.hidden}_{dist_tag}{args.proj_scale:.2f}.pt")
     if args.pos_weight is not None:
         save_path = save_path.replace('.pt', f'_pw{int(args.pos_weight)}.pt')
+    if args.color_specific:
+        save_path = save_path.replace('.pt', '_colorspec.pt')
     if args.single_model:
         save_path = save_path.replace('.pt', '_single.pt')
     if args.legal_weight > 0:
@@ -835,5 +914,6 @@ if __name__ == "__main__":
           pairwise_weight=args.pairwise_weight, pairwise_margin=args.pairwise_margin,
           pos_weight_end=args.pos_weight_end,
           listwise_weight=args.listwise_weight,
-          chunk_prefix=args.chunk_prefix)
+          chunk_prefix=args.chunk_prefix,
+          movers=movers)
 
