@@ -23,7 +23,11 @@ import torch
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES,
 )
-from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
+from hand_crafted_flanking import (
+    enumerate_flanking_patterns,
+    enumerate_flanking_patterns_color_specific,
+    MOVE_TO_IDX,
+)
 from generate_rule_games import precompute_pattern_arrays
 from train_pattern_simple import (
     DirectMLP, EndToEndMLP, TwoStageMLP, compute_pattern_labels_batch,
@@ -175,6 +179,11 @@ if __name__ == "__main__":
     ckpt = torch.load(args.ckpt, map_location=device)
     n_patterns = ckpt.get('n_patterns', 960)
     input_dim = ckpt.get('input_dim', N_MOVES)
+    # Color-specific: 1920 outputs (960 black-mover + 960 white-mover), single MLP.
+    color_specific = ckpt.get('color_specific', False) or n_patterns == 1920
+    if color_specific:
+        print(f"  color-specific checkpoint detected: n_patterns={n_patterns}, "
+              f"single model, parity slices to 960 relevant patterns per position")
 
     # Infer features from input_dim if --features not specified
     if args.features is None:
@@ -207,11 +216,22 @@ if __name__ == "__main__":
     mo.load_state_dict(ckpt['odd']); mo.eval()
     print(f"Loaded {args.ckpt} (pat_acc={ckpt.get('best_pat_acc', '?')})")
 
-    patterns = enumerate_flanking_patterns()
-    pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
-    pattern_to_cell = torch.tensor(
-        [MOVE_TO_IDX[p['target']] for p in patterns],
-        dtype=torch.long, device=device)
+    if color_specific:
+        # Patterns are [first 960 black-mover, next 960 white-mover] in the
+        # canonical 960 ordering. For aggregation, we slice the 1920 outputs
+        # to the 960 matching the current mover and then use the standard
+        # pattern_to_cell / idx / mask mapping on the 960 standard patterns.
+        patterns = enumerate_flanking_patterns()
+        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
+        pattern_to_cell = torch.tensor(
+            [MOVE_TO_IDX[p['target']] for p in patterns],
+            dtype=torch.long, device=device)
+    else:
+        patterns = enumerate_flanking_patterns()
+        pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask = precompute_pattern_arrays(patterns)
+        pattern_to_cell = torch.tensor(
+            [MOVE_TO_IDX[p['target']] for p in patterns],
+            dtype=torch.long, device=device)
     idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
 
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
@@ -293,7 +313,17 @@ if __name__ == "__main__":
             yb = Y[i:i + batch]
             p = pos[i:i + batch]
             em = (p % 2 == 0); om = ~em
-            if args.mode in ("direct", "randproj"):
+            if color_specific:
+                # Single model, 1920 outputs. Per-position parity slice:
+                # om (pos%2==1, black to move) -> patterns[:960] (mover=+1)
+                # em (pos%2==0, white to move) -> patterns[960:] (mover=-1)
+                full = me(x)                                 # (B, 1920)
+                pl = torch.zeros(len(x), 960, device=device)
+                if om.any():
+                    pl[om] = full[om, :960]
+                if em.any():
+                    pl[em] = full[em, 960:]
+            elif args.mode in ("direct", "randproj"):
                 pl = torch.zeros(len(x), 960, device=device)
                 if em.any(): pl[em] = me(x[em])
                 if om.any(): pl[om] = mo(x[om])

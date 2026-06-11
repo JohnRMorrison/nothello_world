@@ -32,6 +32,40 @@ DIRECTIONS = [
 ]
 
 
+def enumerate_flanking_patterns_color_specific():
+    """Enumerate 1920 color-specific flanking patterns (2 * the standard 960).
+
+    Returns the same patterns as `enumerate_flanking_patterns()` but each
+    pattern is duplicated for the two possible mover colors. Each pattern is
+    tagged with a `mover` field in {+1, -1}:
+      - mover = +1 (black is moving): opponent cells contain WHITE pieces (-1),
+                                       terminal contains a BLACK piece (+1).
+      - mover = -1 (white is moving): opponent cells contain BLACK pieces (+1),
+                                       terminal contains a WHITE piece (-1).
+
+    Patterns fire based on absolute spatial color configurations only — no
+    parity (whose-turn-it-is) interpretation needed. This is the comparison
+    point for "is color-relative encoding actually harder to learn?"
+
+    Order: first 960 patterns are the mover=+1 (black) versions, then 960
+    mover=-1 (white) versions, both in the same order as the original 960
+    pattern enumeration.
+    """
+    base = enumerate_flanking_patterns()
+    out = []
+    for mover in (+1, -1):
+        for p in base:
+            out.append({
+                'target': p['target'],
+                'opponents': p['opponents'],
+                'terminal': p['terminal'],
+                'direction': p['direction'],
+                'length': p['length'],
+                'mover': mover,
+            })
+    return out
+
+
 def enumerate_flanking_patterns():
     """Enumerate all valid flanking patterns on the board.
 
