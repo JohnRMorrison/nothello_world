@@ -415,7 +415,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           feature_fn=None, pairwise_weight=0.0, pairwise_margin=1.0,
           pos_weight_end=None, listwise_weight=0.0,
           chunk_prefix="chunk_",
-          movers=None):
+          movers=None,
+          resume_path=None):
     # When `movers` is provided we're in color-specific mode: labels are
     # computed against absolute board state (no parity), patterns number
     # 2 * 960, and the training is single-model regardless of `single_model`.
@@ -543,6 +544,27 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.75, patience=1)
 
+    # Resume from a prior checkpoint if requested. Loads model weights,
+    # optimizer state, scheduler state, and the epoch counter so training
+    # continues cleanly from where it left off.
+    start_epoch = 1
+    if resume_path is not None and os.path.exists(resume_path):
+        rckpt = torch.load(resume_path, map_location=device)
+        model_even.load_state_dict(rckpt['even'])
+        if model_odd is not model_even:
+            model_odd.load_state_dict(rckpt['odd'])
+        if 'optimizer' in rckpt:
+            optimizer.load_state_dict(rckpt['optimizer'])
+        else:
+            print(f"  WARNING: resume checkpoint has no optimizer state; "
+                  f"training will warm-restart Adam moments")
+        if 'scheduler' in rckpt:
+            scheduler.load_state_dict(rckpt['scheduler'])
+        start_epoch = int(rckpt.get('epoch', 0)) + 1
+        prev_best = float(rckpt.get('best_pat_acc', 0.0))
+        print(f"  RESUMED from {resume_path} at epoch {start_epoch}, "
+              f"prior best_pat_acc={prev_best:.4%}")
+
     # Load eval data. Chunks are position-sorted, so a head slice lands
     # in one narrow position bucket (positions 5-6 in practice). Take a
     # deterministic random sample across all positions so metrics are
@@ -566,9 +588,12 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
     print(f"  Eval samples: {len(ev_X)} (random across positions)")
 
     best_acc = 0.0
+    if resume_path is not None and os.path.exists(resume_path):
+        best_acc = float(torch.load(resume_path, map_location='cpu')
+                         .get('best_pat_acc', 0.0))
     best_state = None
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # Scheduled pos_weight (linear from pw_start to pw_end)
         if pos_weight is not None and pw_end != pw_start:
             frac = (epoch - 1) / max(epochs - 1, 1)
@@ -755,6 +780,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                 'mode': mode,
                 'epoch': epoch,
                 'color_specific': color_specific,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
             }, save_path)
             print(f"  Saved {save_path}", flush=True)
 
@@ -786,6 +813,10 @@ if __name__ == "__main__":
                              "encoding) instead of the 960 mine/yours patterns. "
                              "Forces --single-model. Tests whether color-relative "
                              "encoding is actually harder to learn.")
+    parser.add_argument("--resume", default=None,
+                        help="Path to a prior checkpoint. Loads model weights, "
+                             "optimizer state, scheduler state, and resumes from "
+                             "epoch+1.")
     parser.add_argument("--legal-weight", type=float, default=0.0,
                         help="Weight on direct legal-cell BCE loss (logsumexp-aggregated)")
     parser.add_argument("--pairwise-weight", type=float, default=0.0,
@@ -915,5 +946,6 @@ if __name__ == "__main__":
           pos_weight_end=args.pos_weight_end,
           listwise_weight=args.listwise_weight,
           chunk_prefix=args.chunk_prefix,
-          movers=movers)
+          movers=movers,
+          resume_path=args.resume)
 
