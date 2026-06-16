@@ -33,4 +33,5 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_pattern_simple.py \
     --features when+even \
     --epochs 3 \
     --color-specific \
+    --chunk-prefix chunk_ext_ \
     --resume $CKPT
