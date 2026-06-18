@@ -23,6 +23,7 @@ import argparse
 import csv
 import os
 import sys
+import zipfile
 import numpy as np
 import torch
 
@@ -35,29 +36,84 @@ from compare_node_heuristics import (
 )
 
 
-def load_eval(chunk_dir, chunk_prefix):
-    """Load the last chunk (eval) and return X (when+even sliced), positions."""
+def _stream_array_sample(npz_path, member, sample_idx, n_features):
+    """Stream-read npz member, keeping only rows at sample_idx (sorted asc).
+    Avoids loading the whole array into memory.
+    """
+    sample_idx = np.asarray(sample_idx, dtype=np.int64)
+    with zipfile.ZipFile(npz_path) as z:
+        with z.open(member) as fp:
+            version = np.lib.format.read_magic(fp)
+            shape, _, dtype = np.lib.format._read_array_header(fp, version)
+            assert len(shape) in (1, 2)
+            if len(shape) == 2:
+                assert shape[1] == n_features, \
+                    f"Expected {n_features} features, got {shape[1]}"
+            row_bytes = n_features * dtype.itemsize if len(shape) == 2 else dtype.itemsize
+            out = np.zeros((len(sample_idx), n_features) if len(shape) == 2
+                           else (len(sample_idx),), dtype=dtype)
+            current_row = 0
+            for out_idx, sidx in enumerate(sample_idx):
+                skip = int(sidx) - current_row
+                if skip > 0:
+                    # Read+discard skip rows (zip streams can't seek)
+                    remaining = skip * row_bytes
+                    while remaining > 0:
+                        chunk = fp.read(min(remaining, 64 * 1024 * 1024))
+                        if not chunk:
+                            raise EOFError(f"Unexpected EOF skipping rows in {member}")
+                        remaining -= len(chunk)
+                buf = fp.read(row_bytes)
+                if len(buf) != row_bytes:
+                    raise EOFError(f"Unexpected EOF reading row {sidx} in {member}")
+                if len(shape) == 2:
+                    out[out_idx] = np.frombuffer(buf, dtype=dtype)
+                else:
+                    out[out_idx] = np.frombuffer(buf, dtype=dtype)[0]
+                current_row = int(sidx) + 1
+    return out
+
+
+def _read_npz_shape(npz_path, member):
+    with zipfile.ZipFile(npz_path) as z:
+        with z.open(member) as fp:
+            version = np.lib.format.read_magic(fp)
+            shape, _, _ = np.lib.format._read_array_header(fp, version)
+    return shape
+
+
+def load_eval(chunk_dir, chunk_prefix, n_sample=49 * 10000):
+    """Stream-load a random sample from the last chunk (eval). Returns
+    X (when+even sliced) and positions, both as np arrays of size n_sample.
+    Never loads the full chunk into memory.
+    """
     files = sorted(f for f in os.listdir(chunk_dir)
                    if f.startswith(chunk_prefix) and f.endswith('.npz')
                    and '_patterns' not in f and '_when60' not in f)
     if not files:
         raise FileNotFoundError(f"No {chunk_prefix}*.npz in {chunk_dir}")
     eval_path = os.path.join(chunk_dir, files[-1])
-    print(f"Loading eval chunk: {eval_path}")
-    data = np.load(eval_path)
-    X_full = data['features'].astype(np.float32)  # (N, 180)
-    pos = data['positions'].astype(np.int64)      # (N,)
+    print(f"Streaming eval chunk: {eval_path}")
 
-    # Slice to when+even features (indices 60..179)
-    X = X_full[:, 60:180]
-    print(f"  raw eval shape: {X.shape}, positions in [{pos.min()}, {pos.max()}]")
+    # Read shape from header without loading data
+    feat_shape = _read_npz_shape(eval_path, 'features.npy')
+    N_total, F = feat_shape
+    n_sample = min(n_sample, N_total)
+    print(f"  full chunk shape: {feat_shape}, sampling {n_sample}")
 
-    # Match training eval sampling: at most 49*10000 random positions
-    n_eval = min(len(X), 49 * 10000)
+    # Choose sample indices, sorted so we can stream-skip
     rng = np.random.RandomState(0)
-    idx = np.sort(rng.choice(len(X), n_eval, replace=False))
-    X, pos = X[idx], pos[idx]
-    print(f"  sampled eval shape: {X.shape}")
+    idx = np.sort(rng.choice(N_total, n_sample, replace=False))
+
+    # Stream-read just those rows
+    print(f"  reading features...")
+    X_full = _stream_array_sample(eval_path, 'features.npy', idx, F).astype(np.float32)
+    print(f"  reading positions...")
+    pos = _stream_array_sample(eval_path, 'positions.npy', idx, 1).astype(np.int64)
+
+    # Slice features to when+even
+    X = X_full[:, 60:180]
+    print(f"  sampled X shape: {X.shape}")
     return X, pos
 
 
