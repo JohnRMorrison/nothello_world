@@ -145,6 +145,48 @@ def find_minimal_input_sets(W1, b1, W2, b2, p_idx, candidates, input_dim,
     return minimal_sets, by_size, elapsed_per_K
 
 
+def classify_inhibitors(W2, b2, p_idx, h_S, h_default):
+    """Classify hidden nodes by their inhibitory role for pattern p under input S.
+
+    W2[p, j] < 0 means j inhibits p when firing.
+
+    Returns dict:
+      inhibitors_firing_S         : j with W2[p,j]<0 AND h_j(S)>0
+                                    (currently pushing p down)
+      inhibitors_silent_S         : j with W2[p,j]<0 AND h_j(S)==0
+                                    (currently silent)
+      inhibitors_firing_default   : j with W2[p,j]<0 AND h_j(default)>0
+                                    (would inhibit on empty input)
+      silenced_by_S               : j with W2[p,j]<0 AND h_j(default)>0 AND h_j(S)==0
+                                    (S specifically silenced these inhibitors)
+      newly_activated_by_S        : j with W2[p,j]<0 AND h_j(default)==0 AND h_j(S)>0
+                                    (S brought these inhibitors online)
+      inhibition_overcome         : sum_{j in inhibitors_firing_S} |W2[p,j] * h_j(S)|
+                                    (magnitude of current downward pressure)
+    """
+    W2_p = W2[p_idx]
+    inh_mask = W2_p < 0
+    firing_S_mask = h_S > 0
+    firing_default_mask = h_default > 0
+
+    inh_firing_S = np.where(inh_mask & firing_S_mask)[0]
+    inh_silent_S = np.where(inh_mask & ~firing_S_mask)[0]
+    inh_firing_default = np.where(inh_mask & firing_default_mask)[0]
+    silenced_by_S = np.where(inh_mask & firing_default_mask & ~firing_S_mask)[0]
+    newly_activated_by_S = np.where(inh_mask & ~firing_default_mask & firing_S_mask)[0]
+
+    inhibition_overcome = float(np.abs(W2_p[inh_firing_S] * h_S[inh_firing_S]).sum())
+
+    return {
+        'inhibitors_firing_S': frozenset(int(j) for j in inh_firing_S),
+        'inhibitors_silent_S': frozenset(int(j) for j in inh_silent_S),
+        'inhibitors_firing_default': frozenset(int(j) for j in inh_firing_default),
+        'silenced_by_S': frozenset(int(j) for j in silenced_by_S),
+        'newly_activated_by_S': frozenset(int(j) for j in newly_activated_by_S),
+        'inhibition_overcome': inhibition_overcome,
+    }
+
+
 def find_minimal_hidden_subsets(W2, b2, p_idx, h, max_K_hidden=None):
     """For a fixed hidden activation vector h, find minimal subsets of
     positive-contributing firing nodes whose contributions sum > -b2[p].
@@ -235,6 +277,9 @@ def main():
     candidates = get_candidates(W1, W2, b2, args.pattern_idx, args.features)
     print(f"Positive-contribution candidates: {len(candidates)}", flush=True)
 
+    # Compute default hidden activation (empty input) once -- used for inhibitor classification
+    h_default = np.maximum(b1.copy(), 0)
+
     if b2[args.pattern_idx] > 0:
         # Fires by default; "minimal sufficient input" is the empty set
         result = {
@@ -251,12 +296,14 @@ def main():
         h = np.maximum(W1 @ x + b1, 0)
         K_min_h, hidden_subsets = find_minimal_hidden_subsets(
             W2, b2, args.pattern_idx, h, args.max_k_hidden)
+        inhibitor_info = classify_inhibitors(W2, b2, args.pattern_idx, h, h_default)
         result['per_S_data'][frozenset()] = {
             'h_S': h.astype(np.float32) if args.save_h else None,
             'firing_count': int((h > 0).sum()),
             'positive_contrib_nodes': int(((W2[args.pattern_idx] * h) > 0).sum()),
             'K_min_hidden': K_min_h,
             'hidden_minimal_subsets': hidden_subsets,
+            'inhibitor_info': inhibitor_info,
         }
         with gzip.open(args.output, 'wb') as f:
             pickle.dump(result, f)
@@ -311,12 +358,14 @@ def main():
         h = np.maximum(z, 0)
         K_min_h, hidden_subsets = find_minimal_hidden_subsets(
             W2, b2, args.pattern_idx, h, args.max_k_hidden)
+        inhibitor_info = classify_inhibitors(W2, b2, args.pattern_idx, h, h_default)
         per_S_data[s] = {
             'h_S': h.astype(np.float32) if args.save_h else None,
             'firing_count': int((h > 0).sum()),
             'positive_contrib_nodes': int(((W2[args.pattern_idx] * h) > 0).sum()),
             'K_min_hidden': K_min_h,
             'hidden_minimal_subsets': hidden_subsets,
+            'inhibitor_info': inhibitor_info,
         }
         if args.verbose and (s_idx + 1) % 100 == 0:
             print(f"  {s_idx+1}/{len(minimal_input_sets)}", flush=True)
