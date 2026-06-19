@@ -416,7 +416,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           pos_weight_end=None, listwise_weight=0.0,
           chunk_prefix="chunk_",
           movers=None,
-          resume_path=None):
+          resume_path=None,
+          l1_weight=0.0):
     # When `movers` is provided we're in color-specific mode: labels are
     # computed against absolute board state (no parity), patterns number
     # 2 * 960, and the training is single-model regardless of `single_model`.
@@ -690,6 +691,18 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                             loss = loss + legal_weight * nn.functional.binary_cross_entropy_with_logits(
                                 cell_logits, cell_labels)
 
+                # L1 penalty on weights only (not biases) — produces sparse models
+                if l1_weight > 0:
+                    l1 = 0.0
+                    for n_p, p in model_even.named_parameters():
+                        if 'weight' in n_p and p.requires_grad:
+                            l1 = l1 + p.abs().sum()
+                    if model_odd is not model_even:
+                        for n_p, p in model_odd.named_parameters():
+                            if 'weight' in n_p and p.requires_grad:
+                                l1 = l1 + p.abs().sum()
+                    loss = loss + l1_weight * l1
+
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -813,6 +826,9 @@ if __name__ == "__main__":
                              "encoding) instead of the 960 mine/yours patterns. "
                              "Forces --single-model. Tests whether color-relative "
                              "encoding is actually harder to learn.")
+    parser.add_argument("--l1-weight", type=float, default=0.0,
+                        help="L1 penalty coefficient on weights (not biases) for "
+                             "producing sparse models. Typical 1e-4 .. 1e-2.")
     parser.add_argument("--resume", default=None,
                         help="Path to a prior checkpoint. Loads model weights, "
                              "optimizer state, scheduler state, and resumes from "
@@ -932,6 +948,8 @@ if __name__ == "__main__":
         save_path = save_path.replace('.pt', f'_listw{args.listwise_weight:g}.pt')
     if args.loss != "bce":
         save_path = save_path.replace('.pt', f'_{args.loss}.pt')
+    if args.l1_weight > 0:
+        save_path = save_path.replace('.pt', f'_l1{args.l1_weight:g}.pt')
 
     train(chunk_dir, device, input_dim, args.hidden, args.mode,
           feature_cols, pat_targets, pat_terminals, pat_opp_cells, pat_opp_mask,
@@ -947,5 +965,6 @@ if __name__ == "__main__":
           listwise_weight=args.listwise_weight,
           chunk_prefix=args.chunk_prefix,
           movers=movers,
-          resume_path=args.resume)
+          resume_path=args.resume,
+          l1_weight=args.l1_weight)
 
