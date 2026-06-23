@@ -696,11 +696,11 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
                     l1 = 0.0
                     for n_p, p in model_even.named_parameters():
                         if 'weight' in n_p and p.requires_grad:
-                            l1 = l1 + p.abs().sum()
+                            l1 = l1 + p.abs().mean()
                     if model_odd is not model_even:
                         for n_p, p in model_odd.named_parameters():
                             if 'weight' in n_p and p.requires_grad:
-                                l1 = l1 + p.abs().sum()
+                                l1 = l1 + p.abs().mean()
                     loss = loss + l1_weight * l1
 
                 optimizer.zero_grad()
