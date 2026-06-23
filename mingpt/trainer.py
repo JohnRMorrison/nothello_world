@@ -70,7 +70,16 @@ class Trainer:
 
             losses = []
             pbar = tqdm(enumerate(loader), total=len(loader)) if is_train else enumerate(loader)
-            for it, (x, y) in pbar:
+            for it, batch in pbar:
+                # Dataset may yield (x, y) or (x, y, attn_mask).  The third
+                # element, when present, is a per-sample attention mask used
+                # by v3 training (non-causal pattern).
+                if len(batch) == 3:
+                    x, y, attn_mask = batch
+                    attn_mask = attn_mask.to(self.device)
+                else:
+                    x, y = batch
+                    attn_mask = None
 
                 # place data on the correct device
                 x = x.to(self.device)  # [B, T]
@@ -78,7 +87,10 @@ class Trainer:
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
-                    logits, loss = model(x, y)
+                    if attn_mask is not None:
+                        logits, loss = model(x, y, attn_mask=attn_mask)
+                    else:
+                        logits, loss = model(x, y)
                     loss = loss.mean() # collapse all losses if they are scattered on multiple gpus
                     losses.append(loss.item())
 
