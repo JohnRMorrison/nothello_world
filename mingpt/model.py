@@ -52,7 +52,11 @@ class CausalSelfAttention(nn.Module):
                                      .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
 
-    def forward(self, x, layer_past=None, only_last=-1):
+    def forward(self, x, layer_past=None, only_last=-1, attn_mask=None):
+        """If attn_mask is provided (shape [B, T, T] or [B, 1, T, T]),
+        it replaces the default causal mask.  1 = attend, 0 = mask out.
+        Used by training setups that need non-causal patterns (e.g. v3
+        shuffled-prefix with per-sample masks)."""
         B, T, C = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -62,7 +66,12 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+        if attn_mask is None:
+            att = att.masked_fill(self.mask[:,:,:T,:T] == 0, float('-inf'))
+        else:
+            if attn_mask.dim() == 3:
+                attn_mask = attn_mask.unsqueeze(1)  # (B, 1, T, T) broadcasts over heads
+            att = att.masked_fill(attn_mask == 0, float('-inf'))
         if only_last != -1:
             att[:, :, -only_last:, :-only_last] = float('-inf')
         att = F.softmax(att, dim=-1)
@@ -88,8 +97,8 @@ class Block(nn.Module):
             nn.Dropout(config.resid_pdrop),
         )
 
-    def forward(self, x, return_att=False, only_last=-1):
-        updt, att = self.attn(self.ln1(x), only_last=only_last)
+    def forward(self, x, return_att=False, only_last=-1, attn_mask=None):
+        updt, att = self.attn(self.ln1(x), only_last=only_last, attn_mask=attn_mask)
         x = x + updt
         x = x + self.mlp(self.ln2(x))
         if return_att:
@@ -177,7 +186,10 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, attn_mask=None):
+        """attn_mask (optional): per-sample mask of shape [B, T, T] or
+        [B, 1, T, T].  When provided, REPLACES the default triangular causal
+        mask in every block.  Used for non-causal training regimes."""
         b, t = idx.size()  # both of shape [B, T]
         assert t <= self.block_size, "Cannot forward, model block size is exhausted."
 
@@ -185,7 +197,11 @@ class GPT(nn.Module):
         token_embeddings = self.tok_emb(idx) # each index maps to a (learnable) vector
         position_embeddings = self.pos_emb[:, :t, :] # each position maps to a (learnable) vector
         x = self.drop(token_embeddings + position_embeddings)
-        x = self.blocks(x)
+        if attn_mask is None:
+            x = self.blocks(x)
+        else:
+            for block in self.blocks:
+                x = block(x, attn_mask=attn_mask)
         x = self.ln_f(x)  # [B, T, f]
         logits = self.head(x)  # [B, T, # Words]
         # if we are given some desired targets also calculate the loss
