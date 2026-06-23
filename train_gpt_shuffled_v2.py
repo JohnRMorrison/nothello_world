@@ -53,11 +53,16 @@ class ShuffledPrefixDataset(Dataset):
     """For each game produces one (shuffled, parity-tagged prefix, next-move)
     sample per epoch.  Prefix length k is resampled fresh every call.
 
-    Vocab encoding:  token_id = cell_index + 60 * (move_index % 2)
-                     pad      = 120
+    Vocab encoding (index 0 is pad/ignore — matches the model's hardcoded
+    F.cross_entropy(..., ignore_index=0) at mingpt/model.py:194):
+        0           pad (and y ignore)
+        1..60       cells with parity 0
+        61..120     cells with parity 1
+        VOCAB_SIZE = 121
+        token_id = 1 + cell_index + 60 * (move_index % 2)
     """
 
-    PAD_ID = 120
+    PAD_ID = 0
     VOCAB_SIZE = 121
     MIN_K = 4    # minimum prefix length (so the model has some context)
 
@@ -92,12 +97,13 @@ class ShuffledPrefixDataset(Dataset):
         else:
             k = random.randint(self.MIN_K, max_k)
 
-        # Parity-tag the first k moves: token = cell + 60 * (i%2)
+        # Parity-tag the first k moves: token = 1 + cell + 60 * (i%2)
+        # (the +1 shift reserves 0 for pad/ignore — see class docstring)
         tagged = []
         for i in range(k):
             cell = self.cell_stoi[game[i]]
             parity = i % 2
-            tagged.append(cell + 60 * parity)
+            tagged.append(1 + cell + 60 * parity)
 
         # Shuffle the tagged tokens
         random.shuffle(tagged)
@@ -105,11 +111,12 @@ class ShuffledPrefixDataset(Dataset):
         # Target: M_{k+1}, tagged with its original parity k%2
         target_cell = self.cell_stoi[game[k]]
         target_parity = k % 2
-        target_id = target_cell + 60 * target_parity
+        target_id = 1 + target_cell + 60 * target_parity
 
-        # Pad input on the right; target only at position k-1
+        # Pad input on the right; target only at position k-1.
+        # PAD_ID == 0 and y-fill == 0 so the model's ignore_index=0 picks them up.
         x = tagged + [self.PAD_ID] * (self.max_prefix_len - k)
-        y = [-100] * self.max_prefix_len
+        y = [0] * self.max_prefix_len
         # Position k-1 is the last real input token; its output predicts the
         # next token, which we set to M_{k+1}.
         y[k - 1] = target_id
@@ -151,6 +158,14 @@ def main():
     mconf = GPTConfig(ShuffledPrefixDataset.VOCAB_SIZE, max_prefix_len,
                       n_layer=8, n_head=8, n_embd=512)
     model = GPT(mconf)
+
+    load_ckpt = os.environ.get('LOAD_CKPT', '')
+    if load_ckpt:
+        print(f"Loading existing weights from {load_ckpt}")
+        state = torch.load(load_ckpt, map_location='cpu')
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"  load_state_dict: missing={missing}, unexpected={unexpected}")
 
     t_start = time.strftime("%Y%m%d_%H%M%S")
     tag = f"_{ckpt_tag}" if ckpt_tag else ""

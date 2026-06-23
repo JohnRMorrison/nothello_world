@@ -32,6 +32,7 @@ echo "============================================"
 
 EPOCHS=${EPOCHS:-50} BATCH_SIZE=${BATCH_SIZE:-4096} \
     NUM_WORKERS=${NUM_WORKERS:-16} MAX_PREFIX_LEN=${MAX_PREFIX_LEN:-40} \
+    LOAD_CKPT=${LOAD_CKPT:-} \
     python train_gpt_shuffled_v2.py
 
 echo "Completed at: $(date)"
