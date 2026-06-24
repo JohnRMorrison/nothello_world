@@ -30,9 +30,19 @@ echo "EPOCHS=${EPOCHS:-20}  BATCH_SIZE=${BATCH_SIZE:-1024}"
 echo "Started at: $(date)"
 echo "============================================"
 
+# If LOAD_CKPT isn't explicitly set, pick up the most recent v4 ckpt so
+# this script can be safely re-run as part of a dependency chain.
+if [ -z "${LOAD_CKPT:-}" ]; then
+    LATEST_CKPT=$(ls -t ckpts/gpt_shuffled_v4_*.ckpt 2>/dev/null | head -1)
+    if [ -n "$LATEST_CKPT" ]; then
+        echo "Auto-resuming from latest checkpoint: $LATEST_CKPT"
+        LOAD_CKPT="$LATEST_CKPT"
+    fi
+fi
+
 EPOCHS=${EPOCHS:-20} BATCH_SIZE=${BATCH_SIZE:-1024} \
     NUM_WORKERS=${NUM_WORKERS:-16} \
-    LOAD_CKPT=${LOAD_CKPT:-} \
+    LOAD_CKPT="${LOAD_CKPT:-}" \
     python train_gpt_shuffled_v4.py
 
 echo "Completed at: $(date)"
