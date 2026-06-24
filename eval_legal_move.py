@@ -151,14 +151,23 @@ def predict_original_full_game(model, game, train_dataset, device):
 # ---------- Top-K decoding ----------
 
 def topk_cells_v234(logits_vec, cell_stoi_inv, k=5):
-    """Decode top-k token predictions to original cell values.  Returns a list
-    of length <=k, with None for invalid tokens (pad/QUERY)."""
-    topk = logits_vec.topk(min(k * 2, logits_vec.numel()))  # extra to filter invalid
-    out = []
-    for tok in topk.indices.tolist():
+    """Decode top-k UNIQUE cell predictions from the model's logits.
+
+    The v2/v3/v4 vocab encodes each cell twice (once per parity tag), so
+    the raw argmax could pick the same cell at two parities and we'd be
+    counting it twice.  We sort the cell logits (after collapsing parity)
+    and return the top-k distinct cells.
+    """
+    # Sort all token logits descending; walk down, dedup by cell.
+    sorted_tokens = logits_vec.argsort(descending=True).tolist()
+    out, seen = [], set()
+    for tok in sorted_tokens:
         if tok == 0 or tok > 120:
+            continue   # pad or QUERY token
+        cell_idx = (tok - 1) % 60   # parity-agnostic cell index
+        if cell_idx in seen:
             continue
-        cell_idx = (tok - 1) % 60
+        seen.add(cell_idx)
         out.append(cell_stoi_inv[cell_idx])
         if len(out) >= k:
             break
@@ -166,9 +175,11 @@ def topk_cells_v234(logits_vec, cell_stoi_inv, k=5):
 
 
 def topk_cells_original(logits_vec, train_dataset, k=5):
-    topk = logits_vec.topk(min(k * 2, logits_vec.numel()))
+    """Original Othello-GPT has one token per cell (no parity duplication),
+    so no dedup needed.  We still walk past the -100 sentinel."""
+    sorted_tokens = logits_vec.argsort(descending=True).tolist()
     out = []
-    for tok in topk.indices.tolist():
+    for tok in sorted_tokens:
         if tok == 0:
             continue  # the -100 sentinel
         out.append(train_dataset.itos[tok])
