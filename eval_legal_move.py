@@ -23,6 +23,7 @@ Usage:
 """
 import argparse
 import os
+import pickle
 import random
 import sys
 
@@ -31,10 +32,35 @@ import torch
 from tqdm import tqdm
 
 sys.path.insert(0, '.')
-from data import get_othello
 from data.othello import OthelloBoardState
-from mingpt.dataset import CharDataset
 from mingpt.model import GPT, GPTConfig
+
+
+# ----- Memory-efficient pickle loading (bypasses get_othello which loads 23M games) -----
+
+def load_val_games(num_files=2, data_dir='./data/othello_synthetic'):
+    """Load games from the LAST `num_files` pickle files in data_dir.
+    Each pickle file contains ~100K games; 2 files is plenty for eval.
+    Skips the full 23M-game dedup load in get_othello()."""
+    files = sorted(os.listdir(data_dir))
+    games = []
+    for fname in files[-num_files:]:
+        path = os.path.join(data_dir, fname)
+        with open(path, 'rb') as f:
+            batch = pickle.load(f)
+        if len(batch) >= 9e4:
+            games.extend(batch)
+    return games
+
+
+def build_original_vocab(games):
+    """Reconstruct CharDataset's stoi/itos from a sample of games.  The
+    convention is: sorted(unique tokens + {-100}); -100 gets index 0."""
+    import itertools
+    chars = sorted(list(set(list(itertools.chain.from_iterable(games)))) + [-100])
+    stoi = {ch: i for i, ch in enumerate(chars)}
+    itos = {i: ch for i, ch in enumerate(chars)}
+    return stoi, itos
 
 # Per-variant model config used at training time.
 VARIANT_CONFIG = {
@@ -233,8 +259,10 @@ def main():
     ap.add_argument('--variant', choices=list(VARIANT_CONFIG), required=True)
     ap.add_argument('--ckpt', required=True)
     ap.add_argument('--num-games', type=int, default=500)
+    ap.add_argument('--num-pickle-files', type=int, default=2,
+                    help='How many val pickle files to load (~100K games each)')
+    ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--data-root', default=None)
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -245,18 +273,26 @@ def main():
     print(f"Device: {device}")
     print(f"Variant: {args.variant}  ckpt: {args.ckpt}")
 
-    print("Loading Othello dataset (val split)...")
-    othello = get_othello(ood_num=-1, data_root=args.data_root, wthor=True)
-    val_games = othello.val
-    print(f"  {len(val_games)} val games available")
+    print(f"Loading val games from {args.num_pickle_files} pickle file(s) "
+          f"in {args.data_dir}...")
+    val_games = load_val_games(num_files=args.num_pickle_files,
+                               data_dir=args.data_dir)
+    print(f"  {len(val_games)} val games loaded")
 
-    # Build the helper (cell_stoi for v2/v3/v4, train_dataset for original)
+    # Build helper.  cell_stoi for v2/v3/v4; (stoi, itos) for original.
     if args.variant == 'original':
-        print("Building CharDataset (matches train-time stoi/itos)...")
-        helper = CharDataset(othello)
+        print("Building original Othello-GPT vocab (stoi/itos)...")
+        stoi, itos = build_original_vocab(val_games)
+        # Wrap in a tiny shim so the existing predict_original / topk paths
+        # don't need changes — they only use .stoi and .itos.
+        class _Shim:
+            pass
+        helper = _Shim()
+        helper.stoi = stoi
+        helper.itos = itos
     else:
-        print("Building cell_stoi from training games...")
-        helper = build_cell_stoi(othello.sequences)
+        print("Building cell_stoi from val games...")
+        helper = build_cell_stoi(val_games)
 
     model = load_model(args.variant, args.ckpt, device)
     n_params = sum(p.numel() for p in model.parameters())
