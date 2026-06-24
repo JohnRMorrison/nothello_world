@@ -190,17 +190,32 @@ def topk_cells_original(logits_vec, train_dataset, k=5):
 
 # ---------- Main eval loop ----------
 
-def evaluate(model, variant, val_games, helper, device, num_games):
-    """helper: cell_stoi (v2/v3/v4) or train_dataset (original)."""
+def evaluate(model, variant, val_games, helper, device, num_games,
+             pos_start=5, pos_end=54):
+    """helper: cell_stoi (v2/v3/v4) or train_dataset (original).
+
+    Predictions are scored only when the predicted move index m satisfies
+    pos_start <= m < pos_end (matching ogpt_topk_legal.py).  Set
+    pos_start=0, pos_end=999 to evaluate every position."""
     if variant == 'original':
         train_dataset = helper
     else:
         cell_stoi = helper
         cell_stoi_inv = {i: c for c, i in cell_stoi.items()}
 
-    totals = {'n': 0, 'legal1': 0, 'legal3': 0, 'legal5': 0,
-              'top1': 0, 'top3': 0, 'top5': 0}
-    by_phase = {'early': dict(totals), 'mid': dict(totals), 'late': dict(totals)}
+    # Per-position bookkeeping.  Mirrors compare_aggregators.score_from_cs:
+    # legal_c[n] = total # of top-min(n, K) predictions that were legal
+    # legal_t[n] = total # of slots (min(n, K)) summed across positions
+    # legal-frac-topn = legal_c[n] / legal_t[n]  (the project's headline metric)
+    # We also keep "match-actual" (is the actually-played move in top-n).
+    top_ns = (1, 3, 5, 10)
+    def fresh():
+        return {'n': 0,
+                **{f'legal_c_{n}': 0 for n in top_ns},
+                **{f'legal_t_{n}': 0 for n in top_ns},
+                **{f'match_{n}': 0 for n in top_ns}}
+    totals = fresh()
+    by_phase = {'early': fresh(), 'mid': fresh(), 'late': fresh()}
 
     games = val_games[:num_games]
     for game in tqdm(games, desc=f"eval {variant}"):
@@ -219,53 +234,39 @@ def evaluate(model, variant, val_games, helper, device, num_games):
         board = OthelloBoardState()
         for m in range(N):
             # Evaluate prediction of game[m] given context game[:m].
-            if m > 0:
+            if pos_start <= m < pos_end:
                 legal_moves = board.get_valid_moves()  # list of permit values
                 actual = game[m]
+                legal_set = set(legal_moves)
+                K = len(legal_set)
+                if K == 0:
+                    board.update([game[m]])
+                    continue
 
+                # Get the top-10 unique cells (enough to score top-1/3/5/10)
                 if variant in ('v3', 'v4'):
                     logits_vec = query_logits[m]
-                    preds = topk_cells_v234(logits_vec, cell_stoi_inv, k=5)
+                    preds = topk_cells_v234(logits_vec, cell_stoi_inv, k=10)
                 elif variant == 'v2':
                     logits_vec = predict_v2(model, list(game[:m]), cell_stoi, device)
-                    preds = topk_cells_v234(logits_vec, cell_stoi_inv, k=5)
+                    preds = topk_cells_v234(logits_vec, cell_stoi_inv, k=10)
                 elif variant == 'original':
-                    # We want prediction given the first m tokens (game[:m]).
-                    # In autoregressive: logits at position m-1 predicts token m.
                     logits_vec = full_logits[m - 1]
-                    preds = topk_cells_original(logits_vec, train_dataset, k=5)
-
-                if preds:
-                    top1 = preds[0]
-                else:
-                    top1 = None
+                    preds = topk_cells_original(logits_vec, train_dataset, k=10)
 
                 # Pick the phase bucket
                 if m < N / 3:        phase = 'early'
                 elif m < 2 * N / 3:  phase = 'mid'
                 else:                phase = 'late'
 
-                # "ALL top-K predictions are legal" — stricter test of
-                # whether the model has learned the legal-move SET.
-                # K is capped at the number of legal moves available, so the
-                # model gets credit even when fewer than K moves are legal
-                # (e.g., late-game positions with 2-3 legal options).
-                n_legal = len(set(legal_moves))
-                k3 = min(3, n_legal)
-                k5 = min(5, n_legal)
-                top3_all_legal = (k3 > 0 and len(preds) >= k3
-                                  and all(p in legal_moves for p in preds[:k3]))
-                top5_all_legal = (k5 > 0 and len(preds) >= k5
-                                  and all(p in legal_moves for p in preds[:k5]))
-
                 for d in (totals, by_phase[phase]):
-                    d['n']      += 1
-                    d['legal1'] += int(top1 is not None and top1 in legal_moves)
-                    d['legal3'] += int(top3_all_legal)
-                    d['legal5'] += int(top5_all_legal)
-                    d['top1']   += int(top1 == actual)
-                    d['top3']   += int(actual in preds[:3])
-                    d['top5']   += int(actual in preds[:5])
+                    d['n'] += 1
+                    for n in top_ns:
+                        k = min(n, K)
+                        topk_set = set(preds[:k])
+                        d[f'legal_c_{n}'] += len(topk_set & legal_set)
+                        d[f'legal_t_{n}'] += k
+                        d[f'match_{n}'] += int(actual in preds[:n])
 
             board.update([game[m]])
 
@@ -273,14 +274,20 @@ def evaluate(model, variant, val_games, helper, device, num_games):
 
 
 def fmt(d):
+    """Match the project's compare_aggregators / ogpt_topk_legal output format:
+    legal-frac-topN = sum of legal counts / sum of slot counts (micro-avg)."""
     n = d['n'] or 1
-    return (f"  legal: top1 {100*d['legal1']/n:5.2f}%  "
-            f"top3 {100*d['legal3']/n:5.2f}%  "
-            f"top5 {100*d['legal5']/n:5.2f}%  "
-            f"|  match-actual: top1 {100*d['top1']/n:5.2f}%  "
-            f"top3 {100*d['top3']/n:5.2f}%  "
-            f"top5 {100*d['top5']/n:5.2f}%  "
-            f"(n={d['n']})")
+    parts = ["legal-frac: "]
+    for k in (1, 3, 5, 10):
+        denom = d.get(f'legal_t_{k}', 0) or 1
+        acc = 100 * d[f'legal_c_{k}'] / denom
+        parts.append(f"top{k} {acc:6.2f}%  ")
+    parts.append("|  match-actual: ")
+    for k in (1, 3, 5):
+        acc = 100 * d[f'match_{k}'] / n
+        parts.append(f"top{k} {acc:5.2f}%  ")
+    parts.append(f"(n={d['n']})")
+    return ''.join(parts)
 
 
 def main():
@@ -291,6 +298,12 @@ def main():
     ap.add_argument('--num-pickle-files', type=int, default=2,
                     help='How many val pickle files to load (~100K games each)')
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
+    ap.add_argument('--pos-start', type=int, default=5,
+                    help='Skip predictions before this move index (matches '
+                         'ogpt_topk_legal.py default of 5)')
+    ap.add_argument('--pos-end', type=int, default=54,
+                    help='Skip predictions at this move index and beyond '
+                         '(matches ogpt_topk_legal.py default of 54)')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -328,8 +341,11 @@ def main():
     print(f"Loaded model with {n_params/1e6:.1f}M params")
 
     totals, by_phase = evaluate(model, args.variant, val_games,
-                                helper, device, args.num_games)
-    print(f"\n=== {args.variant} overall ===")
+                                helper, device, args.num_games,
+                                pos_start=args.pos_start,
+                                pos_end=args.pos_end)
+    print(f"\n=== {args.variant} overall  "
+          f"(positions {args.pos_start}..{args.pos_end-1}) ===")
     print(fmt(totals))
     for phase in ('early', 'mid', 'late'):
         print(f"  {phase:5s}: {fmt(by_phase[phase])}")
