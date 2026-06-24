@@ -187,7 +187,8 @@ def evaluate(model, variant, val_games, helper, device, num_games):
         cell_stoi = helper
         cell_stoi_inv = {i: c for c, i in cell_stoi.items()}
 
-    totals = {'n': 0, 'legal1': 0, 'top1': 0, 'top3': 0, 'top5': 0}
+    totals = {'n': 0, 'legal1': 0, 'legal3': 0, 'legal5': 0,
+              'top1': 0, 'top3': 0, 'top5': 0}
     by_phase = {'early': dict(totals), 'mid': dict(totals), 'late': dict(totals)}
 
     games = val_games[:num_games]
@@ -233,9 +234,18 @@ def evaluate(model, variant, val_games, helper, device, num_games):
                 elif m < 2 * N / 3:  phase = 'mid'
                 else:                phase = 'late'
 
+                # "ALL top-K predictions are legal" — stricter test of
+                # whether the model has learned the legal-move SET.
+                top3_all_legal = (len(preds) >= 3
+                                  and all(p in legal_moves for p in preds[:3]))
+                top5_all_legal = (len(preds) >= 5
+                                  and all(p in legal_moves for p in preds[:5]))
+
                 for d in (totals, by_phase[phase]):
                     d['n']      += 1
                     d['legal1'] += int(top1 is not None and top1 in legal_moves)
+                    d['legal3'] += int(top3_all_legal)
+                    d['legal5'] += int(top5_all_legal)
                     d['top1']   += int(top1 == actual)
                     d['top3']   += int(actual in preds[:3])
                     d['top5']   += int(actual in preds[:5])
@@ -247,10 +257,12 @@ def evaluate(model, variant, val_games, helper, device, num_games):
 
 def fmt(d):
     n = d['n'] or 1
-    return (f"  legal-top1: {100*d['legal1']/n:5.2f}%  "
-            f"top1: {100*d['top1']/n:5.2f}%  "
-            f"top3: {100*d['top3']/n:5.2f}%  "
-            f"top5: {100*d['top5']/n:5.2f}%  "
+    return (f"  legal: top1 {100*d['legal1']/n:5.2f}%  "
+            f"top3 {100*d['legal3']/n:5.2f}%  "
+            f"top5 {100*d['legal5']/n:5.2f}%  "
+            f"|  match-actual: top1 {100*d['top1']/n:5.2f}%  "
+            f"top3 {100*d['top3']/n:5.2f}%  "
+            f"top5 {100*d['top5']/n:5.2f}%  "
             f"(n={d['n']})")
 
 
