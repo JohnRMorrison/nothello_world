@@ -247,10 +247,16 @@ def evaluate(model, variant, val_games, helper, device, num_games):
 
                 # "ALL top-K predictions are legal" — stricter test of
                 # whether the model has learned the legal-move SET.
-                top3_all_legal = (len(preds) >= 3
-                                  and all(p in legal_moves for p in preds[:3]))
-                top5_all_legal = (len(preds) >= 5
-                                  and all(p in legal_moves for p in preds[:5]))
+                # K is capped at the number of legal moves available, so the
+                # model gets credit even when fewer than K moves are legal
+                # (e.g., late-game positions with 2-3 legal options).
+                n_legal = len(set(legal_moves))
+                k3 = min(3, n_legal)
+                k5 = min(5, n_legal)
+                top3_all_legal = (k3 > 0 and len(preds) >= k3
+                                  and all(p in legal_moves for p in preds[:k3]))
+                top5_all_legal = (k5 > 0 and len(preds) >= k5
+                                  and all(p in legal_moves for p in preds[:k5]))
 
                 for d in (totals, by_phase[phase]):
                     d['n']      += 1
