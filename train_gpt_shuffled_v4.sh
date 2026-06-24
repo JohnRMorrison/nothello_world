@@ -43,6 +43,7 @@ fi
 EPOCHS=${EPOCHS:-20} BATCH_SIZE=${BATCH_SIZE:-1024} \
     NUM_WORKERS=${NUM_WORKERS:-16} \
     LOAD_CKPT="${LOAD_CKPT:-}" \
+    CONSTANT_LR="${CONSTANT_LR:-}" \
     python train_gpt_shuffled_v4.py
 
 echo "Completed at: $(date)"

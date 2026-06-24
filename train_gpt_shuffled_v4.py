@@ -191,11 +191,22 @@ def main():
     os.makedirs('./ckpts', exist_ok=True)
     os.makedirs('./logs', exist_ok=True)
 
+    # If CONSTANT_LR is set, skip warmup+decay and train at that fixed LR.
+    # Used by chained continuation jobs after the first warmup+decay run.
+    constant_lr = os.environ.get('CONSTANT_LR', '')
+    if constant_lr:
+        learning_rate = float(constant_lr)
+        lr_decay = False
+        print(f"Using CONSTANT LR = {learning_rate} (no warmup/decay)")
+    else:
+        learning_rate = 5e-4
+        lr_decay = True
+
     tconf = TrainerConfig(
         max_epochs=epochs,
         batch_size=batch_size,
-        learning_rate=5e-4,
-        lr_decay=True,
+        learning_rate=learning_rate,
+        lr_decay=lr_decay,
         warmup_tokens=len(train_dataset) * block_size * 5,
         final_tokens=len(train_dataset) * block_size * epochs,
         num_workers=num_workers,

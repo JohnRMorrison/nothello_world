@@ -23,13 +23,18 @@ set -e
 
 SEED_JOB=${1:?Usage: chain_v4_training.sh SEED_JOBID [N_CHAIN_JOBS]}
 N_CHAIN=${2:-12}
+# Chained jobs use a constant low LR instead of restarting warmup+decay
+# each time.  Default 5e-5 = end-of-cosine-decay LR from the seed schedule.
+CONSTANT_LR=${CONSTANT_LR:-5e-5}
 
 echo "Chaining $N_CHAIN jobs after seed job $SEED_JOB."
+echo "Chained jobs will train at constant LR = $CONSTANT_LR (override via CONSTANT_LR env var)."
 echo
 
 JOB_PREV=$SEED_JOB
 for i in $(seq 1 "$N_CHAIN"); do
     JOB_NEW=$(sbatch --parsable --dependency=afterany:"$JOB_PREV" \
+                     --export=ALL,CONSTANT_LR="$CONSTANT_LR" \
                      train_gpt_shuffled_v4.sh)
     echo "  Chain step $i: job $JOB_NEW  (after $JOB_PREV)"
     JOB_PREV=$JOB_NEW
