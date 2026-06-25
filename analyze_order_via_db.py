@@ -88,13 +88,32 @@ def summarize(k, count_per_key, boards_per_key):
     multi_mask = counts >= 2
     n_multi = int(multi_mask.sum())
 
+    # Total distinct board states across all games at this depth.
+    total_distinct_boards = int(n_boards.sum())
+
     print(f"k={k}:")
     print(f"  total games processed:        {n_games_total:>9d}")
     print(f"  unique played-sets (keys):    {n_keys:>9d}")
+    print(f"  total distinct board states:  {total_distinct_boards:>9d}")
+    print(f"  mean distinct boards / key:   {n_boards.mean():>9.3f}")
     print(f"  keys with >= 2 games:         {n_multi:>9d}  "
           f"({100*n_multi/max(1,n_keys):.1f}%)")
     print(f"  fraction of games whose key is shared with at least one other: "
           f"{100*(counts[multi_mask].sum())/max(1,n_games_total):.1f}%")
+
+    # Distribution of distinct-boards count over ALL keys (including
+    # unique-game ones, which by definition contribute "1 observed board").
+    all_dist = Counter(n_boards.tolist())
+    print(f"  distinct-boards distribution over ALL keys (n={n_keys}):")
+    for nb in sorted(all_dist):
+        n_sets = all_dist[nb]
+        pct_keys = 100 * n_sets / n_keys
+        games_in = sum(count_per_key[k_]
+                       for k_ in keys
+                       if len(boards_per_key[k_]) == nb)
+        pct_games = 100 * games_in / max(1, n_games_total)
+        print(f"      {nb:>3} board(s):  {n_sets:>7} keys  "
+              f"({pct_keys:5.1f}% of keys, {pct_games:5.1f}% of games)")
 
     if n_multi == 0:
         print(f"  (no shared keys to analyze)")
