@@ -145,18 +145,64 @@ def main():
         k90, p90 = kths(0.90)
         k99, p99 = kths(0.99)
 
+        # ----- "Soft" compressibility measures (partial overlap-aware) -----
+        # Build all observed intersection sets (with multiplicity).
+        all_inter = []
+        for inter, count in intersection_to_count.items():
+            all_inter.extend([inter] * count)
+
+        # 1. Union of cells ever appearing in any intersection.
+        cells_ever_in_intersection = set()
+        for inter in intersection_to_count:
+            cells_ever_in_intersection |= inter
+        # Per-cell frequency: in how many multisets is each cell in the intersection?
+        cell_freqs = np.zeros(64)
+        for inter in all_inter:
+            for c in inter:
+                cell_freqs[c] += 1
+        cell_freqs = cell_freqs / max(1, n_valid)
+        active_cells = np.sum(cell_freqs > 0)
+        always_in = np.sum(cell_freqs > 0.9)
+        often_in = np.sum(cell_freqs > 0.5)
+        rare_in = np.sum((cell_freqs > 0) & (cell_freqs < 0.1))
+
+        # 2. Mean pairwise Jaccard similarity over a sample (full pairs is O(n^2)).
+        rng = np.random.default_rng(args.seed)
+        n_pairs = min(2000, n_valid * (n_valid - 1) // 2)
+        jacc_samples = []
+        idxs = list(range(n_valid))
+        for _ in range(n_pairs):
+            i, j = rng.choice(idxs, size=2, replace=False)
+            a, b = all_inter[i], all_inter[j]
+            if not a and not b:
+                jacc = 1.0
+            elif not a or not b:
+                jacc = 0.0
+            else:
+                jacc = len(a & b) / len(a | b)
+            jacc_samples.append(jacc)
+        jacc_samples = np.array(jacc_samples)
+
         print(f"\nk={k} summary (n={n_valid} multisets with valid samples):")
         print(f"  Distinct intersection sets:           {n_distinct_inter:>5}")
         print(f"  Multisets / distinct intersection:    {compression_ratio:>6.2f}  "
-              f"(compression ratio)")
+              f"(hard compression ratio)")
         print(f"  Distinct empty intersections:         "
               f"{1 if n_empty_intersection else 0} ({n_empty_intersection} multisets)")
-        print(f"  Top intersection pattern coverage:")
+        print(f"  Top intersection pattern coverage (exact match):")
         print(f"    Top {k50:>4} patterns cover 50% of multisets")
         print(f"    Top {k90:>4} patterns cover 90% of multisets")
         print(f"    Top {k99:>4} patterns cover 99% of multisets")
         print(f"  Multisets per pattern: "
               f"mean {counts.mean():.2f}  max {counts.max()}")
+        print(f"\n  --- Soft compressibility (overlap-aware) ---")
+        print(f"  Mean pairwise Jaccard similarity:   {jacc_samples.mean():.3f}")
+        print(f"  Median pairwise Jaccard:            {np.median(jacc_samples):.3f}")
+        print(f"  Cells active (appear in any intersection):  "
+              f"{active_cells} / 60")
+        print(f"  Cells almost always in (>90% of multisets): {int(always_in)}")
+        print(f"  Cells often in (>50%):                      {int(often_in)}")
+        print(f"  Cells rare in (0-10%):                      {int(rare_in)}")
         print(f"  Most common patterns:")
         for inter, count in intersection_to_count.most_common(5):
             cells = sorted(inter)
