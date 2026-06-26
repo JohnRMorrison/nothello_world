@@ -150,15 +150,65 @@ def predict_v4(model, game, k, cell_stoi, device):
     return None
 
 
-def predict_mlp(mlp, played_features, even_features):
-    """Apply MLP pattern detector to (played + even) features (120-d)."""
-    # The MLP outputs 960 pattern logits. Aggregate to 60 cells via max.
-    # The mapping pattern -> target cell depends on which patterns were
-    # used in training (color_specific or not, etc.).
-    raise NotImplementedError(
-        "MLP inference adapter — left for the user to fill in based on "
-        "their pattern-detector training script. The hooks are in "
-        "compare_aggregators.py:agg_max etc.")
+def load_mlp(ckpt_path, hidden, device):
+    """Load a played+even pattern-detector MLP (returns (me, mo, idx, mask))."""
+    sys.path.insert(0, '.')
+    from train_pattern_simple import DirectMLP, _get_cell_pat_index
+    from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    n_patterns = ckpt.get('n_patterns', 960)
+    input_dim = ckpt.get('input_dim', 120)
+    me = DirectMLP(input_dim, hidden, n_patterns).to(device)
+    mo = DirectMLP(input_dim, hidden, n_patterns).to(device)
+    me.load_state_dict(ckpt['even']); me.eval()
+    mo.load_state_dict(ckpt['odd']); mo.eval()
+
+    # Build pattern->cell mapping (each pattern targets a specific cell)
+    patterns = enumerate_flanking_patterns()
+    pattern_to_cell = torch.tensor(
+        [MOVE_TO_IDX[p['target']] for p in patterns],
+        dtype=torch.long, device=device)
+    idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
+    return me, mo, idx, mask
+
+
+def played_even_features(game_prefix):
+    """Build 120-d binary feature vector: 60 played + 60 played-at-parity-0."""
+    feat = torch.zeros(120)
+    for i, c in enumerate(game_prefix):
+        if c not in C64_TO_C60:
+            continue
+        c60 = C64_TO_C60[c]
+        feat[c60] = 1.0
+        if i % 2 == 0:  # parity 0 (move index 0 = move M_1, etc.)
+            feat[60 + c60] = 1.0
+    return feat
+
+
+def predict_mlp(mlp_bundle, game, k, device):
+    """Run a played+even pattern-detector MLP on game[:k], aggregate via
+    prob_or, return predicted cell (64-cell index) for move at depth k.
+
+    prob_or aggregator:  P(cell c is legal) = 1 - prod_p (1 - sigmoid(logit_p))
+    over patterns p targeting c; we rank by -log(1 - P) = sum_p softplus(logit_p),
+    which is monotone in P.
+    """
+    me, mo, idx, mask = mlp_bundle
+    features = played_even_features(game[:k]).unsqueeze(0).to(device)
+    # Parity of move we're predicting (game[k], the (k+1)-th move 1-indexed)
+    pred_parity = k % 2
+    model = me if pred_parity == 0 else mo
+    with torch.no_grad():
+        logits = model(features)  # (1, n_patterns)
+    # prob_or aggregation: per-cell score = sum_p softplus(logit_p) over patterns
+    # p targeting cell c.  (Higher score = higher P(cell c legal).)
+    log1m = -torch.nn.functional.softplus(logits)        # (1, n_patterns)
+    gathered = log1m[:, idx]                              # (1, 60, max_p_per_cell)
+    gathered = gathered.masked_fill(~mask, 0.0)
+    cell_scores = -gathered.sum(dim=-1)[0]                # (60,)
+    pred_c60 = cell_scores.argmax().item()
+    return C60_TO_C64.get(pred_c60)
 
 
 # ---------- Main eval loop ----------
@@ -166,6 +216,10 @@ def predict_mlp(mlp, played_features, even_features):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--v4-ckpt', required=True)
+    ap.add_argument('--mlp-ckpt-512', default=None,
+                    help='Path to pattern_simple_direct_H512_playedeven.pt')
+    ap.add_argument('--mlp-ckpt-8192', default=None,
+                    help='Path to pattern_simple_direct_H8192_playedeven.pt')
     ap.add_argument('--num-games', type=int, default=200)
     ap.add_argument('--pos-start', type=int, default=10)
     ap.add_argument('--pos-end', type=int, default=50)
@@ -199,9 +253,22 @@ def main():
     v4.load_state_dict(torch.load(args.v4_ckpt, map_location='cpu'))
     v4 = v4.to(device).eval()
 
+    # Load MLPs (optional)
+    mlp_512 = mlp_8192 = None
+    if args.mlp_ckpt_512:
+        print(f"Loading MLP H=512 from {args.mlp_ckpt_512}...")
+        mlp_512 = load_mlp(args.mlp_ckpt_512, hidden=512, device=device)
+    if args.mlp_ckpt_8192:
+        print(f"Loading MLP H=8192 from {args.mlp_ckpt_8192}...")
+        mlp_8192 = load_mlp(args.mlp_ckpt_8192, hidden=8192, device=device)
+
     # Stats per heuristic
+    predictor_names = ['random_unplayed', 'adjacent', 'parity_line']
+    if mlp_512 is not None: predictor_names.append('mlp_h512')
+    if mlp_8192 is not None: predictor_names.append('mlp_h8192')
+    predictor_names.append('v4')
     stats = {name: {'n': 0, 'legal': 0, 'agree_v4': 0}
-             for name in ['random_unplayed', 'adjacent', 'parity_line', 'v4']}
+             for name in predictor_names}
 
     for game in tqdm(games, desc="evaluating"):
         board = OthelloBoardState()
@@ -226,11 +293,17 @@ def main():
             pred_parity = heuristic_parity_line(played_parity)
             pred_v4_60 = predict_v4(v4, game, k, cell_stoi, device)
             pred_v4 = C60_TO_C64.get(pred_v4_60) if pred_v4_60 is not None else None
+            pred_mlp512 = predict_mlp(mlp_512, game, k, device) if mlp_512 else None
+            pred_mlp8192 = predict_mlp(mlp_8192, game, k, device) if mlp_8192 else None
 
-            for name, pred in [('random_unplayed', pred_random),
-                                ('adjacent', pred_adjacent),
-                                ('parity_line', pred_parity),
-                                ('v4', pred_v4)]:
+            picks = [('random_unplayed', pred_random),
+                     ('adjacent', pred_adjacent),
+                     ('parity_line', pred_parity)]
+            if mlp_512 is not None: picks.append(('mlp_h512', pred_mlp512))
+            if mlp_8192 is not None: picks.append(('mlp_h8192', pred_mlp8192))
+            picks.append(('v4', pred_v4))
+
+            for name, pred in picks:
                 stats[name]['n'] += 1
                 if pred is not None and pred in legal:
                     stats[name]['legal'] += 1
@@ -242,7 +315,7 @@ def main():
     print(f"\n=== Comparison (positions {args.pos_start}..{args.pos_end-1}, "
           f"n={stats['v4']['n']}) ===")
     print(f"  {'Predictor':<20s}  {'top-1 legal':>12s}  {'agree w/ v4':>12s}")
-    for name in ['random_unplayed', 'adjacent', 'parity_line', 'v4']:
+    for name in predictor_names:
         s = stats[name]
         legal_pct = 100 * s['legal'] / max(1, s['n'])
         agree_pct = 100 * s['agree_v4'] / max(1, s['n'])
