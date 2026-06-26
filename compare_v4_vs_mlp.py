@@ -138,8 +138,9 @@ def predict_v4(model, game, k, cell_stoi, device):
     mask = mask.unsqueeze(0).to(device)
     with torch.no_grad():
         logits, _ = model(x, attn_mask=mask)
-    # Query position k-1 (0-indexed: predicting game[k] from prefix game[:k])
-    qpos = Lc + (k - 1) if k > 0 else Lc
+    # Query position Lc+k predicts game[k] from prefix game[:k].
+    # (At training time, target y[Lc+m] = game[m].)
+    qpos = Lc + k
     vec = logits[0, qpos]
     # Token id = 1 + cell + 60 * parity. Argmax over UNIQUE cells.
     sorted_tokens = vec.argsort(descending=True).cpu().tolist()
