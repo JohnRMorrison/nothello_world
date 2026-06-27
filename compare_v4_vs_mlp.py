@@ -126,10 +126,14 @@ def heuristic_parity_line(played_parity_map):
 # ---------- Inference adapters ----------
 
 def predict_v4(model, game, k, cell_stoi, device):
-    """Return predicted cell (0..59 cell-stoi space) for next move at depth k.
+    """Return predicted cell (0..59 cell-stoi space) for next move at depth k."""
+    cell_scores = v4_cell_scores(model, game, k, cell_stoi, device)
+    return int(np.argmax(cell_scores))
 
-    For v4 (cell-indexed), context positions hold the played-cell+parity tags.
-    """
+
+def v4_cell_scores(model, game, k, cell_stoi, device):
+    """Return per-cell scores from v4 (60-d numpy).  Aggregates the 2-parity
+    token vocab to per-cell scores via max over the two parities."""
     from train_gpt_shuffled_v4 import CellIndexedMaskedDataset
     ds = CellIndexedMaskedDataset([list(game)], cell_stoi=cell_stoi)
     Lc = ds.context_len
@@ -138,16 +142,15 @@ def predict_v4(model, game, k, cell_stoi, device):
     mask = mask.unsqueeze(0).to(device)
     with torch.no_grad():
         logits, _ = model(x, attn_mask=mask)
-    # Query position Lc+k predicts game[k] from prefix game[:k].
-    # (At training time, target y[Lc+m] = game[m].)
     qpos = Lc + k
-    vec = logits[0, qpos]
-    # Token id = 1 + cell + 60 * parity. Argmax over UNIQUE cells.
-    sorted_tokens = vec.argsort(descending=True).cpu().tolist()
-    for tok in sorted_tokens:
-        if 1 <= tok <= 120:
-            return (tok - 1) % 60   # returns 0..59 cell-stoi index
-    return None
+    vec = logits[0, qpos].cpu().numpy()   # shape (vocab,)
+    # tokens 1..120 are (cell, parity); per cell, take max over its 2 parity copies
+    scores = np.full(60, -np.inf)
+    for tok in range(1, 121):
+        cell_idx = (tok - 1) % 60
+        if vec[tok] > scores[cell_idx]:
+            scores[cell_idx] = vec[tok]
+    return scores
 
 
 def load_mlp(ckpt_path, hidden, device):
@@ -187,33 +190,24 @@ def played_even_features(game_prefix):
 
 
 def predict_mlp(mlp_bundle, game, k, device):
-    """Run a played+even pattern-detector MLP on game[:k], aggregate via
-    prob_or, return predicted cell (64-cell index) for move at depth k.
+    """Top-1 cell prediction from a played+even MLP (returns 64-cell idx)."""
+    scores = mlp_cell_scores(mlp_bundle, game, k, device)
+    return C60_TO_C64.get(int(np.argmax(scores)))
 
-    prob_or aggregator:  P(cell c is legal) = 1 - prod_p (1 - sigmoid(logit_p))
-    over patterns p targeting c; we rank by -log(1 - P) = sum_p softplus(logit_p),
-    which is monotone in P.
-    """
+
+def mlp_cell_scores(mlp_bundle, game, k, device):
+    """Per-cell scores from MLP via prob_or aggregator.  Returns 60-d numpy."""
     me, mo, idx, mask = mlp_bundle
     features = played_even_features(game[:k]).unsqueeze(0).to(device)
-    # MLP convention: at training "position" t, features include cells played
-    # at steps 0..t (inclusive) and the label is legality at the NEXT step t+1.
-    # `me` (model_even) was trained where pos % 2 == 0.
-    # In our eval we predict game[k] using features for steps 0..k-1.
-    # That maps to MLP position t = k - 1.  So use `me` iff (k-1) % 2 == 0,
-    # i.e. when k is odd.
     use_even = (k % 2 == 1)
     model = me if use_even else mo
     with torch.no_grad():
-        logits = model(features)  # (1, n_patterns)
-    # prob_or aggregation: per-cell score = sum_p softplus(logit_p) over patterns
-    # p targeting cell c.  (Higher score = higher P(cell c legal).)
-    log1m = -torch.nn.functional.softplus(logits)        # (1, n_patterns)
-    gathered = log1m[:, idx]                              # (1, 60, max_p_per_cell)
+        logits = model(features)
+    log1m = -torch.nn.functional.softplus(logits)
+    gathered = log1m[:, idx]
     gathered = gathered.masked_fill(~mask, 0.0)
-    cell_scores = -gathered.sum(dim=-1)[0]                # (60,)
-    pred_c60 = cell_scores.argmax().item()
-    return C60_TO_C64.get(pred_c60)
+    cell_scores = -gathered.sum(dim=-1)[0]
+    return cell_scores.cpu().numpy()
 
 
 # ---------- Main eval loop ----------
@@ -272,8 +266,20 @@ def main():
     if mlp_512 is not None: predictor_names.append('mlp_h512')
     if mlp_8192 is not None: predictor_names.append('mlp_h8192')
     predictor_names.append('v4')
-    stats = {name: {'n': 0, 'legal': 0, 'agree_v4': 0}
+    stats = {name: {'n': 0, 'legal': 0, 'agree_v4': 0,
+                    'v4_top1_in_top3': 0, 'v4_top1_in_top5': 0,
+                    'jaccard_top5_sum': 0.0,
+                    'spearman_sum': 0.0,
+                    'n_correlated': 0}
              for name in predictor_names}
+
+    # Joint mistake analysis: 2x2 confusion matrix for each predictor vs v4
+    # Cells: (both correct, v4 correct only, predictor correct only, both wrong)
+    # "correct" = predicted cell is legal at this position.
+    joint_stats = {name: {'both_right': 0, 'v4_only_right': 0,
+                          'other_only_right': 0, 'both_wrong': 0,
+                          'both_wrong_same_pick': 0}
+                   for name in predictor_names if name != 'v4'}
 
     for game in tqdm(games, desc="evaluating"):
         board = OthelloBoardState()
@@ -292,39 +298,131 @@ def main():
             played_set = set(game[:k])
             played_parity = {c: i % 2 for i, c in enumerate(game[:k])}
 
+            # Get v4 scores once (used for top-k & rank computations)
+            v4_scores = v4_cell_scores(v4, game, k, cell_stoi, device)
+            pred_v4_60 = int(np.argmax(v4_scores))
+            pred_v4 = C60_TO_C64.get(pred_v4_60)
+            v4_top3 = set(np.argsort(-v4_scores)[:3].tolist())
+            v4_top5 = set(np.argsort(-v4_scores)[:5].tolist())
+            v4_rank = (-v4_scores).argsort().argsort()  # rank 0 = best
+
             # Predictions
             pred_random = heuristic_random_unplayed(played_set)
             pred_adjacent = heuristic_adjacent_to_played(played_set)
             pred_parity = heuristic_parity_line(played_parity)
-            pred_v4_60 = predict_v4(v4, game, k, cell_stoi, device)
-            pred_v4 = C60_TO_C64.get(pred_v4_60) if pred_v4_60 is not None else None
-            pred_mlp512 = predict_mlp(mlp_512, game, k, device) if mlp_512 else None
-            pred_mlp8192 = predict_mlp(mlp_8192, game, k, device) if mlp_8192 else None
+            mlp512_scores = mlp_cell_scores(mlp_512, game, k, device) if mlp_512 else None
+            mlp8192_scores = mlp_cell_scores(mlp_8192, game, k, device) if mlp_8192 else None
+            pred_mlp512 = C60_TO_C64.get(int(np.argmax(mlp512_scores))) if mlp_512 else None
+            pred_mlp8192 = C60_TO_C64.get(int(np.argmax(mlp8192_scores))) if mlp_8192 else None
 
-            picks = [('random_unplayed', pred_random),
-                     ('adjacent', pred_adjacent),
-                     ('parity_line', pred_parity)]
-            if mlp_512 is not None: picks.append(('mlp_h512', pred_mlp512))
-            if mlp_8192 is not None: picks.append(('mlp_h8192', pred_mlp8192))
-            picks.append(('v4', pred_v4))
+            picks = [('random_unplayed', pred_random, None),
+                     ('adjacent', pred_adjacent, None),
+                     ('parity_line', pred_parity, None)]
+            if mlp_512 is not None: picks.append(('mlp_h512', pred_mlp512, mlp512_scores))
+            if mlp_8192 is not None: picks.append(('mlp_h8192', pred_mlp8192, mlp8192_scores))
+            picks.append(('v4', pred_v4, v4_scores))
 
-            for name, pred in picks:
+            v4_correct = pred_v4 is not None and pred_v4 in legal
+
+            for name, pred, scores in picks:
                 stats[name]['n'] += 1
                 if pred is not None and pred in legal:
                     stats[name]['legal'] += 1
                 if pred == pred_v4:
                     stats[name]['agree_v4'] += 1
+                # Predictor's top-1 → is it in v4's top-3 / top-5?
+                if pred is not None and pred in C64_TO_C60:
+                    p60 = C64_TO_C60[pred]
+                    if p60 in v4_top3:
+                        stats[name]['v4_top1_in_top3'] += 1
+                    if p60 in v4_top5:
+                        stats[name]['v4_top1_in_top5'] += 1
+                # Score-based measures (only available for v4/MLP)
+                if scores is not None:
+                    top5 = set(np.argsort(-scores)[:5].tolist())
+                    jacc = len(top5 & v4_top5) / len(top5 | v4_top5)
+                    stats[name]['jaccard_top5_sum'] += jacc
+                    # Spearman: rank correlation
+                    other_rank = (-scores).argsort().argsort()
+                    # Pearson on ranks = Spearman
+                    sp = np.corrcoef(v4_rank, other_rank)[0, 1]
+                    stats[name]['spearman_sum'] += sp
+                    stats[name]['n_correlated'] += 1
+
+                # Joint mistake analysis (predictor vs v4)
+                if name != 'v4':
+                    other_correct = pred is not None and pred in legal
+                    js = joint_stats[name]
+                    if v4_correct and other_correct:
+                        js['both_right'] += 1
+                    elif v4_correct and not other_correct:
+                        js['v4_only_right'] += 1
+                    elif other_correct and not v4_correct:
+                        js['other_only_right'] += 1
+                    else:
+                        js['both_wrong'] += 1
+                        if pred == pred_v4:
+                            js['both_wrong_same_pick'] += 1
 
             board.update([game[k]])
 
+    n_total = stats['v4']['n']
     print(f"\n=== Comparison (positions {args.pos_start}..{args.pos_end-1}, "
-          f"n={stats['v4']['n']}) ===")
-    print(f"  {'Predictor':<20s}  {'top-1 legal':>12s}  {'agree w/ v4':>12s}")
+          f"n={n_total}) ===")
+    hdr = (f"  {'Predictor':<20s}  {'top1 legal':>10s}  "
+           f"{'top1=v4top1':>11s}  {'in v4 top3':>10s}  {'in v4 top5':>10s}  "
+           f"{'Jacc top5':>10s}  {'Spearman':>9s}")
+    print(hdr)
     for name in predictor_names:
         s = stats[name]
-        legal_pct = 100 * s['legal'] / max(1, s['n'])
-        agree_pct = 100 * s['agree_v4'] / max(1, s['n'])
-        print(f"  {name:<20s}  {legal_pct:>11.2f}%  {agree_pct:>11.2f}%")
+        n = max(1, s['n'])
+        legal_pct = 100 * s['legal'] / n
+        agree_pct = 100 * s['agree_v4'] / n
+        t3_pct = 100 * s['v4_top1_in_top3'] / n
+        t5_pct = 100 * s['v4_top1_in_top5'] / n
+        nc = max(1, s['n_correlated'])
+        if s['n_correlated'] > 0:
+            jacc_avg = s['jaccard_top5_sum'] / nc
+            sp_avg = s['spearman_sum'] / nc
+            jacc_str = f"{jacc_avg:.3f}"
+            sp_str = f"{sp_avg:.3f}"
+        else:
+            jacc_str = sp_str = "—"
+        print(f"  {name:<20s}  {legal_pct:>9.2f}%  "
+              f"{agree_pct:>10.2f}%  {t3_pct:>9.2f}%  {t5_pct:>9.2f}%  "
+              f"{jacc_str:>10s}  {sp_str:>9s}")
+
+    # Joint mistake analysis
+    print(f"\n=== Mistake-overlap with v4 (n={n_total}) ===")
+    print(f"  {'Predictor':<20s}  {'both right':>10s}  {'v4 only':>9s}  "
+          f"{'other only':>11s}  {'both wrong':>10s}  "
+          f"{'P(both|either)':>15s}  {'P(other|v4)':>13s}  {'P(v4|other)':>13s}")
+    for name in predictor_names:
+        if name == 'v4' or name not in joint_stats:
+            continue
+        js = joint_stats[name]
+        n = max(1, js['both_right'] + js['v4_only_right']
+                + js['other_only_right'] + js['both_wrong'])
+        # Conditional mistake probabilities
+        v4_wrong = js['v4_only_right'] == 0 and False  # placeholder
+        v4_wrong_n = js['other_only_right'] + js['both_wrong']  # v4 was wrong
+        other_wrong_n = js['v4_only_right'] + js['both_wrong']  # other was wrong
+        either_wrong_n = (js['v4_only_right'] + js['other_only_right']
+                          + js['both_wrong'])
+        both_given_either = (js['both_wrong'] / max(1, either_wrong_n) * 100)
+        # P(other wrong | v4 wrong)
+        other_g_v4 = (js['both_wrong'] / max(1, v4_wrong_n) * 100)
+        # P(v4 wrong | other wrong)
+        v4_g_other = (js['both_wrong'] / max(1, other_wrong_n) * 100)
+        print(f"  {name:<20s}  {js['both_right']:>10d}  "
+              f"{js['v4_only_right']:>9d}  {js['other_only_right']:>11d}  "
+              f"{js['both_wrong']:>10d}  "
+              f"{both_given_either:>13.2f}%  "
+              f"{other_g_v4:>11.2f}%  {v4_g_other:>11.2f}%")
+
+    print("\n  P(both wrong | either wrong): high → same heuristic, fail together")
+    print("  P(other wrong | v4 wrong):    high → other shares v4's blindspots")
+    print("  P(v4 wrong | other wrong):    high → v4 shares other's blindspots")
 
 
 if __name__ == '__main__':
