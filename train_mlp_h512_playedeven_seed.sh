@@ -54,6 +54,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_pattern_simple.py \
     --hidden 512 \
     --features played+even \
     --epochs $EPOCHS \
+    --chunk-prefix chunk_ext_ \
     --seed $SEED
 
 # Move the newly-written ckpt to a seed-tagged filename so it doesn't clobber
