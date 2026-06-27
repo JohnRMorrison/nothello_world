@@ -69,13 +69,21 @@ def to_move_grid_input(X_tensor):
 
 
 def load_chunk(path):
-    """Returns (features, fired, is_forfeit, positions)."""
+    """Returns (features_float16, cell_labels, is_forfeit, positions).
+
+    Memory-efficient: features stored as float16 (cast to float32 per batch),
+    fired-mask released immediately after deriving cell labels.
+    """
     with np.load(path) as z:
-        feats = z['features'].astype(np.float32)
-        fired = z['fired']  # uint8, (N, 960)
+        # float16 halves the feature memory (180-d × float16 × 18M ≈ 6.6 GB
+        # vs 13.3 GB at float32). Conversion to float32 happens per-batch.
+        feats = z['features'].astype(np.float16)
+        # Derive cell labels here, while fired is still in scope.
+        cell_labels = derive_next_cells_batch(z['fired'])
+        # Drop fired -- 17.8 GB recovered.
         is_forfeit = z['is_forfeit'].astype(bool) if 'is_forfeit' in z.files else None
         positions = z['positions'].astype(np.int8) if 'positions' in z.files else None
-    return feats, fired, is_forfeit, positions
+    return feats, cell_labels, is_forfeit, positions
 
 
 def derive_next_cell(fired_row):
@@ -180,25 +188,26 @@ def main():
         chunk_order = rng.permutation(len(train_paths))
 
         for ci_idx, ci in enumerate(chunk_order):
-            feats180, fired, is_forfeit, positions = load_chunk(train_paths[ci])
-            cell_labels = derive_next_cells_batch(fired)
+            # load_chunk now returns (feats_float16, cell_labels, is_forfeit, positions)
+            feats180, cell_labels, is_forfeit, positions = load_chunk(train_paths[ci])
             # Filter: only rows with a valid cell label AND not forfeit
             keep = cell_labels >= 0
             if is_forfeit is not None:
                 keep &= ~is_forfeit
-            feats180 = feats180[keep]
-            cell_labels = cell_labels[keep]
-            if len(feats180) == 0:
+            # Use boolean indexing once (creates filtered copy)
+            valid_idx = np.where(keep)[0]
+            if len(valid_idx) == 0:
                 continue
-            # Shuffle within chunk
-            perm = rng.permutation(len(feats180))
-            feats180 = feats180[perm]
-            cell_labels = cell_labels[perm]
+            # Shuffle by index only (no copy of feats180 yet)
+            rng.shuffle(valid_idx)
 
-            # Train in batches
-            for i in range(0, len(feats180), args.batch_size):
-                x180 = torch.from_numpy(feats180[i:i + args.batch_size]).to(device)
-                y = torch.from_numpy(cell_labels[i:i + args.batch_size]).to(device)
+            # Train in batches.  Pull rows by index (creates one batch-sized
+            # float32 tensor at a time, keeping memory low).
+            for i in range(0, len(valid_idx), args.batch_size):
+                batch_idx = valid_idx[i:i + args.batch_size]
+                # Cast batch from float16 -> float32 just before GPU transfer.
+                x180 = torch.from_numpy(feats180[batch_idx].astype(np.float32)).to(device)
+                y = torch.from_numpy(cell_labels[batch_idx]).to(device)
                 x = slice_features(x180)
                 logits = model(x)
                 loss = F.cross_entropy(logits, y)
@@ -208,6 +217,8 @@ def main():
                 total_loss += loss.item() * len(y)
                 total_correct += (logits.argmax(dim=-1) == y).sum().item()
                 total_n += len(y)
+            # Release this chunk's memory before loading the next.
+            del feats180, cell_labels, is_forfeit, positions, valid_idx
             now = time.time()
             if now - last_log > 60:
                 print(f"  epoch {epoch} chunk {ci_idx+1}/{len(train_paths)}: "
@@ -223,22 +234,22 @@ def main():
         ev_n = 0
         with torch.no_grad():
             for ep in eval_paths:
-                feats180, fired, is_forfeit, _ = load_chunk(ep)
-                cell_labels = derive_next_cells_batch(fired)
+                feats180, cell_labels, is_forfeit, _ = load_chunk(ep)
                 keep = cell_labels >= 0
                 if is_forfeit is not None:
                     keep &= ~is_forfeit
-                feats180 = feats180[keep]
-                cell_labels = cell_labels[keep]
-                for i in range(0, len(feats180), args.batch_size):
-                    x180 = torch.from_numpy(feats180[i:i + args.batch_size]).to(device)
-                    y = torch.from_numpy(cell_labels[i:i + args.batch_size]).to(device)
+                valid_idx = np.where(keep)[0]
+                for i in range(0, len(valid_idx), args.batch_size):
+                    batch_idx = valid_idx[i:i + args.batch_size]
+                    x180 = torch.from_numpy(feats180[batch_idx].astype(np.float32)).to(device)
+                    y = torch.from_numpy(cell_labels[batch_idx]).to(device)
                     x = slice_features(x180)
                     logits = model(x)
                     loss = F.cross_entropy(logits, y, reduction='sum')
                     ev_loss += loss.item()
                     ev_correct += (logits.argmax(dim=-1) == y).sum().item()
                     ev_n += len(y)
+                del feats180, cell_labels, is_forfeit, valid_idx
 
         train_acc = total_correct / max(1, total_n)
         ev_acc = ev_correct / max(1, ev_n)
