@@ -866,16 +866,50 @@ if __name__ == "__main__":
     device = get_device()
     # feature_cols = column-select mode; feature_fn = derived-features mode.
     # Exactly one is used per run.
-    _feat_cols = {
-        "when":         list(range(N_MOVES, 2 * N_MOVES)),          # 60-d
-        "played":       list(range(0, N_MOVES)),                     # 60-d
-        "played+when":  list(range(0, 2 * N_MOVES)),                 # 120-d
-        "when+even":    list(range(N_MOVES, 3 * N_MOVES)),           # 120-d
-        "played+even":  list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
-        "all":          list(range(0, 3 * N_MOVES)),                  # 180-d
-    }
+    # Two chunk formats exist on disk:
+    #   - 180-d: played(60) + when(60) + even(60)  (older precompute)
+    #   - 120-d: played(60) + even(60)             (precompute_chunks_clean.py)
+    # We detect which by peeking at the first chunk file below.
     feature_fn = None
-    if args.features in _feat_cols:
+    if args.features in ("when", "played", "played+when", "when+even",
+                          "played+even", "all"):
+        # Detect chunk feature dimensionality
+        chunk_dir_peek = os.path.join(args.output_dir, "feature_chunks")
+        _chunk_files = sorted(f for f in os.listdir(chunk_dir_peek)
+                              if f.startswith(args.chunk_prefix)
+                              and f.endswith(".npz")
+                              and "_patterns" not in f and "_when60" not in f)
+        if not _chunk_files:
+            raise FileNotFoundError(f"No chunk files in {chunk_dir_peek}")
+        with np.load(os.path.join(chunk_dir_peek, _chunk_files[0])) as _sample:
+            chunk_feat_dim = _sample['features'].shape[-1]
+        print(f"  Detected chunk feature_dim={chunk_feat_dim} "
+              f"(180=played+when+even legacy; 120=played+even compact)")
+
+        if chunk_feat_dim == 180:
+            _feat_cols = {
+                "when":         list(range(N_MOVES, 2 * N_MOVES)),
+                "played":       list(range(0, N_MOVES)),
+                "played+when":  list(range(0, 2 * N_MOVES)),
+                "when+even":    list(range(N_MOVES, 3 * N_MOVES)),
+                "played+even":  list(range(0, N_MOVES))
+                                 + list(range(2 * N_MOVES, 3 * N_MOVES)),
+                "all":          list(range(0, 3 * N_MOVES)),
+            }
+        elif chunk_feat_dim == 120:
+            # Compact chunks: [played(60), even(60)].  No 'when' column.
+            _feat_cols = {
+                "played":      list(range(0, N_MOVES)),
+                "played+even": list(range(0, 2 * N_MOVES)),
+            }
+            if args.features not in _feat_cols:
+                raise ValueError(
+                    f"Feature '{args.features}' requires 'when' columns "
+                    f"that don't exist in compact 120-d chunks. Either "
+                    f"regenerate the chunks at 180-d or pick from "
+                    f"{list(_feat_cols)}.")
+        else:
+            raise ValueError(f"Unexpected chunk feature_dim={chunk_feat_dim}")
         feature_cols = _feat_cols[args.features]
         input_dim = len(feature_cols)
     elif args.features == "signed_parity":
