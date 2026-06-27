@@ -196,9 +196,14 @@ def predict_mlp(mlp_bundle, game, k, device):
     """
     me, mo, idx, mask = mlp_bundle
     features = played_even_features(game[:k]).unsqueeze(0).to(device)
-    # Parity of move we're predicting (game[k], the (k+1)-th move 1-indexed)
-    pred_parity = k % 2
-    model = me if pred_parity == 0 else mo
+    # MLP convention: at training "position" t, features include cells played
+    # at steps 0..t (inclusive) and the label is legality at the NEXT step t+1.
+    # `me` (model_even) was trained where pos % 2 == 0.
+    # In our eval we predict game[k] using features for steps 0..k-1.
+    # That maps to MLP position t = k - 1.  So use `me` iff (k-1) % 2 == 0,
+    # i.e. when k is odd.
+    use_even = (k % 2 == 1)
+    model = me if use_even else mo
     with torch.no_grad():
         logits = model(features)  # (1, n_patterns)
     # prob_or aggregation: per-cell score = sum_p softplus(logit_p) over patterns
