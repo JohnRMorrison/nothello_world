@@ -43,12 +43,16 @@ echo "Started at: $(date)"
 echo "============================================"
 
 # Preserve the existing seed-0 checkpoint by renaming it (only first time).
+# (The python script now writes to a seed-tagged path when --seed != 0, so
+# no other juggling is needed; this is only here so older seed-0 ckpts get
+# a stable seed0 name.)
 if [ -f "$DEFAULT_CKPT" ] && [ ! -f "$TAGGED_SEED0" ]; then
     echo "Renaming existing default ckpt -> ${BASE_NAME}_seed0.pt for safekeeping."
     mv "$DEFAULT_CKPT" "$TAGGED_SEED0"
 fi
 
-# Train.  The script writes to $DEFAULT_CKPT regardless of seed.
+# The python script saves directly to the seed-tagged path; no post-train
+# rename needed.
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_pattern_simple.py \
     --mode direct \
     --hidden 512 \
@@ -56,13 +60,6 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_pattern_simple.py \
     --epochs $EPOCHS \
     --chunk-prefix chunk_ext_ \
     --seed $SEED
-
-# Move the newly-written ckpt to a seed-tagged filename so it doesn't clobber
-# future runs.
-if [ -f "$DEFAULT_CKPT" ]; then
-    echo "Renaming new ckpt -> ${BASE_NAME}_seed${SEED}.pt"
-    mv "$DEFAULT_CKPT" "$TAGGED_NEW"
-fi
 
 echo "Completed at: $(date)"
 echo "Both checkpoints:"

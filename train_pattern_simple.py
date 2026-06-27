@@ -962,8 +962,11 @@ if __name__ == "__main__":
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     save_dir = os.path.join(args.output_dir, "pattern_detector_checkpoints")
     feat_tag = "" if args.features == "when" else f"_{args.features.replace('+', '')}"
+    # Include seed in the save path when --seed != 0 so concurrent jobs at
+    # different seeds don't overwrite each other's checkpoint snapshots.
+    seed_tag = "" if args.seed == 0 else f"_seed{args.seed}"
     save_path = os.path.join(save_dir,
-        f"pattern_simple_{args.mode}_H{args.hidden}{feat_tag}.pt")
+        f"pattern_simple_{args.mode}_H{args.hidden}{feat_tag}{seed_tag}.pt")
 
     board_loss_weight = 0.5 if args.mode == "e2e" else 0.0
     if args.mode == "randproj":
