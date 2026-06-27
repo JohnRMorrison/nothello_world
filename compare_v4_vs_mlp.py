@@ -273,6 +273,14 @@ def main():
                     'n_correlated': 0}
              for name in predictor_names}
 
+    # Joint mistake analysis: 2x2 confusion matrix for each predictor vs v4
+    # Cells: (both correct, v4 correct only, predictor correct only, both wrong)
+    # "correct" = predicted cell is legal at this position.
+    joint_stats = {name: {'both_right': 0, 'v4_only_right': 0,
+                          'other_only_right': 0, 'both_wrong': 0,
+                          'both_wrong_same_pick': 0}
+                   for name in predictor_names if name != 'v4'}
+
     for game in tqdm(games, desc="evaluating"):
         board = OthelloBoardState()
         for k in range(args.pos_end):
@@ -314,6 +322,8 @@ def main():
             if mlp_8192 is not None: picks.append(('mlp_h8192', pred_mlp8192, mlp8192_scores))
             picks.append(('v4', pred_v4, v4_scores))
 
+            v4_correct = pred_v4 is not None and pred_v4 in legal
+
             for name, pred, scores in picks:
                 stats[name]['n'] += 1
                 if pred is not None and pred in legal:
@@ -338,6 +348,21 @@ def main():
                     sp = np.corrcoef(v4_rank, other_rank)[0, 1]
                     stats[name]['spearman_sum'] += sp
                     stats[name]['n_correlated'] += 1
+
+                # Joint mistake analysis (predictor vs v4)
+                if name != 'v4':
+                    other_correct = pred is not None and pred in legal
+                    js = joint_stats[name]
+                    if v4_correct and other_correct:
+                        js['both_right'] += 1
+                    elif v4_correct and not other_correct:
+                        js['v4_only_right'] += 1
+                    elif other_correct and not v4_correct:
+                        js['other_only_right'] += 1
+                    else:
+                        js['both_wrong'] += 1
+                        if pred == pred_v4:
+                            js['both_wrong_same_pick'] += 1
 
             board.update([game[k]])
 
@@ -366,6 +391,38 @@ def main():
         print(f"  {name:<20s}  {legal_pct:>9.2f}%  "
               f"{agree_pct:>10.2f}%  {t3_pct:>9.2f}%  {t5_pct:>9.2f}%  "
               f"{jacc_str:>10s}  {sp_str:>9s}")
+
+    # Joint mistake analysis
+    print(f"\n=== Mistake-overlap with v4 (n={n_total}) ===")
+    print(f"  {'Predictor':<20s}  {'both right':>10s}  {'v4 only':>9s}  "
+          f"{'other only':>11s}  {'both wrong':>10s}  "
+          f"{'P(both|either)':>15s}  {'P(other|v4)':>13s}  {'P(v4|other)':>13s}")
+    for name in predictor_names:
+        if name == 'v4' or name not in joint_stats:
+            continue
+        js = joint_stats[name]
+        n = max(1, js['both_right'] + js['v4_only_right']
+                + js['other_only_right'] + js['both_wrong'])
+        # Conditional mistake probabilities
+        v4_wrong = js['v4_only_right'] == 0 and False  # placeholder
+        v4_wrong_n = js['other_only_right'] + js['both_wrong']  # v4 was wrong
+        other_wrong_n = js['v4_only_right'] + js['both_wrong']  # other was wrong
+        either_wrong_n = (js['v4_only_right'] + js['other_only_right']
+                          + js['both_wrong'])
+        both_given_either = (js['both_wrong'] / max(1, either_wrong_n) * 100)
+        # P(other wrong | v4 wrong)
+        other_g_v4 = (js['both_wrong'] / max(1, v4_wrong_n) * 100)
+        # P(v4 wrong | other wrong)
+        v4_g_other = (js['both_wrong'] / max(1, other_wrong_n) * 100)
+        print(f"  {name:<20s}  {js['both_right']:>10d}  "
+              f"{js['v4_only_right']:>9d}  {js['other_only_right']:>11d}  "
+              f"{js['both_wrong']:>10d}  "
+              f"{both_given_either:>13.2f}%  "
+              f"{other_g_v4:>11.2f}%  {v4_g_other:>11.2f}%")
+
+    print("\n  P(both wrong | either wrong): high → same heuristic, fail together")
+    print("  P(other wrong | v4 wrong):    high → other shares v4's blindspots")
+    print("  P(v4 wrong | other wrong):    high → v4 shares other's blindspots")
 
 
 if __name__ == '__main__':
