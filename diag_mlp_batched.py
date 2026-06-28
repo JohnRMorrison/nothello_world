@@ -20,11 +20,12 @@ from compare_v4_vs_mlp import load_mlp, mlp_cell_scores, C64_TO_C60, C60_TO_C64
 
 
 def mlp_scores_batch(mlp_bundle, feats_120, positions, device):
-    """Same batched scoring as train_aggregator_readout, inlined here."""
+    """Same batched scoring as train_aggregator_readout, inlined here.
+    Parity routing flipped for chunk_ext convention: k = position + 1."""
     me, mo, idx, mask = mlp_bundle
     B = feats_120.shape[0]
     cell_scores = torch.zeros(B, 60, device=device)
-    use_me_mask = (positions % 2 == 1)
+    use_me_mask = (positions % 2 == 0)
     use_mo_mask = ~use_me_mask
     if use_me_mask.any():
         with torch.no_grad():
