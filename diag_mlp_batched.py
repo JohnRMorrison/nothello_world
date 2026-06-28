@@ -35,15 +35,15 @@ def main():
     print(f"Device: {device}")
     mlp = load_mlp(args.ckpt, args.hidden, device)
 
-    # Load a few rows
+    # Load a few rows (lazy: only the sampled indices, not the whole chunk)
     with np.load(args.chunk) as z:
-        N = z['features'].shape[0]
+        N = z['positions'].shape[0]    # cheap: just metadata
         sample = np.random.RandomState(0).choice(
             N, size=args.num_positions, replace=False
         )
         sample.sort()
-        feats_180 = z['features'][sample].astype(np.float32)
-        positions = z['positions'][sample].astype(np.int64)
+        feats_180 = np.asarray(z['features'][sample]).astype(np.float32)
+        positions = np.asarray(z['positions'][sample]).astype(np.int64)
 
     feats_120 = slice_played_even(feats_180)
 
