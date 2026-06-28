@@ -35,22 +35,29 @@ from train_next_cell_mlp_chunks import (
 )
 
 
-def load_chunk_with_legal_cells(path):
-    """Load chunk_ext_NNNN.npz and derive 60-d legal-cell mask per row."""
+def load_chunk_with_legal_cells(path, row_slice=2_000_000):
+    """Load chunk_ext_NNNN.npz and derive 60-d legal-cell mask per row.
+
+    Memory-efficient: processes labels in row slices so the full (N, 960)
+    uint8 array (~17 GB for N=18M) is never simultaneously held with
+    features and cell_legal.
+    """
     with np.load(path) as z:
         feats = z['features'].astype(np.float16)
-        labels = z['labels']        # (N, 960) uint8
+        N = feats.shape[0]
+        # Load labels lazily and derive cell_legal in row slices.
+        labels_arr = z['labels']    # NpzFile lazy reference; backed by zip stream
         positions = z['positions'].astype(np.int8) if 'positions' in z.files else None
-    # Derive legal cell mask: cell c is legal iff any pattern with target=c is in labels
-    # Vectorized: for each row, for each cell, check if max(labels[row, patterns_targeting_c]) > 0
-    N = len(labels)
-    cell_legal = np.zeros((N, 60), dtype=np.uint8)
-    # PATTERN_TO_CELL60[p] gives the cell index for pattern p.
-    # We want, for each cell c, max over patterns p targeting c of labels[:, p].
-    # Equivalent to: scatter-max labels into cell columns by target index.
-    for p in range(labels.shape[1]):
-        c = PATTERN_TO_CELL60[p]
-        np.maximum(cell_legal[:, c], labels[:, p], out=cell_legal[:, c])
+        cell_legal = np.zeros((N, 60), dtype=np.uint8)
+        for start in range(0, N, row_slice):
+            end = min(start + row_slice, N)
+            chunk_labels = np.asarray(labels_arr[start:end])      # (slice, 960) uint8
+            # Vectorized scatter-max via PATTERN_TO_CELL60 grouping.
+            for p in range(chunk_labels.shape[1]):
+                c = PATTERN_TO_CELL60[p]
+                np.maximum(cell_legal[start:end, c], chunk_labels[:, p],
+                           out=cell_legal[start:end, c])
+            del chunk_labels
     return feats, cell_legal, positions
 
 
