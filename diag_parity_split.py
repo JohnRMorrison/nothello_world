@@ -43,19 +43,40 @@ def main():
     model_even.load_state_dict(ckpt['even']); model_even.eval()
     model_odd.load_state_dict(ckpt['odd']);  model_odd.eval()
 
-    print(f"Loading chunk {os.path.basename(args.chunk)}")
+    print(f"Loading chunk {os.path.basename(args.chunk)} (memory-efficient)")
+    # First load only the SMALL fields to compute the valid mask without
+    # materializing features or fired arrays.
     with np.load(args.chunk) as z:
-        feats180 = z['features'].astype(np.float16)
-        cell_labels = derive_next_cells_batch(z['fired'])
-        is_forfeit = z['is_forfeit'].astype(bool) if 'is_forfeit' in z.files else None
+        is_forfeit = (z['is_forfeit'].astype(bool)
+                      if 'is_forfeit' in z.files else None)
         positions = z['positions'].astype(np.int64)
+        N = len(positions)
+        # Sample max_rows random indices first, derive labels only for those.
+        rng = np.random.RandomState(0)
+        sample_idx = rng.choice(N, size=min(N, args.max_rows * 5), replace=False)
+        sample_idx.sort()  # for slice-friendly access into npz
+        # Lazy access by index list — numpy reads only the requested rows.
+        sample_fired = z['fired'][sample_idx]
+        sample_feats = z['features'][sample_idx].astype(np.float16)
+    sample_cell = derive_next_cells_batch(sample_fired)
+    sample_pos = positions[sample_idx]
+    sample_forfeit = (is_forfeit[sample_idx] if is_forfeit is not None
+                      else np.zeros(len(sample_idx), dtype=bool))
 
-    keep = cell_labels >= 0
-    if is_forfeit is not None:
-        keep &= ~is_forfeit
-    valid_idx = np.where(keep)[0]
-    np.random.RandomState(0).shuffle(valid_idx)
-    valid_idx = valid_idx[:args.max_rows]
+    # Filter sampled rows
+    keep = (sample_cell >= 0) & (~sample_forfeit)
+    feats180 = sample_feats[keep]
+    cell_labels = sample_cell[keep]
+    positions_filtered = sample_pos[keep]
+    valid_idx = np.arange(len(feats180))
+    # Trim to requested size
+    if len(valid_idx) > args.max_rows:
+        valid_idx = valid_idx[:args.max_rows]
+        feats180 = feats180[valid_idx]
+        cell_labels = cell_labels[valid_idx]
+        positions_filtered = positions_filtered[valid_idx]
+        valid_idx = np.arange(len(feats180))
+    positions = positions_filtered
     print(f"Eval rows (random sample): {len(valid_idx):,}")
 
     # Split by parity
