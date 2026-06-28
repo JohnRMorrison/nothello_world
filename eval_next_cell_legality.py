@@ -80,8 +80,12 @@ def load_chunk_with_legal_cells(path, row_slice=1_000_000):
     return feats, cell_legal, positions_all.astype(np.int8)
 
 
-def evaluate(model, chunks, device, batch_size=4096):
-    """Run model over chunks; return aggregated metrics."""
+def evaluate(model, chunks, device, batch_size=4096, model_odd=None):
+    """Run model over chunks; return aggregated metrics.
+
+    If model_odd is provided, `model` is the EVEN model and we route batches
+    by `position % 2`.  Otherwise a single model handles all rows.
+    """
     n_total = 0
     n_top1_legal = 0
     n_top3_all_legal = 0
@@ -95,7 +99,7 @@ def evaluate(model, chunks, device, batch_size=4096):
 
     with torch.no_grad():
         for ch_idx, chunk_path in enumerate(chunks):
-            feats180, cell_legal, _ = load_chunk_with_legal_cells(chunk_path)
+            feats180, cell_legal, positions = load_chunk_with_legal_cells(chunk_path)
             print(f"Chunk {ch_idx+1}/{len(chunks)}: {os.path.basename(chunk_path)} "
                   f"n={len(feats180):,}")
             # Filter rows that have at least one legal cell
@@ -106,7 +110,18 @@ def evaluate(model, chunks, device, batch_size=4096):
                 x180 = torch.from_numpy(feats180[bidx].astype(np.float32)).to(device)
                 legal = torch.from_numpy(cell_legal[bidx]).to(device).float()  # (B, 60)
                 x = to_move_grid_input(x180)
-                logits = model(x)                                              # (B, 60)
+                if model_odd is None:
+                    logits = model(x)                                          # (B, 60)
+                else:
+                    # Route by position parity: even rows -> model, odd -> model_odd.
+                    pos_batch = positions[bidx]
+                    even_mask = torch.from_numpy(pos_batch % 2 == 0).to(device)
+                    logits = torch.empty(len(bidx), 60, device=device)
+                    if even_mask.any():
+                        logits[even_mask] = model(x[even_mask])
+                    odd_mask = ~even_mask
+                    if odd_mask.any():
+                        logits[odd_mask] = model_odd(x[odd_mask])
                 # Top-K metrics
                 for k in topK_correct:
                     _, topk_idx = logits.topk(k, dim=-1)                       # (B, k)
@@ -174,9 +189,24 @@ def main():
     hidden = ckpt.get('hidden', 512)
     input_dim = ckpt.get('input_dim', 3600)
     print(f"Loading ckpt: H={hidden}, input_dim={input_dim}")
-    model = NextCellMLP(input_dim=input_dim, hidden_dim=hidden, n_cells=60).to(device)
-    model.load_state_dict(ckpt['state_dict'])
-    model.eval()
+
+    # Two checkpoint formats:
+    #   single-model:   {'state_dict': ..., ...}
+    #   parity-split:   {'even': ..., 'odd': ..., ...}
+    model_odd = None
+    if 'even' in ckpt and 'odd' in ckpt:
+        print("  Detected parity-split checkpoint -> using even+odd models")
+        model = NextCellMLP(input_dim=input_dim, hidden_dim=hidden, n_cells=60).to(device)
+        model_odd = NextCellMLP(input_dim=input_dim, hidden_dim=hidden, n_cells=60).to(device)
+        model.load_state_dict(ckpt['even'])
+        model_odd.load_state_dict(ckpt['odd'])
+        model.eval()
+        model_odd.eval()
+    else:
+        print("  Detected single-model checkpoint")
+        model = NextCellMLP(input_dim=input_dim, hidden_dim=hidden, n_cells=60).to(device)
+        model.load_state_dict(ckpt['state_dict'])
+        model.eval()
 
     chunks = sorted(glob.glob(os.path.join(args.chunk_dir, args.chunk_glob)))
     print(f"Found {len(chunks)} {args.chunk_glob} chunks; using last {args.chunks}")
@@ -184,7 +214,7 @@ def main():
     for c in chunks:
         print(f"  {os.path.basename(c)}")
 
-    results = evaluate(model, chunks, device, args.batch_size)
+    results = evaluate(model, chunks, device, args.batch_size, model_odd=model_odd)
 
     print()
     print("=" * 60)
