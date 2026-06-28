@@ -87,16 +87,21 @@ class VectorizedDirectMLP(nn.Module):
 
 
 def derive_pattern_labels(board_labels, positions, batch_size=200_000):
-    """Compute 960-d pattern legality from 64-d board state in row batches."""
+    """Compute 960-d pattern legality from 64-d board state in row batches.
+
+    Output as uint8 (0/1) to cut chunk-level memory by 4x vs float32.
+    For a 16M-row chunk: 16M*960*1B = 15 GB instead of 61 GB.
+    """
     n = len(board_labels)
-    out = np.zeros((n, N_PATTERNS), dtype=np.float32)
+    out = np.zeros((n, N_PATTERNS), dtype=np.uint8)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
-        out[start:end] = compute_pattern_labels_batch(
+        pat = compute_pattern_labels_batch(
             board_labels[start:end].astype(np.int8),
             positions[start:end].astype(np.int64),
             _PAT_TARGETS, _PAT_TERMINALS, _PAT_OPP_CELLS, _PAT_OPP_MASK,
         )
+        out[start:end] = (pat > 0).astype(np.uint8)
     return out
 
 
@@ -203,7 +208,7 @@ def main():
                     feats_120[batch_idx].astype(np.float32)
                 ).to(device)
                 y_pat = torch.from_numpy(
-                    pattern_legal[batch_idx]
+                    pattern_legal[batch_idx].astype(np.float32)
                 ).to(device)
                 pos = torch.from_numpy(positions[batch_idx]).to(device)
                 even_mask = (pos % 2 == 0)
@@ -267,7 +272,7 @@ def main():
                     ev_feats_120[i:i + args.batch_size].astype(np.float32)
                 ).to(device)
                 y_pat = torch.from_numpy(
-                    ev_pat[i:i + args.batch_size]
+                    ev_pat[i:i + args.batch_size].astype(np.float32)
                 ).to(device)
                 pos = torch.from_numpy(ev_pos[i:i + args.batch_size]).to(device)
                 even_mask = (pos % 2 == 0)
