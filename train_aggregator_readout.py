@@ -83,12 +83,20 @@ def derive_cell_legal(board_labels, positions, batch_size=500_000):
 
 
 def mlp_scores_batch(mlp_bundle, feats_120, positions, device):
-    """Batched per-model cell scores (B, 60).  Matches compare_v4_vs_mlp.mlp_cell_scores
-    convention: use_even = (k % 2 == 1) -> use me (= ckpt['even'])."""
+    """Batched per-model cell scores (B, 60).
+
+    compare_v4_vs_mlp.mlp_cell_scores uses `use_even = (k % 2 == 1)` where
+    k = number of moves played.  In chunk_ext, the stored `position p` is
+    OFF BY ONE: features at position p encode (p+1) played cells. So the
+    equivalent k = position + 1, and the parity formula must flip:
+        use_even = ((position+1) % 2 == 1) = (position % 2 == 0)
+    Training in train_pattern_simple uses the same chunk_ext convention
+    (even_mask = pos % 2 == 0 trains model_even).
+    """
     me, mo, idx, mask = mlp_bundle
     B = feats_120.shape[0]
     cell_scores = torch.zeros(B, 60, device=device)
-    use_me_mask = (positions % 2 == 1)
+    use_me_mask = (positions % 2 == 0)
     use_mo_mask = ~use_me_mask
 
     if use_me_mask.any():
