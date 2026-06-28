@@ -30,36 +30,54 @@ import torch
 
 sys.path.insert(0, '.')
 from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
+from generate_rule_games import precompute_pattern_arrays
+from train_pattern_simple import compute_pattern_labels_batch
 from train_next_cell_mlp_chunks import (
     NextCellMLP, to_move_grid_input, PATTERN_TO_CELL60,
 )
 
+# Per-pattern arrays for compute_pattern_labels_batch (targets, terminals,
+# opponent cells, opponent mask).  These are derived once from the 960 patterns.
+_PAT_TARGETS, _PAT_TERMINALS, _PAT_OPP_CELLS, _PAT_OPP_MASK = (
+    precompute_pattern_arrays(enumerate_flanking_patterns())
+)
 
-def load_chunk_with_legal_cells(path, row_slice=2_000_000):
+
+def load_chunk_with_legal_cells(path, row_slice=1_000_000):
     """Load chunk_ext_NNNN.npz and derive 60-d legal-cell mask per row.
 
-    Memory-efficient: processes labels in row slices so the full (N, 960)
-    uint8 array (~17 GB for N=18M) is never simultaneously held with
-    features and cell_legal.
+    chunk_ext.labels is the 64-d BOARD STATE (0=empty, 1=white, 2=black),
+    NOT a pattern-legality mask.  We derive pattern legality via
+    compute_pattern_labels_batch and then map to cell legality.
+
+    Memory-efficient: processes rows in slices.
     """
     with np.load(path) as z:
         feats = z['features'].astype(np.float16)
+        # labels: (N, 64) board state, positions: (N,) turn index
+        board_all = z['labels']                       # lazy ref
+        positions_all = z['positions'].astype(np.int64)
         N = feats.shape[0]
-        # Load labels lazily and derive cell_legal in row slices.
-        labels_arr = z['labels']    # NpzFile lazy reference; backed by zip stream
-        positions = z['positions'].astype(np.int8) if 'positions' in z.files else None
         cell_legal = np.zeros((N, 60), dtype=np.uint8)
         for start in range(0, N, row_slice):
             end = min(start + row_slice, N)
-            # Cast to uint8 — labels are 0/1 in either int16 or uint8 storage.
-            chunk_labels = np.asarray(labels_arr[start:end]).astype(np.uint8)
-            # Vectorized scatter-max via PATTERN_TO_CELL60 grouping.
-            for p in range(chunk_labels.shape[1]):
+            board = np.asarray(board_all[start:end]).astype(np.int8)
+            pos = positions_all[start:end]
+            # (slice, 960) float32, 1.0 where pattern fires
+            pat_legal = compute_pattern_labels_batch(
+                board, pos, _PAT_TARGETS, _PAT_TERMINALS,
+                _PAT_OPP_CELLS, _PAT_OPP_MASK,
+            )
+            # Map (slice, 960) → (slice, 60) via scatter-max on PATTERN_TO_CELL60
+            slice_legal = np.zeros((end - start, 60), dtype=np.uint8)
+            for p in range(pat_legal.shape[1]):
                 c = PATTERN_TO_CELL60[p]
-                np.maximum(cell_legal[start:end, c], chunk_labels[:, p],
-                           out=cell_legal[start:end, c])
-            del chunk_labels
-    return feats, cell_legal, positions
+                np.maximum(slice_legal[:, c],
+                           (pat_legal[:, p] > 0).astype(np.uint8),
+                           out=slice_legal[:, c])
+            cell_legal[start:end] = slice_legal
+            del board, pat_legal, slice_legal
+    return feats, cell_legal, positions_all.astype(np.int8)
 
 
 def evaluate(model, chunks, device, batch_size=4096):
