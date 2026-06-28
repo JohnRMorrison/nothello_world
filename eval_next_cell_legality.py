@@ -51,7 +51,8 @@ def load_chunk_with_legal_cells(path, row_slice=2_000_000):
         cell_legal = np.zeros((N, 60), dtype=np.uint8)
         for start in range(0, N, row_slice):
             end = min(start + row_slice, N)
-            chunk_labels = np.asarray(labels_arr[start:end])      # (slice, 960) uint8
+            # Cast to uint8 — labels are 0/1 in either int16 or uint8 storage.
+            chunk_labels = np.asarray(labels_arr[start:end]).astype(np.uint8)
             # Vectorized scatter-max via PATTERN_TO_CELL60 grouping.
             for p in range(chunk_labels.shape[1]):
                 c = PATTERN_TO_CELL60[p]
