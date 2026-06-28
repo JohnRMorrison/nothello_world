@@ -1,14 +1,10 @@
-"""Diagnostic: compare batched mlp_scores_batch to single-position mlp_cell_scores.
+"""Minimal diagnostic: compare batched mlp scores vs single-position mlp_cell_scores.
 
-Loads a few real positions from a chunk, computes scores through both
-pipelines, prints the per-cell scores side by side.  If they differ, the bug
-is in the batched version.
+Loads N positions from a chunk, runs each through both pipelines, prints
+the top-cell mismatch (if any).
 
-Usage:
-    python diag_mlp_batched.py \\
-      --ckpt experiments/.../pattern_simple_direct_H512_playedeven_seed44.pt \\
-      --chunk experiments/.../feature_chunks/chunk_ext_0039.npz \\
-      --num-positions 5
+Imports only what's needed -- avoids the heavy precompute_pattern_arrays /
+compute_pattern_labels_batch path that may OOM on small login nodes.
 """
 import argparse
 import os
@@ -16,11 +12,41 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, '.')
+# Only the lightweight imports:
 from compare_v4_vs_mlp import load_mlp, mlp_cell_scores, C64_TO_C60, C60_TO_C64
-from train_aggregator_readout import mlp_scores_batch
-from train_multi_seed_mlp import slice_played_even
+
+
+def mlp_scores_batch(mlp_bundle, feats_120, positions, device):
+    """Same batched scoring as train_aggregator_readout, inlined here."""
+    me, mo, idx, mask = mlp_bundle
+    B = feats_120.shape[0]
+    cell_scores = torch.zeros(B, 60, device=device)
+    use_me_mask = (positions % 2 == 1)
+    use_mo_mask = ~use_me_mask
+    if use_me_mask.any():
+        with torch.no_grad():
+            logits = me(feats_120[use_me_mask])
+        log1m = -F.softplus(logits)
+        gathered = log1m[:, idx]
+        gathered = gathered.masked_fill(~mask, 0.0)
+        cell_scores[use_me_mask] = -gathered.sum(dim=-1)
+    if use_mo_mask.any():
+        with torch.no_grad():
+            logits = mo(feats_120[use_mo_mask])
+        log1m = -F.softplus(logits)
+        gathered = log1m[:, idx]
+        gathered = gathered.masked_fill(~mask, 0.0)
+        cell_scores[use_mo_mask] = -gathered.sum(dim=-1)
+    return cell_scores
+
+
+def slice_played_even(features_180):
+    return np.concatenate(
+        [features_180[:, :60], features_180[:, 120:180]], axis=1
+    )
 
 
 def main():
@@ -35,77 +61,70 @@ def main():
     print(f"Device: {device}")
     mlp = load_mlp(args.ckpt, args.hidden, device)
 
-    # Load a few rows (lazy: only the sampled indices, not the whole chunk)
     with np.load(args.chunk) as z:
-        N = z['positions'].shape[0]    # cheap: just metadata
+        N = z['positions'].shape[0]
         sample = np.random.RandomState(0).choice(
             N, size=args.num_positions, replace=False
         )
         sample.sort()
         feats_180 = np.asarray(z['features'][sample]).astype(np.float32)
         positions = np.asarray(z['positions'][sample]).astype(np.int64)
+    print(f"Loaded {len(feats_180)} sample rows from chunk")
 
     feats_120 = slice_played_even(feats_180)
 
-    # Batched version
     x_dev = torch.from_numpy(feats_120).to(device)
     pos_dev = torch.from_numpy(positions).to(device)
     batched_scores = mlp_scores_batch(mlp, x_dev, pos_dev, device).cpu().numpy()
+    print(f"Batched scores shape: {batched_scores.shape}")
 
-    # For each position, also compute via the single-position path.
-    # The single-position path expects a `game` (list of cell-64 indices) and `k`
-    # (number of moves played).  Reconstruct game from the chunk's "played" feature.
-    # Note: this reconstruction can be ambiguous because chunk features don't
-    # record the play order (the 'when' column does in 180-d).  We use 'when'
-    # to recover order.
-    # features layout: [played(60), when(60), even(60)]
-    print(f"\n{'pos':>4}  {'k':>3}  {'argmax':>7}  {'batched[argmax]':>16}  "
-          f"{'single[argmax]':>15}  {'match?':>8}")
-    print("-" * 72)
+    print(f"\n{'idx':>4}  {'pos':>4}  {'k':>3}  "
+          f"{'batched argmax':>16}  {'single argmax':>15}  match")
+    print("-" * 68)
+    n_match = 0
     for i in range(args.num_positions):
         played = feats_180[i, :60]
         when = feats_180[i, 60:120]
-        # Reconstruct play order from when (step = when*60 - 1)
         played_idx = np.where(played > 0.5)[0]
         steps = (when[played_idx] * 60 - 1).round().astype(int)
         order = np.argsort(steps)
-        game_60 = played_idx[order]  # 60-cell indices in play order
-        game_64 = [C60_TO_C64.get(int(c)) for c in game_60]
-        game_64 = [c for c in game_64 if c is not None]
+        game_60 = played_idx[order]
+        game_64 = [C60_TO_C64.get(int(c)) for c in game_60 if int(c) in C60_TO_C64]
         k = len(game_64)
-        # Sanity: k should equal position+something
-        # In fired_patterns / chunk_ext convention: position = t, features = state at step t-1.
-        # Actually let's just check
-        single_scores = mlp_cell_scores(mlp, game_64 + [0], k, device)
-        # ^ pads game to len k+1 since mlp_cell_scores uses game[:k]
-        # Actually mlp_cell_scores uses game[:k], so game just needs to have at least k items
+        # mlp_cell_scores uses game[:k], so the game just needs to have >= k items
+        single_scores = mlp_cell_scores(mlp, game_64 + [0]*5, k, device)
         argmax_batched = int(batched_scores[i].argmax())
         argmax_single = int(single_scores.argmax())
-        diff_at_argmax = abs(batched_scores[i, argmax_batched]
-                              - single_scores[argmax_batched])
-        match = '✓' if argmax_batched == argmax_single else '✗ MISMATCH'
-        print(f"  {positions[i]:>4}  {k:>3}  {argmax_batched:>7}  "
-              f"{batched_scores[i, argmax_batched]:>16.4f}  "
-              f"{single_scores[argmax_batched]:>15.4f}  {match:>8}")
+        match = argmax_batched == argmax_single
+        if match:
+            n_match += 1
+        symbol = "OK" if match else "MISMATCH"
+        print(f"  {i:>2}  {int(positions[i]):>4}  {k:>3}  "
+              f"{argmax_batched:>16}  {argmax_single:>15}  {symbol}")
 
-    # Detailed comparison for position 0
-    print("\nDetailed comparison for position 0:")
-    print(f"  batched (top-10 cells): "
-          f"{np.argsort(-batched_scores[0])[:10].tolist()}")
-    # Recompute single for position 0
-    played = feats_180[0, :60]
-    when = feats_180[0, 60:120]
-    played_idx = np.where(played > 0.5)[0]
-    steps = (when[played_idx] * 60 - 1).round().astype(int)
-    order = np.argsort(steps)
-    game_60 = played_idx[order]
-    game_64 = [C60_TO_C64.get(int(c)) for c in game_60]
-    game_64 = [c for c in game_64 if c is not None]
-    k = len(game_64)
-    print(f"  k={k}  position={positions[0]}")
-    single_scores = mlp_cell_scores(mlp, game_64 + [0], k, device)
-    print(f"  single  (top-10 cells): {np.argsort(-single_scores)[:10].tolist()}")
-    print(f"  max abs diff: {np.abs(batched_scores[0] - single_scores).max():.6f}")
+    print(f"\nMatch rate: {n_match}/{args.num_positions}")
+    if n_match < args.num_positions:
+        # Show detailed scores for first mismatch
+        for i in range(args.num_positions):
+            played = feats_180[i, :60]
+            when = feats_180[i, 60:120]
+            played_idx = np.where(played > 0.5)[0]
+            steps = (when[played_idx] * 60 - 1).round().astype(int)
+            order = np.argsort(steps)
+            game_60 = played_idx[order]
+            game_64 = [C60_TO_C64.get(int(c)) for c in game_60
+                       if int(c) in C60_TO_C64]
+            k = len(game_64)
+            single_scores = mlp_cell_scores(mlp, game_64 + [0]*5, k, device)
+            if int(batched_scores[i].argmax()) != int(single_scores.argmax()):
+                print(f"\nDETAILS for mismatch at idx {i} (position={positions[i]}, k={k}):")
+                print(f"  batched top-5: {np.argsort(-batched_scores[i])[:5].tolist()}")
+                print(f"  single  top-5: {np.argsort(-single_scores)[:5].tolist()}")
+                print(f"  batched score[0..5]: {batched_scores[i][:5].tolist()}")
+                print(f"  single  score[0..5]: {single_scores[:5].tolist()}")
+                print(f"  max abs diff (over all 60 cells): "
+                      f"{np.abs(batched_scores[i] - single_scores).max():.4f}")
+                break
 
 
 if __name__ == '__main__':
