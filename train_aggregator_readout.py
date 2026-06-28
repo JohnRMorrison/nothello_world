@@ -220,7 +220,8 @@ def main():
     n_test = len(test_scores)
     train_X = torch.from_numpy(train_scores.reshape(n_train, 180).astype(np.float32))
     train_Y = torch.from_numpy(train_legal.astype(np.float32))
-    test_X = torch.from_numpy(test_scores.reshape(n_test, 180).astype(np.float32)).to(device)
+    # Keep test on CPU; batch-stream to GPU during eval to avoid OOM
+    test_X = torch.from_numpy(test_scores.reshape(n_test, 180).astype(np.float32))
     test_Y_np = test_legal.astype(np.float32)
 
     # BCE pos_weight scaled by class imbalance
@@ -249,9 +250,14 @@ def main():
         avg_loss = total_loss / n_train
 
         readout.eval()
+        # Batched test eval to avoid OOM on small GPUs
+        test_preds = np.empty(n_test, dtype=np.int64)
+        eval_bs = args.readout_batch_size * 4
         with torch.no_grad():
-            test_logits = readout(test_X)
-            test_preds = test_logits.argmax(dim=-1).cpu().numpy()
+            for i in range(0, n_test, eval_bs):
+                end = min(i + eval_bs, n_test)
+                xb = test_X[i:end].to(device)
+                test_preds[i:end] = readout(xb).argmax(dim=-1).cpu().numpy()
         test_acc = test_Y_np[np.arange(n_test), test_preds].mean()
         best_test = max(best_test, test_acc)
         print(f"  Epoch {epoch}: train_loss={avg_loss:.4f}  "
