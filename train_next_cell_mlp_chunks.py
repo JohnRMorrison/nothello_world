@@ -165,19 +165,25 @@ def main():
             return to_move_grid_input(X_180)
         raise ValueError(args.features)
 
-    model = NextCellMLP(feature_dim, args.hidden, n_cells=60).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
+    # Two parity-specific networks (matches train_pattern_simple convention):
+    # model_even is trained on rows where position % 2 == 0.
+    model_even = NextCellMLP(feature_dim, args.hidden, n_cells=60).to(device)
+    model_odd = NextCellMLP(feature_dim, args.hidden, n_cells=60).to(device)
+    opt_even = torch.optim.Adam(model_even.parameters(), lr=args.lr)
+    opt_odd = torch.optim.Adam(model_odd.parameters(), lr=args.lr)
+    n_params = sum(p.numel() for p in model_even.parameters()) * 2
+    print(f"Model params (even + odd combined): {n_params:,}")
 
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
     seed_tag = "" if args.seed == 0 else f"_seed{args.seed}"
     feat_tag = args.features.replace('+', '')
     save_path = os.path.join(save_dir,
-        f"next_cell_mlp_H{args.hidden}_{feat_tag}{seed_tag}.pt")
+        f"next_cell_mlp_H{args.hidden}_{feat_tag}_parity{seed_tag}.pt")
 
     for epoch in range(1, args.epochs + 1):
-        model.train()
+        model_even.train()
+        model_odd.train()
         t0 = time.time()
         total_loss = 0.0
         total_correct = 0
@@ -188,36 +194,44 @@ def main():
         chunk_order = rng.permutation(len(train_paths))
 
         for ci_idx, ci in enumerate(chunk_order):
-            # load_chunk now returns (feats_float16, cell_labels, is_forfeit, positions)
             feats180, cell_labels, is_forfeit, positions = load_chunk(train_paths[ci])
-            # Filter: only rows with a valid cell label AND not forfeit
             keep = cell_labels >= 0
             if is_forfeit is not None:
                 keep &= ~is_forfeit
-            # Use boolean indexing once (creates filtered copy)
+            if positions is None:
+                raise RuntimeError("Chunk missing 'positions' field — required for parity split")
             valid_idx = np.where(keep)[0]
             if len(valid_idx) == 0:
                 continue
-            # Shuffle by index only (no copy of feats180 yet)
             rng.shuffle(valid_idx)
 
-            # Train in batches.  Pull rows by index (creates one batch-sized
-            # float32 tensor at a time, keeping memory low).
             for i in range(0, len(valid_idx), args.batch_size):
                 batch_idx = valid_idx[i:i + args.batch_size]
-                # Cast batch from float16 -> float32 just before GPU transfer.
                 x180 = torch.from_numpy(feats180[batch_idx].astype(np.float32)).to(device)
                 y = torch.from_numpy(cell_labels[batch_idx]).to(device)
+                pos_batch = positions[batch_idx]
                 x = slice_features(x180)
-                logits = model(x)
-                loss = F.cross_entropy(logits, y)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item() * len(y)
-                total_correct += (logits.argmax(dim=-1) == y).sum().item()
-                total_n += len(y)
-            # Release this chunk's memory before loading the next.
+                # Split by parity and train each model on its half
+                even_mask = torch.from_numpy(pos_batch % 2 == 0).to(device)
+                odd_mask = ~even_mask
+                if even_mask.any():
+                    logits_e = model_even(x[even_mask])
+                    loss_e = F.cross_entropy(logits_e, y[even_mask])
+                    opt_even.zero_grad()
+                    loss_e.backward()
+                    opt_even.step()
+                    total_loss += loss_e.item() * int(even_mask.sum())
+                    total_correct += (logits_e.argmax(dim=-1) == y[even_mask]).sum().item()
+                    total_n += int(even_mask.sum())
+                if odd_mask.any():
+                    logits_o = model_odd(x[odd_mask])
+                    loss_o = F.cross_entropy(logits_o, y[odd_mask])
+                    opt_odd.zero_grad()
+                    loss_o.backward()
+                    opt_odd.step()
+                    total_loss += loss_o.item() * int(odd_mask.sum())
+                    total_correct += (logits_o.argmax(dim=-1) == y[odd_mask]).sum().item()
+                    total_n += int(odd_mask.sum())
             del feats180, cell_labels, is_forfeit, positions, valid_idx
             now = time.time()
             if now - last_log > 60:
@@ -227,14 +241,15 @@ def main():
                       f"elapsed={int(now-t0)}s", flush=True)
                 last_log = now
 
-        # Eval at end of epoch
-        model.eval()
+        # Eval at end of epoch (split by parity)
+        model_even.eval()
+        model_odd.eval()
         ev_loss = 0.0
         ev_correct = 0
         ev_n = 0
         with torch.no_grad():
             for ep in eval_paths:
-                feats180, cell_labels, is_forfeit, _ = load_chunk(ep)
+                feats180, cell_labels, is_forfeit, positions = load_chunk(ep)
                 keep = cell_labels >= 0
                 if is_forfeit is not None:
                     keep &= ~is_forfeit
@@ -243,13 +258,23 @@ def main():
                     batch_idx = valid_idx[i:i + args.batch_size]
                     x180 = torch.from_numpy(feats180[batch_idx].astype(np.float32)).to(device)
                     y = torch.from_numpy(cell_labels[batch_idx]).to(device)
+                    pos_batch = positions[batch_idx]
                     x = slice_features(x180)
-                    logits = model(x)
-                    loss = F.cross_entropy(logits, y, reduction='sum')
-                    ev_loss += loss.item()
-                    ev_correct += (logits.argmax(dim=-1) == y).sum().item()
-                    ev_n += len(y)
-                del feats180, cell_labels, is_forfeit, valid_idx
+                    even_mask = torch.from_numpy(pos_batch % 2 == 0).to(device)
+                    odd_mask = ~even_mask
+                    if even_mask.any():
+                        logits_e = model_even(x[even_mask])
+                        loss_e = F.cross_entropy(logits_e, y[even_mask], reduction='sum')
+                        ev_loss += loss_e.item()
+                        ev_correct += (logits_e.argmax(dim=-1) == y[even_mask]).sum().item()
+                        ev_n += int(even_mask.sum())
+                    if odd_mask.any():
+                        logits_o = model_odd(x[odd_mask])
+                        loss_o = F.cross_entropy(logits_o, y[odd_mask], reduction='sum')
+                        ev_loss += loss_o.item()
+                        ev_correct += (logits_o.argmax(dim=-1) == y[odd_mask]).sum().item()
+                        ev_n += int(odd_mask.sum())
+                del feats180, cell_labels, is_forfeit, positions, valid_idx
 
         train_acc = total_correct / max(1, total_n)
         ev_acc = ev_correct / max(1, ev_n)
@@ -259,7 +284,8 @@ def main():
               f"({int(time.time()-t0)}s)", flush=True)
 
         torch.save({
-            'state_dict': model.state_dict(),
+            'even': {k: v.cpu().clone() for k, v in model_even.state_dict().items()},
+            'odd':  {k: v.cpu().clone() for k, v in model_odd.state_dict().items()},
             'epoch': epoch,
             'hidden': args.hidden,
             'input_dim': feature_dim,
