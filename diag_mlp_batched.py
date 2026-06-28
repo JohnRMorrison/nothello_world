@@ -19,7 +19,8 @@ import torch
 
 sys.path.insert(0, '.')
 from compare_v4_vs_mlp import load_mlp, mlp_cell_scores, C64_TO_C60, C60_TO_C64
-from train_aggregator_readout import mlp_scores_batch, slice_played_even
+from train_aggregator_readout import mlp_scores_batch
+from train_multi_seed_mlp import slice_played_even
 
 
 def main():
