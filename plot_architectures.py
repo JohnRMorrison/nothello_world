@@ -100,7 +100,7 @@ def plot_ogpt():
         add_box(ax, attn_cx, cy - 0.05, box_w, box_h,
                 "8 attention heads", COLOR_ATTN, fontsize=9.5)
         add_box(ax, mlp_cx,  cy - 0.05, box_w, box_h,
-                "MLP", COLOR_MLP, fontsize=9.5)
+                "MLP (H=512)", COLOR_MLP, fontsize=9.5)
         # bidirectional arrows between residual stream and this layer
         # leftward (input) arrow: rs_x -> 2.50 (group box left edge)
         add_arrow(ax, rs_x, cy + 0.08, 2.48, cy + 0.08)
@@ -109,9 +109,9 @@ def plot_ogpt():
 
     # --- bottom: residual stream -> output ---
     out_cy = 0.45
-    add_box(ax, cx, out_cy, 3.5, 0.75,
-            "OUTPUT:  P(next move)\nsoftmax over 60 board cells",
-            COLOR_OUTPUT, fontsize=10)
+    add_box(ax, cx, out_cy, 2.5, 0.75,
+            "Output\n(next move)",
+            COLOR_OUTPUT, fontsize=11)
     # path from bottom of residual stream to the output box
     ax.plot([rs_x, rs_x], [rs_bot, out_cy + 0.05], color="black", linewidth=1.3)
     ax.plot([rs_x, cx], [out_cy + 0.05, out_cy + 0.05], color="black", linewidth=1.3)
@@ -151,7 +151,7 @@ def plot_mlp():
         add_box(ax, col, ys[0], BOX_W, BOX_H,
                 "Input\n(move history)", COLOR_HISTORY, fontsize=11)
         add_box(ax, col, ys[1], BOX_W, BOX_H,
-                "MLP\nH = 512", COLOR_MLP, fontsize=11)
+                "MLP (H=512)", COLOR_MLP, fontsize=11)
         add_box(ax, col, ys[2], BOX_W, BOX_H,
                 "Output\n(move patterns)", COLOR_OUTPUT, fontsize=11)
         add_arrow(ax, col, ys[0] - BOX_H / 2, col, ys[1] + BOX_H / 2)
