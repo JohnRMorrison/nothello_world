@@ -128,6 +128,9 @@ def main():
                             'heuristic_probe_results/pattern_detector_checkpoints')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--pos-weight', type=float, default=None)
+    ap.add_argument('--max-chunks', type=int, default=None,
+                    help='If set, train on at most this many chunks per epoch '
+                         '(useful when full pass would exceed SLURM limit)')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -157,6 +160,10 @@ def main():
     chunks = sorted(glob.glob(os.path.join(args.chunk_dir, args.chunk_glob)))
     train_chunks = chunks[:-1]
     eval_chunk = chunks[-1]
+    if args.max_chunks is not None:
+        train_chunks = train_chunks[:args.max_chunks]
+        print(f"Limiting to first {len(train_chunks)} training chunks",
+              flush=True)
     print(f"Found {len(chunks)} chunks  Train={len(train_chunks)}  Eval=1",
           flush=True)
 

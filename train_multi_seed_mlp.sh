@@ -23,6 +23,7 @@ NUM_SEEDS=${NUM_SEEDS:-100}
 EPOCHS=${EPOCHS:-3}
 BATCH_SIZE=${BATCH_SIZE:-8192}
 SEED=${SEED:-0}
+MAX_CHUNKS=${MAX_CHUNKS:-}
 
 echo "============================================"
 echo "Multi-seed MLP training"
@@ -31,11 +32,17 @@ echo "Job ID: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
+MAX_CHUNKS_ARG=""
+if [ -n "$MAX_CHUNKS" ]; then
+    MAX_CHUNKS_ARG="--max-chunks $MAX_CHUNKS"
+fi
+
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
     --num-seeds $NUM_SEEDS \
     --hidden $HIDDEN \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
-    --seed $SEED
+    --seed $SEED \
+    $MAX_CHUNKS_ARG
 
 echo "Completed at: $(date)"
