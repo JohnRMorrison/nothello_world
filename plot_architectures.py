@@ -109,13 +109,15 @@ def plot_ogpt():
 
     # --- bottom: residual stream -> output ---
     out_cy = 0.45
-    add_box(ax, cx, out_cy, 2.5, 0.75,
+    out_w = 2.5
+    add_box(ax, cx, out_cy, out_w, 0.75,
             "Output\n(next move)",
             COLOR_OUTPUT, fontsize=11)
-    # path from bottom of residual stream to the output box
-    ax.plot([rs_x, rs_x], [rs_bot, out_cy + 0.05], color="black", linewidth=1.3)
-    ax.plot([rs_x, cx], [out_cy + 0.05, out_cy + 0.05], color="black", linewidth=1.3)
-    add_arrow(ax, cx, out_cy + 0.45, cx, out_cy + 0.4)
+    # Path from bottom of residual stream to the LEFT EDGE of the output box
+    # (no arrowhead on top; line stops at the box, doesn't continue inside)
+    out_left = cx - out_w / 2
+    ax.plot([rs_x, rs_x], [rs_bot, out_cy], color="black", linewidth=1.3)
+    ax.plot([rs_x, out_left], [out_cy, out_cy], color="black", linewidth=1.3)
 
     # --- "Residual stream" label (rotated, on the very left) ---
     ax.text(0.55, (rs_top + rs_bot) / 2, "Residual stream",
