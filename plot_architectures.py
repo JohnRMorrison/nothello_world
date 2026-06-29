@@ -1,6 +1,7 @@
-"""Generate two architecture diagrams to experiments/plots/:
-  - ogpt_architecture.png   : Othello-GPT block stack
-  - mlp_architecture.png    : Two parity-specific MLPs side-by-side
+"""Generate MLP architecture diagram to experiments/plots/.
+
+The Othello-GPT figure is hand-authored elsewhere — this script only
+produces the parallel MLP figure (two parity-specific MLPs side-by-side).
 """
 import os
 
@@ -123,5 +124,4 @@ def plot_mlp():
 
 
 if __name__ == "__main__":
-    plot_ogpt()
     plot_mlp()
