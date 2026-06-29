@@ -100,8 +100,11 @@ def compute_node_signature(W1, b1, j, features='playedeven'):
     if features != 'playedeven':
         raise NotImplementedError(f"features={features} not yet implemented")
 
-    W_b = W1[j, :60]                 # contribution if cell c is BLACK
-    W_w = W1[j, :60] + W1[j, 60:]    # contribution if cell c is WHITE
+    # even[c]=1 means cell c was played on an even step (0, 2, 4, ...), which is
+    # black's move since black moves first -- so "played, even" = BLACK,
+    # "played, not-even" (odd step) = WHITE.
+    W_w = W1[j, :60]                 # contribution if cell c is WHITE
+    W_b = W1[j, :60] + W1[j, 60:]    # contribution if cell c is BLACK
     states = np.stack([np.zeros(60), W_b, W_w], axis=-1)  # (60, 3)
     best = states.max(axis=-1)        # per-cell max contribution
     worst = states.min(axis=-1)       # per-cell min contribution
@@ -209,8 +212,8 @@ def compute_h_lower_bound(W1, b1):
     """
     H = W1.shape[0]
     h_lower = np.zeros(H, dtype=np.float32)
-    W_b = W1[:, :60]
-    W_w = W1[:, :60] + W1[:, 60:]
+    W_w = W1[:, :60]                 # contribution if cell c is WHITE
+    W_b = W1[:, :60] + W1[:, 60:]    # contribution if cell c is BLACK
     states = np.stack([np.zeros_like(W_b), W_b, W_w], axis=-1)
     best = states.max(axis=-1)
     worst = states.min(axis=-1)
