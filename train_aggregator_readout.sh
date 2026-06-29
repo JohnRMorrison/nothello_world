@@ -36,6 +36,11 @@ echo "Job ID: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
+POS_FILTER_ARGS=""
+if [ -n "$POS_MIN" ] && [ -n "$POS_MAX" ]; then
+    POS_FILTER_ARGS="--pos-min $POS_MIN --pos-max $POS_MAX"
+fi
+
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_aggregator_readout.py \
     --ckpts $CKPT_DIR/pattern_simple_direct_H512_playedeven_seed0.pt \
             $CKPT_DIR/pattern_simple_direct_H512_playedeven_seed43.pt \
@@ -45,6 +50,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_aggregator_readout.py \
     --train-size $TRAIN_SIZE \
     --test-size $TEST_SIZE \
     --readout-hidden $READOUT_HIDDEN \
-    --readout-epochs $READOUT_EPOCHS
+    --readout-epochs $READOUT_EPOCHS \
+    $POS_FILTER_ARGS
 
 echo "Completed at: $(date)"

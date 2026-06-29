@@ -116,17 +116,38 @@ def mlp_scores_batch(mlp_bundle, feats_120, positions, device):
     return cell_scores
 
 
-def precompute_chunk(chunk_path, mlps, max_rows, batch_size, device, seed):
-    """Returns (scores: (N, 3, 60) float32, cell_legal: (N, 60) uint8)."""
+def precompute_chunk(chunk_path, mlps, max_rows, batch_size, device, seed,
+                      pos_min=None, pos_max=None):
+    """Returns (scores: (N, 3, 60) float32, cell_legal: (N, 60) uint8).
+
+    If pos_min/pos_max are set, drop rows whose chunk_ext position is outside
+    [pos_min, pos_max].  Recall chunk_ext position p = (number of moves
+    played) - 1, so for "k in 5..53" (compare_mlp_seeds_3way convention) we
+    want chunk_ext positions in 4..52.
+    """
     print(f"Loading chunk {os.path.basename(chunk_path)}")
     with np.load(chunk_path) as z:
         N = z['features'].shape[0]
         rng = np.random.RandomState(seed)
-        sample_idx = rng.choice(N, size=min(N, max_rows), replace=False)
+        # Sample 1.5x what we need so the post-filter total is close to target
+        oversample = int(min(N, max_rows * 1.5)) if pos_min is not None else min(N, max_rows)
+        sample_idx = rng.choice(N, size=oversample, replace=False)
         sample_idx.sort()
         feats = z['features'][sample_idx].astype(np.float16)
         labels = z['labels'][sample_idx].astype(np.int8)
         positions = z['positions'][sample_idx].astype(np.int64)
+    if pos_min is not None and pos_max is not None:
+        keep = (positions >= pos_min) & (positions <= pos_max)
+        feats = feats[keep]
+        labels = labels[keep]
+        positions = positions[keep]
+        # Trim to requested size
+        if len(feats) > max_rows:
+            feats = feats[:max_rows]
+            labels = labels[:max_rows]
+            positions = positions[:max_rows]
+        print(f"  Filtered to positions in [{pos_min}, {pos_max}]: "
+              f"{len(feats):,} rows remain")
     n = len(feats)
     print(f"  Sampled {n:,} rows")
     feats_120 = np.concatenate([feats[:, :60], feats[:, 120:180]], axis=1)
@@ -168,6 +189,12 @@ def main():
     ap.add_argument('--batch-size', type=int, default=8192,
                     help='Batch size for the MLP forward passes during precompute')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--pos-min', type=int, default=None,
+                    help='If set, filter rows to chunk_ext position >= pos_min.  '
+                         'For compare_mlp_seeds_3way parity (k=5..53), use --pos-min 4')
+    ap.add_argument('--pos-max', type=int, default=None,
+                    help='If set, filter rows to chunk_ext position <= pos_max.  '
+                         'For compare_mlp_seeds_3way parity (k=5..53), use --pos-max 52')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -185,12 +212,14 @@ def main():
     train_scores, train_legal = precompute_chunk(
         args.train_chunk, mlps, args.train_size,
         args.batch_size, device, args.seed,
+        pos_min=args.pos_min, pos_max=args.pos_max,
     )
     print()
     print("=== Precompute TEST scores ===")
     test_scores, test_legal = precompute_chunk(
         args.test_chunk, mlps, args.test_size,
         args.batch_size, device, args.seed + 1,
+        pos_min=args.pos_min, pos_max=args.pos_max,
     )
 
     print()
