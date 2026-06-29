@@ -1,0 +1,104 @@
+"""One-time precompute of pattern legality for chunk_ext_*.npz.
+
+For each chunk_ext_NNNN.npz, derive the 960-d pattern legality mask from
+the 64-d board state via compute_pattern_labels_batch, and save as
+sibling chunk_ext_NNNN_patlegal.npz (uint8, ~17 GB per chunk).
+
+Subsequent multi-seed training jobs can then load the precomputed labels
+instead of re-deriving them, cutting per-chunk wall-clock from ~25 min
+to ~30 sec.
+
+Usage (single chunk):
+    python precompute_pattern_legality.py --chunk-idx 0
+
+Usage (SLURM array, recommended):
+    sbatch --array=0-39%10 precompute_pattern_legality.sh
+"""
+import argparse
+import glob
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, '.')
+from hand_crafted_flanking import enumerate_flanking_patterns
+from generate_rule_games import precompute_pattern_arrays
+from train_pattern_simple import compute_pattern_labels_batch
+
+
+_PATTERNS = enumerate_flanking_patterns()
+_PAT_TARGETS, _PAT_TERMINALS, _PAT_OPP_CELLS, _PAT_OPP_MASK = (
+    precompute_pattern_arrays(_PATTERNS)
+)
+
+
+def derive_pattern_labels(board_labels, positions, batch_size=200_000):
+    """Compute 960-d pattern legality from 64-d board state, store as uint8."""
+    n = len(board_labels)
+    out = np.zeros((n, 960), dtype=np.uint8)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        pat = compute_pattern_labels_batch(
+            board_labels[start:end].astype(np.int8),
+            positions[start:end].astype(np.int64),
+            _PAT_TARGETS, _PAT_TERMINALS, _PAT_OPP_CELLS, _PAT_OPP_MASK,
+        )
+        out[start:end] = (pat > 0).astype(np.uint8)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--chunk-idx', type=int, default=None,
+                    help='Which chunk (0..N-1) to process.  If unset, '
+                         'reads SLURM_ARRAY_TASK_ID env var.')
+    ap.add_argument('--chunk-dir',
+                    default='experiments/mathematical_transformation_experiments/'
+                            'heuristic_probe_results/feature_chunks')
+    ap.add_argument('--chunk-glob', default='chunk_ext_*.npz')
+    args = ap.parse_args()
+
+    chunks = sorted(glob.glob(os.path.join(args.chunk_dir, args.chunk_glob)))
+    print(f"Found {len(chunks)} chunks", flush=True)
+
+    if args.chunk_idx is None:
+        env = os.environ.get('SLURM_ARRAY_TASK_ID')
+        if env is None:
+            raise SystemExit("Provide --chunk-idx or run via SLURM array")
+        args.chunk_idx = int(env)
+    if args.chunk_idx < 0 or args.chunk_idx >= len(chunks):
+        raise SystemExit(f"chunk-idx {args.chunk_idx} out of range [0, {len(chunks)})")
+
+    chunk_path = chunks[args.chunk_idx]
+    base = os.path.basename(chunk_path).replace('.npz', '_patlegal.npz')
+    out_path = os.path.join(args.chunk_dir, base)
+    if os.path.exists(out_path):
+        print(f"  Already exists: {out_path}  (skipping)", flush=True)
+        return
+
+    print(f"  Processing {os.path.basename(chunk_path)} -> {base}",
+          flush=True)
+    t0 = time.time()
+    with np.load(chunk_path) as z:
+        board_labels = z['labels'].astype(np.int8)
+        positions = z['positions'].astype(np.int64)
+    print(f"  Loaded {len(board_labels):,} rows in {time.time()-t0:.1f}s",
+          flush=True)
+
+    t1 = time.time()
+    pat_legal = derive_pattern_labels(board_labels, positions)
+    print(f"  Derived 960-d labels in {time.time()-t1:.1f}s "
+          f"({pat_legal.shape}, dtype={pat_legal.dtype})",
+          flush=True)
+
+    t2 = time.time()
+    np.savez_compressed(out_path, pat_legal=pat_legal)
+    print(f"  Saved {out_path} ({os.path.getsize(out_path)/1e9:.2f} GB) "
+          f"in {time.time()-t2:.1f}s", flush=True)
+    print(f"  TOTAL: {time.time()-t0:.1f}s", flush=True)
+
+
+if __name__ == '__main__':
+    main()
