@@ -125,8 +125,7 @@ def main():
     ap.add_argument('--chunk-glob', default='chunk_ext_*.npz')
     ap.add_argument('--output-dir',
                     default='experiments/mathematical_transformation_experiments/'
-                            'heuristic_probe_results/pattern_detector_checkpoints/'
-                            'multi_seed_preliminary')
+                            'heuristic_probe_results/pattern_detector_checkpoints')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--pos-weight', type=float, default=None)
     ap.add_argument('--max-chunks', type=int, default=None,
