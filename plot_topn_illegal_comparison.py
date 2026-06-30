@@ -20,9 +20,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, '.')
+import torch.nn.functional as F
 from mingpt.model import GPT, GPTConfig
 from compare_v4_vs_mlp import (
     load_mlp, mlp_cell_scores, load_val_games, C64_TO_C60, C60_TO_C64,
+    played_even_features,
 )
 from data.othello import OthelloBoardState
 
@@ -49,6 +51,33 @@ def load_ogpt(ckpt_path, device):
     for p in model.parameters():
         p.requires_grad = False
     return model
+
+
+def mlp_predict_per_position(mlp_bundle, game_64, k_min, k_max, device):
+    """Batched MLP predictions at all positions k=k_min..k_max in one game.
+    Returns list of 60-cell argmax predictions.
+    """
+    me, mo, idx, mask = mlp_bundle
+    # Build features for all k in one batch
+    feats = []
+    for k in range(k_min, k_max + 1):
+        feats.append(played_even_features(game_64[:k]))
+    x = torch.stack(feats).to(device)        # (K, 120)
+    ks = torch.arange(k_min, k_max + 1, device=device)
+    use_me = (ks % 2 == 1)
+    use_mo = ~use_me
+    K = x.shape[0]
+    logits = torch.zeros(K, 960, device=device)
+    with torch.no_grad():
+        if use_me.any():
+            logits[use_me] = me(x[use_me])
+        if use_mo.any():
+            logits[use_mo] = mo(x[use_mo])
+    log1m = -F.softplus(logits)               # (K, 960)
+    gathered = log1m[:, idx]                  # (K, 60, max_K)
+    gathered = gathered.masked_fill(~mask, 0.0)
+    cell_scores = -gathered.sum(dim=-1)       # (K, 60)
+    return cell_scores.argmax(dim=-1).cpu().numpy()
 
 
 def ogpt_predict_per_position(model, game_64, device):
@@ -131,32 +160,36 @@ def main():
     ogpt_illegal = np.zeros(n_moves, dtype=int)
     totals = np.zeros(n_moves, dtype=int)
 
+    import time
+    t0 = time.time()
     for gi, game in enumerate(games):
-        # Get OGPT predictions for all positions at once (single forward)
         ogpt_preds = ogpt_predict_per_position(ogpt, game, device)
         if ogpt_preds is None:
             continue
+        # Batched MLP forward across all positions for this game
+        mlp_preds = mlp_predict_per_position(
+            mlp, game, args.k_min, args.k_max, device)
         for k in range(args.k_min, args.k_max + 1):
             legal = legal_cells_60(game, k)
             if legal is None or len(legal) == 0:
                 continue
-            # MLP prediction
-            mlp_scores = mlp_cell_scores(mlp, game, k, device)
-            mlp_pred = int(np.argmax(mlp_scores))
-            # OGPT prediction at position k: predict move k (= the (k+1)th move)
-            # ogpt_preds[k-1] is the prediction conditioned on the first k tokens
+            mi = k - args.k_min
+            mlp_pred = int(mlp_preds[mi])
             if k - 1 < len(ogpt_preds):
                 ogpt_pred = ogpt_preds[k - 1]
             else:
                 continue
-            mi = k - args.k_min
             totals[mi] += 1
             if mlp_pred not in legal:
                 mlp_illegal[mi] += 1
             if ogpt_pred not in legal:
                 ogpt_illegal[mi] += 1
-        if (gi + 1) % 100 == 0:
-            print(f"  {gi+1}/{len(games)} games", flush=True)
+        if (gi + 1) % 500 == 0:
+            rate = (gi + 1) / (time.time() - t0)
+            print(f"  {gi+1}/{len(games)} games  "
+                  f"({rate:.1f} games/sec, ETA "
+                  f"{(len(games) - gi - 1) / rate / 60:.1f} min)",
+                  flush=True)
 
     moves = np.arange(args.k_min, args.k_max + 1)
 
