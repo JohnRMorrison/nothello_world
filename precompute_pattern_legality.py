@@ -1,12 +1,15 @@
 """One-time precompute of pattern legality for chunk_ext_*.npz.
 
 For each chunk_ext_NNNN.npz, derive the 960-d pattern legality mask from
-the 64-d board state via compute_pattern_labels_batch, and save as
-sibling chunk_ext_NNNN_patlegal.npz (uint8, ~17 GB per chunk).
+the 64-d board state via compute_pattern_labels_batch.  Stores as PACKED
+BITS (8 patterns per byte) for compactness:
+    raw uint8:        n_rows × 960 bytes  (~17 GB / chunk)
+    packed bits:      n_rows × 120 bytes  (~2 GB / chunk, before compress)
+    after savez_compressed: typically ~1 GB / chunk
+    40-chunk total: ~40 GB
 
-Subsequent multi-seed training jobs can then load the precomputed labels
-instead of re-deriving them, cutting per-chunk wall-clock from ~25 min
-to ~30 sec.
+Subsequent multi-seed training jobs load this directly (~30 sec/chunk
+instead of ~19 min derive time).
 
 Usage (single chunk):
     python precompute_pattern_legality.py --chunk-idx 0
@@ -94,9 +97,15 @@ def main():
           flush=True)
 
     t2 = time.time()
-    np.savez_compressed(out_path, pat_legal=pat_legal)
-    print(f"  Saved {out_path} ({os.path.getsize(out_path)/1e9:.2f} GB) "
-          f"in {time.time()-t2:.1f}s", flush=True)
+    # Pack 8 patterns per byte: (n, 960) uint8 -> (n, 120) uint8 packed
+    pat_packed = np.packbits(pat_legal, axis=1)
+    n_rows = pat_legal.shape[0]
+    np.savez_compressed(out_path,
+                        pat_legal_packed=pat_packed,
+                        n_rows=np.int64(n_rows),
+                        n_patterns=np.int64(960))
+    print(f"  Saved {out_path} ({os.path.getsize(out_path)/1e9:.2f} GB, "
+          f"packbits) in {time.time()-t2:.1f}s", flush=True)
     print(f"  TOTAL: {time.time()-t0:.1f}s", flush=True)
 
 
