@@ -41,8 +41,28 @@ _PAT_TARGETS, _PAT_TERMINALS, _PAT_OPP_CELLS, _PAT_OPP_MASK = (
 )
 
 
+def load_precomputed_pattern_labels(chunk_path):
+    """Return (n_rows, 960) uint8 pattern legality if a sibling
+    chunk_ext_NNNN_patlegal.npz file exists, else None.
+
+    The packed file stores (n_rows, 120) packbits — unpack on load.
+    """
+    base = chunk_path.replace('.npz', '_patlegal.npz')
+    if not os.path.exists(base):
+        return None
+    with np.load(base) as z:
+        packed = z['pat_legal_packed']     # (n, 120) uint8
+        n_rows = int(z['n_rows'])
+    # Unpack: (n, 120) -> (n, 960)
+    out = np.unpackbits(packed, axis=1, count=N_PATTERNS).astype(np.uint8)
+    assert out.shape == (n_rows, N_PATTERNS), \
+        f"unpack shape mismatch: {out.shape} vs ({n_rows}, {N_PATTERNS})"
+    return out
+
+
 def derive_pattern_labels(board_labels, positions, batch_size=200_000):
-    """Compute 960-d pattern legality from 64-d board state, store as uint8."""
+    """Compute 960-d pattern legality from 64-d board state.  Falls back
+    to live derivation if a precomputed file isn't available."""
     n = len(board_labels)
     out = np.zeros((n, N_PATTERNS), dtype=np.uint8)
     for start in range(0, n, batch_size):
@@ -54,6 +74,14 @@ def derive_pattern_labels(board_labels, positions, batch_size=200_000):
         )
         out[start:end] = (pat > 0).astype(np.uint8)
     return out
+
+
+def get_pattern_labels(chunk_path, board_labels, positions):
+    """Prefer precomputed labels; fall back to live derivation."""
+    pat = load_precomputed_pattern_labels(chunk_path)
+    if pat is not None:
+        return pat, "precomputed"
+    return derive_pattern_labels(board_labels, positions), "derived"
 
 
 def slice_played_even(features_180):
@@ -198,9 +226,11 @@ def main():
                   f"in {t_load:.1f}s", flush=True)
 
             t0 = time.time()
-            pattern_legal = derive_pattern_labels(board_labels, positions)
+            pattern_legal, source = get_pattern_labels(
+                cp, board_labels, positions)
             t_derive = time.time() - t0
-            print(f"    derived 960-d labels in {t_derive:.1f}s", flush=True)
+            print(f"    loaded {source} 960-d labels in {t_derive:.1f}s",
+                  flush=True)
 
             if args.pos_weight is None and epoch == 1 and ci_idx == 0:
                 legal_rate = pattern_legal.mean()
