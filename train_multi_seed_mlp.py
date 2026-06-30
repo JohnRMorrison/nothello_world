@@ -159,6 +159,9 @@ def main():
     ap.add_argument('--max-chunks', type=int, default=None,
                     help='If set, train on at most this many chunks per epoch '
                          '(useful when full pass would exceed SLURM limit)')
+    ap.add_argument('--save-every-chunks', type=int, default=5,
+                    help='Save checkpoint every N chunks (incremental progress). '
+                         'Set to 0 to only save at end of epoch.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -201,6 +204,31 @@ def main():
         save_dir,
         f"multi_seed_N{args.num_seeds}_H{args.hidden}_playedeven.pt",
     )
+
+    def save_now(epoch_val, ci_idx_val, n_chunks_in_epoch, suffix=""):
+        """Save current state to base_save_path (atomic write via .tmp)."""
+        t_save = time.time()
+        tmp_path = base_save_path + ".tmp"
+        all_seeds = [
+            {
+                'even': model_even.state_per_seed(s),
+                'odd':  model_odd.state_per_seed(s),
+            }
+            for s in range(args.num_seeds)
+        ]
+        torch.save({
+            'all_seeds': all_seeds,
+            'hidden_dim': args.hidden,
+            'input_dim': INPUT_DIM,
+            'n_patterns': N_PATTERNS,
+            'num_seeds': args.num_seeds,
+            'epoch': epoch_val,
+            'chunks_completed_this_epoch': ci_idx_val,
+            'chunks_per_epoch': n_chunks_in_epoch,
+        }, tmp_path)
+        os.replace(tmp_path, base_save_path)
+        print(f"    SAVED ckpt to {base_save_path}{suffix}  "
+              f"({int(time.time()-t_save)}s)", flush=True)
 
     for epoch in range(1, args.epochs + 1):
         model_even.train()
@@ -304,24 +332,16 @@ def main():
 
             del feats_180, feats_120, board_labels, positions
 
-        # End-of-epoch save
-        save_path = base_save_path
-        all_seeds = []
-        for s in range(args.num_seeds):
-            all_seeds.append({
-                'even': model_even.state_per_seed(s),
-                'odd':  model_odd.state_per_seed(s),
-            })
-        torch.save({
-            'all_seeds': all_seeds,
-            'hidden_dim': args.hidden,
-            'input_dim': INPUT_DIM,
-            'n_patterns': N_PATTERNS,
-            'num_seeds': args.num_seeds,
-            'epoch': epoch,
-        }, save_path)
+            # Per-chunk incremental save
+            if args.save_every_chunks > 0 and \
+                    (ci_idx + 1) % args.save_every_chunks == 0:
+                save_now(epoch, ci_idx + 1, len(chunk_order),
+                          suffix=f" (after chunk {ci_idx+1}/{len(chunk_order)})")
+
+        # End-of-epoch save (also overwrites in case last save was a few chunks back)
+        save_now(epoch, len(chunk_order), len(chunk_order),
+                 suffix=f" (end of epoch {epoch})")
         print(f"Epoch {epoch}: n={total_n:,} loss={total_loss/total_n:.4f}  "
-              f"saved {save_path}  "
               f"(epoch elapsed {int(time.time()-t_epoch_start)}s)", flush=True)
 
 
