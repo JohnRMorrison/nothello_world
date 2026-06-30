@@ -225,15 +225,19 @@ def main():
                   f"({os.path.basename(cp)}): loaded n={len(feats_120):,} "
                   f"in {t_load:.1f}s", flush=True)
 
-            t0 = time.time()
-            pattern_legal, source = get_pattern_labels(
-                cp, board_labels, positions)
-            t_derive = time.time() - t0
-            print(f"    loaded {source} 960-d labels in {t_derive:.1f}s",
-                  flush=True)
-
+            # Auto pos_weight from a small sample of the first chunk's first batch
+            # (avoids deriving all labels just to compute the prior).
             if args.pos_weight is None and epoch == 1 and ci_idx == 0:
-                legal_rate = pattern_legal.mean()
+                sample_n = min(50_000, len(board_labels))
+                sample_idx = np.random.RandomState(0).choice(
+                    len(board_labels), size=sample_n, replace=False)
+                sample_pat = compute_pattern_labels_batch(
+                    board_labels[sample_idx].astype(np.int8),
+                    positions[sample_idx].astype(np.int64),
+                    _PAT_TARGETS, _PAT_TERMINALS,
+                    _PAT_OPP_CELLS, _PAT_OPP_MASK,
+                )
+                legal_rate = (sample_pat > 0).mean()
                 args.pos_weight = (1 - legal_rate) / max(legal_rate, 1e-6)
                 print(f"    pos_weight auto-set to {args.pos_weight:.2f}",
                       flush=True)
@@ -249,8 +253,15 @@ def main():
                 x = torch.from_numpy(
                     feats_120[batch_idx].astype(np.float32)
                 ).to(device)
+                # Derive 960-d pattern labels for THIS BATCH only (~6 ms each)
+                batch_pat = compute_pattern_labels_batch(
+                    board_labels[batch_idx].astype(np.int8),
+                    positions[batch_idx].astype(np.int64),
+                    _PAT_TARGETS, _PAT_TERMINALS,
+                    _PAT_OPP_CELLS, _PAT_OPP_MASK,
+                )
                 y_pat = torch.from_numpy(
-                    pattern_legal[batch_idx].astype(np.float32)
+                    (batch_pat > 0).astype(np.float32)
                 ).to(device)
                 pos = torch.from_numpy(positions[batch_idx]).to(device)
                 even_mask = (pos % 2 == 0)
@@ -291,7 +302,7 @@ def main():
                           f"(epoch elapsed {int(time.time()-t_epoch_start)}s)",
                           flush=True)
 
-            del feats_180, feats_120, board_labels, positions, pattern_legal
+            del feats_180, feats_120, board_labels, positions
 
         # End-of-epoch save
         save_path = base_save_path
