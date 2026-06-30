@@ -295,6 +295,11 @@ def main():
                 even_mask = (pos % 2 == 0)
                 odd_mask = ~even_mask
 
+                # Multiply BCE by num_seeds so each model's gradient matches
+                # what it would see in a single-model training run.  Otherwise
+                # reduction='mean' over (N, B, 960) divides each model's
+                # gradient by N (vs (B, 960) in single-model), effectively
+                # scaling its learning rate by 1/N.
                 loss = torch.tensor(0.0, device=device)
                 n_in_batch = 0
                 if even_mask.any():
@@ -302,7 +307,7 @@ def main():
                     y_e = y_pat[even_mask]
                     logits_e = model_even(x_e)  # (N, B_e, 960)
                     target_e = y_e.unsqueeze(0).expand(args.num_seeds, -1, -1)
-                    loss = loss + F.binary_cross_entropy_with_logits(
+                    loss = loss + args.num_seeds * F.binary_cross_entropy_with_logits(
                         logits_e, target_e, pos_weight=pw_tensor,
                     )
                     n_in_batch += int(even_mask.sum())
@@ -311,7 +316,7 @@ def main():
                     y_o = y_pat[odd_mask]
                     logits_o = model_odd(x_o)
                     target_o = y_o.unsqueeze(0).expand(args.num_seeds, -1, -1)
-                    loss = loss + F.binary_cross_entropy_with_logits(
+                    loss = loss + args.num_seeds * F.binary_cross_entropy_with_logits(
                         logits_o, target_o, pos_weight=pw_tensor,
                     )
                     n_in_batch += int(odd_mask.sum())
