@@ -404,7 +404,7 @@ def main():
     dsets = {'train': train_dset, 'test': test_dset}
     results = {}
 
-    variants = ['concat', 'mean', 'concat+features',
+    variants = ['concat', 'concat+features',
                 'concat+confidence', 'concat+agreement']
     for v in variants:
         print(f"\n=== Probe: {v} ===")
