@@ -362,6 +362,12 @@ def main():
     ap.add_argument('--num-seeds-used', type=int, default=None,
                     help='If set, use only the first N seeds from the '
                          'checkpoint (default: use all)')
+    ap.add_argument('--variants', type=str, default='all',
+                    help='Comma-separated list of variants to run '
+                         '(concat,concat+features,concat+confidence,'
+                         'concat+agreement,nonlin_concat,'
+                         'nonlin_concat+features,moe) '
+                         'or "all" (default)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -419,9 +425,19 @@ def main():
     dsets = {'train': train_dset, 'test': test_dset}
     results = {}
 
-    variants = ['concat', 'concat+features',
-                'concat+confidence', 'concat+agreement']
-    for v in variants:
+    all_variants = ['concat', 'concat+features',
+                    'concat+confidence', 'concat+agreement',
+                    'nonlin_concat', 'nonlin_concat+features', 'moe']
+    if args.variants == 'all':
+        variants_to_run = all_variants
+    else:
+        variants_to_run = [v.strip() for v in args.variants.split(',')]
+
+    linear_variants = ['concat', 'concat+features',
+                        'concat+confidence', 'concat+agreement']
+    for v in linear_variants:
+        if v not in variants_to_run:
+            continue
         print(f"\n=== Probe: {v} (linear) ===")
         input_dim = variant_input_dim(v, N, hidden)
         print(f"    input_dim={input_dim}")
@@ -432,24 +448,27 @@ def main():
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
         results[v] = acc
 
-    # Non-linear readouts to test if multiplicative interactions help
-    for v in ['concat', 'concat+features']:
-        print(f"\n=== Probe: {v} (non-linear MLP) ===")
-        input_dim = variant_input_dim(v, N, hidden)
+    for v_label, base_v in [('nonlin_concat', 'concat'),
+                              ('nonlin_concat+features', 'concat+features')]:
+        if v_label not in variants_to_run:
+            continue
+        print(f"\n=== Probe: {v_label} (non-linear MLP) ===")
+        input_dim = variant_input_dim(base_v, N, hidden)
         print(f"    input_dim={input_dim}")
         acc = train_probe_lazy(
-            NonLinearProbe, input_dim, v, dsets, N, hidden,
+            NonLinearProbe, input_dim, base_v, dsets, N, hidden,
             device, args.epochs, args.batch_size, args.lr,
         )
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
-        results[v + " (non-linear)"] = acc
+        results[v_label] = acc
 
-    print(f"\n=== Probe: MoE gate ===")
-    acc = train_moe_probe(
-        dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
-    )
-    print(f"    test 3-class per-cell accuracy: {acc:.4f}")
-    results['moe_gate'] = acc
+    if 'moe' in variants_to_run:
+        print(f"\n=== Probe: MoE gate ===")
+        acc = train_moe_probe(
+            dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results['moe_gate'] = acc
 
     print()
     print(f"=== Probing results ({test_dset['hidden'].shape[0]:,} test positions) ===")
