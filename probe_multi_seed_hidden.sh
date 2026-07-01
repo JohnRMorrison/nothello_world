@@ -8,7 +8,7 @@
 #SBATCH --job-name=probe_ms
 #SBATCH -c 4
 #SBATCH --mem=64GB
-#SBATCH --time=02:00:00
+#SBATCH --time=06:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/probe_ms_%j.out
 #SBATCH --account=nklab
@@ -27,6 +27,8 @@ MULTI_CKPT=${MULTI_CKPT:-experiments/mathematical_transformation_experiments/heu
 NUM_TRAIN_GAMES=${NUM_TRAIN_GAMES:-5000}
 NUM_TEST_GAMES=${NUM_TEST_GAMES:-500}
 EPOCHS=${EPOCHS:-5}
+NUM_SEEDS_USED=${NUM_SEEDS_USED:-}
+VARIANTS=${VARIANTS:-all}
 
 echo "============================================"
 echo "Multi-seed hidden-state probing"
@@ -37,10 +39,17 @@ echo "Job: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
+NSU_ARG=""
+if [ -n "$NUM_SEEDS_USED" ]; then
+    NSU_ARG="--num-seeds-used $NUM_SEEDS_USED"
+fi
+
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python probe_multi_seed_hidden.py \
     --multi-ckpt "$MULTI_CKPT" \
     --num-train-games $NUM_TRAIN_GAMES \
     --num-test-games $NUM_TEST_GAMES \
-    --epochs $EPOCHS
+    --epochs $EPOCHS \
+    --variants $VARIANTS \
+    $NSU_ARG
 
 echo "Completed at: $(date)"

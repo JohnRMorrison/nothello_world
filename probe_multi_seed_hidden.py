@@ -167,6 +167,21 @@ class LinearProbe(nn.Module):
         return self.linear(x).view(-1, N_CELLS, N_CLASSES)
 
 
+class NonLinearProbe(nn.Module):
+    """MLP readout: input -> hidden -> 64×3. Can learn multiplicative
+    interactions (gating) between the concat and any auxiliary features."""
+    def __init__(self, input_dim, hidden_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, N_CELLS * N_CLASSES),
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1, N_CELLS, N_CLASSES)
+
+
 class MoEProbe(nn.Module):
     """Features -> softmax over N experts, weighted sum of hidden (512,),
     linear probe."""
@@ -250,6 +265,7 @@ def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
         model.train()
         perm = np.random.permutation(n_train)
         total_loss = 0.0
+        t0 = time.time()
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
             h, cs, f, b = to_gpu_batch(train, idxs)
@@ -262,6 +278,8 @@ def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
             loss.backward()
             opt.step()
             total_loss += loss.item() * len(idxs)
+        print(f"    epoch {epoch}: loss={total_loss/n_train:.4f}  "
+              f"({int(time.time()-t0)}s)", flush=True)
 
     model.eval()
     correct, total = 0, 0
@@ -299,6 +317,8 @@ def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
     for epoch in range(1, epochs + 1):
         model.train()
         perm = np.random.permutation(n_train)
+        total_loss = 0.0
+        t0 = time.time()
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
             h, f, b = to_gpu_batch(train, idxs)
@@ -309,6 +329,9 @@ def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            total_loss += loss.item() * len(idxs)
+        print(f"    epoch {epoch}: loss={total_loss/n_train:.4f}  "
+              f"({int(time.time()-t0)}s)", flush=True)
 
     model.eval()
     correct, total = 0, 0
@@ -336,17 +359,41 @@ def main():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=512)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--num-seeds-used', type=int, default=None,
+                    help='If set, use only the first N seeds from the '
+                         'checkpoint (default: use all)')
+    ap.add_argument('--variants', type=str, default='all',
+                    help='Comma-separated list of variants to run '
+                         '(concat,concat+features,concat+confidence,'
+                         'concat+agreement,nonlin_concat,'
+                         'nonlin_concat+features,moe) '
+                         'or "all" (default)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     print(f"Loading {args.multi_ckpt}")
-    me, mo, N, hidden, input_dim = load_vectorized_from_multi(
+    me, mo, N_total, hidden, input_dim = load_vectorized_from_multi(
         args.multi_ckpt, device)
-    print(f"  N={N} seeds, H={hidden}")
+    print(f"  N_total={N_total} seeds in ckpt, H={hidden}")
 
-    W1_e, b1_e, W2_e, b2_e, W1_o, b1_o, W2_o, b2_o = \
+    W1_e_all, b1_e_all, W2_e_all, b2_e_all, \
+        W1_o_all, b1_o_all, W2_o_all, b2_o_all = \
         get_vectorized_weights(me, mo)
+
+    # Optionally use only the first N seeds
+    if args.num_seeds_used is not None and args.num_seeds_used < N_total:
+        N = args.num_seeds_used
+        print(f"  Using only first {N} of {N_total} seeds")
+        W1_e = W1_e_all[:N]; b1_e = b1_e_all[:N]
+        W2_e = W2_e_all[:N]; b2_e = b2_e_all[:N]
+        W1_o = W1_o_all[:N]; b1_o = b1_o_all[:N]
+        W2_o = W2_o_all[:N]; b2_o = b2_o_all[:N]
+    else:
+        N = N_total
+        W1_e, b1_e, W2_e, b2_e = W1_e_all, b1_e_all, W2_e_all, b2_e_all
+        W1_o, b1_o, W2_o, b2_o = W1_o_all, b1_o_all, W2_o_all, b2_o_all
+    print(f"  Effective N={N}")
 
     patterns = enumerate_flanking_patterns()
     pattern_to_cell = torch.tensor(
@@ -378,10 +425,20 @@ def main():
     dsets = {'train': train_dset, 'test': test_dset}
     results = {}
 
-    variants = ['concat', 'mean', 'concat+features',
-                'concat+confidence', 'concat+agreement']
-    for v in variants:
-        print(f"\n=== Probe: {v} ===")
+    all_variants = ['concat', 'concat+features',
+                    'concat+confidence', 'concat+agreement',
+                    'nonlin_concat', 'nonlin_concat+features', 'moe']
+    if args.variants == 'all':
+        variants_to_run = all_variants
+    else:
+        variants_to_run = [v.strip() for v in args.variants.split(',')]
+
+    linear_variants = ['concat', 'concat+features',
+                        'concat+confidence', 'concat+agreement']
+    for v in linear_variants:
+        if v not in variants_to_run:
+            continue
+        print(f"\n=== Probe: {v} (linear) ===")
         input_dim = variant_input_dim(v, N, hidden)
         print(f"    input_dim={input_dim}")
         acc = train_probe_lazy(
@@ -391,12 +448,27 @@ def main():
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
         results[v] = acc
 
-    print(f"\n=== Probe: MoE gate ===")
-    acc = train_moe_probe(
-        dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
-    )
-    print(f"    test 3-class per-cell accuracy: {acc:.4f}")
-    results['moe_gate'] = acc
+    for v_label, base_v in [('nonlin_concat', 'concat'),
+                              ('nonlin_concat+features', 'concat+features')]:
+        if v_label not in variants_to_run:
+            continue
+        print(f"\n=== Probe: {v_label} (non-linear MLP) ===")
+        input_dim = variant_input_dim(base_v, N, hidden)
+        print(f"    input_dim={input_dim}")
+        acc = train_probe_lazy(
+            NonLinearProbe, input_dim, base_v, dsets, N, hidden,
+            device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results[v_label] = acc
+
+    if 'moe' in variants_to_run:
+        print(f"\n=== Probe: MoE gate ===")
+        acc = train_moe_probe(
+            dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results['moe_gate'] = acc
 
     print()
     print(f"=== Probing results ({test_dset['hidden'].shape[0]:,} test positions) ===")
