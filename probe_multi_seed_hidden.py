@@ -344,17 +344,35 @@ def main():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=512)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--num-seeds-used', type=int, default=None,
+                    help='If set, use only the first N seeds from the '
+                         'checkpoint (default: use all)')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     print(f"Loading {args.multi_ckpt}")
-    me, mo, N, hidden, input_dim = load_vectorized_from_multi(
+    me, mo, N_total, hidden, input_dim = load_vectorized_from_multi(
         args.multi_ckpt, device)
-    print(f"  N={N} seeds, H={hidden}")
+    print(f"  N_total={N_total} seeds in ckpt, H={hidden}")
 
-    W1_e, b1_e, W2_e, b2_e, W1_o, b1_o, W2_o, b2_o = \
+    W1_e_all, b1_e_all, W2_e_all, b2_e_all, \
+        W1_o_all, b1_o_all, W2_o_all, b2_o_all = \
         get_vectorized_weights(me, mo)
+
+    # Optionally use only the first N seeds
+    if args.num_seeds_used is not None and args.num_seeds_used < N_total:
+        N = args.num_seeds_used
+        print(f"  Using only first {N} of {N_total} seeds")
+        W1_e = W1_e_all[:N]; b1_e = b1_e_all[:N]
+        W2_e = W2_e_all[:N]; b2_e = b2_e_all[:N]
+        W1_o = W1_o_all[:N]; b1_o = b1_o_all[:N]
+        W2_o = W2_o_all[:N]; b2_o = b2_o_all[:N]
+    else:
+        N = N_total
+        W1_e, b1_e, W2_e, b2_e = W1_e_all, b1_e_all, W2_e_all, b2_e_all
+        W1_o, b1_o, W2_o, b2_o = W1_o_all, b1_o_all, W2_o_all, b2_o_all
+    print(f"  Effective N={N}")
 
     patterns = enumerate_flanking_patterns()
     pattern_to_cell = torch.tensor(
