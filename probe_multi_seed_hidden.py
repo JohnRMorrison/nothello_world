@@ -85,8 +85,10 @@ def extract_hidden_and_scores(games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e,
     board = np.stack(board_list)                                    # (n, 64)
     ks_arr = np.array(ks_list, dtype=np.int64)
 
-    hidden = np.zeros((n_total, N, hidden_dim), dtype=np.float32)
-    cell_scores = np.zeros((n_total, N, 60), dtype=np.float32)
+    # Store as float16 to halve host memory (49GB -> 24GB for 245K positions).
+    # Cast back to float32 per-batch inside probe training.
+    hidden = np.zeros((n_total, N, hidden_dim), dtype=np.float16)
+    cell_scores = np.zeros((n_total, N, 60), dtype=np.float16)
 
     t0 = time.time()
     with torch.no_grad():
@@ -127,8 +129,8 @@ def extract_hidden_and_scores(games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e,
             gathered = gathered.masked_fill(~mask[None, None], 0.0)
             scores = -gathered.sum(dim=-1)                          # (N, B, 60)
 
-            hidden[i:end]      = h_all.permute(1, 0, 2).cpu().numpy()
-            cell_scores[i:end] = scores.permute(1, 0, 2).cpu().numpy()
+            hidden[i:end]      = h_all.permute(1, 0, 2).cpu().numpy().astype(np.float16)
+            cell_scores[i:end] = scores.permute(1, 0, 2).cpu().numpy().astype(np.float16)
             if (i // batch_size) % 20 == 0:
                 print(f"    {end}/{n_total}  ({int(time.time()-t0)}s)",
                       flush=True)
@@ -191,19 +193,22 @@ def build_variant_features(dset, variant, N, hidden_dim):
     test  = dset['test']
 
     def compute(h, cs, f):
-        # h: (n, N, 512)   cs: (n, N, 60)   f: (n, 120)
+        # h: (n, N, 512) float16   cs: (n, N, 60) float16   f: (n, 120) float32
+        # Cast to float32 for downstream training math
+        h32 = h.astype(np.float32)
+        cs32 = cs.astype(np.float32)
         if variant == 'concat':
-            return h.reshape(h.shape[0], -1)                        # (n, N*512)
+            return h32.reshape(h32.shape[0], -1)                     # (n, N*512)
         if variant == 'mean':
-            return h.mean(axis=1)                                    # (n, 512)
+            return h32.mean(axis=1)                                   # (n, 512)
         if variant == 'concat+features':
-            return np.concatenate([h.reshape(h.shape[0], -1), f], axis=1)
+            return np.concatenate([h32.reshape(h32.shape[0], -1), f], axis=1)
         if variant == 'concat+confidence':
-            conf = cs.max(axis=2)                                    # (n, N)
-            return np.concatenate([h.reshape(h.shape[0], -1), conf], axis=1)
+            conf = cs32.max(axis=2)                                   # (n, N)
+            return np.concatenate([h32.reshape(h32.shape[0], -1), conf], axis=1)
         if variant == 'concat+agreement':
-            agree = cs.std(axis=1)                                   # (n, 60) — std across MLPs per cell
-            return np.concatenate([h.reshape(h.shape[0], -1), agree], axis=1)
+            agree = cs32.std(axis=1)                                  # (n, 60) — std across MLPs per cell
+            return np.concatenate([h32.reshape(h32.shape[0], -1), agree], axis=1)
         raise ValueError(variant)
 
     x_train = compute(train['hidden'], train['cell_scores'], train['features'])
