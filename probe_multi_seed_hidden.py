@@ -167,6 +167,21 @@ class LinearProbe(nn.Module):
         return self.linear(x).view(-1, N_CELLS, N_CLASSES)
 
 
+class NonLinearProbe(nn.Module):
+    """MLP readout: input -> hidden -> 64×3. Can learn multiplicative
+    interactions (gating) between the concat and any auxiliary features."""
+    def __init__(self, input_dim, hidden_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, N_CELLS * N_CLASSES),
+        )
+
+    def forward(self, x):
+        return self.net(x).view(-1, N_CELLS, N_CLASSES)
+
+
 class MoEProbe(nn.Module):
     """Features -> softmax over N experts, weighted sum of hidden (512,),
     linear probe."""
@@ -407,7 +422,7 @@ def main():
     variants = ['concat', 'concat+features',
                 'concat+confidence', 'concat+agreement']
     for v in variants:
-        print(f"\n=== Probe: {v} ===")
+        print(f"\n=== Probe: {v} (linear) ===")
         input_dim = variant_input_dim(v, N, hidden)
         print(f"    input_dim={input_dim}")
         acc = train_probe_lazy(
@@ -416,6 +431,18 @@ def main():
         )
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
         results[v] = acc
+
+    # Non-linear readouts to test if multiplicative interactions help
+    for v in ['concat', 'concat+features']:
+        print(f"\n=== Probe: {v} (non-linear MLP) ===")
+        input_dim = variant_input_dim(v, N, hidden)
+        print(f"    input_dim={input_dim}")
+        acc = train_probe_lazy(
+            NonLinearProbe, input_dim, v, dsets, N, hidden,
+            device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results[v + " (non-linear)"] = acc
 
     print(f"\n=== Probe: MoE gate ===")
     acc = train_moe_probe(
