@@ -3,17 +3,16 @@
 Reports top-K legality (K = 1, 3, 5, 10) for four aggregators across
 N = 1, 5, 10, 20, 50, 100 (or however many seeds are in the checkpoint):
 
-  - Sum log_prob_or : sum(cell_scores) across models (current default)
-  - Mean prob_or    : mean(1 - exp(-cell_scores)) across models
-  - Majority vote   : mode(argmax cell) across models (ties broken by
-                       sum log_prob_or on tied cells)
-  - Sum raw logits  : sum(960-d pattern logits) across models, then
-                       apply prob_or aggregator within each cell
+  - sum_log_prob_or : sum of per-model cell_scores across models
+  - mean_prob_or    : mean of (1 - exp(-cell_scores)) across models
+  - majority_vote   : per-cell vote count (tie-break: sum_log_prob_or)
+  - sum_raw_logits  : sum(pattern_logits) across models, then prob_or per cell
 
 Metric: top-K legality = mean fraction of top-K predicted cells that are
 legal at the position.
 
-Output: printed table (no PNG).
+Memory-efficient: aggregations computed per batch on GPU without
+materializing per-model pattern_logits for the whole test set.
 
 Usage:
     python eval_multi_seed_aggregation.py \\
@@ -24,7 +23,6 @@ import argparse
 import os
 import sys
 import time
-from collections import Counter
 
 import numpy as np
 import torch
@@ -43,7 +41,7 @@ from eval_multi_seed_ensemble import (
 )
 
 
-N_SUBSETS = [1, 5, 10, 20, 50, 100]
+N_SUBSETS_DEFAULT = [1, 5, 10, 20, 50, 100]
 TOP_KS = [1, 3, 5, 10]
 AGG_NAMES = [
     "sum_log_prob_or",
@@ -51,75 +49,6 @@ AGG_NAMES = [
     "majority_vote",
     "sum_raw_logits",
 ]
-
-
-def topk_legality(topk_indices, legal_mask):
-    """topk_indices: (n_pos, K).  legal_mask: (n_pos, 60).
-    Returns mean fraction of top-K cells that are legal, per position.
-    """
-    n_pos, K = topk_indices.shape
-    row_idx = np.arange(n_pos)[:, None]
-    hits = legal_mask[row_idx, topk_indices]  # (n_pos, K) bool
-    return hits.mean()
-
-
-def aggregate_and_topk(pattern_logits, cell_scores, argmax_preds,
-                       n_seeds, agg_name, ks, seed_mask):
-    """Apply the aggregator to the first `n_seeds` models (via seed_mask)
-    and return a dict K -> mean top-K legality preparation (indices only).
-
-    Returns top-max(ks) predicted cell indices per position: (n_pos, max_k).
-    """
-    max_k = max(ks)
-
-    if agg_name == "sum_log_prob_or":
-        # cell_scores: (N, n_pos, 60)
-        agg = cell_scores[seed_mask].sum(axis=0)   # (n_pos, 60)
-        topk = np.argsort(-agg, axis=1)[:, :max_k]
-
-    elif agg_name == "mean_prob_or":
-        prob_or = 1.0 - np.exp(-np.clip(cell_scores[seed_mask], 0, None))
-        agg = prob_or.mean(axis=0)                  # (n_pos, 60)
-        topk = np.argsort(-agg, axis=1)[:, :max_k]
-
-    elif agg_name == "majority_vote":
-        # For each position, count votes among the n_seeds models
-        preds = argmax_preds[seed_mask]             # (n_seeds, n_pos)
-        n_pos = preds.shape[1]
-        # Vectorized voting via bincount per column
-        # We only need top-max_k cells by vote count.
-        # tie-breaker: sum_log_prob_or
-        agg = cell_scores[seed_mask].sum(axis=0)    # (n_pos, 60)
-        # Add vote count as a large weight
-        vote_counts = np.zeros((n_pos, 60), dtype=np.int64)
-        for c in range(60):
-            vote_counts[:, c] = (preds == c).sum(axis=0)
-        # Score: primary = vote count (large), secondary = agg
-        combined = vote_counts.astype(np.float64) * 1e6 + agg
-        topk = np.argsort(-combined, axis=1)[:, :max_k]
-
-    elif agg_name == "sum_raw_logits":
-        # pattern_logits: (N, n_pos, 960)
-        agg_logits = pattern_logits[seed_mask].sum(axis=0)  # (n_pos, 960)
-        # Apply prob_or aggregator within cells
-        log1m = -np.log1p(np.exp(agg_logits))       # log(1 - sigmoid(x))
-        # Aggregate to cells via _get_cell_pat_index-style scatter
-        # Using precomputed AGG_IDX and AGG_MASK
-        n_pos = agg_logits.shape[0]
-        gathered = log1m[:, AGG_IDX]                # (n_pos, 60, K_max_p)
-        gathered = np.where(AGG_MASK[None, :, :], gathered, 0.0)
-        cell_scores_agg = -gathered.sum(axis=-1)    # (n_pos, 60)
-        topk = np.argsort(-cell_scores_agg, axis=1)[:, :max_k]
-
-    else:
-        raise ValueError(f"Unknown aggregator: {agg_name}")
-
-    return topk
-
-
-# Global pattern-to-cell mapping (filled in main)
-AGG_IDX = None
-AGG_MASK = None
 
 
 def main():
@@ -130,7 +59,7 @@ def main():
     ap.add_argument('--k-max', type=int, default=53)
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=1)
-    ap.add_argument('--batch-size', type=int, default=1024)
+    ap.add_argument('--batch-size', type=int, default=512)
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -145,15 +74,9 @@ def main():
         [MOVE_TO_IDX[p['target']] for p in patterns],
         dtype=torch.long, device=device,
     )
-    idx_t, mask_t = _get_cell_pat_index(pattern_to_cell, 60)
+    idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
 
-    # Numpy versions for sum_raw_logits aggregator
-    global AGG_IDX, AGG_MASK
-    AGG_IDX = idx_t.cpu().numpy()   # (60, K_max_p)
-    AGG_MASK = mask_t.cpu().numpy() # (60, K_max_p) bool
-
-    # Filter N_SUBSETS to values <= actual N
-    n_subsets = [n for n in N_SUBSETS if n <= N]
+    n_subsets = [n for n in N_SUBSETS_DEFAULT if n <= N]
     if N not in n_subsets:
         n_subsets.append(N)
     print(f"N subset sizes: {n_subsets}")
@@ -178,68 +101,90 @@ def main():
             legal_mask[i, c] = True
     del legal_list
 
-    # Forward pass through all N MLPs; collect pattern_logits, cell_scores,
-    # argmax_preds for each position and model.
-    print(f"Batched forward pass through all {N} MLPs...")
-    pattern_logits = np.zeros((N, n_total, 960), dtype=np.float16)  # ~7GB @ N=100, 24K
-    cell_scores    = np.zeros((N, n_total, 60), dtype=np.float32)
-    argmax_preds   = np.zeros((N, n_total), dtype=np.int32)
+    # Running total of top-K hits per (aggregator, n_seeds, K).
+    hits = {(a, n, K): 0
+            for a in AGG_NAMES for n in n_subsets for K in TOP_KS}
 
+    print("Batched forward + aggregation...")
     t0 = time.time()
+    max_K = max(TOP_KS)
+
     with torch.no_grad():
-        for i in range(0, n_total, args.batch_size):
-            end = min(i + args.batch_size, n_total)
-            x = torch.stack(feats_list[i:end]).to(device)
-            ks = torch.tensor(ks_list[i:end], device=device)
+        for bstart in range(0, n_total, args.batch_size):
+            bend = min(bstart + args.batch_size, n_total)
+            B = bend - bstart
+            x = torch.stack(feats_list[bstart:bend]).to(device)
+            ks = torch.tensor(ks_list[bstart:bend], device=device)
             use_me = (ks % 2 == 1)
             use_mo = ~use_me
-            B = end - i
-            logits = torch.zeros(N, B, 960, device=device)
+
+            # Full logits from all N models
+            logits = torch.zeros(N, B, 960, device=device)     # (N, B, 960)
             if use_me.any():
                 logits[:, use_me] = me(x[use_me])
             if use_mo.any():
                 logits[:, use_mo] = mo(x[use_mo])
-            log1m = -F.softplus(logits)                       # (N, B, 960)
-            gathered = log1m[:, :, idx_t]                     # (N, B, 60, K)
-            gathered = gathered.masked_fill(~mask_t[None, None], 0.0)
-            scores = -gathered.sum(dim=-1)                    # (N, B, 60)
+            log1m = -F.softplus(logits)                          # (N, B, 960)
+            gathered = log1m[:, :, idx]                          # (N, B, 60, Kp)
+            gathered = gathered.masked_fill(~mask[None, None], 0.0)
+            cell_scores = -gathered.sum(dim=-1)                  # (N, B, 60)
+            prob_or = 1.0 - torch.exp(-cell_scores.clamp(min=0))  # (N, B, 60)
+            per_model_argmax = cell_scores.argmax(dim=-1)         # (N, B)
 
-            pattern_logits[:, i:end, :] = logits.cpu().numpy().astype(np.float16)
-            cell_scores[:, i:end, :]    = scores.cpu().numpy()
-            argmax_preds[:, i:end]      = scores.argmax(dim=-1).cpu().numpy()
+            legal_batch = torch.from_numpy(
+                legal_mask[bstart:bend]).to(device)              # (B, 60)
 
-            if (i // args.batch_size) % 10 == 0:
-                print(f"  {end}/{n_total}  ({int(time.time()-t0)}s)",
+            for n_seeds in n_subsets:
+                sub_scores  = cell_scores[:n_seeds]              # (n, B, 60)
+                sub_prob    = prob_or[:n_seeds]
+                sub_argmax  = per_model_argmax[:n_seeds]
+
+                # Aggregator A: sum log_prob_or
+                agg_a = sub_scores.sum(dim=0)                    # (B, 60)
+
+                # Aggregator B: mean prob_or
+                agg_b = sub_prob.mean(dim=0)                     # (B, 60)
+
+                # Aggregator C: majority vote (tie-break: agg_a)
+                # Vectorized vote count: scatter-add
+                votes = torch.zeros(B, 60, device=device)
+                votes.scatter_add_(
+                    1, sub_argmax.t(),
+                    torch.ones_like(sub_argmax.t(), dtype=torch.float32),
+                )
+                agg_c = votes * 1e6 + agg_a
+
+                # Aggregator D: sum raw logits, then prob_or
+                sub_logits = logits[:n_seeds]                    # (n, B, 960)
+                agg_logits = sub_logits.sum(dim=0)               # (B, 960)
+                log1m_d = -F.softplus(agg_logits)                # (B, 960)
+                gathered_d = log1m_d[:, idx]                     # (B, 60, Kp)
+                gathered_d = gathered_d.masked_fill(~mask[None], 0.0)
+                agg_d = -gathered_d.sum(dim=-1)                  # (B, 60)
+
+                # Top-K legality per aggregator
+                for a_name, agg in [
+                    ("sum_log_prob_or", agg_a),
+                    ("mean_prob_or",    agg_b),
+                    ("majority_vote",   agg_c),
+                    ("sum_raw_logits",  agg_d),
+                ]:
+                    topk_idx = agg.topk(max_K, dim=1).indices    # (B, max_K)
+                    # Gather legality at those indices
+                    legal_at_topk = legal_batch.gather(
+                        1, topk_idx.to(torch.long))              # (B, max_K)
+                    for K in TOP_KS:
+                        hits[(a_name, n_seeds, K)] += int(
+                            legal_at_topk[:, :K].sum())
+
+            if (bstart // args.batch_size) % 10 == 0:
+                print(f"  {bend}/{n_total}  ({int(time.time()-t0)}s)",
                       flush=True)
 
-    # Convert pattern_logits back to float32 for numpy math
-    print("Running aggregators × N subsets...")
-    t0 = time.time()
-
-    # For each (aggregator, N), compute top-K legality
-    results = {}   # (agg_name, n_seeds, K) -> mean top-K legality
-    for n_seeds in n_subsets:
-        seed_mask = np.zeros(N, dtype=bool)
-        seed_mask[:n_seeds] = True
-        for agg_name in AGG_NAMES:
-            if agg_name == "sum_raw_logits":
-                # Need float32 for accurate logsumexp; convert view
-                pattern_logits_f32 = pattern_logits.astype(np.float32)
-                topk = aggregate_and_topk_float(
-                    pattern_logits_f32, cell_scores, argmax_preds,
-                    n_seeds, agg_name, TOP_KS, seed_mask,
-                )
-            else:
-                topk = aggregate_and_topk(
-                    pattern_logits, cell_scores, argmax_preds,
-                    n_seeds, agg_name, TOP_KS, seed_mask,
-                )
-            for K in TOP_KS:
-                results[(agg_name, n_seeds, K)] = topk_legality(
-                    topk[:, :K], legal_mask,
-                )
-            print(f"  {agg_name} @ N={n_seeds}  "
-                  f"({int(time.time()-t0)}s)", flush=True)
+    # Compute rates
+    results = {}
+    for (a, n, K), h in hits.items():
+        results[(a, n, K)] = h / (n_total * K)
 
     # Print table
     print()
@@ -247,31 +192,16 @@ def main():
     for K in TOP_KS:
         print()
         print(f"Top-{K} legality:")
-        header = f"  {'Aggregator':<20}" + "".join(f"  N={n:>4}" for n in n_subsets)
+        header = f"  {'Aggregator':<20}" + \
+                 "".join(f"  N={n:>4}" for n in n_subsets)
         print(header)
         print("  " + "-" * (len(header) - 2))
-        for agg_name in AGG_NAMES:
-            row = f"  {agg_name:<20}"
+        for a_name in AGG_NAMES:
+            row = f"  {a_name:<20}"
             for n_seeds in n_subsets:
-                v = results[(agg_name, n_seeds, K)]
+                v = results[(a_name, n_seeds, K)]
                 row += f"  {v:>6.4f}"
             print(row)
-
-
-def aggregate_and_topk_float(pattern_logits_f32, cell_scores, argmax_preds,
-                              n_seeds, agg_name, ks, seed_mask):
-    """Same as aggregate_and_topk but for float32 pattern_logits."""
-    max_k = max(ks)
-    # sum raw logits: sum across models, then prob_or
-    agg_logits = pattern_logits_f32[seed_mask].sum(axis=0)   # (n_pos, 960)
-    # log(1 - sigmoid(x)) = -softplus(x)
-    log1m = -np.log1p(np.exp(agg_logits))
-    n_pos = agg_logits.shape[0]
-    gathered = log1m[:, AGG_IDX]                             # (n_pos, 60, K_max_p)
-    gathered = np.where(AGG_MASK[None, :, :], gathered, 0.0)
-    cell_scores_agg = -gathered.sum(axis=-1)                 # (n_pos, 60)
-    topk = np.argsort(-cell_scores_agg, axis=1)[:, :max_k]
-    return topk
 
 
 if __name__ == '__main__':
