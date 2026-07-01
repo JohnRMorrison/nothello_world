@@ -250,6 +250,7 @@ def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
         model.train()
         perm = np.random.permutation(n_train)
         total_loss = 0.0
+        t0 = time.time()
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
             h, cs, f, b = to_gpu_batch(train, idxs)
@@ -262,6 +263,8 @@ def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
             loss.backward()
             opt.step()
             total_loss += loss.item() * len(idxs)
+        print(f"    epoch {epoch}: loss={total_loss/n_train:.4f}  "
+              f"({int(time.time()-t0)}s)", flush=True)
 
     model.eval()
     correct, total = 0, 0
@@ -299,6 +302,8 @@ def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
     for epoch in range(1, epochs + 1):
         model.train()
         perm = np.random.permutation(n_train)
+        total_loss = 0.0
+        t0 = time.time()
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
             h, f, b = to_gpu_batch(train, idxs)
@@ -309,6 +314,9 @@ def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
             opt.zero_grad()
             loss.backward()
             opt.step()
+            total_loss += loss.item() * len(idxs)
+        print(f"    epoch {epoch}: loss={total_loss/n_train:.4f}  "
+              f"({int(time.time()-t0)}s)", flush=True)
 
     model.eval()
     correct, total = 0, 0
