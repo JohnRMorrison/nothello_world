@@ -186,70 +186,77 @@ class MoEProbe(nn.Module):
         return self.probe(weighted).view(-1, N_CELLS, N_CLASSES)
 
 
-def build_variant_features(dset, variant, N, hidden_dim):
-    """Return (train_input, test_input) tensors for a given variant.
-    dset: {'train': {...}, 'test': {...}} with 'hidden', 'cell_scores', 'features'."""
-    train = dset['train']
-    test  = dset['test']
+def compute_variant_batch(h_batch, cs_batch, f_batch, variant):
+    """Compute variant features for a batch on GPU.
 
-    def compute(h, cs, f):
-        # h: (n, N, 512) float16   cs: (n, N, 60) float16   f: (n, 120) float32
-        # Cast to float32 for downstream training math
-        h32 = h.astype(np.float32)
-        cs32 = cs.astype(np.float32)
-        if variant == 'concat':
-            return h32.reshape(h32.shape[0], -1)                     # (n, N*512)
-        if variant == 'mean':
-            return h32.mean(axis=1)                                   # (n, 512)
-        if variant == 'concat+features':
-            return np.concatenate([h32.reshape(h32.shape[0], -1), f], axis=1)
-        if variant == 'concat+confidence':
-            conf = cs32.max(axis=2)                                   # (n, N)
-            return np.concatenate([h32.reshape(h32.shape[0], -1), conf], axis=1)
-        if variant == 'concat+agreement':
-            agree = cs32.std(axis=1)                                  # (n, 60) — std across MLPs per cell
-            return np.concatenate([h32.reshape(h32.shape[0], -1), agree], axis=1)
-        raise ValueError(variant)
-
-    x_train = compute(train['hidden'], train['cell_scores'], train['features'])
-    x_test  = compute(test['hidden'],  test['cell_scores'],  test['features'])
-    return x_train, x_test
+    h_batch: (B, N, 512) float32   cs_batch: (B, N, 60) float32   f_batch: (B, 120)
+    Returns (B, input_dim) float32 tensor.
+    """
+    if variant == 'concat':
+        return h_batch.reshape(h_batch.shape[0], -1)
+    if variant == 'mean':
+        return h_batch.mean(dim=1)
+    if variant == 'concat+features':
+        return torch.cat([h_batch.reshape(h_batch.shape[0], -1), f_batch], dim=1)
+    if variant == 'concat+confidence':
+        conf = cs_batch.max(dim=2).values                            # (B, N)
+        return torch.cat([h_batch.reshape(h_batch.shape[0], -1), conf], dim=1)
+    if variant == 'concat+agreement':
+        agree = cs_batch.std(dim=1)                                   # (B, 60)
+        return torch.cat([h_batch.reshape(h_batch.shape[0], -1), agree], dim=1)
+    raise ValueError(variant)
 
 
-def train_probe(model, x_train, y_train_board, x_test, y_test_board,
-                 device, epochs, batch_size, lr, extra_train=None,
-                 extra_test=None):
-    """Train the probe with cross-entropy per cell."""
-    model = model.to(device)
+def variant_input_dim(variant, N, hidden_dim, feature_dim=120):
+    if variant == 'concat':
+        return N * hidden_dim
+    if variant == 'mean':
+        return hidden_dim
+    if variant == 'concat+features':
+        return N * hidden_dim + feature_dim
+    if variant == 'concat+confidence':
+        return N * hidden_dim + N
+    if variant == 'concat+agreement':
+        return N * hidden_dim + 60
+    raise ValueError(variant)
+
+
+def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
+                      device, epochs, batch_size, lr):
+    """Train a probe by computing variant features per-batch (memory efficient).
+
+    dsets: dict with 'train' and 'test' each containing float16 numpy arrays
+       for 'hidden', 'cell_scores', 'features', and int64 for 'board'.
+    """
+    model = model_cls(input_dim).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-    x_train_t = torch.from_numpy(x_train).to(device)
-    y_train_t = torch.from_numpy(y_train_board).to(device)
-    x_test_t  = torch.from_numpy(x_test).to(device)
-    y_test_t  = torch.from_numpy(y_test_board).to(device)
-
-    if extra_train is not None:
-        extra_train_t = torch.from_numpy(extra_train).to(device)
-    if extra_test is not None:
-        extra_test_t = torch.from_numpy(extra_test).to(device)
-
-    n_train = x_train_t.shape[0]
+    train = dsets['train']
+    test  = dsets['test']
+    n_train = train['hidden'].shape[0]
+    n_test  = test['hidden'].shape[0]
     n_params = sum(p.numel() for p in model.parameters())
     print(f"    Params: {n_params:,}")
 
+    def to_gpu_batch(dset, idxs):
+        # Cast float16 -> float32 only for the sliced batch
+        h = torch.from_numpy(dset['hidden'][idxs].astype(np.float32)).to(device)
+        cs = torch.from_numpy(dset['cell_scores'][idxs].astype(np.float32)).to(device)
+        f = torch.from_numpy(dset['features'][idxs]).to(device)
+        b = torch.from_numpy(dset['board'][idxs]).to(device)
+        return h, cs, f, b
+
     for epoch in range(1, epochs + 1):
         model.train()
-        perm = torch.randperm(n_train, device=device)
+        perm = np.random.permutation(n_train)
         total_loss = 0.0
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
-            if extra_train is not None:
-                logits = model(x_train_t[idxs], extra_train_t[idxs])
-            else:
-                logits = model(x_train_t[idxs])
+            h, cs, f, b = to_gpu_batch(train, idxs)
+            x = compute_variant_batch(h, cs, f, variant)
+            logits = model(x)
             loss = F.cross_entropy(
-                logits.view(-1, N_CLASSES),
-                y_train_t[idxs].view(-1),
+                logits.view(-1, N_CLASSES), b.view(-1),
             )
             opt.zero_grad()
             loss.backward()
@@ -257,14 +264,64 @@ def train_probe(model, x_train, y_train_board, x_test, y_test_board,
             total_loss += loss.item() * len(idxs)
 
     model.eval()
+    correct, total = 0, 0
     with torch.no_grad():
-        if extra_test is not None:
-            test_logits = model(x_test_t, extra_test_t)
-        else:
-            test_logits = model(x_test_t)
-        pred = test_logits.argmax(dim=-1)                            # (n, 64)
-        acc = (pred == y_test_t).float().mean().item()
-    return acc
+        for i in range(0, n_test, batch_size):
+            end = min(i + batch_size, n_test)
+            idxs = np.arange(i, end)
+            h, cs, f, b = to_gpu_batch(test, idxs)
+            x = compute_variant_batch(h, cs, f, variant)
+            logits = model(x)
+            pred = logits.argmax(dim=-1)
+            correct += (pred == b).sum().item()
+            total   += b.numel()
+    return correct / total
+
+
+def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
+    """Train the MoE-gate probe by streaming hidden per-batch."""
+    model = MoEProbe(N, hidden_dim).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+
+    train = dsets['train']
+    test  = dsets['test']
+    n_train = train['hidden'].shape[0]
+    n_test  = test['hidden'].shape[0]
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"    Params: {n_params:,}")
+
+    def to_gpu_batch(dset, idxs):
+        h = torch.from_numpy(dset['hidden'][idxs].astype(np.float32)).to(device)
+        f = torch.from_numpy(dset['features'][idxs]).to(device)
+        b = torch.from_numpy(dset['board'][idxs]).to(device)
+        return h, f, b
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        perm = np.random.permutation(n_train)
+        for i in range(0, n_train, batch_size):
+            idxs = perm[i:i + batch_size]
+            h, f, b = to_gpu_batch(train, idxs)
+            logits = model(h, f)
+            loss = F.cross_entropy(
+                logits.view(-1, N_CLASSES), b.view(-1),
+            )
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for i in range(0, n_test, batch_size):
+            end = min(i + batch_size, n_test)
+            idxs = np.arange(i, end)
+            h, f, b = to_gpu_batch(test, idxs)
+            logits = model(h, f)
+            pred = logits.argmax(dim=-1)
+            correct += (pred == b).sum().item()
+            total   += b.numel()
+    return correct / total
 
 
 def main():
@@ -325,32 +382,18 @@ def main():
                 'concat+confidence', 'concat+agreement']
     for v in variants:
         print(f"\n=== Probe: {v} ===")
-        x_tr, x_te = build_variant_features(dsets, v, N, hidden)
-        print(f"    input_dim={x_tr.shape[1]}")
-        input_dim = x_tr.shape[1]
-        probe = LinearProbe(input_dim)
-        acc = train_probe(
-            probe, x_tr,
-            train_dset['board'],
-            x_te,
-            test_dset['board'],
+        input_dim = variant_input_dim(v, N, hidden)
+        print(f"    input_dim={input_dim}")
+        acc = train_probe_lazy(
+            LinearProbe, input_dim, v, dsets, N, hidden,
             device, args.epochs, args.batch_size, args.lr,
         )
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
         results[v] = acc
 
-    # MoE probe: use hidden tensor (n, N, 512) directly + features
     print(f"\n=== Probe: MoE gate ===")
-    moe = MoEProbe(N, hidden)
-    acc = train_probe(
-        moe,
-        train_dset['hidden'],
-        train_dset['board'],
-        test_dset['hidden'],
-        test_dset['board'],
-        device, args.epochs, args.batch_size, args.lr,
-        extra_train=train_dset['features'],
-        extra_test=test_dset['features'],
+    acc = train_moe_probe(
+        dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
     )
     print(f"    test 3-class per-cell accuracy: {acc:.4f}")
     results['moe_gate'] = acc
