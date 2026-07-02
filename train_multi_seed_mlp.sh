@@ -8,6 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/multi_seed_%j.out
 #SBATCH --account=nklab
+#SBATCH --partition=nklab
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
 module load cuda/11.8.0
