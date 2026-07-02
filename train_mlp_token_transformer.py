@@ -104,7 +104,10 @@ def derive_legal_mask(batch_pat, idx, mask):
 class MLPTokenTransformer(nn.Module):
     """MLPs are tokens.  Board context added to each token.  Self-attention
     lets tokens see each other; each token emits its own 60-d prediction
-    and a softmax weight; final output = weighted sum."""
+    and a softmax weight; final output = weighted sum.
+
+    Uses seq-first tensor layout (S, B, E) for compatibility with older
+    PyTorch that doesn't support batch_first=True."""
     def __init__(self, n_seeds, n_cells=60, ctx_dim=120, d_model=64,
                   n_heads=4, n_layers=2, dim_ff=128, dropout=0.0):
         super().__init__()
@@ -113,7 +116,7 @@ class MLPTokenTransformer(nn.Module):
         enc = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
             dim_feedforward=dim_ff, dropout=dropout,
-            batch_first=True, activation='relu',
+            activation='relu',
         )
         self.transformer = nn.TransformerEncoder(enc, n_layers)
         self.per_mlp_pred = nn.Linear(d_model, n_cells)
@@ -128,7 +131,10 @@ class MLPTokenTransformer(nn.Module):
         x = self.token_proj(x)                                    # (B, N, d)
         ids = torch.arange(N, device=x.device)
         x = x + self.mlp_id_emb(ids)                              # broadcast
-        x = self.transformer(x)                                   # (B, N, d)
+        # Seq-first for older PyTorch: (N, B, d)
+        x = x.transpose(0, 1)
+        x = self.transformer(x)                                   # (N, B, d)
+        x = x.transpose(0, 1)                                     # (B, N, d)
         preds = self.per_mlp_pred(x)                              # (B, N, 60)
         weights = F.softmax(
             self.per_mlp_weight(x).squeeze(-1), dim=1)            # (B, N)
