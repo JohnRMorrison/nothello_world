@@ -26,11 +26,13 @@ SEED=${SEED:-0}
 CHUNK_START=${CHUNK_START:-0}
 MAX_CHUNKS=${MAX_CHUNKS:-}
 POS_WEIGHT=${POS_WEIGHT:-1.0}
+RESUME_FROM=${RESUME_FROM:-}
 
 echo "============================================"
 echo "Multi-seed MLP training"
 echo "  H=$HIDDEN  N=$NUM_SEEDS  EPOCHS=$EPOCHS  BATCH=$BATCH_SIZE  SEED=$SEED  POS_WEIGHT=$POS_WEIGHT"
 echo "  Chunks: start=$CHUNK_START, max=${MAX_CHUNKS:-all}"
+echo "  Resume: ${RESUME_FROM:-none}"
 echo "Job ID: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
@@ -38,6 +40,11 @@ echo "============================================"
 MAX_CHUNKS_ARG=""
 if [ -n "$MAX_CHUNKS" ]; then
     MAX_CHUNKS_ARG="--max-chunks $MAX_CHUNKS"
+fi
+
+RESUME_ARG=""
+if [ -n "$RESUME_FROM" ]; then
+    RESUME_ARG="--resume-from $RESUME_FROM"
 fi
 
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
@@ -48,6 +55,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
     --seed $SEED \
     --pos-weight $POS_WEIGHT \
     --chunk-start $CHUNK_START \
-    $MAX_CHUNKS_ARG
+    $MAX_CHUNKS_ARG \
+    $RESUME_ARG
 
 echo "Completed at: $(date)"
