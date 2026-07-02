@@ -48,6 +48,8 @@ AGG_NAMES = [
     "mean_prob_or",
     "majority_vote",
     "sum_raw_logits",
+    "top1_vote_count",  # Union of per-seed top-1 by vote count
+    "mean_rank",        # Borda: cells with lowest mean rank across seeds win
 ]
 
 
@@ -162,12 +164,32 @@ def main():
                 gathered_d = gathered_d.masked_fill(~mask[None], 0.0)
                 agg_d = -gathered_d.sum(dim=-1)                  # (B, 60)
 
+                # Aggregator E: top-1 vote count (Condorcet union of per-seed
+                # argmax choices).  Same "votes" tensor as agg_c but WITHOUT
+                # the sum_log_prob_or tie-breaker — this exposes what pure
+                # top-1 vote counting looks like at top-K.  Ties broken by
+                # a tiny sum_log_prob_or nudge so topk is deterministic.
+                agg_e = votes + agg_a * 1e-6
+
+                # Aggregator F: mean rank (Borda).  For each seed, rank cells
+                # 1..60 by cell_scores descending; sum ranks across seeds;
+                # cells with the LOWEST rank sum win.  Uses full seed
+                # preference ordering, not just argmax.
+                # sub_scores: (n, B, 60).  argsort desc -> arg positions of
+                # ranked cells; argsort of that -> rank per cell (0=best).
+                sorted_idx = sub_scores.argsort(dim=-1, descending=True)
+                ranks = sorted_idx.argsort(dim=-1).float()       # (n, B, 60)
+                mean_rank = ranks.mean(dim=0)                    # (B, 60)
+                agg_f = -mean_rank                               # higher = better
+
                 # Top-K legality per aggregator
                 for a_name, agg in [
                     ("sum_log_prob_or", agg_a),
                     ("mean_prob_or",    agg_b),
                     ("majority_vote",   agg_c),
                     ("sum_raw_logits",  agg_d),
+                    ("top1_vote_count", agg_e),
+                    ("mean_rank",       agg_f),
                 ]:
                     topk_idx = agg.topk(max_K, dim=1).indices    # (B, max_K)
                     # Gather legality at those indices
