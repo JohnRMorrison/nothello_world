@@ -146,7 +146,8 @@ def main():
     ap.add_argument('--hidden', type=int, default=512)
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--lr', type=float, default=1e-3)
-    ap.add_argument('--batch-size', type=int, default=8192)
+    ap.add_argument('--batch-size', type=int, default=1024,
+                    help='Batch size (default 1024, matches train_pattern_simple.py).')
     ap.add_argument('--chunk-dir',
                     default='experiments/mathematical_transformation_experiments/'
                             'heuristic_probe_results/feature_chunks')
@@ -155,10 +156,16 @@ def main():
                     default='experiments/mathematical_transformation_experiments/'
                             'heuristic_probe_results/pattern_detector_checkpoints')
     ap.add_argument('--seed', type=int, default=0)
-    ap.add_argument('--pos-weight', type=float, default=None)
+    ap.add_argument('--pos-weight', type=float, default=1.0,
+                    help='BCE pos_weight (default 1.0 = uniform). '
+                         'Match train_pattern_simple.py convention.')
+    ap.add_argument('--chunk-start', type=int, default=0,
+                    help='Index of first training chunk to use (default 0). '
+                         'Combined with --max-chunks, lets you train on a '
+                         'contiguous slice of the chunk list.')
     ap.add_argument('--max-chunks', type=int, default=None,
                     help='If set, train on at most this many chunks per epoch '
-                         '(useful when full pass would exceed SLURM limit)')
+                         'starting from --chunk-start.')
     ap.add_argument('--save-every-chunks', type=int, default=5,
                     help='Save checkpoint every N chunks (incremental progress). '
                          'Set to 0 to only save at end of epoch.')
@@ -184,19 +191,26 @@ def main():
         list(model_even.parameters()) + list(model_odd.parameters()),
         lr=args.lr,
     )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.75, patience=1)
     n_params = sum(p.numel() for p in model_even.parameters()) * 2
     print(f"Total params (both parities, all {args.num_seeds} seeds): {n_params:,}  "
           f"({int(time.time() - t_build)}s to build)", flush=True)
 
     chunks = sorted(glob.glob(os.path.join(args.chunk_dir, args.chunk_glob)))
-    train_chunks = chunks[:-1]
+    all_train_chunks = chunks[:-1]
     eval_chunk = chunks[-1]
-    if args.max_chunks is not None:
-        train_chunks = train_chunks[:args.max_chunks]
-        print(f"Limiting to first {len(train_chunks)} training chunks",
-              flush=True)
-    print(f"Found {len(chunks)} chunks  Train={len(train_chunks)}  Eval=1",
+    start = args.chunk_start
+    end = None if args.max_chunks is None else start + args.max_chunks
+    train_chunks = all_train_chunks[start:end]
+    print(f"Found {len(chunks)} chunks  "
+          f"Train slice=[{start}:{end}] → {len(train_chunks)}  Eval=1",
           flush=True)
+    if train_chunks:
+        print(f"  first: {os.path.basename(train_chunks[0])}",
+              flush=True)
+        print(f"  last:  {os.path.basename(train_chunks[-1])}",
+              flush=True)
 
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
@@ -253,21 +267,8 @@ def main():
                   f"({os.path.basename(cp)}): loaded n={len(feats_120):,} "
                   f"in {t_load:.1f}s", flush=True)
 
-            # Auto pos_weight from a small sample of the first chunk's first batch
-            # (avoids deriving all labels just to compute the prior).
-            if args.pos_weight is None and epoch == 1 and ci_idx == 0:
-                sample_n = min(50_000, len(board_labels))
-                sample_idx = np.random.RandomState(0).choice(
-                    len(board_labels), size=sample_n, replace=False)
-                sample_pat = compute_pattern_labels_batch(
-                    board_labels[sample_idx].astype(np.int8),
-                    positions[sample_idx].astype(np.int64),
-                    _PAT_TARGETS, _PAT_TERMINALS,
-                    _PAT_OPP_CELLS, _PAT_OPP_MASK,
-                )
-                legal_rate = (sample_pat > 0).mean()
-                args.pos_weight = (1 - legal_rate) / max(legal_rate, 1e-6)
-                print(f"    pos_weight auto-set to {args.pos_weight:.2f}",
+            if epoch == 1 and ci_idx == 0:
+                print(f"    pos_weight={args.pos_weight}  (1.0 = uniform BCE)",
                       flush=True)
             pw_tensor = torch.tensor([args.pos_weight], dtype=torch.float32,
                                      device=device)
@@ -346,8 +347,13 @@ def main():
         # End-of-epoch save (also overwrites in case last save was a few chunks back)
         save_now(epoch, len(chunk_order), len(chunk_order),
                  suffix=f" (end of epoch {epoch})")
-        print(f"Epoch {epoch}: n={total_n:,} loss={total_loss/total_n:.4f}  "
-              f"(epoch elapsed {int(time.time()-t_epoch_start)}s)", flush=True)
+        epoch_loss = total_loss / total_n
+        prev_lr = optimizer.param_groups[0]['lr']
+        scheduler.step(epoch_loss)
+        new_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch}: n={total_n:,} loss={epoch_loss:.4f}  "
+              f"(epoch elapsed {int(time.time()-t_epoch_start)}s)  "
+              f"lr {prev_lr:.2e}->{new_lr:.2e}", flush=True)
 
 
 if __name__ == '__main__':

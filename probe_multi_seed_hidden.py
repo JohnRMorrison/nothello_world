@@ -11,6 +11,10 @@ Variants:
   4. concat + per-MLP confidence (max cell score per MLP): (N*512 + N,)
   5. concat + cross-MLP cell agreement (std of cell scores across MLPs, per cell): (N*512 + 60,)
   6. MoE gate: features -> softmax over N experts -> weighted sum of hidden (512,) -> probe
+  7. shared: single Linear(512, 60×3) applied to each seed's hidden separately,
+     then mean per-seed logits.  ~92K params for any N.
+  8. shared_attn: shared per-seed probe as in (7), weighted by feature-conditioned
+     attention over seeds.  ~100K params for any N.
 
 Metric: per-cell 3-class accuracy, averaged over 64 cells.
 
@@ -201,6 +205,43 @@ class MoEProbe(nn.Module):
         return self.probe(weighted).view(-1, N_CELLS, N_CLASSES)
 
 
+class SharedProbe(nn.Module):
+    """Weight-shared per-seed probe.  Apply the same Linear(H, 60×3) to every
+    seed's hidden vector, then mean the per-seed logits.  Parameter count is
+    independent of N."""
+    def __init__(self, hidden_dim, feature_dim=120):
+        super().__init__()
+        self.probe = nn.Linear(hidden_dim, N_CELLS * N_CLASSES)
+
+    def forward(self, hidden_tensor, features):
+        # hidden_tensor: (B, N, H); features unused
+        B, N, H = hidden_tensor.shape
+        per_seed = self.probe(hidden_tensor.reshape(B * N, H))
+        per_seed = per_seed.reshape(B, N, N_CELLS, N_CLASSES)
+        return per_seed.mean(dim=1)
+
+
+class AttentionSharedProbe(nn.Module):
+    """Shared per-seed probe combined by feature-conditioned attention over
+    seeds (not over the hidden dimension).  Also O(1) params in N."""
+    def __init__(self, hidden_dim, feature_dim=120, attn_dim=32):
+        super().__init__()
+        self.probe = nn.Linear(hidden_dim, N_CELLS * N_CLASSES)
+        self.attn_key = nn.Linear(hidden_dim, attn_dim)
+        self.attn_query = nn.Linear(feature_dim, attn_dim)
+        self.attn_dim = attn_dim
+
+    def forward(self, hidden_tensor, features):
+        B, N, H = hidden_tensor.shape
+        per_seed = self.probe(hidden_tensor.reshape(B * N, H))
+        per_seed = per_seed.reshape(B, N, N_CELLS, N_CLASSES)
+        keys = self.attn_key(hidden_tensor)                             # (B, N, D)
+        query = self.attn_query(features).unsqueeze(1)                  # (B, 1, D)
+        scores = (keys * query).sum(-1) / (self.attn_dim ** 0.5)        # (B, N)
+        weights = F.softmax(scores, dim=1)                              # (B, N)
+        return (weights.unsqueeze(-1).unsqueeze(-1) * per_seed).sum(dim=1)
+
+
 def compute_variant_batch(h_batch, cs_batch, f_batch, variant):
     """Compute variant features for a batch on GPU.
 
@@ -296,9 +337,9 @@ def train_probe_lazy(model_cls, input_dim, variant, dsets, N, hidden_dim,
     return correct / total
 
 
-def train_moe_probe(dsets, N, hidden_dim, device, epochs, batch_size, lr):
-    """Train the MoE-gate probe by streaming hidden per-batch."""
-    model = MoEProbe(N, hidden_dim).to(device)
+def train_stream_probe(model, dsets, device, epochs, batch_size, lr):
+    """Train a probe that takes (hidden_tensor, features) inputs.  Used for
+    MoE / shared / attention-shared probes."""
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     train = dsets['train']
@@ -365,8 +406,8 @@ def main():
     ap.add_argument('--variants', type=str, default='all',
                     help='Comma-separated list of variants to run '
                          '(concat,concat+features,concat+confidence,'
-                         'concat+agreement,nonlin_concat,'
-                         'nonlin_concat+features,moe) '
+                         'concat+agreement,mean,nonlin_concat,'
+                         'nonlin_concat+features,moe,shared,shared_attn) '
                          'or "all" (default)')
     args = ap.parse_args()
 
@@ -426,15 +467,16 @@ def main():
     results = {}
 
     all_variants = ['concat', 'concat+features',
-                    'concat+confidence', 'concat+agreement',
-                    'nonlin_concat', 'nonlin_concat+features', 'moe']
+                    'concat+confidence', 'concat+agreement', 'mean',
+                    'nonlin_concat', 'nonlin_concat+features',
+                    'moe', 'shared', 'shared_attn']
     if args.variants == 'all':
         variants_to_run = all_variants
     else:
         variants_to_run = [v.strip() for v in args.variants.split(',')]
 
     linear_variants = ['concat', 'concat+features',
-                        'concat+confidence', 'concat+agreement']
+                        'concat+confidence', 'concat+agreement', 'mean']
     for v in linear_variants:
         if v not in variants_to_run:
             continue
@@ -464,11 +506,30 @@ def main():
 
     if 'moe' in variants_to_run:
         print(f"\n=== Probe: MoE gate ===")
-        acc = train_moe_probe(
-            dsets, N, hidden, device, args.epochs, args.batch_size, args.lr,
+        model = MoEProbe(N, hidden).to(device)
+        acc = train_stream_probe(
+            model, dsets, device, args.epochs, args.batch_size, args.lr,
         )
         print(f"    test 3-class per-cell accuracy: {acc:.4f}")
         results['moe_gate'] = acc
+
+    if 'shared' in variants_to_run:
+        print(f"\n=== Probe: shared (per-seed probe + mean logits) ===")
+        model = SharedProbe(hidden).to(device)
+        acc = train_stream_probe(
+            model, dsets, device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results['shared'] = acc
+
+    if 'shared_attn' in variants_to_run:
+        print(f"\n=== Probe: shared_attn (per-seed probe + attention combiner) ===")
+        model = AttentionSharedProbe(hidden).to(device)
+        acc = train_stream_probe(
+            model, dsets, device, args.epochs, args.batch_size, args.lr,
+        )
+        print(f"    test 3-class per-cell accuracy: {acc:.4f}")
+        results['shared_attn'] = acc
 
     print()
     print(f"=== Probing results ({test_dset['hidden'].shape[0]:,} test positions) ===")
