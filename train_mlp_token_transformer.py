@@ -149,9 +149,11 @@ class MLPTokenTransformer(nn.Module):
         weights = F.softmax(
             self.per_mlp_weight(x).squeeze(-1), dim=1)            # (B, N)
         delta = (weights.unsqueeze(-1) * preds).sum(dim=1)         # (B, 60)
-        # Residual baseline: sum_log_prob_or (which was our best output-space
-        # aggregator).  Starts at baseline; trains to move.
-        baseline = seed_scores.sum(dim=1)                          # (B, 60)
+        # Residual baseline: MEAN of per-seed cell scores.  Note that argmax
+        # (and top-K) of mean == argmax of sum; using mean keeps the
+        # magnitude in a range compatible with sigmoid+BCE (sum with N=100
+        # saturates: logits ~100 -> BCE ~100 for false positives).
+        baseline = seed_scores.mean(dim=1)                         # (B, 60)
         return baseline + delta
 
 
