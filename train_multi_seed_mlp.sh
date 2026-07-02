@@ -3,7 +3,7 @@
 
 #SBATCH --job-name=multi_seed
 #SBATCH -c 4
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/multi_seed_%j.out
