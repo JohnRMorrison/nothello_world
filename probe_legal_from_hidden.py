@@ -45,15 +45,10 @@ N_CELLS_60 = 60
 TOP_KS = [1, 3, 5, 10]
 
 
-def extract_hidden_and_legal(games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e,
-                               W2_o, b2_o, device, k_min, k_max,
-                               batch_size, N):
-    """Return dict of:
-      hidden:   (n_pos, N, hidden)  float16
-      features: (n_pos, 120)         float32
-      legal:    (n_pos, 60)          bool
-    Skips positions with no legal moves.
-    """
+def build_position_index(games, k_min, k_max):
+    """Return small on-CPU tensors describing the positions to probe.
+    Hidden reps are computed on the fly during training (see forward_hidden_batch)
+    to keep memory O(1) in dataset size."""
     feats_list, ks_list, legal_list = [], [], []
     for game in games:
         for k in range(k_min, k_max + 1):
@@ -64,49 +59,40 @@ def extract_hidden_and_legal(games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e,
             ks_list.append(k)
             legal_list.append(legal)
     n_total = len(feats_list)
-    hidden_dim = W1_e.shape[2]
-
-    features = torch.stack(feats_list).numpy().astype(np.float32)
+    features = torch.stack(feats_list).numpy().astype(np.float32)   # (n, 120)
+    ks = np.array(ks_list, dtype=np.int64)
     legal_mask = np.zeros((n_total, N_CELLS_60), dtype=bool)
-    for i, legal in enumerate(legal_list):
-        for c in legal:
+    for i, lg in enumerate(legal_list):
+        for c in lg:
             legal_mask[i, c] = True
-
-    # Store hidden as float16 to halve host memory.
-    hidden = np.zeros((n_total, N, hidden_dim), dtype=np.float16)
-
-    t0 = time.time()
-    with torch.no_grad():
-        for i in range(0, n_total, batch_size):
-            end = min(i + batch_size, n_total)
-            x = torch.stack(feats_list[i:end]).to(device)
-            ks = torch.tensor(ks_list[i:end], device=device)
-            use_me = (ks % 2 == 1)
-            use_mo = ~use_me
-            B = end - i
-
-            h_all = torch.zeros(N, B, hidden_dim, device=device)
-
-            def forward_hidden(W1, b1, x_slice):
-                x_nbi = x_slice.unsqueeze(0).expand(N, -1, -1)
-                h = torch.bmm(x_nbi, W1) + b1
-                return F.relu(h)
-
-            if use_me.any():
-                h_all[:, use_me] = forward_hidden(W1_e, b1_e, x[use_me])
-            if use_mo.any():
-                h_all[:, use_mo] = forward_hidden(W1_o, b1_o, x[use_mo])
-
-            hidden[i:end] = h_all.permute(1, 0, 2).cpu().numpy().astype(np.float16)
-            if (i // batch_size) % 20 == 0:
-                print(f"    {end}/{n_total}  ({int(time.time()-t0)}s)",
-                      flush=True)
-
     return {
-        'hidden':   hidden,        # (n, N, hidden)
         'features': features,      # (n, 120)
+        'ks':       ks,            # (n,)
         'legal':    legal_mask,    # (n, 60) bool
     }
+
+
+def forward_hidden_batch(features, ks, W1_e, b1_e, W1_o, b1_o, N, hidden_dim,
+                          device):
+    """Compute (N, B, hidden) post-ReLU hidden activations for one batch."""
+    x = features.to(device)
+    ks_t = ks.to(device)
+    use_me = (ks_t % 2 == 1)
+    use_mo = ~use_me
+    B = x.shape[0]
+    h_all = torch.zeros(N, B, hidden_dim, device=device)
+
+    def forward_hidden(W1, b1, x_slice):
+        x_nbi = x_slice.unsqueeze(0).expand(N, -1, -1)
+        h = torch.bmm(x_nbi, W1) + b1
+        return F.relu(h)
+
+    if use_me.any():
+        h_all[:, use_me] = forward_hidden(W1_e, b1_e, x[use_me])
+    if use_mo.any():
+        h_all[:, use_mo] = forward_hidden(W1_o, b1_o, x[use_mo])
+    # Return (B, N, hidden) to match probe input layout.
+    return h_all.permute(1, 0, 2)
 
 
 def get_vectorized_weights(me_module, mo_module):
@@ -171,22 +157,32 @@ def topk_legality(logits, legal_mask, k):
     return hits.mean()
 
 
-def train_probe(model, dsets, device, epochs, batch_size, lr):
+def train_probe(model, dsets, W1_e, b1_e, W1_o, b1_o,
+                 N, hidden_dim, device, epochs, batch_size, lr):
+    """Train with LAZY hidden extraction: re-forward the ensemble each batch.
+
+    Memory footprint is O(1) in dataset size - only the raw features are held.
+    Runtime cost: ~3x an eagerly-cached version, but the H=4096 case doesn't
+    fit in RAM otherwise.
+    """
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.75, patience=1)
 
     train, test = dsets['train'], dsets['test']
-    n_train = train['hidden'].shape[0]
-    n_test  = test['hidden'].shape[0]
+    n_train = train['features'].shape[0]
+    n_test  = test['features'].shape[0]
     n_params = sum(p.numel() for p in model.parameters())
     print(f"    Params: {n_params:,}")
 
-    def to_gpu_batch(dset, idxs):
-        h = torch.from_numpy(dset['hidden'][idxs].astype(np.float32)).to(device)
-        f = torch.from_numpy(dset['features'][idxs]).to(device)
+    def batch_hidden_features_legal(dset, idxs):
+        f_cpu = torch.from_numpy(dset['features'][idxs])
+        ks_cpu = torch.from_numpy(dset['ks'][idxs])
         y = torch.from_numpy(dset['legal'][idxs].astype(np.float32)).to(device)
-        return h, f, y
+        with torch.no_grad():
+            h = forward_hidden_batch(f_cpu, ks_cpu, W1_e, b1_e, W1_o, b1_o,
+                                       N, hidden_dim, device)
+        return h, f_cpu.to(device), y
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -195,7 +191,7 @@ def train_probe(model, dsets, device, epochs, batch_size, lr):
         t0 = time.time()
         for i in range(0, n_train, batch_size):
             idxs = perm[i:i + batch_size]
-            h, f, y = to_gpu_batch(train, idxs)
+            h, f, y = batch_hidden_features_legal(train, idxs)
             logits = model(h, f)
             loss = F.binary_cross_entropy_with_logits(logits, y)
             opt.zero_grad()
@@ -208,16 +204,15 @@ def train_probe(model, dsets, device, epochs, batch_size, lr):
         print(f"    epoch {epoch}: loss={epoch_loss:.4f}  "
               f"lr={cur_lr:.2e}  ({int(time.time()-t0)}s)", flush=True)
 
-    # Evaluate top-K legality on test.
     model.eval()
     all_logits = []
     with torch.no_grad():
         for i in range(0, n_test, batch_size):
             end = min(i + batch_size, n_test)
             idxs = np.arange(i, end)
-            h, f, _ = to_gpu_batch(test, idxs)
+            h, f, _ = batch_hidden_features_legal(test, idxs)
             all_logits.append(model(h, f))
-    all_logits = torch.cat(all_logits, dim=0)  # (n_test, 60)
+    all_logits = torch.cat(all_logits, dim=0)
     results = {K: topk_legality(all_logits, test['legal'], K) for K in TOP_KS}
     return results
 
@@ -269,19 +264,13 @@ def main():
                         args.num_train_games + args.num_test_games]
     print(f"  train games: {len(train_games)}, test games: {len(test_games)}")
 
-    print("Extracting hidden + legal for train...")
-    train_dset = extract_hidden_and_legal(
-        train_games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e, W2_o, b2_o,
-        device, args.k_min, args.k_max, args.batch_size, N,
-    )
-    print(f"  {train_dset['hidden'].shape[0]:,} train positions")
+    print("Indexing train positions (lazy hidden — computed per batch)...")
+    train_dset = build_position_index(train_games, args.k_min, args.k_max)
+    print(f"  {train_dset['features'].shape[0]:,} train positions")
 
-    print("Extracting hidden + legal for test...")
-    test_dset = extract_hidden_and_legal(
-        test_games, W1_e, b1_e, W1_o, b1_o, W2_e, b2_e, W2_o, b2_o,
-        device, args.k_min, args.k_max, args.batch_size, N,
-    )
-    print(f"  {test_dset['hidden'].shape[0]:,} test positions")
+    print("Indexing test positions...")
+    test_dset = build_position_index(test_games, args.k_min, args.k_max)
+    print(f"  {test_dset['features'].shape[0]:,} test positions")
 
     dsets = {'train': train_dset, 'test': test_dset}
     results = {}
@@ -292,32 +281,28 @@ def main():
     else:
         variants_to_run = [v.strip() for v in args.variants.split(',')]
 
+    def run(model, name):
+        r = train_probe(model, dsets, W1_e, b1_e, W1_o, b1_o,
+                          N, hidden, device, args.epochs, args.batch_size,
+                          args.lr)
+        results[name] = r
+        for K in TOP_KS:
+            print(f"    top-{K} legality: {r[K]:.4f}")
+
     if 'concat' in variants_to_run:
         print(f"\n=== Probe: concat (linear) ===")
-        model = ConcatProbe(N, hidden).to(device)
-        results['concat'] = train_probe(
-            model, dsets, device, args.epochs, args.batch_size, args.lr)
-        for K in TOP_KS:
-            print(f"    top-{K} legality: {results['concat'][K]:.4f}")
+        run(ConcatProbe(N, hidden).to(device), 'concat')
 
     if 'shared' in variants_to_run:
         print(f"\n=== Probe: shared (per-seed probe + mean logits) ===")
-        model = SharedProbe(N, hidden).to(device)
-        results['shared'] = train_probe(
-            model, dsets, device, args.epochs, args.batch_size, args.lr)
-        for K in TOP_KS:
-            print(f"    top-{K} legality: {results['shared'][K]:.4f}")
+        run(SharedProbe(N, hidden).to(device), 'shared')
 
     if 'moe' in variants_to_run:
         print(f"\n=== Probe: MoE gate ===")
-        model = MoEProbe(N, hidden).to(device)
-        results['moe'] = train_probe(
-            model, dsets, device, args.epochs, args.batch_size, args.lr)
-        for K in TOP_KS:
-            print(f"    top-{K} legality: {results['moe'][K]:.4f}")
+        run(MoEProbe(N, hidden).to(device), 'moe')
 
     print()
-    print(f"=== Legal-move probing ({test_dset['hidden'].shape[0]:,} test positions) ===")
+    print(f"=== Legal-move probing ({test_dset['features'].shape[0]:,} test positions) ===")
     header = f"  {'variant':<12}" + "".join(f"  top-{K:>2}" for K in TOP_KS)
     print(header)
     print("  " + "-" * (len(header) - 2))
