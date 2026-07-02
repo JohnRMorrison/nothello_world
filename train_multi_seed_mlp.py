@@ -159,6 +159,11 @@ def main():
     ap.add_argument('--pos-weight', type=float, default=1.0,
                     help='BCE pos_weight (default 1.0 = uniform). '
                          'Match train_pattern_simple.py convention.')
+    ap.add_argument('--pos-weight-linspace', type=float, nargs=2, default=None,
+                    metavar=('MIN', 'MAX'),
+                    help='Sweep pos_weight linearly from MIN to MAX across '
+                         'the N seeds (each seed gets its own value). '
+                         'Overrides --pos-weight.')
     ap.add_argument('--chunk-start', type=int, default=0,
                     help='Index of first training chunk to use (default 0). '
                          'Combined with --max-chunks, lets you train on a '
@@ -229,6 +234,9 @@ def main():
             tag += f"_chunks{args.chunk_start}-{args.chunk_start + args.max_chunks - 1}"
     if args.seed != 0:
         tag += f"_seed{args.seed}"
+    if args.pos_weight_linspace is not None:
+        lo, hi = args.pos_weight_linspace
+        tag += f"_pwsweep{lo:g}-{hi:g}"
     base_save_path = os.path.join(
         save_dir,
         f"multi_seed_N{args.num_seeds}_H{args.hidden}_playedeven{tag}.pt",
@@ -261,6 +269,11 @@ def main():
             'optimizer_state':  optimizer.state_dict(),
             'scheduler_state':  scheduler.state_dict(),
             'pos_weight_used':  args.pos_weight,
+            'pos_weight_linspace': args.pos_weight_linspace,  # None if scalar
+            'pos_weight_values':   (
+                np.linspace(*args.pos_weight_linspace, args.num_seeds).tolist()
+                if args.pos_weight_linspace is not None else None
+            ),
             'lr_used':          args.lr,
         }, tmp_path)
         os.replace(tmp_path, base_save_path)
@@ -338,10 +351,28 @@ def main():
                   f"in {t_load:.1f}s", flush=True)
 
             if epoch == 1 and ci_idx == 0:
-                print(f"    pos_weight={args.pos_weight}  (1.0 = uniform BCE)",
-                      flush=True)
-            pw_tensor = torch.tensor([args.pos_weight], dtype=torch.float32,
-                                     device=device)
+                if args.pos_weight_linspace is not None:
+                    print(f"    pos_weight SWEEP: linspace"
+                          f"({args.pos_weight_linspace[0]}, "
+                          f"{args.pos_weight_linspace[1]}, {args.num_seeds}) "
+                          f"— each seed gets its own value", flush=True)
+                else:
+                    print(f"    pos_weight={args.pos_weight}  (1.0 = uniform BCE)",
+                          flush=True)
+            # Build the pos_weight tensor.  Scalar mode keeps existing behavior
+            # (shape (1,)); sweep mode is a per-seed vector (shape (N,)) that
+            # we broadcast per-element inside the loss.
+            if args.pos_weight_linspace is not None:
+                pw_values = np.linspace(
+                    args.pos_weight_linspace[0],
+                    args.pos_weight_linspace[1],
+                    args.num_seeds,
+                )
+                pw_tensor = torch.tensor(pw_values, dtype=torch.float32,
+                                          device=device)
+            else:
+                pw_tensor = torch.tensor([args.pos_weight], dtype=torch.float32,
+                                          device=device)
 
             n_rows = len(feats_120)
             perm = rng.permutation(n_rows)
@@ -371,6 +402,24 @@ def main():
                 # reduction='mean' over (N, B, 960) divides each model's
                 # gradient by N (vs (B, 960) in single-model), effectively
                 # scaling its learning rate by 1/N.
+                def bce_loss(logits, target):
+                    """BCE with logits, supporting scalar OR per-seed pos_weight.
+
+                    Scalar path uses F.binary_cross_entropy_with_logits.
+                    Per-seed path expands to manual BCE:
+                        pw * y * softplus(-z) + (1 - y) * softplus(z)
+                    Both paths return reduction='mean' over (N, B, 960).
+                    """
+                    if pw_tensor.numel() == args.num_seeds:
+                        pw_b = pw_tensor.view(-1, 1, 1)   # (N, 1, 1)
+                        return (
+                            pw_b * target * F.softplus(-logits)
+                            + (1 - target) * F.softplus(logits)
+                        ).mean()
+                    return F.binary_cross_entropy_with_logits(
+                        logits, target, pos_weight=pw_tensor,
+                    )
+
                 loss = torch.tensor(0.0, device=device)
                 n_in_batch = 0
                 if even_mask.any():
@@ -378,18 +427,14 @@ def main():
                     y_e = y_pat[even_mask]
                     logits_e = model_even(x_e)  # (N, B_e, 960)
                     target_e = y_e.unsqueeze(0).expand(args.num_seeds, -1, -1)
-                    loss = loss + args.num_seeds * F.binary_cross_entropy_with_logits(
-                        logits_e, target_e, pos_weight=pw_tensor,
-                    )
+                    loss = loss + args.num_seeds * bce_loss(logits_e, target_e)
                     n_in_batch += int(even_mask.sum())
                 if odd_mask.any():
                     x_o = x[odd_mask]
                     y_o = y_pat[odd_mask]
                     logits_o = model_odd(x_o)
                     target_o = y_o.unsqueeze(0).expand(args.num_seeds, -1, -1)
-                    loss = loss + args.num_seeds * F.binary_cross_entropy_with_logits(
-                        logits_o, target_o, pos_weight=pw_tensor,
-                    )
+                    loss = loss + args.num_seeds * bce_loss(logits_o, target_o)
                     n_in_batch += int(odd_mask.sum())
 
                 optimizer.zero_grad()

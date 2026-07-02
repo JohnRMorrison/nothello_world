@@ -26,6 +26,7 @@ SEED=${SEED:-0}
 CHUNK_START=${CHUNK_START:-0}
 MAX_CHUNKS=${MAX_CHUNKS:-}
 POS_WEIGHT=${POS_WEIGHT:-1.0}
+POS_WEIGHT_LINSPACE=${POS_WEIGHT_LINSPACE:-}   # "MIN MAX", enables per-seed sweep
 RESUME_FROM=${RESUME_FROM:-}
 
 echo "============================================"
@@ -47,6 +48,12 @@ if [ -n "$RESUME_FROM" ]; then
     RESUME_ARG="--resume-from $RESUME_FROM"
 fi
 
+# POS_WEIGHT_LINSPACE="MIN MAX" enables the per-seed sweep and overrides POS_WEIGHT.
+PW_LINSPACE_ARG=""
+if [ -n "$POS_WEIGHT_LINSPACE" ]; then
+    PW_LINSPACE_ARG="--pos-weight-linspace $POS_WEIGHT_LINSPACE"
+fi
+
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
     --num-seeds $NUM_SEEDS \
     --hidden $HIDDEN \
@@ -56,6 +63,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
     --pos-weight $POS_WEIGHT \
     --chunk-start $CHUNK_START \
     $MAX_CHUNKS_ARG \
-    $RESUME_ARG
+    $RESUME_ARG \
+    $PW_LINSPACE_ARG
 
 echo "Completed at: $(date)"
