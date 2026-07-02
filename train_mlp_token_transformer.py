@@ -103,8 +103,14 @@ def derive_legal_mask(batch_pat, idx, mask):
 
 class MLPTokenTransformer(nn.Module):
     """MLPs are tokens.  Board context added to each token.  Self-attention
-    lets tokens see each other; each token emits its own 60-d prediction
-    and a softmax weight; final output = weighted sum.
+    lets tokens see each other; each token emits its own 60-d "delta" and
+    a softmax weight; final output = sum_over_seeds(seed_scores)  (baseline)
+    + weighted_sum(delta) (transformer-learned correction).
+
+    The residual baseline means the transformer starts at sum_log_prob_or's
+    output and only has to learn where to CORRECT it.  per_mlp_pred is
+    zero-initialised so delta=0 at init -> forward is exactly sum aggregation
+    until training moves the weights.
 
     Uses seq-first tensor layout (S, B, E) for compatibility with older
     PyTorch that doesn't support batch_first=True."""
@@ -121,6 +127,10 @@ class MLPTokenTransformer(nn.Module):
         self.transformer = nn.TransformerEncoder(enc, n_layers)
         self.per_mlp_pred = nn.Linear(d_model, n_cells)
         self.per_mlp_weight = nn.Linear(d_model, 1)
+        # Zero-init the delta head so at init the forward pass is exactly
+        # the sum_log_prob_or baseline (delta = 0).
+        nn.init.zeros_(self.per_mlp_pred.weight)
+        nn.init.zeros_(self.per_mlp_pred.bias)
 
     def forward(self, seed_scores, context):
         # seed_scores: (B, N, 60)
@@ -138,7 +148,11 @@ class MLPTokenTransformer(nn.Module):
         preds = self.per_mlp_pred(x)                              # (B, N, 60)
         weights = F.softmax(
             self.per_mlp_weight(x).squeeze(-1), dim=1)            # (B, N)
-        return (weights.unsqueeze(-1) * preds).sum(dim=1)          # (B, 60)
+        delta = (weights.unsqueeze(-1) * preds).sum(dim=1)         # (B, 60)
+        # Residual baseline: sum_log_prob_or (which was our best output-space
+        # aggregator).  Starts at baseline; trains to move.
+        baseline = seed_scores.sum(dim=1)                          # (B, 60)
+        return baseline + delta
 
 
 def iter_batches(chunk_paths, batch_size):
