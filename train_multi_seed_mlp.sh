@@ -3,7 +3,7 @@
 
 #SBATCH --job-name=multi_seed
 #SBATCH -c 4
-#SBATCH --time=16:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mem=120GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/multi_seed_%j.out
@@ -21,13 +21,16 @@ cd $SLURM_SUBMIT_DIR
 HIDDEN=${HIDDEN:-512}
 NUM_SEEDS=${NUM_SEEDS:-100}
 EPOCHS=${EPOCHS:-3}
-BATCH_SIZE=${BATCH_SIZE:-8192}
+BATCH_SIZE=${BATCH_SIZE:-1024}
 SEED=${SEED:-0}
+CHUNK_START=${CHUNK_START:-0}
 MAX_CHUNKS=${MAX_CHUNKS:-}
+POS_WEIGHT=${POS_WEIGHT:-1.0}
 
 echo "============================================"
 echo "Multi-seed MLP training"
-echo "  H=$HIDDEN  N=$NUM_SEEDS  EPOCHS=$EPOCHS  BATCH=$BATCH_SIZE  SEED=$SEED"
+echo "  H=$HIDDEN  N=$NUM_SEEDS  EPOCHS=$EPOCHS  BATCH=$BATCH_SIZE  SEED=$SEED  POS_WEIGHT=$POS_WEIGHT"
+echo "  Chunks: start=$CHUNK_START, max=${MAX_CHUNKS:-all}"
 echo "Job ID: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
@@ -43,6 +46,8 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python train_multi_seed_mlp.py \
     --epochs $EPOCHS \
     --batch-size $BATCH_SIZE \
     --seed $SEED \
+    --pos-weight $POS_WEIGHT \
+    --chunk-start $CHUNK_START \
     $MAX_CHUNKS_ARG
 
 echo "Completed at: $(date)"
