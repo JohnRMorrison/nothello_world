@@ -169,6 +169,10 @@ def main():
     ap.add_argument('--save-every-chunks', type=int, default=5,
                     help='Save checkpoint every N chunks (incremental progress). '
                          'Set to 0 to only save at end of epoch.')
+    ap.add_argument('--resume-from', type=str, default=None,
+                    help='Path to a checkpoint saved at an epoch boundary. '
+                         'Loads model + optimizer + scheduler state and '
+                         'continues training from the next epoch.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -239,12 +243,66 @@ def main():
             'epoch': epoch_val,
             'chunks_completed_this_epoch': ci_idx_val,
             'chunks_per_epoch': n_chunks_in_epoch,
+            # Fields used by --resume-from (epoch-boundary resume).
+            'model_even_state': model_even.state_dict(),
+            'model_odd_state':  model_odd.state_dict(),
+            'optimizer_state':  optimizer.state_dict(),
+            'scheduler_state':  scheduler.state_dict(),
+            'pos_weight_used':  args.pos_weight,
+            'lr_used':          args.lr,
         }, tmp_path)
         os.replace(tmp_path, base_save_path)
         print(f"    SAVED ckpt to {base_save_path}{suffix}  "
               f"({int(time.time()-t_save)}s)", flush=True)
 
-    for epoch in range(1, args.epochs + 1):
+    start_epoch = 1
+    if args.resume_from is not None:
+        print(f"Resuming from {args.resume_from}", flush=True)
+        rckpt = torch.load(args.resume_from, map_location=device)
+        for key in ('model_even_state', 'model_odd_state', 'optimizer_state',
+                    'scheduler_state', 'epoch'):
+            if key not in rckpt:
+                raise RuntimeError(
+                    f"--resume-from checkpoint missing '{key}'. "
+                    "Only checkpoints written by the resume-aware version of "
+                    "this script can be resumed. (Older checkpoints only "
+                    "have per-seed weights.)")
+        # Sanity-check the hyperparameters that must match for a coherent resume.
+        if rckpt.get('num_seeds') != args.num_seeds:
+            raise RuntimeError(
+                f"num_seeds mismatch: ckpt={rckpt['num_seeds']} "
+                f"vs args={args.num_seeds}")
+        if rckpt.get('hidden_dim') != args.hidden:
+            raise RuntimeError(
+                f"hidden_dim mismatch: ckpt={rckpt['hidden_dim']} "
+                f"vs args={args.hidden}")
+        if rckpt.get('pos_weight_used') != args.pos_weight:
+            print(f"  WARNING: pos_weight changed "
+                  f"{rckpt.get('pos_weight_used')} -> {args.pos_weight}",
+                  flush=True)
+        model_even.load_state_dict(rckpt['model_even_state'])
+        model_odd.load_state_dict(rckpt['model_odd_state'])
+        optimizer.load_state_dict(rckpt['optimizer_state'])
+        scheduler.load_state_dict(rckpt['scheduler_state'])
+        saved_epoch = rckpt['epoch']
+        chunks_done = rckpt.get('chunks_completed_this_epoch', 0)
+        chunks_per_epoch = rckpt.get('chunks_per_epoch', 0)
+        if chunks_done != chunks_per_epoch:
+            print(f"  WARNING: ckpt is mid-epoch "
+                  f"(epoch {saved_epoch}, {chunks_done}/{chunks_per_epoch} "
+                  f"chunks). Only epoch-boundary resume is supported; "
+                  f"restarting from epoch {saved_epoch + 1} (partial epoch "
+                  f"{saved_epoch} data is lost).", flush=True)
+        start_epoch = saved_epoch + 1
+        print(f"  Resumed. Continuing from epoch {start_epoch}. "
+              f"Current LR: {optimizer.param_groups[0]['lr']:.2e}",
+              flush=True)
+        if start_epoch > args.epochs:
+            print(f"  All {args.epochs} epochs already completed in the "
+                  f"resumed checkpoint. Nothing to do.", flush=True)
+            return
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model_even.train()
         model_odd.train()
         rng = np.random.RandomState(epoch * 1000 + args.seed)
