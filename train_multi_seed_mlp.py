@@ -218,10 +218,22 @@ def main():
 
     save_dir = args.output_dir
     os.makedirs(save_dir, exist_ok=True)
+    # Distinguish concurrent runs with different chunk slices / init seeds.
+    # Default (chunk_start=0, max_chunks=None, seed=0) preserves the historical
+    # unadorned filename.
+    tag = ""
+    if args.chunk_start != 0 or args.max_chunks is not None:
+        if args.max_chunks is None:
+            tag += f"_chunks{args.chunk_start}-end"
+        else:
+            tag += f"_chunks{args.chunk_start}-{args.chunk_start + args.max_chunks - 1}"
+    if args.seed != 0:
+        tag += f"_seed{args.seed}"
     base_save_path = os.path.join(
         save_dir,
-        f"multi_seed_N{args.num_seeds}_H{args.hidden}_playedeven.pt",
+        f"multi_seed_N{args.num_seeds}_H{args.hidden}_playedeven{tag}.pt",
     )
+    print(f"Save path: {base_save_path}", flush=True)
 
     def save_now(epoch_val, ci_idx_val, n_chunks_in_epoch, suffix=""):
         """Save current state to base_save_path (atomic write via .tmp)."""
