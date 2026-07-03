@@ -47,48 +47,50 @@ from data.othello import OthelloBoardState
 from eval_multi_seed_ensemble import load_vectorized_from_multi
 
 
-# ---------- Board enumeration ----------
+# ---------- Board enumeration (biased MC, matches analyze_late_ambiguity) ----------
 
-def sample_orderings(prefix, n_samples):
-    """For a given played prefix, sample n_samples random orderings that
-    preserve parity: parity-0 cells shuffled among the even-index slots,
-    parity-1 cells shuffled among odd-index slots."""
-    even_moves = [m for i, m in enumerate(prefix) if i % 2 == 0]
-    odd_moves  = [m for i, m in enumerate(prefix) if i % 2 == 1]
-    orderings = []
-    for _ in range(n_samples):
-        e = random.sample(even_moves, len(even_moves))
-        o = random.sample(odd_moves,  len(odd_moves))
-        out = []
-        for i in range(len(prefix)):
-            if i % 2 == 0:
-                out.append(e[i // 2])
-            else:
-                out.append(o[i // 2])
-        orderings.append(out)
-    return orderings
+def sample_one_valid_ordering(p0_cells, p1_cells):
+    """Sample a single valid Othello ordering of the (p0_cells, p1_cells)
+    multiset via uniform-random choice at each step among (legal moves AND
+    remaining cells for the current parity).  Returns (valid, state_8x8,
+    next_hand_color) - valid=False on dead-end.
 
-
-def replay(moves):
-    """Return (is_valid, board_state 8x8, next_hand_color) or (False, None, None)."""
-    b = OthelloBoardState()
-    try:
-        for m in moves:
-            valids = b.get_valid_moves()
-            if m not in valids:
-                return False, None, None
-            b.umpire(m)
-    except Exception:
-        return False, None, None
-    return True, b.state.copy(), b.next_hand_color
+    This is the biased-MC construction: every completed trial is a valid
+    ordering, in contrast to naive shuffling which almost never produces
+    valid orderings at k>=12."""
+    remaining_p0 = list(p0_cells)
+    remaining_p1 = list(p1_cells)
+    board = OthelloBoardState()
+    step = 0
+    while remaining_p0 or remaining_p1:
+        parity = step % 2
+        cands = remaining_p0 if parity == 0 else remaining_p1
+        legal = set(board.get_valid_moves())
+        available = [c for c in cands if c in legal]
+        if not available:
+            return False, None, None
+        chosen = random.choice(available)
+        board.umpire(chosen)
+        if parity == 0:
+            remaining_p0.remove(chosen)
+        else:
+            remaining_p1.remove(chosen)
+        step += 1
+    return True, board.state.copy(), board.next_hand_color
 
 
-def enumerate_consistent_boards(game_prefix, n_samples):
-    """Return dict {board_hash: (state_8x8, next_hand_color, count)}."""
-    orderings = sample_orderings(game_prefix, n_samples)
+def enumerate_consistent_boards(game_prefix, n_samples, max_retries=5):
+    """Return dict {board_hash: (state_8x8, next_hand_color, count)}.
+    Uses biased-MC construction; each trial retries up to max_retries
+    times on dead-ends before giving up."""
+    p0 = list(game_prefix[0::2])
+    p1 = list(game_prefix[1::2])
     boards = {}
-    for seq in orderings:
-        valid, state, next_c = replay(seq)
+    for _ in range(n_samples):
+        for _ in range(max_retries + 1):
+            valid, state, next_c = sample_one_valid_ordering(p0, p1)
+            if valid:
+                break
         if not valid:
             continue
         h = state.tobytes()
