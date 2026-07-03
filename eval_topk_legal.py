@@ -110,6 +110,9 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
+    parser.add_argument("--chunk-prefix", default="chunk_",
+                        help="Filename prefix filter for chunks (e.g. chunk_ext_ for "
+                             "the extended-range chunks used by the played+even MLPs).")
     args = parser.parse_args()
 
     device = get_device()
@@ -162,7 +165,13 @@ if __name__ == "__main__":
     chunk_dir = os.path.join(args.output_dir, "feature_chunks")
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
+                         if f.startswith(args.chunk_prefix)
+                         and f.endswith(".npz")
+                         and "_patterns" not in f and "_when60" not in f)
+    if not chunk_files:
+        raise SystemExit(
+            f"No files matching {args.chunk_prefix}*.npz in {chunk_dir}. "
+            f"Pass --chunk-prefix to match the training-time chunk family.")
     eval_path = chunk_files[-1]
 
     print(f"Mode: {args.mode}, H={args.hidden}")
