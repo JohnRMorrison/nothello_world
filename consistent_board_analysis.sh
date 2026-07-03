@@ -27,6 +27,7 @@ N_SAMPLES=${N_SAMPLES:-1000}
 PROBE_TRAIN_GAMES=${PROBE_TRAIN_GAMES:-2000}
 PROBE_EPOCHS=${PROBE_EPOCHS:-5}
 OUTPUT_CSV=${OUTPUT_CSV:-consistent_board_k${K}.csv}
+SEED_IDX=${SEED_IDX:-}   # if set, use only that single MLP
 
 echo "============================================"
 echo "Consistent-board analysis"
@@ -38,6 +39,11 @@ echo "Job: $SLURM_JOB_ID  Node: $(hostname)"
 echo "Started at: $(date)"
 echo "============================================"
 
+SEED_IDX_ARG=""
+if [ -n "$SEED_IDX" ]; then
+    SEED_IDX_ARG="--seed-idx $SEED_IDX"
+fi
+
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python consistent_board_analysis.py \
     --multi-ckpt "$MULTI_CKPT" \
     --k $K \
@@ -45,6 +51,7 @@ PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python consistent_board_analysis.py \
     --n-samples $N_SAMPLES \
     --probe-train-games $PROBE_TRAIN_GAMES \
     --probe-epochs $PROBE_EPOCHS \
-    --output-csv $OUTPUT_CSV
+    --output-csv $OUTPUT_CSV \
+    $SEED_IDX_ARG
 
 echo "Completed at: $(date)"
