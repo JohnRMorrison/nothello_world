@@ -228,6 +228,8 @@ def main():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=1024)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--num-seeds-used', type=int, default=None,
+                    help='If set, use only the first N seeds from the checkpoint.')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -235,7 +237,18 @@ def main():
     print(f"Loading {args.multi_ckpt}")
     me, mo, N, hidden, input_dim = load_vectorized_from_multi(
         args.multi_ckpt, device)
-    print(f"  N={N} seeds, H={hidden}")
+    print(f"  Loaded N={N} seeds, H={hidden}")
+    if args.num_seeds_used is not None and args.num_seeds_used < N:
+        k = args.num_seeds_used
+        with torch.no_grad():
+            for m in (me, mo):
+                m.n_models = k
+                m.W1 = torch.nn.Parameter(m.W1.data[:k].clone())
+                m.b1 = torch.nn.Parameter(m.b1.data[:k].clone())
+                m.W2 = torch.nn.Parameter(m.W2.data[:k].clone())
+                m.b2 = torch.nn.Parameter(m.b2.data[:k].clone())
+        N = k
+        print(f"  Sliced to first {N} seeds")
 
     patterns = enumerate_flanking_patterns()
     pattern_to_cell = torch.tensor(
