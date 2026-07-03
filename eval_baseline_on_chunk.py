@@ -82,8 +82,17 @@ def main():
     feats_120 = slice_played_even(feats_180)
     n_rows = len(feats_120)
     print(f"  loaded n={n_rows:,} in {time.time()-t0:.1f}s")
-    n_rows = min(n_rows, args.max_positions)
-    print(f"  evaluating {n_rows:,} positions")
+    # The chunk stores rows in order by turn number (all games at turn 5,
+    # then all games at turn 6, ...).  Slicing the first N rows would
+    # sample early-game positions only — massively inflating accuracy.
+    # Shuffle the row indices before capping so any max_positions cap gives
+    # a representative sample.
+    n_total = n_rows
+    shuffled_idx = np.random.RandomState(0).permutation(n_total)
+    if args.max_positions < n_total:
+        shuffled_idx = shuffled_idx[:args.max_positions]
+    n_rows = len(shuffled_idx)
+    print(f"  evaluating {n_rows:,} positions (shuffled sample of {n_total:,})")
 
     KS = [1, 3, 5, 10]
     AGG_NAMES = ["sum_log_prob_or", "mean_prob_or", "majority_vote"]
@@ -96,9 +105,10 @@ def main():
         for i in range(0, n_rows, args.batch_size):
             end = min(i + args.batch_size, n_rows)
             B = end - i
+            batch_idx = shuffled_idx[i:end]
             x = torch.from_numpy(
-                feats_120[i:end].astype(np.float32)).to(device)
-            ks_t = torch.from_numpy(positions[i:end]).to(device)
+                feats_120[batch_idx].astype(np.float32)).to(device)
+            ks_t = torch.from_numpy(positions[batch_idx]).to(device)
             # Forward through all N MLPs.  Chunk positions use train convention:
             # even parity -> me, odd -> mo (NOT eval_multi_seed_ensemble.py's
             # inverted parity, which encodes k differently).
@@ -121,8 +131,8 @@ def main():
 
             # Derive legal mask from pattern labels
             batch_pat = compute_pattern_labels_batch(
-                board_labels[i:end].astype(np.int8),
-                positions[i:end].astype(np.int64),
+                board_labels[batch_idx].astype(np.int8),
+                positions[batch_idx].astype(np.int64),
                 _PAT_TARGETS, _PAT_TERMINALS,
                 _PAT_OPP_CELLS, _PAT_OPP_MASK,
             )
