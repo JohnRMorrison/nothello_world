@@ -95,7 +95,10 @@ def compute_cell_scores(x, ks_t, weights, idx, mask, N, device):
     gathered = log1m[:, :, idx]
     gathered = gathered.masked_fill(~mask[None, None], 0.0)
     cell_scores = -gathered.sum(dim=-1)                # (N, B, 60)
-    return cell_scores.permute(1, 0, 2)                 # (B, N, 60)
+    # Return both:
+    #   cell_scores (B, N, 60) — used as the residual baseline
+    #   pattern_logits (B, N, 960) — richer per-token input for the transformer
+    return cell_scores.permute(1, 0, 2), logits.permute(1, 0, 2)
 
 
 def derive_legal_mask(batch_pat, idx, mask):
@@ -108,22 +111,26 @@ def derive_legal_mask(batch_pat, idx, mask):
 
 
 class MLPTokenTransformer(nn.Module):
-    """MLPs are tokens.  Board context added to each token.  Self-attention
-    lets tokens see each other; each token emits its own 60-d "delta" and
-    a softmax weight; final output = sum_over_seeds(seed_scores)  (baseline)
-    + weighted_sum(delta) (transformer-learned correction).
+    """MLPs are tokens.  Each token carries the MLP's RAW 960-d pattern
+    logits (not the 60-d aggregated cell scores) plus the board context.
+    Self-attention lets tokens see each other; each token emits its own
+    60-d "delta"; final output = mean(cell_scores) baseline + weighted
+    delta.
 
-    The residual baseline means the transformer starts at sum_log_prob_or's
-    output and only has to learn where to CORRECT it.  per_mlp_pred is
-    zero-initialised so delta=0 at init -> forward is exactly sum aggregation
-    until training moves the weights.
+    Using pattern logits (960) instead of cell scores (60) as the token
+    input preserves per-pattern nuance that the prob_or aggregation would
+    have collapsed before the transformer sees anything.
+
+    The residual baseline still uses the aggregated cell scores so we start
+    from the sum_log_prob_or output; per_mlp_pred is zero-initialised so
+    delta=0 at init.
 
     Uses seq-first tensor layout (S, B, E) for compatibility with older
     PyTorch that doesn't support batch_first=True."""
-    def __init__(self, n_seeds, n_cells=60, ctx_dim=120, d_model=64,
-                  n_heads=4, n_layers=2, dim_ff=128, dropout=0.0):
+    def __init__(self, n_seeds, n_cells=60, n_patterns=960, ctx_dim=120,
+                  d_model=64, n_heads=4, n_layers=2, dim_ff=128, dropout=0.0):
         super().__init__()
-        self.token_proj = nn.Linear(n_cells + ctx_dim, d_model)
+        self.token_proj = nn.Linear(n_patterns + ctx_dim, d_model)
         self.mlp_id_emb = nn.Embedding(n_seeds, d_model)
         enc = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads,
@@ -138,12 +145,13 @@ class MLPTokenTransformer(nn.Module):
         nn.init.zeros_(self.per_mlp_pred.weight)
         nn.init.zeros_(self.per_mlp_pred.bias)
 
-    def forward(self, seed_scores, context):
-        # seed_scores: (B, N, 60)
-        # context:     (B, 120)
-        B, N, _ = seed_scores.shape
+    def forward(self, pattern_logits, cell_scores, context):
+        # pattern_logits: (B, N, 960) — richer per-token input
+        # cell_scores:    (B, N, 60)  — used only for the residual baseline
+        # context:        (B, 120)
+        B, N, _ = pattern_logits.shape
         ctx = context.unsqueeze(1).expand(B, N, -1)              # (B, N, 120)
-        x = torch.cat([seed_scores, ctx], dim=-1)                # (B, N, 60+120)
+        x = torch.cat([pattern_logits, ctx], dim=-1)             # (B, N, 960+120)
         x = self.token_proj(x)                                    # (B, N, d)
         ids = torch.arange(N, device=x.device)
         x = x + self.mlp_id_emb(ids)                              # broadcast
@@ -155,11 +163,10 @@ class MLPTokenTransformer(nn.Module):
         weights = F.softmax(
             self.per_mlp_weight(x).squeeze(-1), dim=1)            # (B, N)
         delta = (weights.unsqueeze(-1) * preds).sum(dim=1)         # (B, 60)
-        # Residual baseline: MEAN of per-seed cell scores.  Note that argmax
-        # (and top-K) of mean == argmax of sum; using mean keeps the
-        # magnitude in a range compatible with sigmoid+BCE (sum with N=100
-        # saturates: logits ~100 -> BCE ~100 for false positives).
-        baseline = seed_scores.mean(dim=1)                         # (B, 60)
+        # Residual baseline: MEAN of per-seed CELL SCORES (aggregated
+        # prob_or).  Argmax of mean == argmax of sum, so top-K matches
+        # sum_log_prob_or at init.
+        baseline = cell_scores.mean(dim=1)                         # (B, 60)
         return baseline + delta
 
 
@@ -200,8 +207,9 @@ def eval_topk_legality(model, chunk_path, weights, idx, mask, N, device,
         for feats, pos_np, pat_np in iter_batches([chunk_path], batch_size):
             x = torch.from_numpy(feats).to(device)
             ks_t = torch.from_numpy(pos_np).to(device)
-            scores = compute_cell_scores(x, ks_t, weights, idx, mask, N, device)
-            logits = model(scores, x)                          # (B, 60)
+            cell_scores, pattern_logits = compute_cell_scores(
+                x, ks_t, weights, idx, mask, N, device)
+            logits = model(pattern_logits, cell_scores, x)     # (B, 60)
             legal = derive_legal_mask(pat_np, idx, mask)       # (B, 60)
             # Skip positions with no legal moves.
             has_legal = legal.any(dim=1)
@@ -293,10 +301,10 @@ def main():
         for feats, pos_np, pat_np in iter_batches(train_chunks, args.batch_size):
             x = torch.from_numpy(feats).to(device)
             ks_t = torch.from_numpy(pos_np).to(device)
-            scores = compute_cell_scores(x, ks_t, weights, idx, mask,
-                                            N_total, device)
+            cell_scores, pattern_logits = compute_cell_scores(
+                x, ks_t, weights, idx, mask, N_total, device)
             legal = derive_legal_mask(pat_np, idx, mask).float()
-            logits = model(scores, x)
+            logits = model(pattern_logits, cell_scores, x)
             loss = F.binary_cross_entropy_with_logits(logits, legal)
             opt.zero_grad(); loss.backward(); opt.step()
             total_loss += loss.item() * x.shape[0]
