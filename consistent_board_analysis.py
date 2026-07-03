@@ -240,6 +240,12 @@ def main():
     ap.add_argument('--num-data-files', type=int, default=1)
     ap.add_argument('--output-csv', required=True)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--seed-idx', type=int, default=None,
+                    help='If set, use only ONE MLP (the given seed index) '
+                         'instead of the full ensemble.  The probe is trained '
+                         'on that single MLP\'s hidden reps.  Its legal '
+                         'prediction and probe prediction are compared '
+                         'against each consistent board.')
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -250,11 +256,18 @@ def main():
     print(f"Loading {args.multi_ckpt}")
     me, mo, N, hidden_dim, _ = load_vectorized_from_multi(
         args.multi_ckpt, device)
-    print(f"  N={N}, H={hidden_dim}")
+    print(f"  Loaded N={N}, H={hidden_dim}")
     weights = (
         me.W1.detach(), me.b1.detach(), me.W2.detach(), me.b2.detach(),
         mo.W1.detach(), mo.b1.detach(), mo.W2.detach(), mo.b2.detach(),
     )
+    if args.seed_idx is not None:
+        assert 0 <= args.seed_idx < N, (
+            f"--seed-idx {args.seed_idx} out of range [0, {N})")
+        idx_ = args.seed_idx
+        weights = tuple(w[idx_:idx_ + 1] for w in weights)
+        N = 1
+        print(f"  Using single MLP: seed {idx_}.  Effective N=1")
 
     games = load_val_games(args.data_dir, args.num_data_files)
     probe_games = games[:args.probe_train_games]
