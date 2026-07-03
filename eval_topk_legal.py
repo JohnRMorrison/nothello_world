@@ -113,20 +113,46 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     device = get_device()
-    feature_cols = list(range(N_MOVES, 2 * N_MOVES))
 
     ckpt = torch.load(args.ckpt, map_location=device)
     n_patterns = ckpt.get('n_patterns', 960)
 
-    if args.mode in ("direct", "randproj"):
-        model_even = DirectMLP(N_MOVES, args.hidden, n_patterns).to(device)
-        model_odd = DirectMLP(N_MOVES, args.hidden, n_patterns).to(device)
-    elif args.mode == "two-stage":
-        model_even = TwoStageMLP(N_MOVES, args.hidden, n_patterns).to(device)
-        model_odd = TwoStageMLP(N_MOVES, args.hidden, n_patterns).to(device)
+    # Infer feature preprocessing from the checkpoint filename (matches
+    # probe_pattern_models.py's convention).  The old default was hardcoded
+    # to "when" features (line was `feature_cols = list(range(N_MOVES, 2*N_MOVES))`),
+    # which silently gave random accuracy for MLPs trained on other feature sets.
+    name = os.path.basename(args.ckpt)
+    _feat_cols_map = {
+        "when":        list(range(N_MOVES, 2 * N_MOVES)),
+        "played":      list(range(0, N_MOVES)),
+        "played+when": list(range(0, 2 * N_MOVES)),
+        "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
+        "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+        "all":         list(range(0, 3 * N_MOVES)),
+    }
+    if "playedeven" in name:
+        feature_cols = _feat_cols_map["played+even"]
+    elif "wheneven" in name:
+        feature_cols = _feat_cols_map["when+even"]
+    elif "when" in name and "even" not in name:
+        feature_cols = _feat_cols_map["when"]
+    elif "played" in name and "when" not in name and "even" not in name:
+        feature_cols = _feat_cols_map["played"]
     else:
-        model_even = EndToEndMLP(N_MOVES, args.hidden, n_patterns).to(device)
-        model_odd = EndToEndMLP(N_MOVES, args.hidden, n_patterns).to(device)
+        # Fall back to legacy "when" default so old runs stay reproducible.
+        feature_cols = _feat_cols_map["when"]
+    input_dim = len(feature_cols)
+    print(f"Detected features from ckpt name: input_dim={input_dim}")
+
+    if args.mode in ("direct", "randproj"):
+        model_even = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
+        model_odd = DirectMLP(input_dim, args.hidden, n_patterns).to(device)
+    elif args.mode == "two-stage":
+        model_even = TwoStageMLP(input_dim, args.hidden, n_patterns).to(device)
+        model_odd = TwoStageMLP(input_dim, args.hidden, n_patterns).to(device)
+    else:
+        model_even = EndToEndMLP(input_dim, args.hidden, n_patterns).to(device)
+        model_odd = EndToEndMLP(input_dim, args.hidden, n_patterns).to(device)
     model_even.load_state_dict(ckpt['even'])
     model_odd.load_state_dict(ckpt['odd'])
 
