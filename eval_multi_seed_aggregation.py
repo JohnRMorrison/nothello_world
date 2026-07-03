@@ -50,6 +50,7 @@ AGG_NAMES = [
     "sum_raw_logits",
     "top1_vote_count",  # Union of per-seed top-1 by vote count
     "mean_rank",        # Borda: cells with lowest mean rank across seeds win
+    "topK_vote_count",  # Union of per-seed top-K by vote count (K matches metric)
 ]
 
 
@@ -181,6 +182,26 @@ def main():
                 ranks = sorted_idx.argsort(dim=-1).float()       # (n, B, 60)
                 mean_rank = ranks.mean(dim=0)                    # (B, 60)
                 agg_f = -mean_rank                               # higher = better
+
+                # Aggregator G: union-of-top-K votes.  For each metric K,
+                # each seed contributes ITS top-K picks as +1 votes.  Cells
+                # ranked by vote count; take top K of ranked list.  This
+                # differs from top1_vote_count and majority_vote because
+                # each K has its own vote basis - the aggregation depth
+                # matches the metric depth.
+                for K in TOP_KS:
+                    per_seed_topK = sub_scores.topk(K, dim=-1).indices  # (n, B, K)
+                    votes_K = torch.zeros(B, 60, device=device)
+                    for k_slot in range(K):
+                        votes_K.scatter_add_(
+                            1, per_seed_topK[:, :, k_slot].t(),
+                            torch.ones_like(per_seed_topK[:, :, k_slot].t(),
+                                             dtype=torch.float32),
+                        )
+                    # tie-break by a tiny sum_log_prob_or nudge
+                    tk = (votes_K + agg_a * 1e-6).topk(K, dim=1).indices
+                    hits[("topK_vote_count", n_seeds, K)] += int(
+                        legal_batch.gather(1, tk).sum())
 
                 # Top-K legality per aggregator
                 for a_name, agg in [
