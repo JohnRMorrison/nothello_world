@@ -105,7 +105,7 @@ def main():
     del legal_list
 
     # Running total of top-K hits per (aggregator, n_seeds, K).
-    hits = {(a, n, K): 0
+    hits = {(a, n, K): 0.0
             for a in AGG_NAMES for n in n_subsets for K in TOP_KS}
 
     print("Batched forward + aggregation...")
@@ -183,12 +183,12 @@ def main():
                 mean_rank = ranks.mean(dim=0)                    # (B, 60)
                 agg_f = -mean_rank                               # higher = better
 
+                # Number of legal moves per position (>= 1 by construction)
+                n_legal_pos = legal_batch.sum(dim=1).clamp(min=1).float()  # (B,)
+
                 # Aggregator G: union-of-top-K votes.  For each metric K,
                 # each seed contributes ITS top-K picks as +1 votes.  Cells
-                # ranked by vote count; take top K of ranked list.  This
-                # differs from top1_vote_count and majority_vote because
-                # each K has its own vote basis - the aggregation depth
-                # matches the metric depth.
+                # ranked by vote count; take top K.
                 for K in TOP_KS:
                     per_seed_topK = sub_scores.topk(K, dim=-1).indices  # (n, B, K)
                     votes_K = torch.zeros(B, 60, device=device)
@@ -198,10 +198,15 @@ def main():
                             torch.ones_like(per_seed_topK[:, :, k_slot].t(),
                                              dtype=torch.float32),
                         )
-                    # tie-break by a tiny sum_log_prob_or nudge
                     tk = (votes_K + agg_a * 1e-6).topk(K, dim=1).indices
-                    hits[("topK_vote_count", n_seeds, K)] += int(
-                        legal_batch.gather(1, tk).sum())
+                    got = legal_batch.gather(1, tk).sum(dim=1).float()   # (B,)
+                    # "Recall of achievable" score per position:
+                    #   score = got / min(K, n_legal)
+                    # Full credit if we caught every reachable legal cell.
+                    denom = torch.minimum(torch.full_like(n_legal_pos, K),
+                                            n_legal_pos)
+                    hits[("topK_vote_count", n_seeds, K)] += \
+                        (got / denom).sum().item()
 
                 # Top-K legality per aggregator
                 for a_name, agg in [
@@ -213,21 +218,25 @@ def main():
                     ("mean_rank",       agg_f),
                 ]:
                     topk_idx = agg.topk(max_K, dim=1).indices    # (B, max_K)
-                    # Gather legality at those indices
                     legal_at_topk = legal_batch.gather(
                         1, topk_idx.to(torch.long))              # (B, max_K)
                     for K in TOP_KS:
-                        hits[(a_name, n_seeds, K)] += int(
-                            legal_at_topk[:, :K].sum())
+                        got = legal_at_topk[:, :K].sum(dim=1).float()
+                        denom = torch.minimum(torch.full_like(n_legal_pos, K),
+                                                n_legal_pos)
+                        hits[(a_name, n_seeds, K)] += \
+                            (got / denom).sum().item()
 
             if (bstart // args.batch_size) % 10 == 0:
                 print(f"  {bend}/{n_total}  ({int(time.time()-t0)}s)",
                       flush=True)
 
-    # Compute rates
+    # Compute rates.  hits now stores the SUM of per-position
+    # "recall of achievable" scores (got / min(K, n_legal)), so the
+    # denominator is n_total, not n_total * K.
     results = {}
     for (a, n, K), h in hits.items():
-        results[(a, n, K)] = h / (n_total * K)
+        results[(a, n, K)] = h / n_total
 
     # Print table
     print()
