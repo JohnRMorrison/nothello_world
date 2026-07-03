@@ -70,9 +70,15 @@ def load_ensemble(ckpt_paths, device):
 
 @torch.no_grad()
 def compute_cell_scores(x, ks_t, weights, idx, mask, N, device):
-    """Forward through all N MLPs, return (B, N, 60) prob_or cell scores."""
+    """Forward through all N MLPs, return (B, N, 60) prob_or cell scores.
+
+    Routes chunk `positions` values to me/mo following train_multi_seed_mlp.py's
+    convention: even positions -> me, odd -> mo.  NB: eval_multi_seed_ensemble.py
+    uses the OPPOSITE parity because it stores `k` = "moves played before this
+    position", not the position's own turn number.  Since chunk `positions`
+    matches training semantics directly, we mirror the training convention here."""
     W1_e, b1_e, W2_e, b2_e, W1_o, b1_o, W2_o, b2_o = weights
-    use_me = (ks_t % 2 == 1); use_mo = ~use_me
+    use_me = (ks_t % 2 == 0); use_mo = ~use_me
     B = x.shape[0]
     logits = torch.zeros(N, B, N_PATTERNS, device=device)
 

@@ -99,8 +99,10 @@ def main():
             x = torch.from_numpy(
                 feats_120[i:end].astype(np.float32)).to(device)
             ks_t = torch.from_numpy(positions[i:end]).to(device)
-            # Forward through all N MLPs
-            use_me = (ks_t % 2 == 1); use_mo = ~use_me
+            # Forward through all N MLPs.  Chunk positions use train convention:
+            # even parity -> me, odd -> mo (NOT eval_multi_seed_ensemble.py's
+            # inverted parity, which encodes k differently).
+            use_me = (ks_t % 2 == 0); use_mo = ~use_me
             logits = torch.zeros(N_total, B, 960, device=device)
 
             def fwd(W1, b1, W2, b2, xs):
