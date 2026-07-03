@@ -417,7 +417,8 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
           chunk_prefix="chunk_",
           movers=None,
           resume_path=None,
-          l1_weight=0.0):
+          l1_weight=0.0,
+          max_chunks=None):
     # When `movers` is provided we're in color-specific mode: labels are
     # computed against absolute board state (no parity), patterns number
     # 2 * 960, and the training is single-model regardless of `single_model`.
@@ -435,6 +436,10 @@ def train(chunk_dir, device, input_dim, hidden_dim, mode,
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
+    if max_chunks is not None:
+        train_paths = train_paths[:max_chunks]
+        print(f"Limiting training to first {len(train_paths)} chunks "
+              f"(~{600_000 * len(train_paths):,} games)")
     n_patterns = len(pat_targets)
 
     # pos_weight for BCE: upweight rare positive class (patterns fire ~1.35%).
@@ -859,6 +864,10 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-prefix", default="chunk_",
                         help="Filename prefix for chunks (e.g. chunk_ext_ for "
                              "extended-range chunks covering turns 5-58).")
+    parser.add_argument("--max-chunks", type=int, default=None,
+                        help="If set, train on at most this many chunks per "
+                             "epoch (each chunk = ~600K games). Default uses "
+                             "all chunks except the last (which is eval).")
     parser.add_argument("--output-dir",
                         default="experiments/mathematical_transformation_experiments/heuristic_probe_results")
     args = parser.parse_args()
@@ -1003,5 +1012,6 @@ if __name__ == "__main__":
           chunk_prefix=args.chunk_prefix,
           movers=movers,
           resume_path=args.resume,
-          l1_weight=args.l1_weight)
+          l1_weight=args.l1_weight,
+          max_chunks=args.max_chunks)
 
