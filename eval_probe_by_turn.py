@@ -57,25 +57,28 @@ def main():
     pe.eval(); po.eval()
     print(f"Probe: best_acc={probe_ckpt.get('best_acc'):.4f}")
 
-    # Load chunk
+    # Load chunk — read positions first (small), stride-sample, then slice
+    # the big arrays before any dtype conversion.  Avoids doubling the peak
+    # memory during .astype(np.float32).
     print(f"Loading {args.chunk}...")
     with np.load(args.chunk) as z:
-        feats_all = z['features'].astype(np.float32)   # (n, 180) or (n, 120)
-        labels_all = z['labels'].astype(np.int8)       # (n, 64) board state
-        positions_all = z['positions'].astype(np.int64)  # (n,) turn number
-    n_total = len(feats_all)
-    print(f"  {n_total:,} rows, turn range [{positions_all.min()}, {positions_all.max()}]")
+        positions_all = z['positions'][:].astype(np.int64)
+        n_total = len(positions_all)
+        stride = max(1, n_total // args.n_eval)
+        idx = np.arange(0, n_total, stride)[:args.n_eval]
+        # Slice at native dtype, THEN cast (small array after slicing).
+        feats_all = z['features'][idx].astype(np.float32)
+        labels_all = z['labels'][idx].astype(np.int64)
+    positions_all = positions_all[idx]
+    print(f"  {n_total:,} rows total, turn range "
+          f"[{positions_all.min()}, {positions_all.max()}]")
+    print(f"  sampled {len(idx):,} positions (stride={stride})")
 
     # Slice features to played+even (120-d compact: use as-is; 180-d: slice)
     if feats_all.shape[1] == 180:
         played_even_cols = list(range(0, 60)) + list(range(120, 180))
         feats_all = feats_all[:, played_even_cols]
     print(f"  feature dim after slicing: {feats_all.shape[1]}")
-
-    # Stride sample
-    stride = max(1, n_total // args.n_eval)
-    idx = np.arange(0, n_total, stride)[:args.n_eval]
-    print(f"  sampling {len(idx):,} positions (stride={stride})")
 
     # Convert labels: chunk stores 0=empty, 1=black, 2=white (Li encoding)
     # But probe was trained with same encoding. Just use directly.
@@ -84,14 +87,14 @@ def main():
     correct_all = 0
     total_all = 0
 
+    n_sampled = len(feats_all)
     batch_size = 4096
     with torch.no_grad():
-        for bstart in range(0, len(idx), batch_size):
-            bend = min(bstart + batch_size, len(idx))
-            batch_idx = idx[bstart:bend]
-            x = torch.from_numpy(feats_all[batch_idx]).to(device)
-            pos = positions_all[batch_idx]
-            y = labels_all[batch_idx].astype(np.int64)  # (B, 64)
+        for bstart in range(0, n_sampled, batch_size):
+            bend = min(bstart + batch_size, n_sampled)
+            x = torch.from_numpy(feats_all[bstart:bend]).to(device)
+            pos = positions_all[bstart:bend]
+            y = labels_all[bstart:bend]                          # (B, 64)
 
             # Parity routing (matches training convention)
             even_mask = (pos % 2 == 0)
