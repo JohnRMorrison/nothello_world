@@ -38,6 +38,12 @@ def main():
     ap.add_argument('--k-max', type=int, default=53)
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=1)
+    ap.add_argument('--file-start', type=int, default=None,
+                    help='If set, use pickle files [file_start : file_start + num_data_files] '
+                         'instead of the last num_data_files.  Use 0 to eval '
+                         'on TRAINING pickle files (chunks 0-9 came from '
+                         'files 0-59), or leave unset to keep the default '
+                         'held-out behavior.')
     ap.add_argument('--batch-size', type=int, default=512)
     args = ap.parse_args()
 
@@ -63,7 +69,28 @@ def main():
     idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
 
     print(f"Building test set from {args.num_games} val games...")
-    games = load_val_games(args.data_dir, args.num_data_files)[:args.num_games]
+    if args.file_start is None:
+        # Default: last N pickle files (held-out val)
+        games = load_val_games(args.data_dir, args.num_data_files)
+        source = f"last {args.num_data_files} files"
+    else:
+        # Explicit range: files [file_start : file_start + num_data_files]
+        import os as _os
+        import pickle as _pickle
+        all_files = sorted(_os.listdir(args.data_dir))
+        picked = all_files[args.file_start:
+                            args.file_start + args.num_data_files]
+        games = []
+        for fname in picked:
+            with open(_os.path.join(args.data_dir, fname), 'rb') as f:
+                batch = _pickle.load(f)
+            if len(batch) >= 9e4:
+                games.extend(batch)
+        source = (f"files [{args.file_start} : "
+                   f"{args.file_start + args.num_data_files}] "
+                   f"({', '.join(picked)})")
+    games = games[:args.num_games]
+    print(f"  Source: {source}")
     feats_list, ks_list, legal_list = [], [], []
     for game in games:
         for k in range(args.k_min, args.k_max + 1):
