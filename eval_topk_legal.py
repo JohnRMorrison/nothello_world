@@ -113,6 +113,11 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-prefix", default="chunk_",
                         help="Filename prefix filter for chunks (e.g. chunk_ext_ for "
                              "the extended-range chunks used by the played+even MLPs).")
+    parser.add_argument("--eval-chunk-idx", type=int, default=-1,
+                        help="Index of the chunk to evaluate on (after the "
+                             "prefix+filter sort).  Default -1 = last (the "
+                             "held-out eval chunk).  Use 0..9 to evaluate on "
+                             "training chunks for a train/test comparison.")
     args = parser.parse_args()
 
     device = get_device()
@@ -172,7 +177,7 @@ if __name__ == "__main__":
         raise SystemExit(
             f"No files matching {args.chunk_prefix}*.npz in {chunk_dir}. "
             f"Pass --chunk-prefix to match the training-time chunk family.")
-    eval_path = chunk_files[-1]
+    eval_path = chunk_files[args.eval_chunk_idx]
 
     print(f"Mode: {args.mode}, H={args.hidden}")
     print(f"Eval: {os.path.basename(eval_path)}")
