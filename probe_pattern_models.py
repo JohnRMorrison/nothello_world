@@ -32,7 +32,7 @@ def get_hidden(model, x, mode):
 
 def train_probe(chunk_dir, device, model_even, model_odd, mode,
                 feature_cols, hidden_dim, epochs=10, lr=1e-3, batch_size=1024,
-                feature_fn=None, chunk_prefix="chunk_"):
+                feature_fn=None, chunk_prefix="chunk_", max_chunks=None):
     """Train linear probe streaming through all chunks."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
@@ -44,6 +44,10 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
 
     eval_path = chunk_files[-1]
     train_paths = chunk_files[:-1]
+    if max_chunks is not None:
+        train_paths = train_paths[:max_chunks]
+        print(f"Limiting probe training to first {len(train_paths)} chunks",
+              flush=True)
 
     print(f"Probe training: {len(chunk_files)} chunks, H={hidden_dim}, {epochs} epochs")
 
@@ -174,6 +178,9 @@ if __name__ == "__main__":
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--max-chunks", type=int, default=None,
+                        help="If set, train the probe on at most this many "
+                             "chunks per epoch (each chunk ~600K games).")
     parser.add_argument("--chunk-prefix", default="chunk_",
                         help="Filename prefix for chunks to use (e.g. "
                              "'chunk_ext_' for extended-range chunks).")
@@ -280,7 +287,7 @@ if __name__ == "__main__":
     best_acc, best_probe_state = train_probe(
         chunk_dir, device, model_even, model_odd, args.mode,
         feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn,
-        chunk_prefix=args.chunk_prefix)
+        chunk_prefix=args.chunk_prefix, max_chunks=args.max_chunks)
 
     # Save probe weights. Derive suffix from source checkpoint filename so
     # probes for variants (_single, _pw50, _lw1, etc.) don't overwrite each other.
