@@ -95,10 +95,15 @@ def legal_from_state(state_8x8, next_hand_color):
 
 
 def board_state_target_from_state(state_8x8):
+    # Match the encoding the probes were trained under: chunks store
+    # 0=empty, 1=white, 2=black (see precompute_chunks_clean.py remap of the
+    # nanda-encoded state 0/-1/+1).  The old version used 0=empty, 1=black,
+    # 2=white — that flipped the two colors and made played-cell accuracy
+    # collapse to the "predict all empty" floor.
     flat = state_8x8.flatten()
     out = np.zeros(64, dtype=np.int64)
-    out[flat == 1]  = 1
-    out[flat == -1] = 2
+    out[flat == -1] = 1  # WHITE
+    out[flat == 1]  = 2  # BLACK
     return out
 
 
@@ -136,9 +141,12 @@ def forward_hidden_scores_probe(feats, k_parity, models, probes, idx, mask,
     model_even, model_odd = models
     probe_even, probe_odd = probes
     x = feats.unsqueeze(0).to(device)  # (1, 120)
-    # Convention (matches train_pattern_simple + train_multi_seed): even parity
-    # -> model_even.  If chunk positions field: (positions % 2 == 0) -> even.
-    is_even = (k_parity % 2 == 0)
+    # k_parity here is val-game k = number of moves played so far.  The MLPs
+    # were trained on CHUNK positions where pos=t means moves 0..t (i.e.
+    # t+1 moves played), so val-game k=25 <-> chunk pos=24.  Chunk pos=24 is
+    # EVEN -> model_even.  So the val-game convention is (k % 2 == 1) -> even.
+    # (Matches eval_single_mlp_val_games.py's `use_me = (ks % 2 == 1)`.)
+    is_even = (k_parity % 2 == 1)
     mlp = model_even if is_even else model_odd
     probe = probe_even if is_even else probe_odd
 
