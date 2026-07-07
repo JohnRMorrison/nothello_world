@@ -1,22 +1,11 @@
-"""Learned readouts for the N-seed multi-seed MLP ensemble.
+"""Learned readout for the N-seed multi-seed MLP ensemble.
 
-Trains three learned aggregators on the outputs of N MLPs and reports
-top-K legality (K = 1, 3, 5, 10) on a held-out set.
+Trains a small MLP that maps the N seeds' cell scores to per-cell legality
+logits, then reports top-K legality (K = 1, 3, 5, 10) on a held-out set.
 
-  Variant A (readout, no features):
-      MLP:  [N × 60 cell scores] -> hidden -> 60 output
-      Trained with BCE against 60-d cell legal mask.
-
-  Variant B (readout + features):
-      MLP:  [N × 60 cell scores + 120 played+even features] -> hidden -> 60 output
-
-  Variant C (mixture-of-experts gate):
-      gate_net: [120 features] -> softmax over N experts
-      output:   sum_n (gate_weight[n] * cell_scores[n]) (weighted sum, 60-d)
-      No extra MLP; the gate is trained end-to-end with BCE against 60-d
-      cell legal mask.  This variant tests whether MLPs specialize by
-      position — if gate weights become non-uniform conditional on features,
-      that's evidence of specialization.
+  Architecture:
+      MLP:  [N × 60 cell scores] -> hidden (default 128) -> 60 output
+      Loss: BCE with pos_weight from the training legal_rate.
 
 Usage:
     python train_multi_seed_readout.py \\
@@ -38,9 +27,8 @@ from train_multi_seed_mlp import VectorizedMLP
 from train_pattern_simple import _get_cell_pat_index
 from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
 from compare_v4_vs_mlp import (
-    load_val_games, played_even_features, C64_TO_C60,
+    load_val_games, played_even_features,
 )
-from data.othello import OthelloBoardState
 from eval_multi_seed_ensemble import (
     load_vectorized_from_multi, legal_cells_60,
 )
@@ -49,7 +37,7 @@ from eval_multi_seed_ensemble import (
 TOP_KS = [1, 3, 5, 10]
 
 
-class VariantA(nn.Module):
+class ReadoutMLP(nn.Module):
     """Readout: [N × 60] -> hidden -> 60."""
     def __init__(self, n_seeds, hidden=128):
         super().__init__()
@@ -59,54 +47,15 @@ class VariantA(nn.Module):
             nn.Linear(hidden, 60),
         )
 
-    def forward(self, scores, features):
-        # scores: (B, N, 60)   features: (B, 120)   [features unused]
+    def forward(self, scores):
+        # scores: (B, N, 60)
         B = scores.shape[0]
-        x = scores.reshape(B, -1)
-        return self.net(x)
-
-
-class VariantB(nn.Module):
-    """Readout + features: [N × 60 + 120] -> hidden -> 60."""
-    def __init__(self, n_seeds, hidden=128, feature_dim=120):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_seeds * 60 + feature_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, 60),
-        )
-
-    def forward(self, scores, features):
-        B = scores.shape[0]
-        x = torch.cat([scores.reshape(B, -1), features], dim=1)
-        return self.net(x)
-
-
-class VariantC(nn.Module):
-    """Mixture-of-experts gate: features -> softmax over N -> weighted sum
-    of the N cell-score vectors."""
-    def __init__(self, n_seeds, gate_hidden=128, feature_dim=120):
-        super().__init__()
-        self.n_seeds = n_seeds
-        self.gate = nn.Sequential(
-            nn.Linear(feature_dim, gate_hidden),
-            nn.ReLU(),
-            nn.Linear(gate_hidden, n_seeds),
-        )
-
-    def forward(self, scores, features):
-        # scores: (B, N, 60)   features: (B, 120)
-        gate_logits = self.gate(features)                # (B, N)
-        gate = F.softmax(gate_logits, dim=1)              # (B, N)
-        # Weighted sum: (B, N, 1) * (B, N, 60) -> (B, 60)
-        weighted = (gate.unsqueeze(-1) * scores).sum(dim=1)
-        return weighted
+        return self.net(scores.reshape(B, -1))
 
 
 def build_dataset(games, mlp_bundle_me, mlp_bundle_mo, idx, mask, N, device,
                    k_min, k_max, batch_size=1024):
-    """Return: scores (n_pos, N, 60), features (n_pos, 120),
-       legal (n_pos, 60), ks (n_pos,)."""
+    """Return: scores (n_pos, N, 60), legal (n_pos, 60)."""
     feats_list, ks_list, legal_list = [], [], []
     for game in games:
         for k in range(k_min, k_max + 1):
@@ -122,10 +71,6 @@ def build_dataset(games, mlp_bundle_me, mlp_bundle_mo, idx, mask, N, device,
     for i, legal in enumerate(legal_list):
         for c in legal:
             legal_mask[i, c] = True
-
-    # Build features on host
-    features_arr = torch.stack(feats_list).numpy().astype(np.float32)   # (n_total, 120)
-    ks_arr = np.array(ks_list, dtype=np.int64)
 
     # MLP forward pass to get per-model cell scores
     scores = np.zeros((n_total, N, 60), dtype=np.float32)
@@ -153,7 +98,7 @@ def build_dataset(games, mlp_bundle_me, mlp_bundle_mo, idx, mask, N, device,
                 print(f"    {end}/{n_total}  ({int(time.time()-t0)}s)",
                       flush=True)
 
-    return scores, features_arr, legal_mask, ks_arr
+    return scores, legal_mask
 
 
 def topk_legality_torch(logits, legal_mask_np, k):
@@ -164,26 +109,21 @@ def topk_legality_torch(logits, legal_mask_np, k):
     return hits.mean()
 
 
-def train_and_eval(model_cls, name, args, train_scores, train_feats,
-                    train_legal, test_scores, test_feats, test_legal, device):
-    print(f"\n=== Training {name} ===")
+def train_and_eval(args, train_scores, train_legal, test_scores, test_legal,
+                    device):
+    print(f"\n=== Training readout ===")
     N = train_scores.shape[1]
-    model = model_cls(N).to(device)
+    model = ReadoutMLP(N, hidden=args.readout_hidden).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     n_train = train_scores.shape[0]
-    n_test  = test_scores.shape[0]
 
-    # Move data to device
     train_scores_t = torch.from_numpy(train_scores).to(device)
-    train_feats_t  = torch.from_numpy(train_feats).to(device)
     train_legal_t  = torch.from_numpy(train_legal.astype(np.float32)).to(device)
     test_scores_t  = torch.from_numpy(test_scores).to(device)
-    test_feats_t   = torch.from_numpy(test_feats).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Params: {n_params:,}")
+    print(f"  Params: {n_params:,}   hidden={args.readout_hidden}")
 
-    # BCE with pos_weight from legal_rate
     legal_rate = train_legal.mean()
     pos_weight = torch.tensor([(1 - legal_rate) / max(legal_rate, 1e-6)],
                                device=device)
@@ -194,7 +134,7 @@ def train_and_eval(model_cls, name, args, train_scores, train_feats,
         total_loss = 0.0
         for i in range(0, n_train, args.batch_size):
             idxs = perm[i:i + args.batch_size]
-            logits = model(train_scores_t[idxs], train_feats_t[idxs])
+            logits = model(train_scores_t[idxs])
             loss = F.binary_cross_entropy_with_logits(
                 logits, train_legal_t[idxs], pos_weight=pos_weight,
             )
@@ -206,14 +146,14 @@ def train_and_eval(model_cls, name, args, train_scores, train_feats,
 
         model.eval()
         with torch.no_grad():
-            test_logits = model(test_scores_t, test_feats_t)
+            test_logits = model(test_scores_t)
         results = {K: topk_legality_torch(test_logits, test_legal, K)
                    for K in TOP_KS}
         print(f"  Epoch {epoch}: loss={avg_loss:.4f}  " +
               "  ".join(f"top-{K}={results[K]:.4f}" for K in TOP_KS),
               flush=True)
 
-    return {K: topk_legality_torch(test_logits, test_legal, K) for K in TOP_KS}
+    return results
 
 
 def main():
@@ -228,6 +168,7 @@ def main():
     ap.add_argument('--epochs', type=int, default=5)
     ap.add_argument('--batch-size', type=int, default=1024)
     ap.add_argument('--lr', type=float, default=1e-3)
+    ap.add_argument('--readout-hidden', type=int, default=128)
     ap.add_argument('--num-seeds-used', type=int, default=None,
                     help='If set, use only the first N seeds from the checkpoint.')
     args = ap.parse_args()
@@ -265,37 +206,26 @@ def main():
     print(f"  train={len(train_games)}  test={len(test_games)}")
 
     print("Building train set (MLP forward)...")
-    train_scores, train_feats, train_legal, _ = build_dataset(
+    train_scores, train_legal = build_dataset(
         train_games, me, mo, idx, mask, N, device,
         args.k_min, args.k_max, args.batch_size,
     )
     print(f"  {train_scores.shape[0]:,} training positions")
 
     print("Building test set...")
-    test_scores, test_feats, test_legal, _ = build_dataset(
+    test_scores, test_legal = build_dataset(
         test_games, me, mo, idx, mask, N, device,
         args.k_min, args.k_max, args.batch_size,
     )
     print(f"  {test_scores.shape[0]:,} test positions")
 
-    all_results = {}
-    for cls, name in [
-        (VariantA, "Variant A (readout, outputs only)"),
-        (VariantB, "Variant B (readout + features)"),
-        (VariantC, "Variant C (MoE gate, softmax over experts)"),
-    ]:
-        r = train_and_eval(cls, name, args, train_scores, train_feats,
-                           train_legal, test_scores, test_feats,
-                           test_legal, device)
-        all_results[name] = r
+    results = train_and_eval(args, train_scores, train_legal,
+                              test_scores, test_legal, device)
 
     print()
     print(f"=== Learned readout results ({test_scores.shape[0]:,} test positions) ===")
     for K in TOP_KS:
-        print()
-        print(f"Top-{K} legality:")
-        for name in all_results:
-            print(f"  {name:<45}  {all_results[name][K]:.4f}")
+        print(f"  top-{K:<3}  {results[K]:.4f}")
 
 
 if __name__ == '__main__':
