@@ -219,6 +219,7 @@ def train(chunk_dir, chunk_prefix, device, input_dim, hidden_dim,
         if best_state and save_path:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             torch.save({**best_state,
+                        'feature_type': 'played+even',
                         'hidden_dim': hidden_dim,
                         'input_dim':  input_dim,
                         'n_patterns': n_patterns,

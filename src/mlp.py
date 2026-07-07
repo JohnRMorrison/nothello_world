@@ -71,6 +71,8 @@ MLP_CKPT_PATHS = {
         _PAT_CKPT_DIR, "pattern_simple_direct_H1024_wheneven.pt"),
     "movegrid_H4096": os.path.join(
         _PAT_CKPT_DIR, "pattern_simple_direct_H4096_move_grid.pt"),
+    "playedeven_H4096": os.path.join(
+        _PAT_CKPT_DIR, "pattern_clean_H4096.pt"),
 }
 MLP_PROBE_PATHS = {
     "wheneven_H512": os.path.join(
@@ -79,6 +81,8 @@ MLP_PROBE_PATHS = {
         _PAT_CKPT_DIR, "probe_direct_H1024_wheneven.pt"),
     "movegrid_H4096": os.path.join(
         _PAT_CKPT_DIR, "probe_direct_H4096_move_grid.pt"),
+    "playedeven_H4096": os.path.join(
+        _PAT_CKPT_DIR, "probe_pattern_clean_H4096.pt"),
 }
 
 
@@ -150,6 +154,11 @@ def to_when_even_features(raw_180d: np.ndarray) -> np.ndarray:
     return raw_180d[60:180]
 
 
+def to_played_even_features(raw_180d: np.ndarray) -> np.ndarray:
+    """120-d view: [played, even]. Matches feature_type='played+even'."""
+    return np.concatenate([raw_180d[:60], raw_180d[120:180]])
+
+
 def to_move_grid_features(raw_180d: np.ndarray) -> np.ndarray:
     """3600-d signed move grid: grid[cell, move_num] = +1 if black, -1 if
     white, 0 otherwise. Flat-shaped (60 cells × 60 move-numbers).
@@ -172,6 +181,7 @@ def to_move_grid_features(raw_180d: np.ndarray) -> np.ndarray:
 # Feature-type registry: maps the human-readable name to (input_dim, fn).
 FEATURE_VIEWS: dict[str, tuple[int, Callable]] = {
     "when+even": (120, to_when_even_features),
+    "played+even": (120, to_played_even_features),
     "move_grid": (3600, to_move_grid_features),
 }
 
@@ -208,7 +218,7 @@ def load_mlp(ckpt_path: str, hidden_dim: int = None, device: str = "cpu"):
     mo.load_state_dict(ckpt["odd"]); mo.eval()
 
     # Infer feature type from input_dim (only the two we expose).
-    feature_type = {120: "when+even", 3600: "move_grid"}.get(input_dim)
+    feature_type = ckpt.get("feature_type") or {120: "when+even", 3600: "move_grid"}.get(input_dim)
     if feature_type is None:
         raise ValueError(
             f"Unrecognized MLP input_dim={input_dim}; only when+even (120) "
