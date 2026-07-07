@@ -141,11 +141,17 @@ def precompute_chunk(chunk_path, mlps, max_rows, batch_size, device, seed,
         feats = feats[keep]
         labels = labels[keep]
         positions = positions[keep]
-        # Trim to requested size
+        # Trim to requested size, uniformly at random over the filtered set.
+        # Previously took feats[:max_rows], but since sample_idx was sorted for
+        # I/O locality (and chunks are ordered by turn), that biased toward
+        # early turns.  Sample max_rows indices uniformly instead.
         if len(feats) > max_rows:
-            feats = feats[:max_rows]
-            labels = labels[:max_rows]
-            positions = positions[:max_rows]
+            rng_trim = np.random.RandomState(seed + 42)
+            trim_idx = rng_trim.choice(len(feats), size=max_rows, replace=False)
+            trim_idx.sort()
+            feats = feats[trim_idx]
+            labels = labels[trim_idx]
+            positions = positions[trim_idx]
         print(f"  Filtered to positions in [{pos_min}, {pos_max}]: "
               f"{len(feats):,} rows remain")
     n = len(feats)
