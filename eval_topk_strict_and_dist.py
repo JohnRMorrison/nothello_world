@@ -199,16 +199,18 @@ def main():
     print(f"=== Legality metrics on {n_scored:,} scored positions ===")
     print(f"  {'K':<5}  "
           f"{'achievability-aware':>20}  "
-          f"{'strict (n_legal>=K)':>24}")
-    print("  " + "-" * 55)
+          f"{'strict':>10}  "
+          f"{'n_positions (n_legal>=K)':>26}")
+    print("  " + "-" * 68)
     for K in KS:
         a = hits_achievability[K] / n_scored
-        if counts_strict[K] > 0:
-            s = hits_strict[K] / (counts_strict[K] * K)
-            s_lbl = f"{s:.4f}  (n={counts_strict[K]:,})"
+        n_pos = counts_strict[K]
+        if n_pos > 0:
+            s = hits_strict[K] / (n_pos * K)
+            s_str = f"{s:.4f}"
         else:
-            s_lbl = "n/a (no positions)"
-        print(f"  top-{K:<2}  {a:>20.4f}  {s_lbl:>24}")
+            s_str = "n/a"
+        print(f"  top-{K:<2}  {a:>20.4f}  {s_str:>10}  {n_pos:>26,}")
 
 
 if __name__ == '__main__':
