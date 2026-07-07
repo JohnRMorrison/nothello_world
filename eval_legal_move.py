@@ -213,7 +213,13 @@ def evaluate(model, variant, val_games, helper, device, num_games,
         return {'n': 0,
                 **{f'legal_c_{n}': 0 for n in top_ns},
                 **{f'legal_t_{n}': 0 for n in top_ns},
-                **{f'match_{n}': 0 for n in top_ns}}
+                **{f'match_{n}': 0 for n in top_ns},
+                # Strict metric: restrict to positions with n_legal >= n and
+                # score hits / n (not hits / min(n, K)).  Removes "free credit"
+                # from positions with fewer legal moves than the top-K depth.
+                **{f'strict_c_{n}': 0 for n in top_ns},   # hits in top-n
+                **{f'strict_pos_{n}': 0 for n in top_ns}, # #positions counted
+                }
     totals = fresh()
     by_phase = {'early': fresh(), 'mid': fresh(), 'late': fresh()}
 
@@ -267,6 +273,12 @@ def evaluate(model, variant, val_games, helper, device, num_games,
                         d[f'legal_c_{n}'] += len(topk_set & legal_set)
                         d[f'legal_t_{n}'] += k
                         d[f'match_{n}'] += int(actual in preds[:n])
+                        # Strict: only positions with at least n legal moves.
+                        # Score against a full n-slot top-K (no min() collapse).
+                        if K >= n:
+                            topn_set = set(preds[:n])
+                            d[f'strict_c_{n}'] += len(topn_set & legal_set)
+                            d[f'strict_pos_{n}'] += 1
 
             board.update([game[m]])
 
@@ -282,6 +294,14 @@ def fmt(d):
         denom = d.get(f'legal_t_{k}', 0) or 1
         acc = 100 * d[f'legal_c_{k}'] / denom
         parts.append(f"top{k} {acc:6.2f}%  ")
+    parts.append("|  strict: ")
+    for k in (1, 3, 5, 10):
+        pos_n = d.get(f'strict_pos_{k}', 0)
+        if pos_n > 0:
+            acc = 100 * d[f'strict_c_{k}'] / (pos_n * k)
+            parts.append(f"top{k} {acc:6.2f}% (n={pos_n})  ")
+        else:
+            parts.append(f"top{k}   n/a  ")
     parts.append("|  match-actual: ")
     for k in (1, 3, 5):
         acc = 100 * d[f'match_{k}'] / n
