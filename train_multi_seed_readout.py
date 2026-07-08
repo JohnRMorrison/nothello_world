@@ -117,9 +117,10 @@ def train_and_eval(args, train_scores, train_legal, test_scores, test_legal,
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     n_train = train_scores.shape[0]
 
-    train_scores_t = torch.from_numpy(train_scores).to(device)
-    train_legal_t  = torch.from_numpy(train_legal.astype(np.float32)).to(device)
-    test_scores_t  = torch.from_numpy(test_scores).to(device)
+    # Keep training tensors PINNED on CPU and move per-batch to GPU.
+    # Full N=100, H=512, 5M positions is ~120 GiB — exceeds any single GPU.
+    train_scores_cpu = torch.from_numpy(train_scores).pin_memory()
+    train_legal_cpu  = torch.from_numpy(train_legal.astype(np.float32)).pin_memory()
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Params: {n_params:,}   hidden={args.readout_hidden}")
@@ -130,13 +131,15 @@ def train_and_eval(args, train_scores, train_legal, test_scores, test_legal,
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        perm = torch.randperm(n_train, device=device)
+        perm = torch.randperm(n_train)              # CPU perm
         total_loss = 0.0
         for i in range(0, n_train, args.batch_size):
             idxs = perm[i:i + args.batch_size]
-            logits = model(train_scores_t[idxs])
+            x = train_scores_cpu[idxs].to(device, non_blocking=True)
+            y = train_legal_cpu[idxs].to(device, non_blocking=True)
+            logits = model(x)
             loss = F.binary_cross_entropy_with_logits(
-                logits, train_legal_t[idxs], pos_weight=pos_weight,
+                logits, y, pos_weight=pos_weight,
             )
             opt.zero_grad()
             loss.backward()
@@ -144,9 +147,18 @@ def train_and_eval(args, train_scores, train_legal, test_scores, test_legal,
             total_loss += loss.item() * len(idxs)
         avg_loss = total_loss / n_train
 
+        # Eval — batch through the test set too (test is only ~10x smaller,
+        # but for consistency and to keep memory low we still batch).
         model.eval()
+        test_scores_cpu = torch.from_numpy(test_scores)
+        n_test = test_scores.shape[0]
+        test_logits_chunks = []
         with torch.no_grad():
-            test_logits = model(test_scores_t)
+            for i in range(0, n_test, args.batch_size):
+                x = test_scores_cpu[i:i + args.batch_size].to(device,
+                                                                non_blocking=True)
+                test_logits_chunks.append(model(x).cpu())
+        test_logits = torch.cat(test_logits_chunks, dim=0)
         results = {K: topk_legality_torch(test_logits, test_legal, K)
                    for K in TOP_KS}
         print(f"  Epoch {epoch}: loss={avg_loss:.4f}  " +
