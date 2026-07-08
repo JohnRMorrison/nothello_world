@@ -138,8 +138,14 @@ def predict_v4_full_game(model, game, cell_stoi, device):
 # ---------- original Othello-GPT forward (full game in one pass) ----------
 
 def predict_original_full_game(model, game, train_dataset, device):
-    """Returns logits at each prefix-end position (k, vocab)."""
-    dix = [train_dataset.stoi[s] for s in game]
+    """Returns logits at each prefix-end position (k, vocab).
+
+    Truncates the game to the model's block_size — Li's Othello-GPT was
+    trained with block_size=59, but val games are 60 moves.  We only
+    score predictions up to move 53 anyway (--pos-end 54), so dropping the
+    last move loses nothing relevant to the metric.
+    """
+    dix = [train_dataset.stoi[s] for s in game][:model.block_size]
     x = torch.tensor(dix, dtype=torch.long).unsqueeze(0).to(device)
     with torch.no_grad():
         logits, _ = model(x)
