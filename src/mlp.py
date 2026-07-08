@@ -71,6 +71,8 @@ MLP_CKPT_PATHS = {
         _PAT_CKPT_DIR, "pattern_simple_direct_H1024_wheneven.pt"),
     "movegrid_H4096": os.path.join(
         _PAT_CKPT_DIR, "pattern_simple_direct_H4096_move_grid.pt"),
+    "playedeven_H512": os.path.join(
+        _PAT_CKPT_DIR, "pattern_simple_direct_H512_playedeven.pt"),
     "playedeven_H4096": os.path.join(
         _PAT_CKPT_DIR, "pattern_clean_H4096.pt"),
 }
@@ -81,6 +83,8 @@ MLP_PROBE_PATHS = {
         _PAT_CKPT_DIR, "probe_direct_H1024_wheneven.pt"),
     "movegrid_H4096": os.path.join(
         _PAT_CKPT_DIR, "probe_direct_H4096_move_grid.pt"),
+    "playedeven_H512": os.path.join(
+        _PAT_CKPT_DIR, "probe_direct_H512_playedeven.pt"),
     "playedeven_H4096": os.path.join(
         _PAT_CKPT_DIR, "probe_pattern_clean_H4096.pt"),
 }
