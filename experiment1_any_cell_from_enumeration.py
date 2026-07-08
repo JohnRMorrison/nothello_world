@@ -88,15 +88,17 @@ def batch_predict(model, dataset, device, seqs, stoi_arr):
 
 def score_and_check(active_beams, model, dataset, device, stoi_arr,
                      vocab_to_pos):
-    """For each beam, return (illegal_prob_mass, is_adversarial).
+    """For each beam, return (illegal_prob_mass, is_adversarial, top1_illegal_pos).
 
     illegal_prob_mass = sum of softmax over cells currently illegal.
     is_adversarial = True iff model top-1 argmax lands on illegal cell.
+    top1_illegal_pos = the illegal cell C (0..63) if adversarial, else -1.
     """
     seqs = [b[0] for b in active_beams]
     top1, probs = batch_predict(model, dataset, device, seqs, stoi_arr)
     illegal_mass = np.zeros(len(active_beams), dtype=np.float32)
     is_adv = np.zeros(len(active_beams), dtype=bool)
+    top1_illegal_pos = np.full(len(active_beams), -1, dtype=np.int64)
     for i, (seq, brd, cum) in enumerate(active_beams):
         valid_set = set(brd.get_valid_moves())
         for tok_idx in range(probs.shape[1]):
@@ -106,19 +108,28 @@ def score_and_check(active_beams, model, dataset, device, stoi_arr,
         top1_pos = vocab_to_pos[int(top1[i])]
         if top1_pos >= 0 and top1_pos not in valid_set:
             is_adv[i] = True
-    return illegal_mass, is_adv
+            top1_illegal_pos[i] = top1_pos
+    return illegal_mass, is_adv, top1_illegal_pos
 
 
 def run_from_prefix(model, dataset, device, prefix, beam_width, max_depth,
-                     stoi_arr, vocab_to_pos):
+                     stoi_arr, vocab_to_pos, save_positions=False):
+    """Beam search from prefix.
+
+    Returns:
+        adversarial_found: bool
+        adversarial_records: list of (game_sequence, turn, illegal_cell)
+                             tuples if save_positions=True, else empty.
+    """
     board = OthelloBoardState()
     for m in prefix:
         board.umpire(m)
     if not board.get_valid_moves():
-        return False
+        return False, []
 
     beams = [(list(prefix), fast_copy_board(board), 0.0)]
     adversarial_found = False
+    records = []
     for depth in range(len(prefix), max_depth):
         candidates = []
         for game_seq, brd, cum in beams:
@@ -133,10 +144,19 @@ def run_from_prefix(model, dataset, device, prefix, beam_width, max_depth,
         if not candidates:
             break
 
-        illegal_mass, is_adv = score_and_check(
+        illegal_mass, is_adv, top1_illegal_pos = score_and_check(
             candidates, model, dataset, device, stoi_arr, vocab_to_pos)
         if is_adv.any():
             adversarial_found = True
+            if save_positions:
+                for i in range(len(candidates)):
+                    if is_adv[i]:
+                        seq = candidates[i][0]
+                        # Position in the game: after len(seq)-1 moves played,
+                        # model predicts move at index len(seq).
+                        # The illegal top-1 is at index len(seq)-1 (0-indexed).
+                        records.append((tuple(seq), len(seq) - 1,
+                                          int(top1_illegal_pos[i])))
 
         new_scored = [
             (seq, brd, cum + float(illegal_mass[i]))
@@ -147,8 +167,7 @@ def run_from_prefix(model, dataset, device, prefix, beam_width, max_depth,
 
         if adversarial_found and depth >= len(prefix) + 6:
             break
-
-    return adversarial_found
+    return adversarial_found, records
 
 
 def main():
@@ -158,6 +177,10 @@ def main():
     ap.add_argument('--beam-width', type=int, default=10)
     ap.add_argument('--prefix-len', type=int, default=5)
     ap.add_argument('--max-depth', type=int, default=40)
+    ap.add_argument('--save-positions', action='store_true',
+                    help='Also save every (game, turn, illegal_cell) triple '
+                         'found during beam search — feeds directly into the '
+                         'causal-analysis script.')
     args = ap.parse_args()
 
     t0 = time.time()
@@ -177,17 +200,23 @@ def main():
 
     n_success = 0
     success_mask = np.zeros(len(prefixes), dtype=bool)
+    all_records = []
     for pi, prefix in enumerate(prefixes):
-        if run_from_prefix(
+        found, records = run_from_prefix(
             model, dataset, device, prefix,
             args.beam_width, args.max_depth, stoi_arr, vocab_to_pos,
-        ):
+            save_positions=args.save_positions,
+        )
+        if found:
             n_success += 1
             success_mask[pi] = True
+        if args.save_positions:
+            all_records.extend(records)
         if (pi + 1) % 100 == 0:
             print(f"  {pi+1}/{len(prefixes)}  "
-                  f"success: {n_success}  ({int(time.time()-t0)}s)",
-                  flush=True)
+                  f"success: {n_success}  "
+                  f"records: {len(all_records)}  "
+                  f"({int(time.time()-t0)}s)", flush=True)
 
     rate = n_success / len(prefixes)
     print()
@@ -205,6 +234,20 @@ def main():
         rate=rate,
         success_mask=success_mask,
     )
+    if args.save_positions:
+        # Save the (game, turn, illegal_cell) records as an object array for
+        # downstream tools (e.g., experiment_probe_causal_analysis.py).
+        games_arr = np.array([r[0] for r in all_records], dtype=object)
+        turns_arr = np.array([r[1] for r in all_records], dtype=np.int64)
+        cells_arr = np.array([r[2] for r in all_records], dtype=np.int64)
+        np.savez_compressed(
+            os.path.join(args.output_dir, 'adversarial_records.npz'),
+            games=games_arr,
+            turns=turns_arr,
+            illegal_cells=cells_arr,
+        )
+        print(f"  Saved {len(all_records)} adversarial records to "
+              f"adversarial_records.npz")
 
 
 if __name__ == '__main__':

@@ -233,7 +233,17 @@ def main():
 
     token_to_pos = _build_token_to_board_pos(block_size, device)
 
-    if args.natural_source:
+    # Support loading pre-computed adversarial records from any-cell enum
+    records_path = os.path.join(args.adversarial_dir, 'adversarial_records.npz')
+    if os.path.exists(records_path) and not args.natural_source:
+        print(f"Loading pre-computed adversarial records from {records_path}...")
+        d = np.load(records_path, allow_pickle=True)
+        games = d['games']; turns = d['turns']; cells = d['illegal_cells']
+        adv_positions = [(tuple(games[i]), int(turns[i]), int(cells[i]))
+                          for i in range(len(games))]
+        if args.max_adversarial and len(adv_positions) > args.max_adversarial:
+            adv_positions = adv_positions[:args.max_adversarial]
+    elif args.natural_source:
         print(f"Loading val games (up to {args.max_files} pickle files)...")
         val_games = load_games(max_files=args.max_files)
         print(f"  {len(val_games):,} val games loaded")
