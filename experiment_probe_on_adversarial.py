@@ -276,6 +276,59 @@ def main():
     ctrl_acc = eval_probe(control_by_turn)
     print(f"  done in {int(time.time()-t0)}s")
 
+    # ---- Causal test: are probe errors ON the illegal-predicted cell? ----
+    # For each adversarial (game, turn, top1_illegal_cell) triple, check
+    # whether the probe's per-cell prediction is WRONG on that specific cell.
+    # Compare to two baselines:
+    #   - Probe error rate on a random OTHER cell in the same position
+    #   - Probe error rate on any played (non-empty) cell
+    # If error on the top1 cell isn't higher than the baselines, the world-
+    # model degradation is INCIDENTAL, not causal.
+    print("\nCausal test — probe errors on the specific illegal cell vs. baselines...")
+    n_pos_analyzed = 0
+    n_wrong_on_top1 = 0
+    n_wrong_on_random = 0
+    n_wrong_on_random_played = 0
+    for t, items in adv_by_turn.items():
+        for game, top1_board_pos in items:
+            hidden, state = get_hidden_and_state(
+                model, device, tuple(game), t, args.layer, block_size)
+            pred = probe_predict(hidden, t, probe)                # (8, 8)
+            gt = state_to_gt(state)                                # (8, 8)
+            per_cell_wrong = (pred != gt).flatten()               # (64,)
+            r, c = top1_board_pos // 8, top1_board_pos % 8
+            n_pos_analyzed += 1
+            if per_cell_wrong[top1_board_pos]:
+                n_wrong_on_top1 += 1
+            # Random other cell (not the top1)
+            other_cells = [i for i in range(64) if i != top1_board_pos]
+            rnd = other_cells[np.random.randint(len(other_cells))]
+            if per_cell_wrong[rnd]:
+                n_wrong_on_random += 1
+            # Random PLAYED cell (state != 0); if none exist, skip
+            played = [i for i in range(64)
+                       if state.flatten()[i] != 0 and i != top1_board_pos]
+            if played:
+                r2 = played[np.random.randint(len(played))]
+                if per_cell_wrong[r2]:
+                    n_wrong_on_random_played += 1
+
+    print(f"  Positions analyzed: {n_pos_analyzed}")
+    if n_pos_analyzed > 0:
+        p_top1 = n_wrong_on_top1 / n_pos_analyzed
+        p_rnd = n_wrong_on_random / n_pos_analyzed
+        p_rnd_played = n_wrong_on_random_played / n_pos_analyzed
+        print(f"  P(probe wrong on top1 illegal cell): {p_top1:.4f}")
+        print(f"  P(probe wrong on any other cell):    {p_rnd:.4f}")
+        print(f"  P(probe wrong on random played cell):{p_rnd_played:.4f}")
+        print()
+        print(f"  Ratio (top1 / any-other):           {p_top1 / max(p_rnd, 1e-9):.2f}x")
+        print(f"  Ratio (top1 / random-played):       {p_top1 / max(p_rnd_played, 1e-9):.2f}x")
+        print()
+        print(f"  Interpretation:")
+        print(f"    Ratio ~1  -> probe errors are UNIFORMLY distributed (incidental)")
+        print(f"    Ratio >>1 -> probe errors CONCENTRATE on the illegal cell (causal)")
+
     # ---- Report ----
     print()
     print("=== Probe accuracy: adversarial vs. turn-matched control ===")
