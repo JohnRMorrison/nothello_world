@@ -170,8 +170,11 @@ if __name__ == "__main__":
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        from matplotlib.figure import Figure
         grid = acc.reshape(8, 8)
-        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        # Some environments' plt.subplots returns a dummy; use Figure directly.
+        fig = Figure(figsize=(6.5, 5.5))
+        ax = fig.add_subplot(111)
         im = ax.imshow(grid, cmap='viridis', vmin=grid.min(), vmax=1.0)
         for r in range(8):
             for c in range(8):
@@ -185,12 +188,11 @@ if __name__ == "__main__":
         ax.set_yticklabels([str(i + 1) for i in range(8)])
         ax.set_title("Per-cell probe accuracy on Othello-MLP",
                       fontsize=13, fontweight='bold')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        plt.tight_layout()
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        fig.tight_layout()
         os.makedirs(os.path.dirname(args.heatmap_path) or '.', exist_ok=True)
-        plt.savefig(args.heatmap_path, dpi=200, bbox_inches='tight')
+        fig.savefig(args.heatmap_path, dpi=200, bbox_inches='tight')
         print(f"\nSaved heatmap to {args.heatmap_path}")
-        plt.close()
 
     order = np.argsort(acc)
     print("\nWorst 10 cells:")
