@@ -63,13 +63,17 @@ def enumerate_prefixes(prefix_len):
 
 
 def load_mlp(mlp_ckpt_path, hidden, device):
-    ckpt = torch.load(mlp_ckpt_path, map_location=device)
+    # Load to CPU first so torch.load doesn't fail on a busy shared GPU
+    # (the model itself is only tens of MB — the failure was during the
+    # storage's initial cuda() call, not during any subsequent compute).
+    ckpt = torch.load(mlp_ckpt_path, map_location='cpu')
     input_dim = ckpt.get('input_dim', 120)
     n_patterns = ckpt.get('n_patterns', 960)
-    me = DirectMLP(input_dim, hidden, n_patterns).to(device)
-    mo = DirectMLP(input_dim, hidden, n_patterns).to(device)
+    me = DirectMLP(input_dim, hidden, n_patterns)
+    mo = DirectMLP(input_dim, hidden, n_patterns)
     me.load_state_dict(ckpt['even'])
     mo.load_state_dict(ckpt['odd'])
+    me = me.to(device); mo = mo.to(device)
     me.eval(); mo.eval()
     return me, mo, input_dim, n_patterns
 
