@@ -55,6 +55,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--features", default="when+even")
     parser.add_argument("--n-positions", type=int, default=50000)
+    parser.add_argument("--heatmap-path", default=None,
+                        help="If set, save an 8x8 accuracy heatmap PNG at this path.")
     args = parser.parse_args()
 
     device = get_device()
@@ -151,6 +153,33 @@ if __name__ == "__main__":
         vals = acc[cells]
         print(f"  {label:>6s} n={len(cells):2d}  mean={vals.mean():.4f}  "
               f"min={vals.min():.4f}  max={vals.max():.4f}")
+
+    # ---------- Heatmap (optional) ----------
+    if args.heatmap_path:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        grid = acc.reshape(8, 8)
+        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        im = ax.imshow(grid, cmap='viridis', vmin=grid.min(), vmax=1.0)
+        for r in range(8):
+            for c in range(8):
+                v = grid[r, c]
+                color = 'white' if v < (grid.min() + grid.max()) / 2 else 'black'
+                ax.text(c, r, f"{v:.3f}", ha='center', va='center',
+                         color=color, fontsize=9)
+        ax.set_xticks(range(8))
+        ax.set_xticklabels(list("abcdefgh"))
+        ax.set_yticks(range(8))
+        ax.set_yticklabels([str(i + 1) for i in range(8)])
+        ax.set_title("Per-cell probe accuracy on Othello-MLP",
+                      fontsize=13, fontweight='bold')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(args.heatmap_path) or '.', exist_ok=True)
+        plt.savefig(args.heatmap_path, dpi=200, bbox_inches='tight')
+        print(f"\nSaved heatmap to {args.heatmap_path}")
+        plt.close()
 
     order = np.argsort(acc)
     print("\nWorst 10 cells:")
