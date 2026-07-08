@@ -83,31 +83,31 @@ def score_and_check_adversarial(active_beams, model, dataset, device,
     top1, probs = batch_predict(model, dataset, device, seqs, stoi_arr)
     illegal_mass = np.zeros(len(active_beams), dtype=np.float32)
     is_adv = np.zeros(len(active_beams), dtype=bool)
+    top1_illegal_pos = np.full(len(active_beams), -1, dtype=np.int64)
     for i, (seq, brd, cum) in enumerate(active_beams):
         valid_set = set(brd.get_valid_moves())
-        # Sum prob mass over cells that are NOT currently legal
         for tok_idx in range(probs.shape[1]):
             board_pos = vocab_to_pos[tok_idx]
             if board_pos >= 0 and board_pos not in valid_set:
                 illegal_mass[i] += probs[i, tok_idx]
-        # Check top-1 argmax
         top1_pos = vocab_to_pos[int(top1[i])]
         if top1_pos >= 0 and top1_pos not in valid_set:
             is_adv[i] = True
-    return illegal_mass, is_adv
+            top1_illegal_pos[i] = top1_pos
+    return illegal_mass, is_adv, top1_illegal_pos
 
 
 def run_sample(model, dataset, device, prefix, beam_width, max_depth,
-               stoi_arr, vocab_to_pos):
-    """Run beam search from a starting prefix.  Return True if adversarial found."""
+               stoi_arr, vocab_to_pos, save_positions=False):
     board = OthelloBoardState()
     for m in prefix:
         board.umpire(m)
     if not board.get_valid_moves():
-        return False
+        return False, []
 
     beams = [(list(prefix), fast_copy_board(board), 0.0)]
     adversarial_found = False
+    records = []
 
     for depth in range(len(prefix), max_depth):
         candidates = []
@@ -123,25 +123,27 @@ def run_sample(model, dataset, device, prefix, beam_width, max_depth,
         if not candidates:
             break
 
-        illegal_mass, is_adv = score_and_check_adversarial(
+        illegal_mass, is_adv, top1_illegal_pos = score_and_check_adversarial(
             candidates, model, dataset, device, stoi_arr, vocab_to_pos,
         )
         if is_adv.any():
             adversarial_found = True
+            if save_positions:
+                for i in range(len(candidates)):
+                    if is_adv[i]:
+                        seq = candidates[i][0]
+                        records.append((tuple(seq), len(seq) - 1,
+                                          int(top1_illegal_pos[i])))
 
-        # Score cumulative + current-position illegal mass
-        new_scored = []
-        for i, (seq, brd, cum) in enumerate(candidates):
-            score = cum + float(illegal_mass[i])
-            new_scored.append((seq, brd, score))
+        new_scored = [(seq, brd, cum + float(illegal_mass[i]))
+                       for i, (seq, brd, cum) in enumerate(candidates)]
         new_scored.sort(key=lambda x: x[2], reverse=True)
         beams = new_scored[:beam_width]
 
-        # Early exit once we've established adversarial + few more levels
         if adversarial_found and depth >= len(prefix) + 6:
             break
 
-    return adversarial_found
+    return adversarial_found, records
 
 
 def load_val_games(data_dir, max_files, min_length=59):
@@ -177,6 +179,10 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=3)
     ap.add_argument('--seed', type=int, default=42)
+    ap.add_argument('--save-positions', action='store_true',
+                    help='Save every (game, turn, illegal_cell) triple '
+                         'to adversarial_records.npz for downstream causal '
+                         'analysis.')
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -206,18 +212,22 @@ def main():
     print(f"Sampled {len(prefixes)} prefixes at depth {args.depth}", flush=True)
 
     n_success = 0
+    all_records = []
     for pi, prefix in enumerate(prefixes):
-        adv = run_sample(
+        adv, records = run_sample(
             model, dataset, device, prefix,
             args.beam_width, args.max_depth,
-            stoi_arr, vocab_to_pos,
+            stoi_arr, vocab_to_pos, save_positions=args.save_positions,
         )
         if adv:
             n_success += 1
+        if args.save_positions:
+            all_records.extend(records)
         if (pi + 1) % 100 == 0:
             print(f"  {pi+1}/{len(prefixes)}  "
-                  f"success: {n_success}  ({int(time.time()-t0)}s)",
-                  flush=True)
+                  f"success: {n_success}  "
+                  f"records: {len(all_records)}  "
+                  f"({int(time.time()-t0)}s)", flush=True)
 
     rate = n_success / len(prefixes) if prefixes else 0.0
     print()
@@ -235,6 +245,19 @@ def main():
         n_success=n_success,
         rate=rate,
     )
+    if args.save_positions:
+        games_arr = np.array([r[0] for r in all_records], dtype=object)
+        turns_arr = np.array([r[1] for r in all_records], dtype=np.int64)
+        cells_arr = np.array([r[2] for r in all_records], dtype=np.int64)
+        np.savez_compressed(
+            os.path.join(args.output_dir,
+                          f"adversarial_records_depth_{args.depth:02d}.npz"),
+            games=games_arr,
+            turns=turns_arr,
+            illegal_cells=cells_arr,
+        )
+        print(f"  Saved {len(all_records)} adversarial records to "
+              f"adversarial_records_depth_{args.depth:02d}.npz")
 
 
 if __name__ == '__main__':
