@@ -241,6 +241,10 @@ def main():
         games = d['games']; turns = d['turns']; cells = d['illegal_cells']
         adv_positions = [(tuple(games[i]), int(turns[i]), int(cells[i]))
                           for i in range(len(games))]
+        # Shuffle so max_adversarial cap samples uniformly across depths, not
+        # just the first depth in file order.
+        rng = np.random.RandomState(0)
+        rng.shuffle(adv_positions)
         if args.max_adversarial and len(adv_positions) > args.max_adversarial:
             adv_positions = adv_positions[:args.max_adversarial]
     elif args.natural_source:
