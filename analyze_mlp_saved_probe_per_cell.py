@@ -165,34 +165,45 @@ if __name__ == "__main__":
         print(f"  {label:>6s} n={len(cells):2d}  mean={vals.mean():.4f}  "
               f"min={vals.min():.4f}  max={vals.max():.4f}")
 
-    # ---------- Heatmap (optional) ----------
+    # ---------- Save raw grid + optional heatmap PNG ----------
     if args.heatmap_path:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        from matplotlib.figure import Figure
-        grid = acc.reshape(8, 8)
-        # Some environments' plt.subplots returns a dummy; use Figure directly.
-        fig = Figure(figsize=(6.5, 5.5))
-        ax = fig.add_subplot(111)
-        im = ax.imshow(grid, cmap='viridis', vmin=grid.min(), vmax=1.0)
-        for r in range(8):
-            for c in range(8):
-                v = grid[r, c]
-                color = 'white' if v < (grid.min() + grid.max()) / 2 else 'black'
-                ax.text(c, r, f"{v:.3f}", ha='center', va='center',
-                         color=color, fontsize=9)
-        ax.set_xticks(range(8))
-        ax.set_xticklabels(list("abcdefgh"))
-        ax.set_yticks(range(8))
-        ax.set_yticklabels([str(i + 1) for i in range(8)])
-        ax.set_title("Per-cell probe accuracy on Othello-MLP",
-                      fontsize=13, fontweight='bold')
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        fig.tight_layout()
         os.makedirs(os.path.dirname(args.heatmap_path) or '.', exist_ok=True)
-        fig.savefig(args.heatmap_path, dpi=200, bbox_inches='tight')
-        print(f"\nSaved heatmap to {args.heatmap_path}")
+        # Always save the raw 8x8 grid alongside the PNG path so you can
+        # regenerate the heatmap locally if the cluster's matplotlib is broken.
+        grid_path = os.path.splitext(args.heatmap_path)[0] + '.npy'
+        np.save(grid_path, acc.reshape(8, 8))
+        print(f"\nSaved raw 8x8 grid to {grid_path}")
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            from matplotlib.figure import Figure
+            grid = acc.reshape(8, 8)
+            fig = Figure(figsize=(6.5, 5.5))
+            ax = fig.add_subplot(111)
+            im = ax.imshow(grid, cmap='viridis',
+                            vmin=grid.min(), vmax=1.0)
+            for r in range(8):
+                for c in range(8):
+                    v = grid[r, c]
+                    color = ('white'
+                             if v < (grid.min() + grid.max()) / 2 else 'black')
+                    ax.text(c, r, f"{v:.3f}", ha='center', va='center',
+                             color=color, fontsize=9)
+            ax.set_xticks(range(8))
+            ax.set_xticklabels(list("abcdefgh"))
+            ax.set_yticks(range(8))
+            ax.set_yticklabels([str(i + 1) for i in range(8)])
+            ax.set_title("Per-cell probe accuracy on Othello-MLP",
+                          fontsize=13, fontweight='bold')
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(args.heatmap_path, dpi=200, bbox_inches='tight')
+            print(f"Saved heatmap to {args.heatmap_path}")
+        except Exception as e:
+            print(f"[warning] Skipping PNG render due to matplotlib issue: "
+                  f"{type(e).__name__}: {e}")
+            print(f"[warning] Raw grid still saved at {grid_path} — render "
+                  f"the heatmap locally from that .npy file.")
 
     order = np.argsort(acc)
     print("\nWorst 10 cells:")
