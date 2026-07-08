@@ -195,12 +195,23 @@ def shuffled_baseline(probe_state, gt_state, C_cell, all_ray_cells,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--adversarial-dir', default='experiment1_data')
+    ap.add_argument('--adversarial-dir', default='experiment1_data',
+                    help='Directory of experiment1 output .npz files.  Ignored '
+                         'when --natural-source is set.')
+    ap.add_argument('--natural-source', action='store_true',
+                    help='Instead of loading beam-search adversarial games '
+                         'from experiment1_data, walk val games directly and '
+                         'find EVERY position where OGPT top-1 is illegal. '
+                         'Larger sample, matches natural failure distribution.')
+    ap.add_argument('--max-files', type=int, default=3,
+                    help='For --natural-source: how many val pickle files to '
+                         'load (each ~100K games).')
     ap.add_argument('--ckpt', default='ckpts/gpt_nanda_synthetic.ckpt')
     ap.add_argument('--probe',
                     default='mechanistic_interpretability/main_linear_probe.pth')
     ap.add_argument('--layer', type=int, default=6)
-    ap.add_argument('--max-adversarial', type=int, default=1000)
+    ap.add_argument('--max-adversarial', type=int, default=5000,
+                    help='Cap on number of adversarial positions to analyze.')
     ap.add_argument('--n-shuffles', type=int, default=100)
     ap.add_argument('--output-csv', default='experiment_probe_causal.csv')
     args = ap.parse_args()
@@ -222,23 +233,33 @@ def main():
 
     token_to_pos = _build_token_to_board_pos(block_size, device)
 
-    print(f"Loading adversarial games from {args.adversarial_dir}...")
-    adv_games = []
-    for c in range(60):
-        p = os.path.join(args.adversarial_dir, f'cell_{c:02d}.npz')
-        if not os.path.exists(p):
-            continue
-        d = np.load(p, allow_pickle=True)
-        for g in d['top_games']:
-            adv_games.append(list(g))
-    print(f"  {len(adv_games)} candidate games")
-
-    print("Finding adversarial (game, turn, C) triples...")
-    adv_positions = find_adversarial_positions(
-        model, device, adv_games, block_size, token_to_pos,
-        max_positions=args.max_adversarial,
-    )
-    print(f"  {len(adv_positions)} adversarial positions")
+    if args.natural_source:
+        print(f"Loading val games (up to {args.max_files} pickle files)...")
+        val_games = load_games(max_files=args.max_files)
+        print(f"  {len(val_games):,} val games loaded")
+        print("Finding adversarial (game, turn, C) triples from val games "
+              "(every position with illegal top-1)...")
+        adv_positions = find_adversarial_positions(
+            model, device, val_games, block_size, token_to_pos,
+            max_positions=args.max_adversarial,
+        )
+    else:
+        print(f"Loading adversarial games from {args.adversarial_dir}...")
+        adv_games = []
+        for c in range(60):
+            p = os.path.join(args.adversarial_dir, f'cell_{c:02d}.npz')
+            if not os.path.exists(p):
+                continue
+            d = np.load(p, allow_pickle=True)
+            for g in d['top_games']:
+                adv_games.append(list(g))
+        print(f"  {len(adv_games)} candidate games")
+        print("Finding adversarial (game, turn, C) triples...")
+        adv_positions = find_adversarial_positions(
+            model, device, adv_games, block_size, token_to_pos,
+            max_positions=args.max_adversarial,
+        )
+    print(f"  {len(adv_positions):,} adversarial positions")
 
     # Per-position analysis
     rows = []
