@@ -284,28 +284,84 @@ def main():
     #   - Probe error rate on any played (non-empty) cell
     # If error on the top1 cell isn't higher than the baselines, the world-
     # model degradation is INCIDENTAL, not causal.
-    print("\nCausal test — probe errors on the specific illegal cell vs. baselines...")
+    print("\nCausal test — is the probe's decoded state responsible for the illegal pick?")
+
+    # Helper: reconstruct nanda state (1=black, -1=white, 0=empty) from probe pred
+    def probe_to_nanda_state(pred_flat):
+        """pred_flat: (64,) with 0=empty, 1=white, 2=black -> (8,8) nanda state."""
+        st = np.zeros((8, 8), dtype=np.int8)
+        for cell in range(64):
+            r_, c_ = cell // 8, cell % 8
+            if pred_flat[cell] == 1:
+                st[r_, c_] = -1
+            elif pred_flat[cell] == 2:
+                st[r_, c_] = 1
+        return st
+
+    def next_hand_color_at_turn(t):
+        """Turn t = t+1 moves played; next player = BLACK if (t+1) even else WHITE."""
+        k = t + 1
+        return 1 if (k % 2 == 0) else -1  # 1=black, -1=white
+
+    def flanking_ray_cells(cell_C):
+        """Cells along the 8 directions from C, up to the board edge — the set
+        whose contents matter for whether any flanking pattern makes C legal."""
+        rr, cc = cell_C // 8, cell_C % 8
+        rays = []
+        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                        (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+            r_, c_ = rr + dr, cc + dc
+            while 0 <= r_ < 8 and 0 <= c_ < 8:
+                rays.append(r_ * 8 + c_)
+                r_ += dr; c_ += dc
+        return rays
+
     n_pos_analyzed = 0
     n_wrong_on_top1 = 0
     n_wrong_on_random = 0
     n_wrong_on_random_played = 0
+    n_wrong_on_any_ray_cell = 0
+    n_legal_under_probe = 0     # KEY: does probe's board make C legal?
+    n_had_probe_state = 0
     for t, items in adv_by_turn.items():
+        color_next = next_hand_color_at_turn(t)
         for game, top1_board_pos in items:
             hidden, state = get_hidden_and_state(
                 model, device, tuple(game), t, args.layer, block_size)
             pred = probe_predict(hidden, t, probe)                # (8, 8)
             gt = state_to_gt(state)                                # (8, 8)
-            per_cell_wrong = (pred != gt).flatten()               # (64,)
-            r, c = top1_board_pos // 8, top1_board_pos % 8
+            pred_flat = pred.flatten()
+            gt_flat = gt.flatten()
+            per_cell_wrong = (pred_flat != gt_flat)               # (64,)
             n_pos_analyzed += 1
+
+            # (a) probe wrong on top1 cell itself
             if per_cell_wrong[top1_board_pos]:
                 n_wrong_on_top1 += 1
-            # Random other cell (not the top1)
+
+            # (b) probe wrong on ANY cell along the 8 rays from C
+            ray_cells = flanking_ray_cells(top1_board_pos)
+            if any(per_cell_wrong[i] for i in ray_cells):
+                n_wrong_on_any_ray_cell += 1
+
+            # (c) DIRECT causal question: is C legal under the probe's decoded board?
+            probe_state = probe_to_nanda_state(pred_flat)
+            try:
+                b = OthelloBoardState()
+                b.state = probe_state.copy()
+                b.next_hand_color = color_next
+                valid_under_probe = b.get_valid_moves()
+                n_had_probe_state += 1
+                if top1_board_pos in valid_under_probe:
+                    n_legal_under_probe += 1
+            except Exception:
+                pass
+
+            # Baseline: random OTHER cell + random played cell
             other_cells = [i for i in range(64) if i != top1_board_pos]
             rnd = other_cells[np.random.randint(len(other_cells))]
             if per_cell_wrong[rnd]:
                 n_wrong_on_random += 1
-            # Random PLAYED cell (state != 0); if none exist, skip
             played = [i for i in range(64)
                        if state.flatten()[i] != 0 and i != top1_board_pos]
             if played:
@@ -316,18 +372,29 @@ def main():
     print(f"  Positions analyzed: {n_pos_analyzed}")
     if n_pos_analyzed > 0:
         p_top1 = n_wrong_on_top1 / n_pos_analyzed
+        p_ray = n_wrong_on_any_ray_cell / n_pos_analyzed
+        p_legal_under_probe = (n_legal_under_probe / max(n_had_probe_state, 1))
         p_rnd = n_wrong_on_random / n_pos_analyzed
         p_rnd_played = n_wrong_on_random_played / n_pos_analyzed
-        print(f"  P(probe wrong on top1 illegal cell): {p_top1:.4f}")
-        print(f"  P(probe wrong on any other cell):    {p_rnd:.4f}")
-        print(f"  P(probe wrong on random played cell):{p_rnd_played:.4f}")
         print()
-        print(f"  Ratio (top1 / any-other):           {p_top1 / max(p_rnd, 1e-9):.2f}x")
-        print(f"  Ratio (top1 / random-played):       {p_top1 / max(p_rnd_played, 1e-9):.2f}x")
+        print(f"  === Category (a): probe error ON the illegal cell ===")
+        print(f"    P(probe wrong on top1 illegal cell): {p_top1:.4f}")
+        print(f"    P(probe wrong on any other cell):    {p_rnd:.4f}")
+        print(f"    P(probe wrong on random played cell):{p_rnd_played:.4f}")
         print()
-        print(f"  Interpretation:")
-        print(f"    Ratio ~1  -> probe errors are UNIFORMLY distributed (incidental)")
-        print(f"    Ratio >>1 -> probe errors CONCENTRATE on the illegal cell (causal)")
+        print(f"  === Category (b): probe error on any ray/flanking-relevant cell ===")
+        print(f"    P(probe wrong on ANY cell in 8-ray from illegal cell): {p_ray:.4f}")
+        print()
+        print(f"  === Category (c) — direct causal test ===")
+        print(f"    P(illegal cell is LEGAL under probe's decoded board): "
+              f"{p_legal_under_probe:.4f}")
+        print(f"    (Positions analyzed for (c): {n_had_probe_state})")
+        print()
+        print(f"  Interpretation of (c):")
+        print(f"    High P -> World model DOES rationalize the illegal pick (causal)")
+        print(f"    Low P  -> World model does NOT rationalize the illegal pick")
+        print(f"             (the model would agree C is illegal from its own state,")
+        print(f"              but still picks it -> downstream heuristic override)")
 
     # ---- Report ----
     print()
