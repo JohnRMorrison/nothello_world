@@ -199,6 +199,7 @@ def main():
 
     n_success = 0
     successes = []
+    success_mask = np.zeros(len(prefixes), dtype=bool)
     for pi, prefix in enumerate(prefixes):
         adv, seq, score = run_start(
             me, mo, idx, mask, device, args.cell, prefix,
@@ -206,6 +207,7 @@ def main():
         )
         if adv:
             n_success += 1
+            success_mask[pi] = True
             successes.append((score, seq))
         if (pi + 1) % 100 == 0:
             print(f"  {pi+1}/{len(prefixes)}  "
@@ -230,6 +232,7 @@ def main():
         n_prefixes=len(prefixes),
         n_success=n_success,
         rate=rate,
+        success_mask=success_mask,
         top_scores=np.array([sc for sc, _ in successes[:args.top_save]],
                              dtype=np.float32),
         top_games=np.array(top_games, dtype=object),
