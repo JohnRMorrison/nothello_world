@@ -36,6 +36,13 @@ from probe_state_pred_for_othello import (
 )
 
 
+def _tokenize_one(game, block_size, device):
+    """Tokenize one game using Nanda's canonical vocab (tokenize_games handles
+    the mapping)."""
+    toks = tokenize_games([game], seq_len=block_size).to(device)
+    return toks  # (1, block_size)
+
+
 def state_to_gt(state_8x8):
     """OthelloBoardState.state -> Nanda probe GT: 0=empty, 1=white, 2=black."""
     gt = np.zeros((8, 8), dtype=np.int64)
@@ -44,56 +51,80 @@ def state_to_gt(state_8x8):
     return gt
 
 
-def find_adversarial_positions(model, dataset, device, games, block_size,
-                                 max_positions=None):
+def _build_token_to_board_pos(block_size, device):
+    """Return array of shape (VOCAB_SIZE,) mapping token index -> board pos.
+
+    Uses tokenize_games to derive Nanda's canonical vocab.  Returns -1 for
+    tokens that don't correspond to a board cell (e.g. padding token 0).
+    """
+    valid_moves = [i for i in range(64) if i not in {27, 28, 35, 36}]
+    dummy_game = list(valid_moves)  # play each valid cell once (length 60)
+    toks = tokenize_games([dummy_game], seq_len=block_size)  # (1, block_size)
+    toks = toks[0].tolist()
+    token_to_pos = np.full(VOCAB_SIZE, -1, dtype=np.int64)
+    for i, m in enumerate(dummy_game):
+        if i < len(toks):
+            token_to_pos[toks[i]] = m
+    return token_to_pos
+
+
+def find_adversarial_positions(model, device, games, block_size,
+                                 token_to_pos, max_positions=None):
     """For each game, find positions where OGPT's top-1 is illegal.
 
     Returns list of (game_tuple, turn, top1_board_pos) tuples.
+
+    Convention: 'turn' T means state after T+1 moves played (matches
+    analyze_nanda_probe_per_cell.py's states[i, t] = state after t+1 moves,
+    where t is the 0-indexed absolute position).  Model's prediction for
+    move at index T+1 given tokens[0..T] = logits[0, T].  We check whether
+    that prediction is legal against the board state AFTER move T is played
+    (i.e., the state the model has "seen" via tokens[0..T]).
     """
-    stoi = dataset.stoi
     positions = []
     with torch.no_grad():
         for g_idx, game in enumerate(games):
-            board = OthelloBoardState()
             L = min(len(game), block_size)
-            # Batch: score every position from turn 1..L-1
-            tokens = torch.tensor(
-                [stoi[s] for s in game[:L]], dtype=torch.long, device=device
-            ).unsqueeze(0)  # (1, L)
-            logits, _ = model(tokens)                   # (1, L, V)
-            top1 = logits.argmax(dim=-1)[0].cpu().numpy()  # (L,)
-            for t in range(L):
+            tokens = tokenize_games([list(game)], seq_len=block_size).to(device)
+            logits, _ = model(tokens)                        # (1, block_size, V)
+            top1 = logits.argmax(dim=-1)[0].cpu().numpy()    # (block_size,)
+
+            # Replay to get board state at each position; state[T] = state
+            # after moves 0..T played (T+1 moves total).
+            board = OthelloBoardState()
+            for T in range(L):
+                try:
+                    board.umpire(game[T])
+                except Exception:
+                    break
+                # After playing game[T], model's prediction for the NEXT
+                # move (index T+1) uses logits[0, T].  Board.get_valid_moves()
+                # now reflects the state after T+1 moves — the correct
+                # comparison population for logits[0, T].
                 valid = board.get_valid_moves()
-                if valid:
-                    # OGPT predicts move at position t+1 given tokens[:t+1]
-                    top1_token = int(top1[t])
-                    top1_board_pos = None
-                    for c, i in stoi.items():
-                        if i == top1_token and isinstance(c, int):
-                            top1_board_pos = c
-                            break
-                    if top1_board_pos is not None and top1_board_pos not in valid:
-                        positions.append((tuple(game[:L]), t, top1_board_pos))
-                        if max_positions and len(positions) >= max_positions:
-                            return positions
-                if t < len(game):
-                    board.umpire(game[t])
+                if not valid:
+                    continue
+                top1_token = int(top1[T])
+                top1_board_pos = int(token_to_pos[top1_token])
+                if top1_board_pos < 0:
+                    continue
+                if top1_board_pos not in valid:
+                    positions.append((tuple(game[:L]), T, top1_board_pos))
+                    if max_positions and len(positions) >= max_positions:
+                        return positions
     return positions
 
 
-def get_hidden_and_state(model, dataset, device, game_tuple, turn, layer,
-                          block_size):
-    """Return (hidden_512, true_state_8x8) at the position after 'turn' moves."""
+def get_hidden_and_state(model, device, game_tuple, turn, layer, block_size):
+    """Return (hidden_512, true_state_8x8) at position `turn` (state after
+    turn+1 moves — matches probe training convention)."""
     L = min(len(game_tuple), block_size)
     game = list(game_tuple)[:L]
-    tokens = torch.tensor(
-        [dataset.stoi[s] for s in game], dtype=torch.long, device=device,
-    ).unsqueeze(0)
+    tokens = tokenize_games([game], seq_len=block_size).to(device)
     with torch.no_grad():
-        h = extract_activations(model, tokens, layer)   # (1, L, 512)
+        h = extract_activations(model, tokens, layer)  # (1, block_size, 512)
     hidden = h[0, turn, :].cpu().numpy()               # (512,)
 
-    # Ground truth state after `turn` moves
     board = OthelloBoardState()
     for m in game[:turn + 1]:
         board.umpire(m)
@@ -144,20 +175,14 @@ def main():
     model = model.to(device).eval()
     print(f"Loaded OGPT (block_size={block_size}), probing layer {args.layer}")
 
-    # ---- Build the vocab/dataset shim (analogous to eval_legal_move.py) ----
+    # Build the canonical token->board-pos map from Nanda's tokenize_games.
+    token_to_pos = _build_token_to_board_pos(block_size, device)
+    print(f"Built Nanda token->board-pos map: "
+          f"{int((token_to_pos >= 0).sum())} valid entries / {VOCAB_SIZE}")
+
     print(f"Loading val games (up to {args.max_files} files)...")
     val_games = load_games(max_files=args.max_files)
     print(f"  {len(val_games)} val games loaded")
-    stoi = {}; itos = {}
-    for game in val_games:
-        for m in game:
-            if m not in stoi:
-                i = len(stoi)
-                stoi[m] = i
-                itos[i] = m
-    class _Shim: pass
-    dataset = _Shim(); dataset.stoi = stoi; dataset.itos = itos
-    dataset.block_size = block_size
 
     # ---- Collect adversarial games from experiment1 output ----
     print(f"\nCollecting adversarial games from {args.adversarial_dir}...")
@@ -174,7 +199,7 @@ def main():
     # ---- Find adversarial POSITIONS (top-1 illegal) in those games ----
     print("Finding positions where OGPT top-1 is illegal...")
     adv_positions = find_adversarial_positions(
-        model, dataset, device, adv_games, block_size,
+        model, device, adv_games, block_size, token_to_pos,
         max_positions=args.max_adversarial,
     )
     print(f"  {len(adv_positions)} adversarial positions")
@@ -191,37 +216,34 @@ def main():
     print(f"\nBuilding turn-matched control from {args.n_control_games} val games...")
     control_by_turn = {t: [] for t in adv_by_turn}
     needed_by_turn = {t: len(v) for t, v in adv_by_turn.items()}
-    stoi_arr = np.zeros(64, dtype=np.int64)
-    for pos, tok in stoi.items():
-        if isinstance(pos, int):
-            stoi_arr[pos] = tok
 
     with torch.no_grad():
         for g_idx, game in enumerate(val_games[:args.n_control_games]):
             if all(len(control_by_turn[t]) >= needed_by_turn[t] * 3
                    for t in needed_by_turn):
                 break
-            board = OthelloBoardState()
             L = min(len(game), block_size)
-            tokens = torch.tensor(
-                [stoi[s] for s in game[:L]], dtype=torch.long, device=device
-            ).unsqueeze(0)
+            tokens = tokenize_games([list(game)], seq_len=block_size).to(device)
             logits, _ = model(tokens)
             top1 = logits.argmax(dim=-1)[0].cpu().numpy()
-            for t in range(L):
+
+            board = OthelloBoardState()
+            for T in range(L):
+                try:
+                    board.umpire(game[T])
+                except Exception:
+                    break
                 valid = board.get_valid_moves()
-                if valid and t in control_by_turn and \
-                   len(control_by_turn[t]) < needed_by_turn[t] * 3:
-                    top1_token = int(top1[t])
-                    top1_board_pos = None
-                    for c, i in stoi.items():
-                        if i == top1_token and isinstance(c, int):
-                            top1_board_pos = c
-                            break
-                    if top1_board_pos is not None and top1_board_pos in valid:
-                        control_by_turn[t].append(tuple(game[:L]))
-                if t < len(game):
-                    board.umpire(game[t])
+                if not valid:
+                    continue
+                if T not in control_by_turn:
+                    continue
+                if len(control_by_turn[T]) >= needed_by_turn[T] * 3:
+                    continue
+                top1_token = int(top1[T])
+                top1_board_pos = int(token_to_pos[top1_token])
+                if top1_board_pos >= 0 and top1_board_pos in valid:
+                    control_by_turn[T].append(tuple(game[:L]))
     total_ctrl = sum(len(v) for v in control_by_turn.values())
     print(f"  {total_ctrl} control positions found across matched turns")
 
@@ -236,8 +258,7 @@ def main():
                 if not isinstance(game, (list, tuple)):
                     game = item
                 hidden, state = get_hidden_and_state(
-                    model, dataset, device, tuple(game), t, args.layer,
-                    block_size)
+                    model, device, tuple(game), t, args.layer, block_size)
                 pred = probe_predict(hidden, t, probe)
                 gt = state_to_gt(state)
                 correct += int((pred == gt).sum())
