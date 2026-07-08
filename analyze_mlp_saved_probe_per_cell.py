@@ -28,10 +28,11 @@ from train_pattern_simple import DirectMLP
 
 
 _FEAT_COLS = {
-    "when":      list(range(N_MOVES, 2 * N_MOVES)),
-    "played":    list(range(0, N_MOVES)),
-    "when+even": list(range(N_MOVES, 3 * N_MOVES)),
-    "all":       list(range(0, 3 * N_MOVES)),
+    "when":        list(range(N_MOVES, 2 * N_MOVES)),
+    "played":      list(range(0, N_MOVES)),
+    "when+even":   list(range(N_MOVES, 3 * N_MOVES)),
+    "played+even": list(range(0, N_MOVES)) + list(range(2 * N_MOVES, 3 * N_MOVES)),
+    "all":         list(range(0, 3 * N_MOVES)),
 }
 CENTER_64 = {27, 28, 35, 36}
 
