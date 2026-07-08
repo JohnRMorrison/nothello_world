@@ -58,6 +58,9 @@ if __name__ == "__main__":
     parser.add_argument("--n-positions", type=int, default=50000)
     parser.add_argument("--heatmap-path", default=None,
                         help="If set, save an 8x8 accuracy heatmap PNG at this path.")
+    parser.add_argument("--chunk-prefix", default="chunk_",
+                        help="Prefix filter for the eval chunk file (default: 'chunk_'; "
+                             "use 'chunk_ext_' for played+even MLPs on 120-d compact chunks).")
     args = parser.parse_args()
 
     device = get_device()
@@ -81,9 +84,16 @@ if __name__ == "__main__":
     # Load feature chunk (last as eval)
     out_dir = "experiments/mathematical_transformation_experiments/heuristic_probe_results"
     chunk_dir = os.path.join(out_dir, "feature_chunks")
-    chunk_files = sorted(os.path.join(chunk_dir, f)
-                         for f in os.listdir(chunk_dir)
-                         if f.endswith(".npz") and "_patterns" not in f and "_when60" not in f)
+    chunk_files = sorted(
+        os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir)
+        if f.startswith(args.chunk_prefix) and f.endswith(".npz")
+        and "_patterns" not in f and "_when60" not in f
+        and "rule_firings" not in f
+    )
+    if not chunk_files:
+        raise SystemExit(
+            f"No files matching {args.chunk_prefix}*.npz in {chunk_dir}. "
+            f"Pass --chunk-prefix to match the training-time chunk family.")
     eval_path = chunk_files[-1]
     print(f"Loading {eval_path}")
 
