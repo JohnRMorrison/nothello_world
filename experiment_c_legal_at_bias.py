@@ -123,7 +123,8 @@ def main():
                     default='mechanistic_interpretability/main_linear_probe.pth')
     ap.add_argument('--layer', type=int, default=6)
     ap.add_argument('--limit', type=int, default=0)
-    ap.add_argument('--thresholds', type=str, default='0.01,0.03,0.05')
+    ap.add_argument('--thresholds', type=str,
+                    default='0.001,0.003,0.005,0.01,0.03,0.05')
     ap.add_argument('--output-csv', default='c_legal_at_bias.csv')
     ap.add_argument('--output-summary', default='c_legal_at_bias.txt')
     args = ap.parse_args()
@@ -151,8 +152,16 @@ def main():
     N = len(games) if args.limit == 0 else min(args.limit, len(games))
     print(f"Processing {N} positions")
 
-    counts = {th: {'no_bias': 0, 'c_legal': 0, 'c_illegal': 0, 'total': 0}
-              for th in thresholds}
+    # Uniqueness diagnostics -- how many distinct games at various prefix lengths?
+    for K in [5, 10, 15, 20]:
+        prefixes = set()
+        for i in range(N):
+            g = tuple(games[i])
+            prefixes.add(g[:K])
+        print(f"  Unique first-{K}-moves prefixes: {len(prefixes)}  "
+              f"({len(prefixes) / N * 100:.1f}% of records)")
+
+    counts = {th: {'c_legal': 0, 'c_illegal': 0, 'total': 0} for th in thresholds}
     csv_rows = [['idx', 'T', 'C'] + [f'th{th}_c_legal' for th in thresholds]]
 
     t0 = time.time()
@@ -165,10 +174,8 @@ def main():
         for th in thresholds:
             counts[th]['total'] += 1
             if res is None or res[th]['t_bias'] is None:
-                counts[th]['no_bias'] += 1
                 row.append('')
-                continue
-            if res[th]['c_legal_per_probe']:
+            elif res[th]['c_legal_per_probe']:
                 counts[th]['c_legal'] += 1
                 row.append('1')
             else:
@@ -192,10 +199,8 @@ def main():
         c = counts[th]
         total = c['total']
         classified = c['c_legal'] + c['c_illegal']
-        lines.append(f"=== Threshold P(C) > {th * 100:.0f}% ===")
+        lines.append(f"=== Threshold P(C) > {th * 100:.2f}% ===")
         lines.append(f"  Total positions:              {total}")
-        lines.append(f"  No bias turn:                 {c['no_bias']}  "
-                     f"({c['no_bias'] / total * 100:5.1f}%)")
         lines.append(f"  Classified positions:         {classified}  "
                      f"({classified / total * 100:5.1f}%)")
         if classified > 0:
