@@ -50,22 +50,25 @@ def alg(cell):
 
 
 def render_board(state_8x8, marks=None):
-    """Return list of 8 strings (rows).  marks: {cell_idx: char} overlay."""
+    """Return list of 8 strings (rows).  marks: {cell_idx: suffix_char} —
+    the cell shows its state (X/O/.) plus the suffix.  If a mark starts with
+    '#' the whole cell is displayed as the mark (used for the illegal cell)."""
     marks = marks or {}
     rows = []
-    header = "     a  b  c  d  e  f  g  h"
+    header = "     a   b   c   d   e   f   g   h"
     rows.append(header)
-    rows.append("    " + "-" * 26)
+    rows.append("    " + "-" * 34)
     for r in range(8):
         cells = []
         for c in range(8):
             cell_i = r * 8 + c
-            if cell_i in marks:
-                ch = marks[cell_i]
-            else:
-                v = state_8x8[r, c]
-                ch = "." if v == 0 else ("X" if v == 1 else "O")
-            cells.append(f" {ch} ")
+            v = state_8x8[r, c]
+            base = "." if v == 0 else ("X" if v == 1 else "O")
+            suffix = marks.get(cell_i, " ")
+            if suffix == "#":
+                base = "#"
+                suffix = " "
+            cells.append(f" {base}{suffix} ")
         rows.append(f"  {r + 1} |" + "".join(cells))
     return rows
 
