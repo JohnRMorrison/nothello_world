@@ -40,7 +40,7 @@ from mingpt.model import GPT, GPTConfig
 from data.othello import OthelloBoardState
 sys.path.insert(0, "experiments/mathematical_transformation_experiments")
 from probe_state_pred_for_othello import (
-    tokenize_games, VOCAB_SIZE,
+    tokenize_games, VOCAB_SIZE, extract_activations,
 )
 
 
@@ -108,6 +108,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--adversarial-dir', default='experiment1_by_depth')
     ap.add_argument('--ckpt', default='ckpts/gpt_nanda_synthetic.ckpt')
+    ap.add_argument('--probe',
+                    default='mechanistic_interpretability/main_linear_probe.pth')
+    ap.add_argument('--layer', type=int, default=6)
     ap.add_argument('--n-games', type=int, default=5)
     ap.add_argument('--last-n-turns', type=int, default=15,
                     help='For each game, show the last N turns before the '
@@ -126,6 +129,22 @@ def main():
     model.load_state_dict(sd)
     model = model.to(device).eval()
     print(f"Loaded OGPT (block_size={block_size})")
+
+    probe = torch.load(args.probe, map_location='cpu')
+    assert probe.shape == (3, 512, 8, 8, 3)
+    print(f"Loaded probe {tuple(probe.shape)}")
+
+    def probe_decode(hidden_512, turn):
+        """Nanda-mode probe: mode 0 for odd positions, mode 1 for even."""
+        mode = 0 if turn % 2 == 1 else 1
+        W = probe[mode]                                                # (512, 8, 8, 3)
+        h = torch.from_numpy(hidden_512).float()
+        logits = torch.einsum('d,drco->rco', h, W)
+        cls = logits.argmax(dim=-1).numpy()                            # (8, 8) in {0=empty, 1=white, 2=black}
+        st = np.zeros((8, 8), dtype=np.int8)
+        st[cls == 1] = -1
+        st[cls == 2] = 1
+        return st  # nanda state
 
     token_to_pos, pos_to_token = build_token_to_pos_and_pos_to_token(block_size)
 
@@ -156,11 +175,14 @@ def main():
         lines.append(f"Game length: {len(game)}")
         lines.append("=" * 72)
 
-        # Feed tokens to model ONCE (through error_turn), then read per-position logits
+        # Feed tokens to model ONCE (through error_turn), then read per-position
+        # logits AND layer-args.layer activations
         L = min(error_turn + 1, block_size)
         tokens = tokenize_games([game[:L]], seq_len=block_size).to(device)
         with torch.no_grad():
-            logits, _ = model(tokens)                             # (1, L, V)
+            logits, _ = model(tokens)                             # (1, block_size, V)
+            acts = extract_activations(model, tokens, args.layer)  # (1, block_size, 512)
+        acts_np = acts.cpu().numpy()[0]                            # (block_size, 512)
 
         # For each turn t (0..error_turn), extract prediction
         # logits[0, t-1] gives prediction of move at position t (given tokens[0..t-1])
@@ -241,6 +263,24 @@ def main():
                           f"C {'LEGAL' if C_legal_seen[j] else 'ILLEGAL'}  "
                           f"P(all illegal)={p_illegal_total_seen[j]:.4f} ---")
             lines.extend(hm)
+
+            # Probe decode at this turn — compare probe's decoded state
+            # to the actual state and print which cells disagree.
+            probe_state = probe_decode(acts_np[t], t)
+            diffs = []
+            for cell in range(64):
+                r_, c_ = cell // 8, cell % 8
+                if probe_state[r_, c_] != state[r_, c_]:
+                    prb = ('empty' if probe_state[r_, c_] == 0
+                           else ('BLACK' if probe_state[r_, c_] == 1 else 'WHITE'))
+                    tru = ('empty' if state[r_, c_] == 0
+                           else ('BLACK' if state[r_, c_] == 1 else 'WHITE'))
+                    diffs.append(f"{alg(cell)}: probe={prb} vs actual={tru}")
+            if diffs:
+                lines.append(f"    probe errors ({len(diffs)}): "
+                              f"{', '.join(diffs)}")
+            else:
+                lines.append(f"    probe errors (0): (perfect decode)")
 
         # Bookkeeping for plot
         first_illegal_turn = None
