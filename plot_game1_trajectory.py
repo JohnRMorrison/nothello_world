@@ -208,25 +208,46 @@ def main():
         if not args.plots:
             continue
 
-        # --- Plot 1: P(C) over turns start..end ---
-        ts_all = list(range(args.start_turn, end_turn + 1))
-        p_C_all = [per_turn[t]['p_C'] for t in ts_all]
-        ts_c = [t for t in ts_all if per_turn[t]['is_c_parity']]
+        # --- C's-player turns only ---
+        ts_c = [t for t in range(args.start_turn, end_turn + 1)
+                 if per_turn[t]['is_c_parity']]
         p_C_c = [per_turn[t]['p_C'] for t in ts_c]
+        m_c = [per_turn[t]['margin'] for t in ts_c]
+        c_illegal = [per_turn[t]['C_illegal'] for t in ts_c]
+        # margin > 0 => probe correct on this cell at that turn
+        m_correct = [per_turn[t]['margin'] > 0 for t in ts_c]
 
+        GREEN = '#2ca02c'
+        RED   = '#d1341a'
+
+        # --- Plot 1: P(C) with green/red dots for C's-player legality ---
         fig1, ax1 = plt.subplots(figsize=(8, 4))
-        ax1.plot(ts_all, p_C_all, '-', color='#888888', linewidth=1,
-                 alpha=0.6, label='all turns')
-        ax1.plot(ts_c, p_C_c, 'o', color='#d1341a', markersize=8,
-                 label="C's-player turns")
+        ax1.plot(ts_c, p_C_c, '-', color='#888888', linewidth=1, alpha=0.5)
+        colors_p = [RED if ill else GREEN for ill in c_illegal]
+        ax1.scatter(ts_c, p_C_c, c=colors_p, s=80, zorder=3,
+                     edgecolor='black', linewidth=0.5)
         ax1.axvline(T, color='black', linestyle=':', linewidth=1,
                     label=f'error turn T={T}')
+        # Custom legend for dot colors
+        from matplotlib.lines import Line2D
+        legend_dots = [
+            Line2D([0], [0], marker='o', color='w', label=f'{alg(C)} legal',
+                    markerfacecolor=GREEN, markersize=9,
+                    markeredgecolor='black', markeredgewidth=0.5),
+            Line2D([0], [0], marker='o', color='w', label=f'{alg(C)} illegal',
+                    markerfacecolor=RED, markersize=9,
+                    markeredgecolor='black', markeredgewidth=0.5),
+        ]
         ax1.set_xlabel('turn')
         ax1.set_ylabel(f'P({alg(C)})')
-        ax1.set_title(f"Game {gi + 1}: "
-                       f"P({alg(C)}) over turns {args.start_turn}-{end_turn}")
+        ax1.set_title(f"Game {gi + 1}: P({alg(C)}) on "
+                       f"{alg(C)}-player turns "
+                       f"[{args.start_turn}-{end_turn}]")
         ax1.grid(True, alpha=0.3)
-        ax1.legend(loc='upper left', fontsize=9)
+        ax1.legend(handles=legend_dots + [
+            Line2D([0], [0], color='black', linestyle=':',
+                    label=f'error turn T={T}')
+        ], loc='upper left', fontsize=9)
         fig1.tight_layout()
         p1_path = f"{args.out_prefix}_g{gi + 1}_p_C.png"
         os.makedirs(os.path.dirname(p1_path) or '.', exist_ok=True)
@@ -234,26 +255,36 @@ def main():
         plt.close(fig1)
         print(f"Wrote plot to {p1_path}")
 
-        # --- Plot 2: probe logit margin at margin_cell ---
-        m_all = [per_turn[t]['margin'] for t in ts_all]
-        m_c = [per_turn[t]['margin'] for t in ts_c]
-
+        # --- Plot 2: probe logit margin at margin_cell with green/red dots
+        #            indicating probe correctness on this cell ---
         fig2, ax2 = plt.subplots(figsize=(8, 4))
         ax2.axhline(0, color='#666666', linewidth=1, linestyle='-')
-        ax2.plot(ts_all, m_all, '-', color='#888888', linewidth=1,
-                 alpha=0.6, label='all turns')
-        ax2.plot(ts_c, m_c, 'o', color='#177245', markersize=8,
-                 label="C's-player turns")
-        ax2.axvline(T, color='black', linestyle=':', linewidth=1,
-                    label=f'error turn T={T}')
+        ax2.plot(ts_c, m_c, '-', color='#888888', linewidth=1, alpha=0.5)
+        colors_m = [GREEN if ok else RED for ok in m_correct]
+        ax2.scatter(ts_c, m_c, c=colors_m, s=80, zorder=3,
+                     edgecolor='black', linewidth=0.5)
+        ax2.axvline(T, color='black', linestyle=':', linewidth=1)
+        legend_dots2 = [
+            Line2D([0], [0], marker='o', color='w',
+                    label=f'probe correct on {alg(margin_cell)}',
+                    markerfacecolor=GREEN, markersize=9,
+                    markeredgecolor='black', markeredgewidth=0.5),
+            Line2D([0], [0], marker='o', color='w',
+                    label=f'probe wrong on {alg(margin_cell)}',
+                    markerfacecolor=RED, markersize=9,
+                    markeredgecolor='black', markeredgewidth=0.5),
+        ]
         ax2.set_xlabel('turn')
         ax2.set_ylabel(f'logit margin at {alg(margin_cell)}\n'
                         f'(gt class − max other)')
-        ax2.set_title(f"Game {gi + 1}: "
-                       f"probe logit margin at {alg(margin_cell)}, "
-                       f"turns {args.start_turn}-{end_turn}")
+        ax2.set_title(f"Game {gi + 1}: probe logit margin at "
+                       f"{alg(margin_cell)} on {alg(C)}-player turns "
+                       f"[{args.start_turn}-{end_turn}]")
         ax2.grid(True, alpha=0.3)
-        ax2.legend(loc='upper right', fontsize=9)
+        ax2.legend(handles=legend_dots2 + [
+            Line2D([0], [0], color='black', linestyle=':',
+                    label=f'error turn T={T}')
+        ], loc='upper right', fontsize=9)
         fig2.tight_layout()
         p2_path = f"{args.out_prefix}_g{gi + 1}_margin_{args.margin_cell}.png"
         fig2.savefig(p2_path, dpi=200, bbox_inches='tight')
