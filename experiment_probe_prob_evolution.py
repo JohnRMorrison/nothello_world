@@ -190,16 +190,16 @@ def main():
             if t < 0 or t >= L:
                 continue
             # Extract 60-d probability marginal
-            v = torch.zeros(60, dtype=torch.float32)
+            probs_60 = np.zeros(60, dtype=np.float32)
             probs = F.softmax(logits[0, t, :], dim=-1).cpu().numpy()
-            for m in VALID_MOVES:
+            for k, m in enumerate(VALID_MOVES):
                 tok = int(pos_to_token[m])
                 if tok >= 0:
-                    v[VALID_MOVES.index(m)] = probs[tok]
+                    probs_60[k] = float(probs[tok])
 
             # Renormalize (probability might not sum to 1 over just the 60 cells)
-            total = float(v.sum())
-            probs_60 = v.numpy() / max(total, 1e-9)
+            total = float(probs_60.sum())
+            probs_60 = probs_60 / max(total, 1e-9)
 
             # Track P(C), rank of C, C's legality, P(illegal)
             C_idx60 = VALID_MOVES.index(C)
