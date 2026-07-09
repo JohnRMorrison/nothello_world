@@ -63,7 +63,7 @@ def probe_logits_at_cell(hidden_512, turn, probe, cell):
     W = probe[mode]  # (512, 8, 8, 3)
     r, c = cell // 8, cell % 8
     h = torch.from_numpy(hidden_512).float()
-    return torch.einsum('d,do->o', h, W[:, r, c, :]).numpy()
+    return torch.einsum('d,do->o', h, W[:, r, c, :]).detach().numpy()
 
 
 def probe_argmax_state(hidden_512, turn, probe):
@@ -72,7 +72,7 @@ def probe_argmax_state(hidden_512, turn, probe):
     W = probe[mode]
     h = torch.from_numpy(hidden_512).float()
     logits = torch.einsum('d,drco->rco', h, W)  # (8, 8, 3)
-    cls = logits.argmax(dim=-1).numpy()
+    cls = logits.argmax(dim=-1).detach().numpy()
     st = np.zeros((8, 8), dtype=np.int8)
     st[cls == 1] = -1
     st[cls == 2] = 1
