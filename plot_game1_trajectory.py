@@ -96,7 +96,7 @@ def main():
                     default='mechanistic_interpretability/main_linear_probe.pth')
     ap.add_argument('--layer', type=int, default=6)
     ap.add_argument('--game-index', type=int, default=0)
-    ap.add_argument('--start-turn', type=int, default=12)
+    ap.add_argument('--start-turn', type=int, default=0)
     ap.add_argument('--end-turn', type=int, default=-1,
                     help='-1 = the error turn T.')
     ap.add_argument('--margin-cell', type=str, default='f2')
@@ -186,14 +186,15 @@ def main():
     lines.append("=" * 68)
     lines.append(f"Game {args.game_index + 1}: C = {alg(C)}, error turn T = {T}")
     lines.append("=" * 68)
-    lines.append("  turn |   P(C)   |  probe-error cells (any)")
+    lines.append("  turn |   P(C)   | C status  |  probe-error cells (any)")
     lines.append("  " + "-" * 62)
     for t in range(args.start_turn, end_turn + 1):
         if not per_turn[t]['is_c_parity']:
             continue
         err_str = ",".join(alg(k) for k in per_turn[t]['err_cells']) \
                     if per_turn[t]['err_cells'] else '-'
-        lines.append(f"   {t:>3d} | {per_turn[t]['p_C']:7.4f}  |  {err_str}")
+        c_status = 'ILLEGAL' if per_turn[t]['C_illegal'] else 'LEGAL  '
+        lines.append(f"   {t:>3d} | {per_turn[t]['p_C']:7.4f}  | {c_status}   |  {err_str}")
 
     tbl_path = f"{args.out_prefix}_table.txt"
     os.makedirs(os.path.dirname(tbl_path) or '.', exist_ok=True)
