@@ -160,19 +160,23 @@ def main():
 
     rng = np.random.RandomState(args.seed)
 
-    # Cache: control_game_idx -> layer-6 activations (block_size, 512)
+    # Cache only the activation at the specific turn we need, keyed by
+    # (control_game_idx, turn).  Full-game caching consumed several GB
+    # because most control games are sampled only once and each entry
+    # holds (block_size, 512) floats.
     act_cache = {}
 
-    def get_control_acts(ctrl_idx):
-        if ctrl_idx in act_cache:
-            return act_cache[ctrl_idx]
+    def get_control_act_at(ctrl_idx, turn):
+        key = (ctrl_idx, turn)
+        if key in act_cache:
+            return act_cache[key]
         g = val_games[ctrl_idx]
-        L = min(len(g), block_size)
+        L = min(turn + 1, block_size)
         tokens = tokenize_games([g[:L]], seq_len=block_size).to(device)
         with torch.no_grad():
             acts = extract_activations(model, tokens, args.layer)
-        arr = acts.cpu().numpy()[0]
-        act_cache[ctrl_idx] = arr
+        arr = acts.cpu().numpy()[0, turn].copy()   # (512,) only
+        act_cache[key] = arr
         return arr
 
     csv_rows = [['adv_game_id', 'control_game_id', 'turn', 'C',
@@ -211,9 +215,9 @@ def main():
                 continue
             state = np.asarray(board.state, dtype=np.int8)
 
-            acts_np = get_control_acts(ctrl_idx)
+            act = get_control_act_at(ctrl_idx, t_bias)
             min_m, mean_m = compute_ray_min_and_mean(
-                acts_np[t_bias], t_bias, probe, C, state)
+                act, t_bias, probe, C, state)
             csv_rows.append([adv_game_id, ctrl_idx, t_bias, C,
                               f"{min_m:.4f}", f"{mean_m:.4f}"])
             control_min_margins.append(min_m)
