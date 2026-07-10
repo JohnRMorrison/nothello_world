@@ -7,6 +7,7 @@
 #SBATCH --cpus-per-task=2
 #SBATCH --gres=gpu:1
 #SBATCH --partition=nklab,burst
+#SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
 echo "Started at: $(date)"
 
