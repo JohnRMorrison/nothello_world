@@ -45,6 +45,9 @@ def main():
     ap.add_argument('--turn', type=int, default=-1,
                     help='-1 = the error turn T.')
     ap.add_argument('--k', type=int, default=10)
+    ap.add_argument('--all-in-order', action='store_true',
+                    help='Print all 60 cells in the model output-node order '
+                         '(1..60, following the vocab token ordering).')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -90,11 +93,33 @@ def main():
         board.umpire(game[t])
     legal_set = set(board.get_valid_moves())
 
-    # Rank cells
-    order = np.argsort(-probs_60)
     print(f"Game {args.game_index + 1}: error turn T = {T}, illegal C = {alg(C)}")
     print(f"Distribution at turn {turn} (after {turn + 1} moves played)")
     print()
+
+    if args.all_in_order:
+        # Order by the model's output-vocab token index (1..60 following the
+        # order the model actually emits).  Each token corresponds to a board
+        # cell; probs_60 is indexed by VALID_MOVES; we reorder by the token
+        # each cell maps to.
+        order = sorted(range(60),
+                        key=lambda i: int(pos_to_token[VALID_MOVES[i]]))
+        print(f"  idx | cell |    P     | legal on actual")
+        print(f"  ----+------+----------+-----------------")
+        for out_i, idx60 in enumerate(order):
+            cell = VALID_MOVES[idx60]
+            p = float(probs_60[idx60])
+            is_legal = cell in legal_set
+            is_C = (cell == C)
+            marker = ' <- C' if is_C else ''
+            print(f"  {out_i + 1:>3} | {alg(cell):>4} | {p * 100:7.4f}% | "
+                  f"{'LEGAL' if is_legal else 'ILLEGAL'}{marker}")
+        print()
+        print(f"  Sum: {probs_60.sum() * 100:.2f}%")
+        return
+
+    # Ranked (top-K) view
+    order = np.argsort(-probs_60)
     print(f"  rank | cell |  P    | legal on actual")
     print(f"  -----+------+-------+-----------------")
     for r in range(args.k):
