@@ -20,6 +20,7 @@ import sys
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 sys.path.insert(0, '.')
 from data.othello import OthelloBoardState
@@ -40,30 +41,29 @@ def load_mlp(mlp_ckpt_path, hidden, device):
     n_patterns = ckpt.get('n_patterns', 960)
     me = DirectMLP(input_dim, hidden, n_patterns)
     mo = DirectMLP(input_dim, hidden, n_patterns)
-    me.load_state_dict(ckpt['me'])
-    mo.load_state_dict(ckpt['mo'])
+    me.load_state_dict(ckpt['even'])
+    mo.load_state_dict(ckpt['odd'])
     me.to(device).eval()
     mo.to(device).eval()
     return me, mo, input_dim, n_patterns
 
 
-def cell_scores_from_mlp(me, mo, feats, device):
-    """Feats: (1, 120).  Returns (60,) tensor of cell scores."""
+def cell_scores_from_mlp(me, mo, feats, k, device):
+    """feats: (1, 120).  k = number of moves played so far.  Returns (60,)."""
     idx, mask = _get_cell_pat_index()
     idx = idx.to(device)
     mask = mask.to(device)
+    # Parity routing: use `me` (even model) when k is odd, matching the
+    # val-game convention used in experiment1_adversarial_rate_mlp.py.
     with torch.no_grad():
-        logits_e = me(feats)                              # (1, 960)
-        logits_o = mo(feats)
-        # prob_or aggregation across 16 patterns per cell
-        logits = 0.5 * (logits_e + logits_o)
-        # From batch_cell_scores in experiment1_adversarial_rate_mlp.py:
-        gathered = torch.gather(
-            (-torch.nn.functional.logsigmoid(logits)).unsqueeze(0),
-            2, idx.unsqueeze(0).expand(1, 60, 16),
-        )                                                  # (1, 60, 16)
-        gathered = gathered * mask.unsqueeze(0)
-        cell_scores = -gathered.sum(dim=-1).squeeze(0)     # (60,)
+        if k % 2 == 1:
+            logits = me(feats)                            # (1, 960)
+        else:
+            logits = mo(feats)
+        log1m = -F.softplus(logits)                       # (1, 960)
+        gathered = log1m[:, idx]                          # (1, 60, 16)
+        gathered = gathered.masked_fill(~mask[None], 0.0)
+        cell_scores = -gathered.sum(dim=-1).squeeze(0)    # (60,)
     return cell_scores
 
 
@@ -99,7 +99,8 @@ def main():
     legal_set = set(board.get_valid_moves())
 
     feats = played_even_features(game[:turn + 1]).unsqueeze(0).to(device)
-    scores_60 = cell_scores_from_mlp(me, mo, feats, device).cpu().numpy()
+    k = turn + 1
+    scores_60 = cell_scores_from_mlp(me, mo, feats, k, device).cpu().numpy()
     probs_60 = 1.0 - np.exp(-scores_60.clip(min=0))
 
     print(f"Game {args.game_index + 1}: error turn T = {T}, illegal C = {alg(C)}")
