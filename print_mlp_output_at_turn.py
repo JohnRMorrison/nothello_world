@@ -26,6 +26,7 @@ sys.path.insert(0, '.')
 from data.othello import OthelloBoardState
 from train_pattern_simple import DirectMLP, _get_cell_pat_index
 from compare_v4_vs_mlp import played_even_features, C64_TO_C60
+from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
 
 
 MOVABLE_64 = sorted(C64_TO_C60.keys())      # 60 board cells in cell-index order
@@ -50,7 +51,12 @@ def load_mlp(mlp_ckpt_path, hidden, device):
 
 def cell_scores_from_mlp(me, mo, feats, k, device):
     """feats: (1, 120).  k = number of moves played so far.  Returns (60,)."""
-    idx, mask = _get_cell_pat_index()
+    patterns = enumerate_flanking_patterns()
+    pattern_to_cell = torch.tensor(
+        [MOVE_TO_IDX[p['target']] for p in patterns],
+        dtype=torch.long, device=device,
+    )
+    idx, mask = _get_cell_pat_index(pattern_to_cell, 60)
     idx = idx.to(device)
     mask = mask.to(device)
     # Parity routing: use `me` (even model) when k is odd, matching the
