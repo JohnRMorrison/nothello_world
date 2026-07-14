@@ -87,7 +87,7 @@ def _paired_box(ax, before, after, before_label, after_label,
                  y_label, title, log_y=False, med_fmt='{:.3f}'):
     bp = ax.boxplot(
         [before, after],
-        tick_labels=[before_label, after_label],
+        labels=[before_label, after_label],
         widths=0.4,
         whis=(10, 90),
         showfliers=False,
