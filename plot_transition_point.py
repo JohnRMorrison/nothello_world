@@ -19,9 +19,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 
-def load_csv(path):
+def load_csv(path, min_episode_len=1):
+    """Load transition CSV.  If min_episode_len > 1, filter rows to
+    positions whose final-illegal-episode length (in same-parity turns)
+    is at least min_episode_len.  Episode length = (T - t_transition) / 2 + 1."""
     P_L, P_I, Bm_L, Bm_I, Bl_L, Bl_I = [], [], [], [], [], []
-    Bl_crit_L, Bl_crit_I = [], []   # critical-cell loss (may be empty)
+    Bl_crit_L, Bl_crit_I = [], []
     with open(path) as f:
         f.readline()
         for line in f:
@@ -29,6 +32,11 @@ def load_csv(path):
             if len(parts) < 11:
                 continue
             try:
+                T = int(parts[1])
+                t_transition = int(parts[4])
+                ep_len = (T - t_transition) // 2 + 1
+                if ep_len < min_episode_len:
+                    continue
                 P_L.append(float(parts[5]))
                 P_I.append(float(parts[6]))
                 Bm_L.append(float(parts[7]))
@@ -223,12 +231,20 @@ def main():
                     default='all')
     ap.add_argument('--metric', choices=['loss', 'margin'], default='loss',
                     help='B metric: CE loss (default) or -logit margin.')
+    ap.add_argument('--min-episode-len', type=int, default=1,
+                    help='Filter to positions whose final illegal episode '
+                         'is at least this many same-parity turns long. '
+                         'Default 1 = no filtering.  Use 2 for '
+                         'confidence_crit to remove the t_I = T positions '
+                         'where the critical cell is flipped by construction.')
     args = ap.parse_args()
 
     (P_L, P_I, Bm_L, Bm_I, Bl_L, Bl_I,
-     Bl_crit_L, Bl_crit_I) = load_csv(args.csv)
+     Bl_crit_L, Bl_crit_I) = load_csv(args.csv,
+                                         min_episode_len=args.min_episode_len)
     print(f"Loaded {len(P_L)} rows from {args.csv}  "
-          f"(critical-cell subset: {len(Bl_crit_I)})")
+          f"(critical-cell subset: {len(Bl_crit_I)}, "
+          f"min_episode_len={args.min_episode_len})")
     if len(P_L) == 0:
         print("No data.")
         return
