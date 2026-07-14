@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 
 def load_csv(path):
     P_L, P_I, Bm_L, Bm_I, Bl_L, Bl_I = [], [], [], [], [], []
+    Bl_crit_L, Bl_crit_I = [], []   # critical-cell loss (may be empty)
     with open(path) as f:
         f.readline()
         for line in f:
@@ -36,9 +37,17 @@ def load_csv(path):
                 Bl_I.append(float(parts[10]))
             except ValueError:
                 continue
+            # Critical-cell columns (may be blank if no critical cell)
+            if len(parts) >= 16 and parts[14].strip() and parts[15].strip():
+                try:
+                    Bl_crit_L.append(float(parts[14]))
+                    Bl_crit_I.append(float(parts[15]))
+                except ValueError:
+                    pass
     return (np.array(P_L), np.array(P_I),
             np.array(Bm_L), np.array(Bm_I),
-            np.array(Bl_L), np.array(Bl_I))
+            np.array(Bl_L), np.array(Bl_I),
+            np.array(Bl_crit_L), np.array(Bl_crit_I))
 
 
 COLOR_L = '#a6cee3'   # last-legal (before)
@@ -46,9 +55,13 @@ COLOR_I = '#fb9a99'   # first-illegal (after)
 COLOR_MED = '#d1341a'
 
 
-def plot_confidence(B_loss_I, out_path):
-    """Analog of the persistence plot for board corruption: histogram of
-    the probe's mean p(true class) over C's ray cells at t_I."""
+def plot_confidence(B_loss_I, out_path, kind='ray'):
+    """Histogram of the probe's p(true class) at t_I.
+
+    kind='ray': mean over C's 8-ray cells
+    kind='crit': the critical cell (min-margin at T among flank-breaking
+                 errors)
+    """
     p_true = np.exp(-B_loss_I)
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bins = np.linspace(0, 1, 41)
@@ -56,11 +69,17 @@ def plot_confidence(B_loss_I, out_path):
         p_true, bins=bins, color='#1f77b4', edgecolor='white',
         weights=100 * np.ones_like(p_true) / len(p_true),
     )
-    ax.set_xlabel("probe's mean p(true class) on C's ray cells\n"
-                   'at the first illegal turn')
+    if kind == 'crit':
+        ax.set_xlabel("probe's p(true class) at the critical cell\n"
+                       "at the first illegal turn")
+        ax.set_title('How confident does the probe remain\n'
+                      'about the critical cell around C?')
+    else:
+        ax.set_xlabel("probe's mean p(true class) on C's ray cells\n"
+                       'at the first illegal turn')
+        ax.set_title('How confident does the probe remain\n'
+                      'about the true state of ray cells around C?')
     ax.set_ylabel('% of adversarial positions')
-    ax.set_title('How confident does the probe remain\n'
-                  'about the true state of ray cells around C?')
     ax.set_xlim(0, 1)
     ax.grid(True, alpha=0.3, axis='y')
     fig.tight_layout()
@@ -199,14 +218,17 @@ def main():
     ap.add_argument('--csv', default='transition.csv')
     ap.add_argument('--out-prefix', default='plots/transition')
     ap.add_argument('--kind', choices=['persistence', 'confidence',
+                                         'confidence_crit',
                                          'absolute', 'change', 'all'],
                     default='all')
     ap.add_argument('--metric', choices=['loss', 'margin'], default='loss',
                     help='B metric: CE loss (default) or -logit margin.')
     args = ap.parse_args()
 
-    P_L, P_I, Bm_L, Bm_I, Bl_L, Bl_I = load_csv(args.csv)
-    print(f"Loaded {len(P_L)} rows from {args.csv}")
+    (P_L, P_I, Bm_L, Bm_I, Bl_L, Bl_I,
+     Bl_crit_L, Bl_crit_I) = load_csv(args.csv)
+    print(f"Loaded {len(P_L)} rows from {args.csv}  "
+          f"(critical-cell subset: {len(Bl_crit_I)})")
     if len(P_L) == 0:
         print("No data.")
         return
@@ -218,15 +240,21 @@ def main():
         B_L, B_I = Bm_L, Bm_I
         B_label = "mean −logit margin on C's ray cells"
 
-    kinds = (['persistence', 'confidence', 'absolute', 'change']
+    kinds = (['persistence', 'confidence', 'confidence_crit',
+              'absolute', 'change']
              if args.kind == 'all' else [args.kind])
     for k in kinds:
         out = f"{args.out_prefix}_{k}.png"
         if k == 'persistence':
             plot_persistence(P_L, P_I, out)
         elif k == 'confidence':
-            # Always use loss for confidence (need p(true))
-            plot_confidence(Bl_I, out)
+            plot_confidence(Bl_I, out, kind='ray')
+        elif k == 'confidence_crit':
+            if len(Bl_crit_I) == 0:
+                print(f"[skip] {k}: no critical-cell columns in CSV "
+                      f"(re-run experiment_transition_point.py)")
+                continue
+            plot_confidence(Bl_crit_I, out, kind='crit')
         elif k == 'absolute':
             plot_absolute(P_L, P_I, B_L, B_I, B_label, out)
         elif k == 'change':

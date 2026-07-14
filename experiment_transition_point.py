@@ -41,6 +41,7 @@ from probe_state_pred_for_othello import (
 )
 from experiment_probe_causal_analysis import (
     next_hand_color_at_turn, DIRS, ray_cells_in_direction,
+    flank_providing_directions, critical_errors_for_direction,
 )
 
 
@@ -85,6 +86,23 @@ def compute_ray_corruption(hidden_512, turn, probe, C, state, ray_cells):
         margins.append(float(lg[gt_cls] - max(other)))
         losses.append(float(-np.log(p[gt_cls] + 1e-12)))
     return -float(np.mean(margins)), float(np.mean(losses))
+
+
+def compute_single_cell_corruption(hidden_512, turn, probe, cell, state):
+    """Return (-margin, CE loss) at a specific cell."""
+    mode = 0 if turn % 2 == 1 else 1
+    W = probe[mode]
+    r_, c_ = cell // 8, cell % 8
+    h = torch.from_numpy(hidden_512).float()
+    lg = torch.einsum('d,do->o', h, W[:, r_, c_, :]).detach().cpu().numpy()
+    gt_cls = gt_probe_class(state, cell)
+    s = lg - lg.max()
+    exp_s = np.exp(s)
+    p = exp_s / exp_s.sum()
+    other = [lg[j] for j in range(3) if j != gt_cls]
+    margin = float(lg[gt_cls] - max(other))
+    loss = float(-np.log(p[gt_cls] + 1e-12))
+    return -margin, loss
 
 
 def process_position(game, T, C, model, probe, layer, block_size,
@@ -150,11 +168,51 @@ def process_position(game, T, C, model, probe, layer, block_size,
         acts_np[t_transition], t_transition, probe, C,
         state_at[t_transition], ray_cells)
 
+    # Critical cell: the min-margin cell at T among cells that break the
+    # hallucinated flank when reverted.  May not exist for all positions.
+    color_next = next_hand_color_at_turn(T)
+    mode_T = 0 if T % 2 == 1 else 1
+    hT = torch.from_numpy(acts_np[T]).float()
+    logits_T = torch.einsum('d,drco->rco', hT, probe[mode_T]).detach().cpu().numpy()
+    cls_T = logits_T.argmax(axis=-1)
+    probe_state_T = np.zeros((8, 8), dtype=np.int8)
+    probe_state_T[cls_T == 1] = -1
+    probe_state_T[cls_T == 2] = 1
+    flank_dirs = flank_providing_directions(probe_state_T, C, color_next)
+    crit_set = set()
+    for dr in flank_dirs:
+        crit_set.update(critical_errors_for_direction(
+            probe_state_T, state_at[T], C, dr, color_next))
+
+    critical_cell = None
+    crit_margin_L = crit_loss_L = None
+    crit_margin_I = crit_loss_I = None
+    if crit_set:
+        worst_m, worst = np.inf, None
+        for k in crit_set:
+            r_, c_ = k // 8, k % 8
+            lg = logits_T[r_, c_]
+            gt = gt_probe_class(state_at[T], k)
+            other = [lg[j] for j in range(3) if j != gt]
+            m = float(lg[gt] - max(other))
+            if m < worst_m:
+                worst_m = m
+                worst = int(k)
+        critical_cell = worst
+        crit_margin_L, crit_loss_L = compute_single_cell_corruption(
+            acts_np[t_L], t_L, probe, critical_cell, state_at[t_L])
+        crit_margin_I, crit_loss_I = compute_single_cell_corruption(
+            acts_np[t_transition], t_transition, probe, critical_cell,
+            state_at[t_transition])
+
     return {
         't_L': t_L, 't_transition': t_transition,
         'P_L': P_L, 'P_I': P_I,
         'B_margin_L': B_margin_L, 'B_margin_I': B_margin_I,
         'B_loss_L': B_loss_L, 'B_loss_I': B_loss_I,
+        'critical_cell': critical_cell,
+        'B_margin_crit_L': crit_margin_L, 'B_margin_crit_I': crit_margin_I,
+        'B_loss_crit_L': crit_loss_L,     'B_loss_crit_I': crit_loss_I,
     }
 
 
@@ -195,7 +253,10 @@ def main():
 
     header = ['idx', 'T', 'C', 't_L', 't_transition',
                'P_L', 'P_I', 'B_margin_L', 'B_margin_I',
-               'B_loss_L', 'B_loss_I']
+               'B_loss_L', 'B_loss_I',
+               'critical_cell',
+               'B_margin_crit_L', 'B_margin_crit_I',
+               'B_loss_crit_L', 'B_loss_crit_I']
     csv_rows = [header]
     skipped = 0
 
@@ -207,11 +268,16 @@ def main():
         if res is None:
             skipped += 1
             continue
+        def _f(x, w=4):
+            return f"{x:.{w}f}" if x is not None else ''
         csv_rows.append([
             i, T, C, res['t_L'], res['t_transition'],
             f"{res['P_L']:.6f}", f"{res['P_I']:.6f}",
             f"{res['B_margin_L']:.4f}", f"{res['B_margin_I']:.4f}",
             f"{res['B_loss_L']:.4f}", f"{res['B_loss_I']:.4f}",
+            res['critical_cell'] if res['critical_cell'] is not None else '',
+            _f(res['B_margin_crit_L']), _f(res['B_margin_crit_I']),
+            _f(res['B_loss_crit_L']),   _f(res['B_loss_crit_I']),
         ])
         if (i + 1) % 500 == 0:
             elapsed = time.time() - t0
