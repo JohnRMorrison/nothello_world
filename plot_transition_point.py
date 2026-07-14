@@ -48,33 +48,18 @@ COLOR_MED = '#d1341a'
 
 def plot_persistence(P_L, P_I, out_path):
     ratio = P_I / np.maximum(P_L, 1e-12)
-    ratio = np.clip(ratio, 0, 1.5)   # cap tail; annotate the overflow
+    ratio = np.clip(ratio, 0, 1.5)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bins = np.linspace(0, 1.5, 31)
-    counts, edges, _ = ax.hist(
+    ax.hist(
         ratio, bins=bins, color='#1f77b4', edgecolor='white',
         weights=100 * np.ones_like(ratio) / len(ratio),
     )
-    ax.axvline(1.0, color='#333333', linestyle='--', linewidth=1,
-               label='no drop (P_I = P_L)')
-    ax.axvline(0.5, color=COLOR_MED, linestyle=':', linewidth=1.5,
-               label='>½ retained')
-    m = float(np.median(ratio))
-    ax.axvline(m, color='black', linewidth=1.5)
-    frac_half = float((P_I / np.maximum(P_L, 1e-12) > 0.5).mean())
     ax.set_xlabel('persistence: P(C, first illegal) / P(C, last legal)')
     ax.set_ylabel('% of adversarial positions')
     ax.set_title('How much probability does OGPT retain\n'
                   'when C flips from legal to illegal?')
-    ax.text(0.02, 0.95,
-            f'n = {len(ratio):,}\n'
-            f'median = {m:.2f}\n'
-            f'>½ retained: {frac_half*100:.1f}%',
-            transform=ax.transAxes, va='top',
-            bbox=dict(boxstyle='round,pad=0.4', fc='white',
-                      ec='#333333', alpha=0.9))
-    ax.legend(loc='upper right', fontsize=9)
     ax.grid(True, alpha=0.3, axis='y')
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
