@@ -56,6 +56,25 @@ VALID_MOVES = [i for i in range(64) if i not in CENTER_CELLS]
 LAGS = list(range(-3, 4))
 METRICS = ['margin_crit', 'margin_mean', 'loss_crit', 'loss_mean']
 SLICES = ['all', 'ill']
+CORR_METHODS = ['pearson', 'spearman']
+
+
+def rankdata(arr):
+    """Average-rank of `arr` (ties -> mean of tied ranks).  scipy-free."""
+    a = np.asarray(arr, dtype=np.float64)
+    n = len(a)
+    order = a.argsort()
+    ranks = np.empty(n)
+    i = 0
+    while i < n:
+        j = i
+        while j < n and a[order[j]] == a[order[i]]:
+            j += 1
+        avg_rank = 0.5 * (i + j - 1)
+        for k in range(i, j):
+            ranks[order[k]] = avg_rank
+        i = j
+    return ranks
 
 
 def build_pos_to_token(block_size):
@@ -124,11 +143,12 @@ def compute_probe_metrics(hidden_512, turn, probe, C, state,
     return out
 
 
-def lag_correlations(x, y, lags):
-    """Return {lag -> Pearson rho} for shifting y by lag turns.
+def lag_correlations(x, y, lags, method='pearson'):
+    """Return {lag -> rho} for shifting y by lag turns.
 
     Positive lag: pair x[t] with y[t+lag] (y in the future).
     Negative lag: pair x[t] with y[t+lag] (y in the past).
+    method: 'pearson' or 'spearman' (rank-based, robust to scale).
     """
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -141,10 +161,17 @@ def lag_correlations(x, y, lags):
         else:
             xs = x[-lag:]
             ys = y[: n + lag]
-        # NaN filter (a metric might be undefined at some turns)
         m = np.isfinite(xs) & np.isfinite(ys)
         if m.sum() < 3 or np.std(xs[m]) == 0 or np.std(ys[m]) == 0:
             out[lag] = np.nan
+            continue
+        if method == 'spearman':
+            xr = rankdata(xs[m])
+            yr = rankdata(ys[m])
+            if np.std(xr) == 0 or np.std(yr) == 0:
+                out[lag] = np.nan
+            else:
+                out[lag] = float(np.corrcoef(xr, yr)[0, 1])
         else:
             out[lag] = float(np.corrcoef(xs[m], ys[m])[0, 1])
     return out
@@ -250,12 +277,12 @@ def process_position(game, T, C, model, probe, layer, block_size,
         p_slice = p_series[mask]
         for m in METRICS:
             y = np.array(metric_series[m], dtype=np.float64)[mask]
-            if len(p_slice) < 5:
-                # too short for reliable lag correlations
-                result[(slice_name, m)] = {lag: np.nan for lag in LAGS}
-            else:
-                result[(slice_name, m)] = lag_correlations(
-                    p_slice, y, LAGS)
+            for method in CORR_METHODS:
+                if len(p_slice) < 5:
+                    result[(slice_name, m, method)] = {lag: np.nan for lag in LAGS}
+                else:
+                    result[(slice_name, m, method)] = lag_correlations(
+                        p_slice, y, LAGS, method=method)
     return result
 
 
@@ -293,12 +320,15 @@ def main():
     header = ['idx', 'T', 'C', 'critical_cell', 'n_all', 'n_ill']
     for slice_name in SLICES:
         for m in METRICS:
-            for lag in LAGS:
-                header.append(f"{slice_name}_{m}_lag{lag:+d}")
+            for method in CORR_METHODS:
+                for lag in LAGS:
+                    header.append(f"{slice_name}_{m}_{method}_lag{lag:+d}")
     csv_rows = [header]
 
     # Accumulators for aggregation
-    all_rhos = {(sl, m, lag): [] for sl in SLICES for m in METRICS for lag in LAGS}
+    all_rhos = {(sl, m, method, lag): []
+                for sl in SLICES for m in METRICS
+                for method in CORR_METHODS for lag in LAGS}
 
     t0 = time.time()
     for i in range(N):
@@ -314,11 +344,12 @@ def main():
                      res['n_all'], res['n_ill']])
         for sl in SLICES:
             for m in METRICS:
-                for lag in LAGS:
-                    v = res[(sl, m)][lag]
-                    row.append(f"{v:.4f}" if np.isfinite(v) else '')
-                    if np.isfinite(v):
-                        all_rhos[(sl, m, lag)].append(v)
+                for method in CORR_METHODS:
+                    for lag in LAGS:
+                        v = res[(sl, m, method)][lag]
+                        row.append(f"{v:.4f}" if np.isfinite(v) else '')
+                        if np.isfinite(v):
+                            all_rhos[(sl, m, method, lag)].append(v)
         csv_rows.append(row)
 
         if (i + 1) % 500 == 0:
@@ -335,41 +366,36 @@ def main():
     lines = [f"Adversarial positions processed: {N}", ""]
     for sl in SLICES:
         for m in METRICS:
-            lines.append(f"=== slice={sl}  metric={m} ===")
-            arr_by_lag = {lag: np.array(all_rhos[(sl, m, lag)]) for lag in LAGS}
-            n = len(arr_by_lag[0])
-            lines.append(f"  n positions with defined rho: {n}")
-            if n == 0:
-                lines.append("  (no data)"); lines.append(""); continue
-            lines.append(f"  Lag |  median rho  |   IQR (p25..p75)")
-            for lag in LAGS:
-                a = arr_by_lag[lag]
-                if len(a) < 2:
-                    lines.append(f"   {lag:+d} |  (insufficient)")
-                    continue
-                lines.append(f"   {lag:+d} |  {np.median(a):+7.4f}   |  "
-                              f"{np.percentile(a, 25):+7.4f} .. "
-                              f"{np.percentile(a, 75):+7.4f}")
-            # Asymmetry: median per-position of rho(+1) - rho(-1)
-            pos_ids = [i for i in range(len(all_rhos[(sl, m, 1)]))
-                       if i < len(all_rhos[(sl, m, -1)])]
-            # Align the two lag arrays (same order of positions since
-            # both use the same filtering path)
-            r_plus  = np.array(all_rhos[(sl, m, 1)])
-            r_minus = np.array(all_rhos[(sl, m, -1)])
-            # Restrict to overlapping length (they should be the same)
-            L_ = min(len(r_plus), len(r_minus))
-            if L_ >= 2:
-                diffs = r_plus[:L_] - r_minus[:L_]
-                lines.append(f"  Asymmetry S = median [rho(+1) - rho(-1)]: "
-                              f"{np.median(diffs):+7.4f}   "
-                              f"(mean {diffs.mean():+.4f}, "
-                              f"IQR {np.percentile(diffs, 25):+.4f} .. "
-                              f"{np.percentile(diffs, 75):+.4f})")
-                lines.append(f"  S > 0 => bias-first (P(C) predicts future "
-                              f"corruption)")
-                lines.append(f"  S < 0 => corruption-first")
-            lines.append("")
+            for method in CORR_METHODS:
+                lines.append(f"=== slice={sl}  metric={m}  corr={method} ===")
+                arr_by_lag = {lag: np.array(all_rhos[(sl, m, method, lag)])
+                              for lag in LAGS}
+                n = len(arr_by_lag[0])
+                lines.append(f"  n positions with defined rho: {n}")
+                if n == 0:
+                    lines.append("  (no data)"); lines.append(""); continue
+                lines.append(f"  Lag |  median rho  |   IQR (p25..p75)")
+                for lag in LAGS:
+                    a = arr_by_lag[lag]
+                    if len(a) < 2:
+                        lines.append(f"   {lag:+d} |  (insufficient)")
+                        continue
+                    lines.append(f"   {lag:+d} |  {np.median(a):+7.4f}   |  "
+                                  f"{np.percentile(a, 25):+7.4f} .. "
+                                  f"{np.percentile(a, 75):+7.4f}")
+                r_plus  = np.array(all_rhos[(sl, m, method, 1)])
+                r_minus = np.array(all_rhos[(sl, m, method, -1)])
+                L_ = min(len(r_plus), len(r_minus))
+                if L_ >= 2:
+                    diffs = r_plus[:L_] - r_minus[:L_]
+                    lines.append(f"  Asymmetry S = median [rho(+1) - rho(-1)]: "
+                                  f"{np.median(diffs):+7.4f}   "
+                                  f"(mean {diffs.mean():+.4f}, "
+                                  f"IQR {np.percentile(diffs, 25):+.4f} .. "
+                                  f"{np.percentile(diffs, 75):+.4f})")
+                    lines.append(f"  S > 0 => bias-first")
+                    lines.append(f"  S < 0 => corruption-first")
+                lines.append("")
 
     with open(args.output_summary, 'w') as f:
         f.write("\n".join(lines))
