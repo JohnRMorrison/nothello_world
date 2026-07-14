@@ -46,6 +46,30 @@ COLOR_I = '#fb9a99'   # first-illegal (after)
 COLOR_MED = '#d1341a'
 
 
+def plot_confidence(B_loss_I, out_path):
+    """Analog of the persistence plot for board corruption: histogram of
+    the probe's mean p(true class) over C's ray cells at t_I."""
+    p_true = np.exp(-B_loss_I)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    bins = np.linspace(0, 1, 41)
+    ax.hist(
+        p_true, bins=bins, color='#1f77b4', edgecolor='white',
+        weights=100 * np.ones_like(p_true) / len(p_true),
+    )
+    ax.set_xlabel("probe's mean p(true class) on C's ray cells\n"
+                   'at the first illegal turn')
+    ax.set_ylabel('% of adversarial positions')
+    ax.set_title('How confident does the probe remain\n'
+                  'about the true state of ray cells around C?')
+    ax.set_xlim(0, 1)
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(out_path) or '.', exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Wrote {out_path}")
+
+
 def plot_persistence(P_L, P_I, out_path):
     ratio = P_I / np.maximum(P_L, 1e-12)
     ratio = np.clip(ratio, 0, 1.5)
@@ -174,8 +198,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--csv', default='transition.csv')
     ap.add_argument('--out-prefix', default='plots/transition')
-    ap.add_argument('--kind', choices=['persistence', 'absolute',
-                                         'change', 'all'],
+    ap.add_argument('--kind', choices=['persistence', 'confidence',
+                                         'absolute', 'change', 'all'],
                     default='all')
     ap.add_argument('--metric', choices=['loss', 'margin'], default='loss',
                     help='B metric: CE loss (default) or -logit margin.')
@@ -194,11 +218,15 @@ def main():
         B_L, B_I = Bm_L, Bm_I
         B_label = "mean −logit margin on C's ray cells"
 
-    kinds = ['persistence', 'absolute', 'change'] if args.kind == 'all' else [args.kind]
+    kinds = (['persistence', 'confidence', 'absolute', 'change']
+             if args.kind == 'all' else [args.kind])
     for k in kinds:
         out = f"{args.out_prefix}_{k}.png"
         if k == 'persistence':
             plot_persistence(P_L, P_I, out)
+        elif k == 'confidence':
+            # Always use loss for confidence (need p(true))
+            plot_confidence(Bl_I, out)
         elif k == 'absolute':
             plot_absolute(P_L, P_I, B_L, B_I, B_label, out)
         elif k == 'change':
