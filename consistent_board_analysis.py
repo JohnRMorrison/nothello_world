@@ -297,11 +297,16 @@ def main():
     per_cell_hits_w = np.zeros(64, dtype=np.int64)
     n_rows_uw = 0
     n_rows_w = 0
-    # Per-moveset "how overlapping are the probe's errors across the
-    # consistent boards" measured as the mean pairwise Jaccard of the
-    # error sets.  One scalar per moveset with n_distinct >= 2.
-    per_moveset_jaccard = []                # list of floats in [0, 1]
-    per_moveset_n_boards = []               # list of int (n_distinct per moveset)
+    # Per-moveset summary of "how overlapping are the probe's errors
+    # across the consistent boards".  For each moveset with n_distinct >= 2,
+    # we store several stats of the pairwise Jaccard distribution plus the
+    # multi-set Jaccard |intersection| / |union| over ALL M error sets.
+    per_moveset_jaccard = []                # mean pairwise Jaccard
+    per_moveset_jac_std = []                # stdev pairwise
+    per_moveset_jac_min = []                # min pairwise (worst pair)
+    per_moveset_jac_max = []                # max pairwise (best pair)
+    per_moveset_jac_multi = []              # multi-set Jaccard over all M
+    per_moveset_n_boards = []               # M
     with open(args.output_csv, 'w', newline='') as f_out:
         w = csv.writer(f_out)
         w.writerow([
@@ -350,26 +355,31 @@ def main():
                 probe_argmax = probe_logits.argmax(dim=-1).squeeze(0)   # (64,)
                 probe_argmax = probe_argmax.cpu().numpy()
 
-            # ---- Per-moveset: mean pairwise Jaccard of error sets ----
-            # For each of the n_distinct boards, error_i[k] = 1 iff probe
-            # is wrong at cell k on that board.  Mean pairwise Jaccard over
-            # all n_distinct*(n_distinct-1)/2 board pairs is a single
-            # scalar in [0, 1] summarizing how overlapping the errors are.
+            # ---- Per-moveset: how overlapping are the probe's error sets ----
+            # error_i[k] = 1 iff probe is wrong at cell k on board i.
             board_targets_all = np.stack([
                 board_state_target_from_state(s) for s, _, _ in boards.values()
             ])                                                              # (n_dist, 64)
             error_mat = (probe_argmax[None, :] != board_targets_all)        # bool (n_dist, 64)
             M = error_mat.shape[0]
             if M >= 2:
-                total_j, n_pairs = 0.0, 0
+                pair_vals = []
                 for i_ in range(M):
                     for j_ in range(i_ + 1, M):
                         inter = int((error_mat[i_] & error_mat[j_]).sum())
                         union = int((error_mat[i_] | error_mat[j_]).sum())
                         j_val = 1.0 if union == 0 else inter / union
-                        total_j += j_val
-                        n_pairs += 1
-                per_moveset_jaccard.append(total_j / n_pairs)
+                        pair_vals.append(j_val)
+                arr = np.asarray(pair_vals)
+                per_moveset_jaccard.append(float(arr.mean()))
+                per_moveset_jac_std.append(float(arr.std()))
+                per_moveset_jac_min.append(float(arr.min()))
+                per_moveset_jac_max.append(float(arr.max()))
+                # Multi-set Jaccard over ALL M error sets
+                all_and = np.all(error_mat, axis=0).sum()
+                all_or = np.any(error_mat, axis=0).sum()
+                per_moveset_jac_multi.append(
+                    1.0 if all_or == 0 else float(all_and) / float(all_or))
                 per_moveset_n_boards.append(M)
 
             for b_hash, (state, next_c, count) in boards.items():
@@ -410,6 +420,10 @@ def main():
                   n_uw=int(n_rows_uw),
                   n_w=int(n_rows_w),
                   moveset_jaccard=np.array(per_moveset_jaccard, dtype=np.float64),
+                  moveset_jac_std=np.array(per_moveset_jac_std, dtype=np.float64),
+                  moveset_jac_min=np.array(per_moveset_jac_min, dtype=np.float64),
+                  moveset_jac_max=np.array(per_moveset_jac_max, dtype=np.float64),
+                  moveset_jac_multi=np.array(per_moveset_jac_multi, dtype=np.float64),
                   moveset_n_boards=np.array(per_moveset_n_boards, dtype=np.int64),
                   k=args.k,
                   hidden_dim=int(hidden_dim),

@@ -35,33 +35,90 @@ def main():
     k = int(d['k']); H = int(d['hidden_dim']); N = int(d['N'])
     os.makedirs(os.path.dirname(args.out_prefix) or '.', exist_ok=True)
 
-    # ---- Figure 1: Jaccard histogram (the main analysis) ----
+    # ---- Figure 1: Jaccard histogram + mean-vs-stdev scatter + multi-set overlay ----
     if 'moveset_jaccard' in d.files:
-        jac = d['moveset_jaccard']
-        n_moves = len(jac)
-        print(f'Per-moveset Jaccard: n={n_moves}, '
-              f'mean={jac.mean():.4f}, median={np.median(jac):.4f}')
+        jac_mean = d['moveset_jaccard']
+        jac_std = d.get('moveset_jac_std', np.zeros_like(jac_mean))
+        jac_min = d.get('moveset_jac_min', jac_mean)
+        jac_max = d.get('moveset_jac_max', jac_mean)
+        jac_multi = d.get('moveset_jac_multi', np.array([]))
+        n_moves = len(jac_mean)
+        print(f'Per-moveset stats (n={n_moves}):')
+        print(f'  mean pairwise Jaccard:  mean={jac_mean.mean():.4f}  median={np.median(jac_mean):.4f}')
+        print(f'  stdev pairwise Jaccard: mean={jac_std.mean():.4f}  median={np.median(jac_std):.4f}')
+        print(f'  min pairwise Jaccard:   mean={jac_min.mean():.4f}  median={np.median(jac_min):.4f}')
+        print(f'  max pairwise Jaccard:   mean={jac_max.mean():.4f}  median={np.median(jac_max):.4f}')
+        if len(jac_multi) > 0:
+            print(f'  multi-set Jaccard:      mean={jac_multi.mean():.4f}  median={np.median(jac_multi):.4f}')
 
-        fig, ax = plt.subplots(figsize=(7, 4))
-        ax.hist(jac, bins=np.linspace(0, 1, 41), color='#1f77b4',
-                edgecolor='white')
-        ax.axvline(jac.mean(), color='#d1341a', linestyle='--', linewidth=1.5,
-                    label=f'mean {jac.mean():.3f}')
-        ax.axvline(np.median(jac), color='#333333', linestyle=':', linewidth=1.5,
-                    label=f'median {np.median(jac):.3f}')
-        ax.set_xlabel('mean pairwise Jaccard of probe error sets\n'
-                       '(across consistent boards, one value per moveset)')
+        # Figure: 1x3 grid — histogram of mean, histogram of stdev, mean vs stdev scatter
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        bins = np.linspace(0, 1, 41)
+
+        ax = axes[0]
+        ax.hist(jac_mean, bins=bins, color='#1f77b4', edgecolor='white',
+                label='mean pairwise')
+        if len(jac_multi) > 0:
+            ax.hist(jac_multi, bins=bins, color='#d1341a', edgecolor='white',
+                    alpha=0.55, label='multi-set (∩/∪)')
+        ax.axvline(jac_mean.mean(), color='#333333', linestyle=':', linewidth=1.2)
+        ax.set_xlabel('Jaccard')
         ax.set_ylabel('number of movesets')
-        ax.set_title(f'How overlapping are probe errors across consistent boards?\n'
-                      f'k={k}, H={H}, N={N}, movesets={n_moves}')
+        ax.set_title('Mean pairwise + multi-set Jaccard')
         ax.set_xlim(0, 1)
-        ax.legend()
+        ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
+
+        ax = axes[1]
+        ax.hist(jac_std, bins=np.linspace(0, jac_std.max() * 1.1 + 0.01, 41),
+                color='#2ca02c', edgecolor='white')
+        ax.set_xlabel('stdev of pairwise Jaccard within moveset')
+        ax.set_ylabel('number of movesets')
+        ax.set_title(f'Within-moveset variance\n(median stdev = {np.median(jac_std):.3f})')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        ax = axes[2]
+        ax.scatter(jac_mean, jac_std, s=14, c='#1f77b4', alpha=0.5,
+                    edgecolor='none')
+        ax.set_xlabel('mean pairwise Jaccard')
+        ax.set_ylabel('stdev pairwise Jaccard')
+        ax.set_title('Mean vs stdev per moveset')
+        ax.set_xlim(0, 1)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.3)
+
+        fig.suptitle(f'How overlapping are probe errors across consistent boards?  '
+                      f'k={k}, H={H}, movesets={n_moves}',
+                      fontsize=11, y=1.02)
         fig.tight_layout()
         p_jac = f'{args.out_prefix}_jaccard.png'
         fig.savefig(p_jac, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f'Wrote {p_jac}')
+
+        # Second figure: min / max pairwise (worst / best pair per moveset)
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+        for ax, arr, lbl, col in [
+            (axes[0], jac_min, 'min pairwise Jaccard (worst pair)', '#c65500'),
+            (axes[1], jac_max, 'max pairwise Jaccard (best pair)', '#177245'),
+        ]:
+            ax.hist(arr, bins=bins, color=col, edgecolor='white')
+            ax.axvline(arr.mean(), color='#333333', linestyle=':',
+                        linewidth=1.2, label=f'mean {arr.mean():.3f}')
+            ax.axvline(np.median(arr), color='#111111', linestyle='--',
+                        linewidth=1.2, label=f'median {np.median(arr):.3f}')
+            ax.set_xlabel(lbl)
+            ax.set_ylabel('number of movesets')
+            ax.set_xlim(0, 1)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+        fig.suptitle(f'Worst and best pair per moveset  '
+                      f'(k={k}, H={H}, movesets={n_moves})', fontsize=11, y=1.02)
+        fig.tight_layout()
+        p_mm = f'{args.out_prefix}_jaccard_minmax.png'
+        fig.savefig(p_mm, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Wrote {p_mm}')
     else:
         print('(no moveset_jaccard in NPZ)')
 
