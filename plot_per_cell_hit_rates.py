@@ -191,20 +191,13 @@ def main():
     # ---- Aux Figure: 8x8 heatmap of per-cell hit rates ----
     fig, ax = plt.subplots(figsize=(6, 5.5))
     grid = rate.reshape(8, 8).copy()
-    for c in CENTER_CELLS:
-        grid[c // 8, c % 8] = np.nan
     im = ax.imshow(grid, vmin=0, vmax=1, cmap='RdYlGn', origin='upper')
     for r in range(8):
         for c in range(8):
-            cell_i = r * 8 + c
-            if cell_i in CENTER_CELLS:
-                ax.text(c, r, '·', ha='center', va='center',
-                         fontsize=14, color='#333333')
-            else:
-                v = grid[r, c]
-                text_color = 'black' if 0.35 < v < 0.85 else 'white'
-                ax.text(c, r, f'{v:.2f}', ha='center', va='center',
-                         fontsize=8, color=text_color)
+            v = grid[r, c]
+            text_color = 'black' if 0.35 < v < 0.85 else 'white'
+            ax.text(c, r, f'{v:.2f}', ha='center', va='center',
+                     fontsize=8, color=text_color)
     ax.set_xticks(range(8))
     ax.set_yticks(range(8))
     ax.set_xticklabels(list('abcdefgh'))
