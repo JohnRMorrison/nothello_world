@@ -102,6 +102,9 @@ def main():
             'jac_mean': [], 'jac_std': [],
             'jac_min': [], 'jac_max': [],
             'jac_multi': [], 'n_boards': [],
+            # For each moveset, cell -> count of boards where probe wrong.
+            # Stored as (n_movesets, 64) after np.stack in the save block.
+            'per_cell_wrong_counts': [],
         }
 
     with open(args.output_csv, 'w', newline='') as f_out:
@@ -150,6 +153,9 @@ def main():
                 s['n_w'] += int(board_counts_arr.sum())
                 M = error_mat.shape[0]
                 if M >= 2:
+                    # per-cell "how many boards is probe wrong on" for this moveset
+                    s['per_cell_wrong_counts'].append(
+                        error_mat.sum(axis=0).astype(np.int64))
                     pair_vals = []
                     for i_ in range(M):
                         for j_ in range(i_ + 1, M):
@@ -196,6 +202,9 @@ def main():
     if args.per_cell_npz_prefix:
         for H, s in per_H_stats.items():
             outp = f'{args.per_cell_npz_prefix}_H{H}.npz'
+            wrong_counts = (np.stack(s['per_cell_wrong_counts'])
+                             if s['per_cell_wrong_counts']
+                             else np.zeros((0, 64), dtype=np.int64))
             np.savez(outp,
                       hits_uw=s['hits_uw'],
                       hits_w=s['hits_w'],
@@ -207,6 +216,7 @@ def main():
                       moveset_jac_max=np.array(s['jac_max'], dtype=np.float64),
                       moveset_jac_multi=np.array(s['jac_multi'], dtype=np.float64),
                       moveset_n_boards=np.array(s['n_boards'], dtype=np.int64),
+                      per_cell_wrong_counts=wrong_counts,
                       k=k, hidden_dim=int(H), N=1)
             print(f"  {outp}  "
                   f"(pooled n_uw={s['n_uw']}; movesets={len(s['jac_mean'])})")

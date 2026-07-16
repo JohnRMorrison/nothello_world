@@ -51,20 +51,45 @@ def main():
         if len(jac_multi) > 0:
             print(f'  multi-set Jaccard:      mean={jac_multi.mean():.4f}  median={np.median(jac_multi):.4f}')
 
-        # Figure: 1x3 grid — histogram of mean, histogram of stdev, mean vs stdev scatter
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        # ---- 1x3 figure: mean / min / max pairwise Jaccard, shared y-axis ----
         bins = np.linspace(0, 1, 41)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4), sharey=True)
+        panels = [
+            (axes[0], jac_mean, 'mean pairwise Jaccard', '#1f77b4'),
+            (axes[1], jac_min, 'min pairwise Jaccard (worst pair)', '#c65500'),
+            (axes[2], jac_max, 'max pairwise Jaccard (best pair)', '#177245'),
+        ]
+        for ax, arr, lbl, col in panels:
+            ax.hist(arr, bins=bins, color=col, edgecolor='white')
+            ax.axvline(arr.mean(), color='#333333', linestyle=':',
+                        linewidth=1.2, label=f'mean {arr.mean():.3f}')
+            ax.axvline(np.median(arr), color='#111111', linestyle='--',
+                        linewidth=1.2, label=f'median {np.median(arr):.3f}')
+            ax.set_xlabel(lbl)
+            ax.set_xlim(0, 1)
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+        axes[0].set_ylabel('number of movesets')
+        fig.suptitle(f'Jaccard of probe error sets across consistent boards\n'
+                      f'k={k}, H={H}, movesets={n_moves}',
+                      fontsize=11, y=1.02)
+        fig.tight_layout()
+        p_jac = f'{args.out_prefix}_jaccard.png'
+        fig.savefig(p_jac, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Wrote {p_jac}')
 
+        # ---- Supplementary: stdev + mean-vs-stdev scatter + multi-set overlay ----
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
         ax = axes[0]
         ax.hist(jac_mean, bins=bins, color='#1f77b4', edgecolor='white',
                 label='mean pairwise')
         if len(jac_multi) > 0:
             ax.hist(jac_multi, bins=bins, color='#d1341a', edgecolor='white',
                     alpha=0.55, label='multi-set (∩/∪)')
-        ax.axvline(jac_mean.mean(), color='#333333', linestyle=':', linewidth=1.2)
         ax.set_xlabel('Jaccard')
         ax.set_ylabel('number of movesets')
-        ax.set_title('Mean pairwise + multi-set Jaccard')
+        ax.set_title('Mean pairwise + multi-set overlay')
         ax.set_xlim(0, 1)
         ax.legend(fontsize=9)
         ax.grid(True, alpha=0.3, axis='y')
@@ -87,40 +112,51 @@ def main():
         ax.set_ylim(bottom=0)
         ax.grid(True, alpha=0.3)
 
-        fig.suptitle(f'How overlapping are probe errors across consistent boards?  '
-                      f'k={k}, H={H}, movesets={n_moves}',
-                      fontsize=11, y=1.02)
-        fig.tight_layout()
-        p_jac = f'{args.out_prefix}_jaccard.png'
-        fig.savefig(p_jac, dpi=200, bbox_inches='tight')
-        plt.close(fig)
-        print(f'Wrote {p_jac}')
-
-        # Second figure: min / max pairwise (worst / best pair per moveset)
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-        for ax, arr, lbl, col in [
-            (axes[0], jac_min, 'min pairwise Jaccard (worst pair)', '#c65500'),
-            (axes[1], jac_max, 'max pairwise Jaccard (best pair)', '#177245'),
-        ]:
-            ax.hist(arr, bins=bins, color=col, edgecolor='white')
-            ax.axvline(arr.mean(), color='#333333', linestyle=':',
-                        linewidth=1.2, label=f'mean {arr.mean():.3f}')
-            ax.axvline(np.median(arr), color='#111111', linestyle='--',
-                        linewidth=1.2, label=f'median {np.median(arr):.3f}')
-            ax.set_xlabel(lbl)
-            ax.set_ylabel('number of movesets')
-            ax.set_xlim(0, 1)
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3, axis='y')
-        fig.suptitle(f'Worst and best pair per moveset  '
+        fig.suptitle(f'Supplementary: variance decomposition  '
                       f'(k={k}, H={H}, movesets={n_moves})', fontsize=11, y=1.02)
         fig.tight_layout()
-        p_mm = f'{args.out_prefix}_jaccard_minmax.png'
-        fig.savefig(p_mm, dpi=200, bbox_inches='tight')
+        p_supp = f'{args.out_prefix}_jaccard_supp.png'
+        fig.savefig(p_supp, dpi=200, bbox_inches='tight')
         plt.close(fig)
-        print(f'Wrote {p_mm}')
+        print(f'Wrote {p_supp}')
     else:
         print('(no moveset_jaccard in NPZ)')
+
+    # ---- Per-moveset "how many cells are wrong on X+ boards" histograms ----
+    if 'per_cell_wrong_counts' in d.files:
+        wc = d['per_cell_wrong_counts']       # (n_movesets, 64) int
+        n_moves = wc.shape[0]
+        union_count = (wc > 0).sum(axis=1)    # cells wrong on >= 1 board
+        thr3_count  = (wc >= 3).sum(axis=1)   # cells wrong on >= 3 boards
+        panels = [
+            ('cells wrong on ≥ 1 board (union)', union_count, '#1f77b4'),
+            ('cells wrong on ≥ 3 boards', thr3_count, '#c65500'),
+        ]
+        # Shared x-range for comparability; use max seen so bins align
+        xmax = max(union_count.max(), thr3_count.max()) if n_moves > 0 else 1
+        bins = np.arange(0, xmax + 2)         # integer bins
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+        for ax, (label, arr, col) in zip(axes, panels):
+            ax.hist(arr, bins=bins, color=col, edgecolor='white', align='left')
+            ax.axvline(arr.mean(), color='#333333', linestyle=':',
+                        linewidth=1.2, label=f'mean {arr.mean():.2f}')
+            ax.axvline(np.median(arr), color='#111111', linestyle='--',
+                        linewidth=1.2, label=f'median {np.median(arr):.1f}')
+            ax.set_xlabel(f'number of squares — {label}')
+            ax.legend(fontsize=9)
+            ax.grid(True, alpha=0.3, axis='y')
+        axes[0].set_ylabel('number of movesets')
+        fig.suptitle(f'Wrong squares per moveset  '
+                      f'(k={k}, H={H}, movesets={n_moves})', fontsize=11, y=1.02)
+        fig.tight_layout()
+        p_wc = f'{args.out_prefix}_wrong_counts.png'
+        fig.savefig(p_wc, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Wrote {p_wc}')
+        print(f'  cells wrong on >=1 board:  mean={union_count.mean():.2f}  '
+              f'median={np.median(union_count):.1f}')
+        print(f'  cells wrong on >=3 boards: mean={thr3_count.mean():.2f}  '
+              f'median={np.median(thr3_count):.1f}')
 
     # ---- Aux Figure: per-cell hit rate histogram (across 64 cells) ----
     if args.weighted:
