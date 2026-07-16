@@ -88,8 +88,8 @@ def main():
         plurality = d[pl_key]                       # (64,)
         diversity = 1.0 - plurality
         n_pos = int(d['n_positions_plurality'])
-        # Restrict to non-center cells (center cells are never targets)
-        mask = np.array([i not in CENTER_CELLS for i in range(64)])
+        # Include all 64 cells.
+        mask = np.ones(64, dtype=bool)
         x = diversity[mask]
         y = rate[mask]
         # Pearson + Spearman
@@ -121,7 +121,7 @@ def main():
                       f'k={k}, H={H}, n_positions={n_pos}, mode={label}')
         ax.text(0.02, 0.02,
                  f'Pearson r = {pear:+.3f}\nSpearman ρ = {spear:+.3f}\n'
-                 f'{int(mask.sum())} non-center cells',
+                 f'{int(mask.sum())} cells',
                  transform=ax.transAxes, va='bottom',
                  bbox=dict(boxstyle='round,pad=0.3', fc='white',
                            ec='#333333', alpha=0.9), fontsize=9)
