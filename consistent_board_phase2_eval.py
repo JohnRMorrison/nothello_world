@@ -49,6 +49,9 @@ def main():
     ap.add_argument('--mlp-ckpts', nargs='+', required=True)
     ap.add_argument('--probe-ckpts', nargs='+', required=True)
     ap.add_argument('--output-csv', required=True)
+    ap.add_argument('--per-cell-npz-prefix', default=None,
+                    help='If set, save per-cell hit accumulators and per-moveset '
+                         'Jaccard stats to <prefix>_H<H>.npz, one file per H.')
     args = ap.parse_args()
 
     if len(args.mlp_ckpts) != len(args.probe_ckpts):
@@ -88,6 +91,19 @@ def main():
     n_processed = 0
     t0 = time.time()
 
+    # Per-H per-cell hit accumulators and per-moveset Jaccard stats.
+    per_H_stats = {}
+    for H, _, _ in triples:
+        per_H_stats[H] = {
+            'hits_uw': np.zeros(64, dtype=np.int64),
+            'hits_w': np.zeros(64, dtype=np.int64),
+            'n_uw': 0,
+            'n_w': 0,
+            'jac_mean': [], 'jac_std': [],
+            'jac_min': [], 'jac_max': [],
+            'jac_multi': [], 'n_boards': [],
+        }
+
     with open(args.output_csv, 'w', newline='') as f_out:
         w = csv.writer(f_out)
         w.writerow([
@@ -111,11 +127,46 @@ def main():
 
             feats = played_even_features(prefix)                    # (120,)
 
+            # Gather board targets and counts once per record (H-independent).
+            board_targets_all = np.stack([
+                board_state_target_from_state(s) for s, _, _ in boards.values()
+            ])                                                                  # (M, 64)
+            board_counts_arr = np.array(
+                [c for _, _, c in boards.values()], dtype=np.int64)             # (M,)
+
             for H, models, probes in triples:
                 cell_scores, probe_out = forward_hidden_scores_probe(
                     feats, k, models, probes, idx, mask, device)
                 top1_60 = int(cell_scores.argmax().item())
                 probe_argmax = probe_out.argmax(dim=-1).cpu().numpy()
+
+                # Per-cell hit + Jaccard tracking for this (record, H)
+                s = per_H_stats[H]
+                error_mat = (probe_argmax[None, :] != board_targets_all)        # (M, 64)
+                hits_row = (~error_mat).astype(np.int64)                        # (M, 64)
+                s['hits_uw'] += hits_row.sum(axis=0)
+                s['hits_w'] += (hits_row * board_counts_arr[:, None]).sum(axis=0)
+                s['n_uw'] += error_mat.shape[0]
+                s['n_w'] += int(board_counts_arr.sum())
+                M = error_mat.shape[0]
+                if M >= 2:
+                    pair_vals = []
+                    for i_ in range(M):
+                        for j_ in range(i_ + 1, M):
+                            inter = int((error_mat[i_] & error_mat[j_]).sum())
+                            union = int((error_mat[i_] | error_mat[j_]).sum())
+                            j_val = 1.0 if union == 0 else inter / union
+                            pair_vals.append(j_val)
+                    arr = np.asarray(pair_vals)
+                    s['jac_mean'].append(float(arr.mean()))
+                    s['jac_std'].append(float(arr.std()))
+                    s['jac_min'].append(float(arr.min()))
+                    s['jac_max'].append(float(arr.max()))
+                    all_and = int(np.all(error_mat, axis=0).sum())
+                    all_or = int(np.any(error_mat, axis=0).sum())
+                    s['jac_multi'].append(1.0 if all_or == 0
+                                           else all_and / all_or)
+                    s['n_boards'].append(M)
 
                 for b_hash, (state, next_c, count) in boards.items():
                     legal_set = legal_from_state(state, next_c)
@@ -141,6 +192,24 @@ def main():
     print(f"Done.  Wrote {n_written} rows over "
           f"{n_processed} records × {len(triples)} Hs.")
     print(f"Output: {args.output_csv}")
+
+    if args.per_cell_npz_prefix:
+        for H, s in per_H_stats.items():
+            outp = f'{args.per_cell_npz_prefix}_H{H}.npz'
+            np.savez(outp,
+                      hits_uw=s['hits_uw'],
+                      hits_w=s['hits_w'],
+                      n_uw=int(s['n_uw']),
+                      n_w=int(s['n_w']),
+                      moveset_jaccard=np.array(s['jac_mean'], dtype=np.float64),
+                      moveset_jac_std=np.array(s['jac_std'], dtype=np.float64),
+                      moveset_jac_min=np.array(s['jac_min'], dtype=np.float64),
+                      moveset_jac_max=np.array(s['jac_max'], dtype=np.float64),
+                      moveset_jac_multi=np.array(s['jac_multi'], dtype=np.float64),
+                      moveset_n_boards=np.array(s['n_boards'], dtype=np.int64),
+                      k=k, hidden_dim=int(H), N=1)
+            print(f"  {outp}  "
+                  f"(pooled n_uw={s['n_uw']}; movesets={len(s['jac_mean'])})")
 
 
 if __name__ == '__main__':
