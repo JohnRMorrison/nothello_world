@@ -296,6 +296,12 @@ def main():
     per_cell_hits_w = np.zeros(64, dtype=np.int64)
     n_rows_uw = 0
     n_rows_w = 0
+    # Per-cell plurality accumulators: for each position, plurality[k] is the
+    # fraction of consistent boards (unweighted or MC-count-weighted) that
+    # share the most common class at cell k.  We average across positions.
+    per_cell_plurality_uw_sum = np.zeros(64, dtype=np.float64)
+    per_cell_plurality_w_sum = np.zeros(64, dtype=np.float64)
+    n_positions_plurality = 0
     with open(args.output_csv, 'w', newline='') as f_out:
         w = csv.writer(f_out)
         w.writerow([
@@ -318,6 +324,30 @@ def main():
             if n_distinct < 2:
                 continue
             n_with_ambiguity += 1
+
+            # Per-cell plurality across the consistent boards for this
+            # position: what fraction of boards share the most common class
+            # at cell k?  Compute both unweighted and MC-count-weighted.
+            board_targets = np.stack([
+                board_state_target_from_state(s) for s, _, _ in boards.values()
+            ])                                                              # (n_dist, 64)
+            board_counts_arr = np.array(
+                [c for _, _, c in boards.values()], dtype=np.int64)         # (n_dist,)
+            n_dist = board_targets.shape[0]
+            for cell in range(64):
+                vals = board_targets[:, cell]
+                # unweighted
+                _, cs = np.unique(vals, return_counts=True)
+                per_cell_plurality_uw_sum[cell] += cs.max() / n_dist
+                # weighted
+                classes = np.unique(vals)
+                max_w = 0
+                for cls in classes:
+                    w_sum = int(board_counts_arr[vals == cls].sum())
+                    if w_sum > max_w:
+                        max_w = w_sum
+                per_cell_plurality_w_sum[cell] += max_w / int(board_counts_arr.sum())
+            n_positions_plurality += 1
 
             # Determine which board is the "training" one
             b_actual = OthelloBoardState()
@@ -376,16 +406,26 @@ def main():
     print(f"Output: {args.output_csv}")
 
     if args.per_cell_npz:
+        avg_pl_uw = (per_cell_plurality_uw_sum / n_positions_plurality
+                      if n_positions_plurality > 0
+                      else np.zeros(64))
+        avg_pl_w = (per_cell_plurality_w_sum / n_positions_plurality
+                     if n_positions_plurality > 0
+                     else np.zeros(64))
         np.savez(args.per_cell_npz,
                   hits_uw=per_cell_hits_uw,
                   hits_w=per_cell_hits_w,
                   n_uw=int(n_rows_uw),
                   n_w=int(n_rows_w),
+                  avg_plurality_uw=avg_pl_uw,
+                  avg_plurality_w=avg_pl_w,
+                  n_positions_plurality=int(n_positions_plurality),
                   k=args.k,
                   hidden_dim=int(hidden_dim),
                   N=int(N))
-        print(f"Per-cell hit accumulators: {args.per_cell_npz}  "
-              f"(n_uw={n_rows_uw}, n_w={n_rows_w})")
+        print(f"Per-cell hit + plurality accumulators: {args.per_cell_npz}  "
+              f"(n_uw={n_rows_uw}, n_w={n_rows_w}, "
+              f"n_positions_plurality={n_positions_plurality})")
 
 
 if __name__ == '__main__':

@@ -78,6 +78,65 @@ def main():
     plt.close(fig)
     print(f'Wrote {p1}')
 
+    # ---- Figure X: correlation between hit rate and cross-board diversity ----
+    # Diversity = 1 - avg_plurality.  If a cell has high diversity, consistent
+    # boards genuinely disagree there, so the probe cannot be correct on all
+    # of them.  We expect a negative correlation (or equivalently: hit_rate
+    # positively correlates with plurality).
+    if 'avg_plurality_uw' in d.files:
+        pl_key = 'avg_plurality_w' if args.weighted else 'avg_plurality_uw'
+        plurality = d[pl_key]                       # (64,)
+        diversity = 1.0 - plurality
+        n_pos = int(d['n_positions_plurality'])
+        # Restrict to non-center cells (center cells are never targets)
+        mask = np.array([i not in CENTER_CELLS for i in range(64)])
+        x = diversity[mask]
+        y = rate[mask]
+        # Pearson + Spearman
+        pear = float(np.corrcoef(x, y)[0, 1])
+        rx = x.argsort().argsort()
+        ry = y.argsort().argsort()
+        spear = float(np.corrcoef(rx, ry)[0, 1])
+
+        fig, ax = plt.subplots(figsize=(6.5, 5.5))
+        ax.scatter(x, y, s=40, c='#1f77b4', edgecolor='white')
+        # Annotate the worst cells
+        for i, on_off in enumerate(mask):
+            if not on_off:
+                continue
+            if rate[i] < 0.75 or diversity[i] > 0.4:
+                r_, c_ = i // 8, i % 8
+                nm = "abcdefgh"[c_] + str(r_ + 1)
+                ax.annotate(nm, (diversity[i], rate[i]),
+                             xytext=(3, 3), textcoords='offset points',
+                             fontsize=8, color='#333333')
+        # y=1-x reference (the "optimal predictor" upper bound: probe would
+        # achieve at most `plurality` if it always picked the plurality class)
+        ref_x = np.linspace(0, max(x.max(), 0.7), 50)
+        ax.plot(ref_x, 1.0 - ref_x, ls='--', color='#666666',
+                 lw=1.0, label='hit rate = plurality  (optimal upper bound)')
+        ax.set_xlabel('per-cell cross-board diversity  (= 1 - avg plurality)')
+        ax.set_ylabel('per-cell probe hit rate')
+        ax.set_title(f'Probe accuracy vs. cross-board disagreement\n'
+                      f'k={k}, H={H}, n_positions={n_pos}, mode={label}')
+        ax.text(0.02, 0.02,
+                 f'Pearson r = {pear:+.3f}\nSpearman ρ = {spear:+.3f}\n'
+                 f'{int(mask.sum())} non-center cells',
+                 transform=ax.transAxes, va='bottom',
+                 bbox=dict(boxstyle='round,pad=0.3', fc='white',
+                           ec='#333333', alpha=0.9), fontsize=9)
+        ax.legend(loc='lower left', fontsize=8, bbox_to_anchor=(0, 0.15))
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        p3 = f'{args.out_prefix}_corr.png'
+        fig.savefig(p3, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'Wrote {p3}')
+        print(f'  Pearson r  (diversity vs hit rate) = {pear:+.4f}')
+        print(f'  Spearman rho                       = {spear:+.4f}')
+    else:
+        print('(no plurality data in NPZ - skip correlation figure)')
+
     # ---- Figure 2: 8x8 heatmap of hit rates ----
     fig, ax = plt.subplots(figsize=(6, 5.5))
     grid = rate.reshape(8, 8)
