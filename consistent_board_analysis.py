@@ -239,6 +239,10 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=1)
     ap.add_argument('--output-csv', required=True)
+    ap.add_argument('--per-cell-npz', default=None,
+                    help='If set, save per-cell probe hit accumulators '
+                         '(both unweighted and MC-count-weighted) to this '
+                         'NPZ file for downstream per-square analysis.')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--seed-idx', type=int, default=None,
                     help='If set, use only ONE MLP (the given seed index) '
@@ -287,6 +291,11 @@ def main():
     n_written = 0
     n_positions = 0
     n_with_ambiguity = 0
+    # Per-cell hit accumulators (unweighted and MC-count-weighted).
+    per_cell_hits_uw = np.zeros(64, dtype=np.int64)
+    per_cell_hits_w = np.zeros(64, dtype=np.int64)
+    n_rows_uw = 0
+    n_rows_w = 0
     with open(args.output_csv, 'w', newline='') as f_out:
         w = csv.writer(f_out)
         w.writerow([
@@ -339,7 +348,12 @@ def main():
                 legal_set = legal_from_state(state, next_c)
                 top1_legal = int(top1_60 in legal_set)
                 board_target = board_state_target_from_state(state)
-                probe_acc = float((probe_argmax == board_target).mean())
+                hits_per_cell = (probe_argmax == board_target).astype(np.int64)
+                probe_acc = float(hits_per_cell.mean())
+                per_cell_hits_uw += hits_per_cell
+                per_cell_hits_w += hits_per_cell * int(count)
+                n_rows_uw += 1
+                n_rows_w += int(count)
                 w.writerow([
                     g_idx, args.k, b_hash.hex()[:16],  # short hash
                     count, n_distinct, n_valid,
@@ -360,6 +374,18 @@ def main():
           f"{n_with_ambiguity}/{n_positions} positions with ambiguity "
           f"(distinct consistent boards >= 2).")
     print(f"Output: {args.output_csv}")
+
+    if args.per_cell_npz:
+        np.savez(args.per_cell_npz,
+                  hits_uw=per_cell_hits_uw,
+                  hits_w=per_cell_hits_w,
+                  n_uw=int(n_rows_uw),
+                  n_w=int(n_rows_w),
+                  k=args.k,
+                  hidden_dim=int(hidden_dim),
+                  N=int(N))
+        print(f"Per-cell hit accumulators: {args.per_cell_npz}  "
+              f"(n_uw={n_rows_uw}, n_w={n_rows_w})")
 
 
 if __name__ == '__main__':
