@@ -174,14 +174,23 @@ class OpeningTreeMLP(nn.Module):
         self.register_buffer('b', torch.from_numpy(biases).to(device))
         self.path_info = path_info
 
-    def forward(self, x, batch=8192):
+    def forward(self, x, batch=4096, out_device='cpu',
+                 out_dtype=torch.bool):
+        """Compute hidden activations in chunks.
+
+        By default the output tensor is bool on CPU — this keeps memory
+        usage tractable when H is large (e.g. 70K).  Downstream (probe)
+        code should move per-batch slices to the compute device and cast
+        to float there.
+        """
         H = self.hidden_dim
         N = x.shape[0]
-        out = torch.empty(N, H, device=x.device)
+        out = torch.empty(N, H, device=out_device, dtype=out_dtype)
         with torch.no_grad():
             for i in range(0, N, batch):
                 pre = x[i:i + batch] @ self.W.T + self.b
-                out[i:i + batch] = (pre > 0.0).float()
+                act = (pre > 0.0)
+                out[i:i + batch] = act.to(device=out_device, dtype=out_dtype)
         return out
 
 
@@ -190,34 +199,50 @@ class OpeningTreeMLP(nn.Module):
 # ------------------------------------------------------------------------------
 
 def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
-                 weight_decay=1e-4):
-    device = H_tr.device
+                 weight_decay=1e-4, device=None):
+    """Train linear probe.  H_* may be on CPU (as bool) and S_* on CPU (as
+    int64) — batches are moved to `device` (or the probe's device) and cast
+    to float / long as needed.
+    """
     hidden = H_tr.shape[1]
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
     probe = nn.Linear(hidden, BOARD_CELLS * 3).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=lr,
                               weight_decay=weight_decay)
     ce = nn.CrossEntropyLoss()
     N = H_tr.shape[0]
     for _ in range(epochs):
-        perm = torch.randperm(N, device=device)
+        perm = torch.randperm(N)
         for i in range(0, N, batch):
             idx = perm[i:i + batch]
-            logits = probe(H_tr[idx]).view(-1, BOARD_CELLS, 3)
-            loss = ce(logits.reshape(-1, 3), S_tr[idx].reshape(-1).long())
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            y = S_tr[idx].to(device=device, dtype=torch.long)
+            logits = probe(h).view(-1, BOARD_CELLS, 3)
+            loss = ce(logits.reshape(-1, 3), y.reshape(-1))
             opt.zero_grad(); loss.backward(); opt.step()
     return probe
 
 
-def evaluate(probe, H, S, T=None):
+def evaluate(probe, H, S, T=None, batch=4096):
+    device = next(probe.parameters()).device
+    N = H.shape[0]
+    preds_all = torch.empty(N, BOARD_CELLS, dtype=torch.long, device='cpu')
     with torch.no_grad():
-        preds = probe(H).view(-1, BOARD_CELLS, 3).argmax(dim=-1)
-    correct = (preds == S).float()
+        for i in range(0, N, batch):
+            h = H[i:i + batch].to(device=device, dtype=torch.float32)
+            preds = probe(h).view(-1, BOARD_CELLS, 3).argmax(dim=-1)
+            preds_all[i:i + batch] = preds.cpu()
+    S_cpu = S.cpu() if S.is_cuda else S
+    correct = (preds_all == S_cpu).float()
     acc = correct.mean().item()
-    per_cell = correct.mean(dim=0).cpu().numpy()
+    per_cell = correct.mean(dim=0).numpy()
     by_ply = {}
     if T is not None:
-        for ply in range(int(T.max().item()) + 1):
-            mask = (T == ply)
+        T_cpu = T.cpu() if T.is_cuda else T
+        for ply in range(int(T_cpu.max().item()) + 1):
+            mask = (T_cpu == ply)
             if mask.any():
                 by_ply[ply] = (int(mask.sum().item()),
                                 correct[mask].mean().item())
@@ -309,14 +334,25 @@ def main():
 
     X_tr = torch.from_numpy(Xnp_tr).to(device)
     X_te = torch.from_numpy(Xnp_te).to(device)
-    S_tr = torch.from_numpy(Snp_tr).to(device)
-    S_te = torch.from_numpy(Snp_te).to(device)
-    T_te = torch.from_numpy(Tnp_te).to(device)
+    # Labels + turn indices live on CPU (bool/int8 activations too);
+    # batches move to compute device inside train/eval.
+    S_tr = torch.from_numpy(Snp_tr)
+    S_te = torch.from_numpy(Snp_te)
+    T_te = torch.from_numpy(Tnp_te)
 
-    print('\ncomputing hidden activations...')
-    H_tr = mlp(X_tr); H_te = mlp(X_te)
+    print('\ncomputing hidden activations (bool on CPU)...')
+    t0 = time.time()
+    H_tr = mlp(X_tr, out_device='cpu', out_dtype=torch.bool)
+    H_te = mlp(X_te, out_device='cpu', out_dtype=torch.bool)
+    print(f'  H_tr {tuple(H_tr.shape)} ({H_tr.element_size() * H_tr.nelement() / 1e9:.2f} GB)  '
+           f'H_te {tuple(H_te.shape)} ({H_te.element_size() * H_te.nelement() / 1e9:.2f} GB)  '
+           f'({time.time() - t0:.1f}s)')
+    # Free the big input tensor on GPU; we don't need X after activations.
+    del X_tr, X_te
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
 
-    fire_rate = H_tr.mean(dim=0)
+    fire_rate = H_tr.float().mean(dim=0)
     print(f'  per-unit firing rate on train: mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '
            f'max={fire_rate.max().item()*100:.2f}%')
@@ -324,7 +360,7 @@ def main():
 
     print('\ntraining linear probe on hidden layer...')
     probe = train_probe(H_tr, S_tr, H_te, S_te,
-                          epochs=args.probe_epochs)
+                          epochs=args.probe_epochs, device=device)
 
     acc_tr, _, _ = evaluate(probe, H_tr, S_tr)
     acc_te, per_cell_te, by_ply = evaluate(probe, H_te, S_te, T_te)
