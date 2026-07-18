@@ -365,7 +365,7 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
     return probe
 
 
-def evaluate(probe, H, S, T=None, batch=4096):
+def evaluate(probe, H, S, T=None, batch=512):
     device = next(probe.parameters()).device
     N = H.shape[0]
     preds_all = torch.empty(N, BOARD_CELLS, dtype=torch.long, device='cpu')
@@ -527,9 +527,14 @@ def main():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    # H_tr is bool; take the sum along dim 0 (int64, ~1 MB), then divide.
-    # Avoids materializing an (N, H) float32 tensor of ~540 GB.
-    fire_rate = H_tr.sum(dim=0).float() / H_tr.shape[0]
+    # Compute per-unit firing rate WITHOUT materializing an (N, H) float or
+    # int64 copy of H_tr — chunk over the row axis with int64 accumulator.
+    counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
+    chunk_rows = 512
+    for i in range(0, H_tr.shape[0], chunk_rows):
+        # Convert only the small chunk to int64 (chunk_rows × H × 8 bytes).
+        counts += H_tr[i:i + chunk_rows].to(torch.int64).sum(dim=0)
+    fire_rate = counts.float() / H_tr.shape[0]
     print(f'  per-unit firing rate on train: mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '
            f'max={fire_rate.max().item()*100:.2f}%')

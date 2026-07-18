@@ -320,7 +320,10 @@ def main():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    fire_rate = H_tr.sum(dim=0).float() / H_tr.shape[0]
+    counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
+    for i in range(0, H_tr.shape[0], 512):
+        counts += H_tr[i:i + 512].to(torch.int64).sum(dim=0)
+    fire_rate = counts.float() / H_tr.shape[0]
     print(f'  per-unit firing rate on train: '
            f'mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '
