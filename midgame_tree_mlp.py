@@ -219,6 +219,13 @@ def main():
     ap.add_argument('--tree-max-features', default=None,
                     help='Passed to sklearn: sqrt/log2/int/float.  Use with '
                           '--use-move-grid to keep tree fit tractable.')
+    ap.add_argument('--hidden-activation', default='step',
+                    choices=['step', 'relu'],
+                    help='step (default): hidden units output bool 0/1.  '
+                          'relu: hidden units output continuous excess '
+                          'above threshold (max(0, count - K + 0.5)).  '
+                          'ReLU preserves count magnitude the probe can '
+                          'weight, closing much of the MLP gap.')
     ap.add_argument('--include-count-nodes', action='store_true',
                     help='Append structured count-node bank (~1800 units) '
                           'to the hidden layer.  Each node is "at least K '
@@ -435,10 +442,18 @@ def main():
     S_te = torch.from_numpy(Snp_te)
     T_te = torch.from_numpy(Tnp_te)
 
-    print('\ncomputing hidden activations (bool on CPU)...')
+    use_relu = args.hidden_activation == 'relu'
+    if use_relu:
+        act_dtype = torch.float32
+        print('\ncomputing hidden activations (ReLU, float32 on CPU)...')
+    else:
+        act_dtype = torch.bool
+        print('\ncomputing hidden activations (step, bool on CPU)...')
     t0 = time.time()
-    H_tr = mlp(X_tr, out_device='cpu', out_dtype=torch.bool)
-    H_te = mlp(X_te, out_device='cpu', out_dtype=torch.bool)
+    H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
+                 use_relu=use_relu)
+    H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
+                 use_relu=use_relu)
     print(f'  H_tr {tuple(H_tr.shape)} '
            f'({H_tr.element_size() * H_tr.nelement() / 1e9:.2f} GB)  '
            f'H_te {tuple(H_te.shape)} '
@@ -476,9 +491,9 @@ def main():
 
         t0 = time.time()
         CN_tr = compute_count_activations(count_nodes_used, played_tr,
-                                            even_tr)
+                                            even_tr, use_relu=use_relu)
         CN_te = compute_count_activations(count_nodes_used, played_te,
-                                            even_te)
+                                            even_te, use_relu=use_relu)
         print(f'  count activations: '
                f'CN_tr {CN_tr.shape} '
                f'({CN_tr.nbytes / 1e9:.2f} GB)  '
@@ -497,10 +512,15 @@ def main():
             all_meta.append({'kind': 'count_node', 'name': n[0],
                               'parity': n[2], 'threshold': n[3]})
 
-    counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
+    # Diagnostic: "firing rate" (fraction >0) works for both bool and float.
+    fire_counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
     for i in range(0, H_tr.shape[0], 512):
-        counts += H_tr[i:i + 512].to(torch.int64).sum(dim=0)
-    fire_rate = counts.float() / H_tr.shape[0]
+        chunk = H_tr[i:i + 512]
+        if chunk.dtype == torch.bool:
+            fire_counts += chunk.to(torch.int64).sum(dim=0)
+        else:
+            fire_counts += (chunk > 0).to(torch.int64).sum(dim=0)
+    fire_rate = fire_counts.float() / H_tr.shape[0]
     print(f'  per-unit firing rate on train: '
            f'mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '

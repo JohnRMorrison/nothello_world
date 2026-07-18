@@ -185,21 +185,26 @@ def build_random_count_nodes(n_nodes, seed=42, min_size=3, max_size=15):
 # Activation computation
 # ------------------------------------------------------------------------------
 
-def compute_count_activations(count_nodes, played_np, even_np, chunk=8192):
-    """For each count node, compute a (N,) bool activation vector.
+def compute_count_activations(count_nodes, played_np, even_np, chunk=8192,
+                                 use_relu=False):
+    """For each count node, compute a (N,) activation vector.
 
     Args:
       count_nodes: list of (name, c60_mask, parity, threshold) tuples.
       played_np:   (N, 60) float32 or bool — played bits per non-center cell.
       even_np:     (N, 60) float32 or bool — even bits per non-center cell.
       chunk:       row chunk size for memory efficiency.
+      use_relu:    if True, return continuous "excess above threshold"
+                    (max(0, count - k + 0.5)) as float32.  If False,
+                    return bool (count >= k).
 
     Returns:
-      (N, len(count_nodes)) bool activation matrix.
+      (N, len(count_nodes)) activation matrix.
     """
     N = played_np.shape[0]
     H = len(count_nodes)
-    out = np.zeros((N, H), dtype=np.bool_)
+    out_dtype = np.float32 if use_relu else np.bool_
+    out = np.zeros((N, H), dtype=out_dtype)
     played_np = played_np.astype(np.uint8)
     even_np = even_np.astype(np.uint8)
 
@@ -207,10 +212,6 @@ def compute_count_activations(count_nodes, played_np, even_np, chunk=8192):
         pl = played_np[i:i + chunk]      # (b, 60)
         ev = even_np[i:i + chunk]
 
-        # Precompute indicators per parity variant.
-        # ind_p0[i, c] = 1 iff cell c was played at parity 0 (played AND even)
-        # ind_p1[i, c] = 1 iff cell c was played at parity 1 (played AND !even)
-        # ind_any[i, c] = played[i, c]
         ind_p0 = pl * ev
         ind_p1 = pl * (1 - ev)
 
@@ -221,7 +222,11 @@ def compute_count_activations(count_nodes, played_np, even_np, chunk=8192):
                 counts = ind_p1[:, mask].sum(axis=1)
             else:
                 counts = pl[:, mask].sum(axis=1)
-            out[i:i + chunk, j] = counts >= k
+            if use_relu:
+                out[i:i + chunk, j] = np.maximum(
+                    0.0, counts.astype(np.float32) - k + 0.5)
+            else:
+                out[i:i + chunk, j] = counts >= k
 
     return out
 

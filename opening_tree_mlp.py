@@ -344,21 +344,33 @@ class OpeningTreeMLP(nn.Module):
         self.path_info = path_info
 
     def forward(self, x, batch=256, out_device='cpu',
-                 out_dtype=torch.bool):
+                 out_dtype=torch.bool, use_relu=False):
         """Compute hidden activations in chunks.
 
         Default batch is small (256) because H can grow into the 100k+
         range for endgame/midgame, and the per-batch matmul on GPU costs
         `batch × H × 4` bytes.  batch=256 with H=200k = 200 MB — safe on
         a 10 GB GPU.
+
+        use_relu=False (default): step activation, output is (bool)
+          1 iff pre-activation > 0, else 0.
+        use_relu=True: ReLU activation, output is float32 = max(0, pre).
+          Each unit gives "excess magnitude above threshold" — preserves
+          count-like information the linear probe can then weight
+          continuously.  out_dtype should be torch.float32 in this case.
         """
         H = self.hidden_dim
         N = x.shape[0]
+        if use_relu and out_dtype == torch.bool:
+            out_dtype = torch.float32
         out = torch.empty(N, H, device=out_device, dtype=out_dtype)
         with torch.no_grad():
             for i in range(0, N, batch):
                 pre = x[i:i + batch] @ self.W.T + self.b
-                act = (pre > 0.0)
+                if use_relu:
+                    act = torch.relu(pre)
+                else:
+                    act = (pre > 0.0)
                 out[i:i + batch] = act.to(device=out_device, dtype=out_dtype)
         return out
 
