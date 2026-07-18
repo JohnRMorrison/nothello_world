@@ -102,6 +102,66 @@ def build_structured_count_nodes():
 # Random pool
 # ------------------------------------------------------------------------------
 
+def build_tree_derived_count_nodes(path_info):
+    """From tree-path metadata, derive per-cell region-of-interest count
+    features.
+
+    For each output cell C, look at every tree path targeting C (path_info
+    entries with kind=='tree_path' and cell==C).  Collect all cells that
+    appear in ANY of those paths' conditions.  That set is C's "region of
+    interest" — cells the tree cares about when predicting C's state.
+
+    Generate count features:  for each parity variant (black / white / any)
+    and each threshold k ∈ [1, |ROI|], one node "at least k of ROI(C) are
+    played at parity P".  Directly interpretable — each node ties to a
+    specific output cell's decoding decision.
+
+    Args:
+      path_info: list of dicts as saved by midgame_tree_mlp; each entry with
+                 kind=='tree_path' has 'cell' (output cell 0-63) and
+                 'conditions' (list of (feature_idx, required_value)).
+
+    Returns:
+      list of (name, c60_mask, parity, threshold) tuples in the same format
+      as build_structured_count_nodes().
+    """
+    from collections import defaultdict
+    roi_per_output = defaultdict(set)
+    for p in path_info:
+        if p.get('kind') != 'tree_path':
+            continue
+        out_cell = p['cell']
+        for feat_idx, _val in p['conditions']:
+            # Features 0..59 are played[c60], 60..119 are even[c60].
+            # 120 is mover_parity; 121+ are bucket / move-grid — skip those.
+            if feat_idx < 60:
+                roi_per_output[out_cell].add(feat_idx)
+            elif feat_idx < 120:
+                roi_per_output[out_cell].add(feat_idx - 60)
+
+    nodes = []
+    for c in range(64):
+        roi_c60 = roi_per_output.get(c, set())
+        if not roi_c60:
+            continue
+        # Convert c60 indices back to c64.
+        roi_c64 = set()
+        for i in roi_c60:
+            for c64, c60 in C64_TO_C60.items():
+                if c60 == i:
+                    roi_c64.add(c64)
+                    break
+        n_roi = len(roi_c64)
+        if n_roi == 0:
+            continue
+        mask = _cells_to_c60_mask(roi_c64)
+        for p_label, parity in [('black', 0), ('white', 1), ('any', None)]:
+            for k in range(1, n_roi + 1):
+                nodes.append(
+                    (f'roi_out{c}_{p_label}_k{k}', mask, parity, k))
+    return nodes
+
+
 def build_random_count_nodes(n_nodes, seed=42, min_size=3, max_size=15):
     """Generate n_nodes random count-node specs with random cell subsets
     (size in [min_size, max_size]) and random thresholds."""

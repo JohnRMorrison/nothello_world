@@ -37,7 +37,7 @@ from endgame_tree_mlp import (
 )
 from count_nodes import (
     build_structured_count_nodes, build_random_count_nodes,
-    compute_count_activations,
+    build_tree_derived_count_nodes, compute_count_activations,
 )
 
 
@@ -223,6 +223,13 @@ def main():
                     help='Append structured count-node bank (~1800 units) '
                           'to the hidden layer.  Each node is "at least K '
                           'cells in region R are played at parity P".')
+    ap.add_argument('--include-tree-derived-count-nodes',
+                    action='store_true',
+                    help='Append count-node bank derived from the tree '
+                          'paths: for each output cell C, count features '
+                          'over the union of cells appearing in C\'s top-K '
+                          'tree paths.  Each node ties directly to a '
+                          'specific decoding decision.')
     ap.add_argument('--random-count-nodes', type=int, default=0,
                     help='Number of random-subset count nodes to add.')
     ap.add_argument('--random-count-seed', type=int, default=42)
@@ -434,12 +441,17 @@ def main():
 
     # ---- Optionally append count-node bank ----
     count_nodes_used = []
-    if args.include_count_nodes or args.random_count_nodes > 0:
+    if (args.include_count_nodes or args.random_count_nodes > 0
+            or args.include_tree_derived_count_nodes):
         print('\nbuilding count-node bank...')
         if args.include_count_nodes:
             count_nodes_used.extend(build_structured_count_nodes())
             print(f'  structured count nodes: '
                    f'{len(count_nodes_used)}')
+        if args.include_tree_derived_count_nodes:
+            tree_nodes = build_tree_derived_count_nodes(all_meta)
+            count_nodes_used.extend(tree_nodes)
+            print(f'  tree-derived count nodes: {len(tree_nodes)}')
         if args.random_count_nodes > 0:
             rn = build_random_count_nodes(args.random_count_nodes,
                                             seed=args.random_count_seed)
