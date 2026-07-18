@@ -406,8 +406,8 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
 
 
 def train_probe_sklearn(H_tr, S_tr, H_te, S_te, C=1.0, n_jobs=1,
-                           max_iter=1000, verbose=True,
-                           subsample_train=None):
+                           max_iter=200, verbose=True,
+                           subsample_train=None, solver='lbfgs'):
     """Fit sklearn LogisticRegression per cell using the LBFGS solver.
 
     LBFGS provably converges to the global optimum for the convex logistic
@@ -446,7 +446,8 @@ def train_probe_sklearn(H_tr, S_tr, H_te, S_te, C=1.0, n_jobs=1,
             print(f'  subsampled train to {H_tr_np.shape[0]} rows')
 
     def fit_one(c):
-        lr = LogisticRegression(solver='lbfgs', C=C, max_iter=max_iter)
+        lr = LogisticRegression(solver=solver, C=C, max_iter=max_iter,
+                                  tol=1e-3)
         lr.fit(H_tr_np, S_tr_np[:, c])
         return lr
 

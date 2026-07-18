@@ -267,6 +267,11 @@ def main():
     ap.add_argument('--sklearn-subsample-train', type=int, default=200000,
                     help='If set, subsample this many training rows before '
                           'fitting sklearn LR to bound memory/time.')
+    ap.add_argument('--sklearn-solver', default='lbfgs',
+                    choices=['lbfgs', 'saga', 'liblinear'],
+                    help='sklearn LR solver.  saga is much faster on large '
+                          'multi-class problems.')
+    ap.add_argument('--sklearn-max-iter', type=int, default=200)
     ap.add_argument('--count-features-as-input', action='store_true',
                     help='Add count-node activations to the raw input X '
                           '(before tree fitting) instead of appending to '
@@ -603,7 +608,9 @@ def main():
         sk_models = train_probe_sklearn(
             H_tr, S_tr, H_te, S_te,
             C=args.sklearn_C, n_jobs=args.sklearn_n_jobs,
-            subsample_train=args.sklearn_subsample_train)
+            subsample_train=args.sklearn_subsample_train,
+            solver=args.sklearn_solver,
+            max_iter=args.sklearn_max_iter)
         # For consistency with downstream code we use ensemble containers
         # but fill with the sklearn models.
         probes = None      # legacy variable, unused with sklearn path
