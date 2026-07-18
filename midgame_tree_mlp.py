@@ -27,6 +27,8 @@ from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
     train_per_cell_trees, train_probe, train_probe_ensemble,
     train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
+    train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
+    evaluate_legal_ensemble, legal_accuracy_from_state,
     OpeningTreeMLP,
     load_or_sample, prune_paths_by_count,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
@@ -55,15 +57,17 @@ from order_nodes import (
 def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                                 when_bucket_size=None,
                                 use_move_grid=False,
-                                recent_Ks=None):
+                                recent_Ks=None,
+                                collect_legal_moves=False):
     """Play random games; extract positions with ply in [ply_min, ply_max).
-    Returns (X, S, T) with:
-      X: (N, 120) played_even features
-      S: (N, 64) int64 class labels (0 empty, 1 mine, 2 opp)
+    Returns (X, S, T) — or (X, S, T, L) if collect_legal_moves — with:
+      X: (N, ...) played_even features
+      S: (N, 64) int64 state labels (0 empty, 1 mine, 2 opp)
       T: (N,) int32 — ply index within the game
+      L: (N, 64) uint8 legal-move mask (1 iff cell is a legal next move)
     """
     rng = np.random.RandomState(seed)
-    Xs, Ss, Ts = [], [], []
+    Xs, Ss, Ts, Ls = [], [], [], []
     for _ in range(num_games):
         board = OthelloBoardState()
         prefix = []
@@ -87,6 +91,11 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                                                 recent_Ks=recent_Ks))
                 Ss.append(lbl)
                 Ts.append(ply)
+                if collect_legal_moves:
+                    lmask = np.zeros(BOARD_CELLS, dtype=np.uint8)
+                    for m in valid:
+                        lmask[m] = 1
+                    Ls.append(lmask)
             move = valid[rng.randint(len(valid))]
             board.update([move])
             prefix.append(move)
@@ -94,8 +103,10 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
         raise RuntimeError(
             f'no positions extracted; ply range [{ply_min},{ply_max}) '
             f'may not overlap game play')
-    return (np.stack(Xs), np.stack(Ss),
-             np.array(Ts, dtype=np.int32))
+    X = np.stack(Xs); S = np.stack(Ss); T = np.array(Ts, dtype=np.int32)
+    if collect_legal_moves:
+        return X, S, T, np.stack(Ls)
+    return X, S, T
 
 
 # ------------------------------------------------------------------------------
@@ -334,6 +345,15 @@ def main():
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
+    ap.add_argument('--task', default='state',
+                    choices=['state', 'legal', 'both'],
+                    help='state (default): train state-decoding probe only. '
+                          'legal: only legal-move probes.  both: state + '
+                          'all three legal-move predictors on the same H.')
+    ap.add_argument('--legal-modes', default='bce,probor,derived',
+                    help='For task in {legal,both}: comma-separated subset '
+                          'of {bce, probor, derived} to run.')
+    ap.add_argument('--legal-probe-epochs', type=int, default=50)
     ap.add_argument('--skip-tree-fit', action='store_true',
                     help='Skip per-cell tree fit + path extraction entirely. '
                           'Hidden layer starts empty (N, 0); only count / '
@@ -358,38 +378,53 @@ def main():
         print(f'input includes recent bits for K in {recent_Ks} — '
                f'{60 * len(recent_Ks)} extra cols per position')
 
+    collect_legal = args.task != 'state'
+    if collect_legal:
+        print(f'task={args.task}: collecting per-position legal-move masks')
+
     print(f'sampling {args.num_train_games} train + '
            f'{args.num_test_games} test games...')
     t0 = time.time()
-    Xnp_tr, Snp_tr, Tnp_tr = load_or_sample(
+    tr = load_or_sample(
         args.cache_tr, sample_midgame_positions,
         args.num_train_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed,
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
-        recent_Ks=recent_Ks)
-    Xnp_te, Snp_te, Tnp_te = load_or_sample(
+        recent_Ks=recent_Ks,
+        collect_legal_moves=collect_legal)
+    te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed + 1_000_000,
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
-        recent_Ks=recent_Ks)
+        recent_Ks=recent_Ks,
+        collect_legal_moves=collect_legal)
+    if collect_legal:
+        Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = tr
+        Xnp_te, Snp_te, Tnp_te, Lnp_te = te
+    else:
+        Xnp_tr, Snp_tr, Tnp_tr = tr
+        Xnp_te, Snp_te, Tnp_te = te
+        Lnp_tr = Lnp_te = None
 
     # If a cache from a wider ply range was loaded, narrow it to the current
     # args range.  Lets a single (10, 50) cache serve any [a, b) subwindow.
-    def _narrow(X, S, T):
+    def _narrow(X, S, T, L=None):
         mask = (T >= args.ply_min) & (T < args.ply_max)
         if mask.all():
-            return X, S, T
+            return X, S, T, L
         n_before = X.shape[0]
         X = X[mask]; S = S[mask]; T = T[mask]
+        if L is not None:
+            L = L[mask]
         print(f'  filtered cache: {n_before} → {X.shape[0]} positions '
                f'in ply [{args.ply_min}, {args.ply_max})')
-        return X, S, T
+        return X, S, T, L
 
-    Xnp_tr, Snp_tr, Tnp_tr = _narrow(Xnp_tr, Snp_tr, Tnp_tr)
-    Xnp_te, Snp_te, Tnp_te = _narrow(Xnp_te, Snp_te, Tnp_te)
+    Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = _narrow(Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr)
+    Xnp_te, Snp_te, Tnp_te, Lnp_te = _narrow(Xnp_te, Snp_te, Tnp_te, Lnp_te)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
 
@@ -857,16 +892,89 @@ def main():
         print(f'    [{lo:2d},{hi:2d})  n={int(mask.sum()):6d}  '
                f'acc={100*acc_b:.4f}%')
 
+    # ------------------------------------------------------------------
+    # Legal-move task: three predictors.
+    # ------------------------------------------------------------------
+    legal_results = {}
+    if args.task != 'state':
+        L_tr = torch.from_numpy(Lnp_tr)
+        L_te = torch.from_numpy(Lnp_te)
+        modes = [m.strip() for m in args.legal_modes.split(',') if m.strip()]
+        avg_legal = L_te.float().sum(dim=1).mean().item()
+        legal_rate = L_te.float().mean().item()
+        illegal_rate = 1.0 - legal_rate
+        print(f'\n============================================')
+        print(f'LEGAL-MOVE TASK  (modes={modes})')
+        print(f'============================================')
+        print(f'  avg legal-cells per position: {avg_legal:.2f} / 64')
+        print(f'  chance-level per-cell acc (predict all illegal): '
+               f'{100 * illegal_rate:.2f}%')
+
+        def _print_legal_report(tag, acc, per_cell, aux):
+            print(f'  {tag} ensemble test per-cell acc: {100*acc:.4f}%')
+            print(f'  {tag} position-perfect: '
+                   f'{100*aux["position_perfect"]:.4f}%')
+            for (lo, hi), (n, a) in sorted(aux.get('by_ply', {}).items()):
+                print(f'    ply [{lo:2d},{hi:2d})  n={n:6d}  '
+                       f'acc={100*a:.4f}%')
+            legal_results[tag] = {
+                'test_acc': acc,
+                'position_perfect': aux['position_perfect'],
+                'by_ply': aux.get('by_ply', {}),
+                'per_cell_acc': per_cell.tolist()
+                    if hasattr(per_cell, 'tolist') else list(per_cell),
+            }
+
+        if 'bce' in modes:
+            print(f'\ntraining legal-BCE probe ('
+                   f'{args.probe_seeds} seed(s), '
+                   f'{args.legal_probe_epochs} epochs)...')
+            t0 = time.time()
+            bce_probes = train_probe_legal_bce_ensemble(
+                H_tr, L_tr,
+                n_seeds=args.probe_seeds,
+                epochs=args.legal_probe_epochs,
+                device=device)
+            print(f'  ({time.time() - t0:.1f}s)')
+            acc, per_cell, aux = evaluate_legal_ensemble(
+                bce_probes, H_te, L_te, T=T_te, kind='bce')
+            _print_legal_report('BCE   ', acc, per_cell, aux)
+
+        if 'probor' in modes:
+            print(f'\ntraining legal-probOR probe ('
+                   f'{args.probe_seeds} seed(s), '
+                   f'{args.legal_probe_epochs} epochs)...')
+            t0 = time.time()
+            po_probes = train_probe_legal_probor_ensemble(
+                H_tr, L_tr,
+                n_seeds=args.probe_seeds,
+                epochs=args.legal_probe_epochs,
+                device=device)
+            print(f'  ({time.time() - t0:.1f}s)')
+            acc, per_cell, aux = evaluate_legal_ensemble(
+                po_probes, H_te, L_te, T=T_te, kind='probor')
+            _print_legal_report('probOR', acc, per_cell, aux)
+
+        if 'derived' in modes:
+            print(f'\ndriving legal moves from state predictions...')
+            acc, per_cell, aux = legal_accuracy_from_state(
+                preds_te, L_te, T=T_te)
+            _print_legal_report('DerivS', acc, per_cell, aux)
+
     torch.save({
-        'W': mlp.W.cpu(), 'b': mlp.b.cpu(),
+        'W': mlp.W.cpu() if not args.skip_tree_fit else None,
+        'b': mlp.b.cpu() if not args.skip_tree_fit else None,
         'probe_state': probe.state_dict() if probe is not None else None,
         'path_info': all_meta,
-        'per_cell_leaf_counts': per_cell_leaf_counts,
-        'per_cell_tree_acc': tree_correct_per_cell.tolist(),
+        'per_cell_leaf_counts': per_cell_leaf_counts
+            if not args.skip_tree_fit else None,
+        'per_cell_tree_acc': tree_correct_per_cell.tolist()
+            if not args.skip_tree_fit else None,
         'per_class_probe_acc': cls_break,
         'args': vars(args),
         'test_acc': acc_te, 'train_acc': acc_tr,
         'by_ply': by_ply,
+        'legal_results': legal_results,
     }, args.out)
     print(f'\nsaved {args.out}')
 

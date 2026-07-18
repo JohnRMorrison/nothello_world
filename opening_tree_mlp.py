@@ -18,6 +18,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.tree import DecisionTreeClassifier, _tree
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -619,6 +620,200 @@ def evaluate(probe, H, S, T=None, batch=512):
                 by_ply[ply] = (int(mask.sum().item()),
                                 correct[mask].mean().item())
     return acc, per_cell, by_ply
+
+
+# ------------------------------------------------------------------------------
+# Legal-move prediction:
+#   - Option A: linear head + BCE loss.
+#   - Option B: noisy-OR head — 1 - exp(-Σ w_ic h_i) — with BCE loss.
+#   - Option C: derive from state predictions by applying flanking rules.
+# ------------------------------------------------------------------------------
+
+
+def _by_ply_10(T_np, correct):
+    """Bucket per-cell correctness by 10-ply intervals; return {(lo, hi): (n, acc)}."""
+    if T_np is None or correct is None:
+        return {}
+    out = {}
+    for lo in range(int(T_np.min()) // 10 * 10,
+                     int(T_np.max()) + 1, 10):
+        mask = (T_np >= lo) & (T_np < lo + 10)
+        if mask.any():
+            out[(lo, lo + 10)] = (int(mask.sum()),
+                                    float(correct[mask].mean()))
+    return out
+
+
+def train_probe_legal_bce(H_tr, L_tr, epochs=25, lr=0.01, batch=512,
+                             weight_decay=1e-4, device=None, seed=0):
+    """Linear H → 64 logits with BCE-with-logits loss.
+    L_tr: (N, 64) uint8 legal-move mask."""
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = nn.Linear(H_tr.shape[1], BOARD_CELLS).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    bce = nn.BCEWithLogitsLoss()
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            l = L_tr[idx].to(device=device, dtype=torch.float32)
+            logits = probe(h)
+            loss = bce(logits, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_legal_bce_ensemble(H_tr, L_tr, n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_legal_bce(H_tr, L_tr, seed=0, **kwargs)]
+    return [train_probe_legal_bce(H_tr, L_tr, seed=s, **kwargs)
+            for s in range(n_seeds)]
+
+
+class NoisyOrHead(nn.Module):
+    """Noisy-OR / prob-OR combination of per-(unit, output-cell) votes.
+
+    Each unit i with activation h_i ≥ 0 casts a per-cell "vote":
+        p_{i,c} = 1 - exp(-w_{i,c} h_i),   w_{i,c} ≥ 0
+    Combined by prob-OR ("legal iff any unit fires FOR it"):
+        P(legal_c) = 1 - Π_i (1 - p_{i,c}) = 1 - exp(-(h @ w)_c)
+    Trained end-to-end with BCE.  w = softplus(raw) keeps rates non-negative.
+    """
+    def __init__(self, H, C=BOARD_CELLS):
+        super().__init__()
+        # Start with lambda = H * w * h ≈ 0 so P(legal) ≈ 0 across cells.
+        # For H ~ 4000 and h ≈ 0.5, we want w * H * h ≈ small ⇒ w ~ 1e-4 ⇒
+        # softplus(raw) ≈ 1e-4 ⇒ raw ≈ ln(exp(1e-4) - 1) ≈ -9.2.
+        self.raw = nn.Parameter(torch.randn(H, C) * 0.01 - 9.0)
+
+    def forward(self, h):
+        w = F.softplus(self.raw)
+        return 1.0 - torch.exp(-(h @ w))
+
+
+def train_probe_legal_probor(H_tr, L_tr, epochs=25, lr=0.05, batch=512,
+                                 weight_decay=0.0, device=None, seed=0):
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = NoisyOrHead(H_tr.shape[1]).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    bce = nn.BCELoss()
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            l = L_tr[idx].to(device=device, dtype=torch.float32)
+            probs = probe(h).clamp(1e-6, 1 - 1e-6)
+            loss = bce(probs, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_legal_probor_ensemble(H_tr, L_tr, n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_legal_probor(H_tr, L_tr, seed=0, **kwargs)]
+    return [train_probe_legal_probor(H_tr, L_tr, seed=s, **kwargs)
+            for s in range(n_seeds)]
+
+
+def evaluate_legal_ensemble(probes, H, L, T=None, batch=512, kind='bce'):
+    """Ensemble by averaging per-cell probability across seeds; threshold 0.5.
+    kind='bce' → sigmoid(logits); kind='probor' → probe(h) already probs.
+
+    Returns (mean_acc, per_cell_acc, {by_ply: ..., pos_perfect: ...})."""
+    device = next(probes[0].parameters()).device
+    N = H.shape[0]
+    accum = torch.zeros(N, BOARD_CELLS, dtype=torch.float32)
+    for i in range(0, N, batch):
+        h = H[i:i + batch].to(device=device, dtype=torch.float32)
+        probs = torch.zeros(h.shape[0], BOARD_CELLS,
+                              dtype=torch.float32, device=device)
+        for probe in probes:
+            with torch.no_grad():
+                out = probe(h)
+                if kind == 'bce':
+                    out = torch.sigmoid(out)
+                probs = probs + out
+        probs = probs / len(probes)
+        accum[i:i + batch] = probs.cpu()
+    preds = (accum > 0.5).to(torch.uint8)
+    L_cpu = torch.from_numpy(L) if isinstance(L, np.ndarray) else L.cpu()
+    correct = (preds == L_cpu).float()               # (N, 64)
+    per_cell_acc = correct.mean(dim=0).numpy()
+    mean_acc = correct.mean().item()
+    aux = {'position_perfect':
+             correct.all(dim=1).float().mean().item()}
+    if T is not None:
+        T_np = T.numpy() if hasattr(T, 'numpy') else T
+        aux['by_ply'] = _by_ply_10(T_np, correct.mean(dim=1).numpy())
+    return mean_acc, per_cell_acc, aux
+
+
+_DIRS_LEGAL = ((-1, -1), (-1, 0), (-1, 1),
+                (0, -1),           (0, 1),
+                (1, -1),  (1, 0),  (1, 1))
+
+
+def state_to_legal(state_argmax):
+    """Given (N, 64) state predictions in {0=empty, 1=mine, 2=opp}, return
+    (N, 64) uint8 mask of legal next moves for the mover.
+
+    Cell C is legal iff state[C] == empty AND for some direction there is
+    ≥1 opp cell immediately in that direction, followed by a mine cell
+    (within board bounds)."""
+    N = state_argmax.shape[0]
+    grid = state_argmax.reshape(N, 8, 8)
+    L = np.zeros((N, 64), dtype=np.uint8)
+    for c in range(64):
+        r0, c0 = c // 8, c % 8
+        empty = grid[:, r0, c0] == 0
+        cell_flank = np.zeros(N, dtype=bool)
+        for dr, dc in _DIRS_LEGAL:
+            r1, c1 = r0 + dr, c0 + dc
+            if not (0 <= r1 < 8 and 0 <= c1 < 8):
+                continue
+            opp_streak = (grid[:, r1, c1] == 2)
+            found = np.zeros(N, dtype=bool)
+            for step in range(2, 8):
+                rs, cs = r0 + step * dr, c0 + step * dc
+                if not (0 <= rs < 8 and 0 <= cs < 8):
+                    break
+                cell = grid[:, rs, cs]
+                found |= opp_streak & (cell == 1)
+                opp_streak = opp_streak & (cell == 2)
+            cell_flank |= found
+        L[:, c] = (empty & cell_flank).astype(np.uint8)
+    return L
+
+
+def legal_accuracy_from_state(state_preds, L, T=None):
+    """Compute Option-C legal-move accuracy: derive legal moves from
+    state argmax preds and compare to ground-truth L."""
+    S_np = state_preds if isinstance(state_preds, np.ndarray) \
+        else state_preds.cpu().numpy()
+    L_np = L if isinstance(L, np.ndarray) else L.cpu().numpy()
+    L_pred = state_to_legal(S_np)
+    correct = (L_pred == L_np)                       # (N, 64) bool
+    per_cell = correct.mean(axis=0)
+    mean = float(correct.mean())
+    aux = {'position_perfect': float(correct.all(axis=1).mean())}
+    if T is not None:
+        T_np = T.numpy() if hasattr(T, 'numpy') else T
+        aux['by_ply'] = _by_ply_10(T_np, correct.mean(axis=1))
+    return mean, per_cell, aux
 
 
 # ------------------------------------------------------------------------------
