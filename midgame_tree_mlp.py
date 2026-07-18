@@ -26,6 +26,7 @@ from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
     train_per_cell_trees, train_probe, evaluate, OpeningTreeMLP,
+    load_or_sample,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
     C64_TO_C60, C60_TO_C64, STATE_NAMES,
 )
@@ -203,6 +204,10 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='midgame_tree_mlp.pt')
+    ap.add_argument('--cache-tr', default=None,
+                    help='Path to .npz cache for the sampled TRAIN set.')
+    ap.add_argument('--cache-te', default=None,
+                    help='Path to .npz cache for the sampled TEST set.')
     args = ap.parse_args()
 
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -215,10 +220,12 @@ def main():
     print(f'sampling {args.num_train_games} train + '
            f'{args.num_test_games} test games...')
     t0 = time.time()
-    Xnp_tr, Snp_tr, Tnp_tr = sample_midgame_positions(
+    Xnp_tr, Snp_tr, Tnp_tr = load_or_sample(
+        args.cache_tr, sample_midgame_positions,
         args.num_train_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed)
-    Xnp_te, Snp_te, Tnp_te = sample_midgame_positions(
+    Xnp_te, Snp_te, Tnp_te = load_or_sample(
+        args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed + 1_000_000)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '

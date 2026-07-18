@@ -34,7 +34,7 @@ MIN_LEAF=${4:-50}     # bumped from 5 — 800k midgame positions blow RAM otherw
 PLY_MIN=${5:-10}
 PLY_MAX=${6:-50}
 STAB=${7:-nostab}
-N_JOBS=${8:-4}        # 4 workers × ~40 GB each fits under 240 GB comfortably
+N_JOBS=${8:-1}        # single-threaded tree fit — no worker copies, safest
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -58,6 +58,11 @@ fi
 
 OUT="ckpts_midgame/midgame_tree_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}${STAB_TAG}.pt"
 
+# Cache the sampled positions so reruns skip the ~15-min sampling step.
+mkdir -p ckpts_midgame/cache
+CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_tr.npz"
+CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_te.npz"
+
 CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
     ${STAB_FLAG} \
     --num-train-games ${NUM_TRAIN} \
@@ -69,6 +74,8 @@ CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
     --tree-n-jobs ${N_JOBS} \
     --probe-epochs 30 \
     --device cuda \
+    --cache-tr ${CACHE_TR} \
+    --cache-te ${CACHE_TE} \
     --out ${OUT}
 
 echo "Completed at: $(date)"

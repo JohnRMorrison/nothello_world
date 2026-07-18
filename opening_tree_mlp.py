@@ -75,6 +75,31 @@ def feature_name(feat_idx):
 # Data
 # ------------------------------------------------------------------------------
 
+def load_or_sample(cache_path, sampler_fn, *args, **kwargs):
+    """Load sampled arrays from an .npz cache if it exists, else run
+    `sampler_fn(*args, **kwargs)`, save the resulting tuple of arrays to
+    the cache, and return them.
+
+    Sampling takes 12-15 minutes at cluster scale.  With a cache path, an
+    interrupted or reconfigured run can skip re-sampling and go straight
+    to tree fit / probe.
+    """
+    if cache_path and os.path.exists(cache_path):
+        print(f'  loading cached dataset from {cache_path}...')
+        with np.load(cache_path) as d:
+            result = tuple(d[k] for k in sorted(d.files,
+                                                  key=lambda x: int(x.split('_')[1])))
+        return result
+    result = sampler_fn(*args, **kwargs)
+    if cache_path:
+        os.makedirs(os.path.dirname(cache_path) or '.', exist_ok=True)
+        print(f'  saving dataset cache to {cache_path}...')
+        np.savez_compressed(
+            cache_path,
+            **{f'arr_{i}': r for i, r in enumerate(result)})
+    return result
+
+
 def sample_opening_positions(num_games, max_ply=10, seed=42):
     """Play random games; for each game extract positions at plies 0..max_ply-1.
     At each position: features (120,), state labels (64,) as mine/opp/empty
@@ -363,6 +388,11 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='opening_tree_mlp.pt')
+    ap.add_argument('--cache-tr', default=None,
+                    help='Path to .npz cache for the sampled TRAIN set. '
+                          'If exists, skip sampling.  If not, sample + save.')
+    ap.add_argument('--cache-te', default=None,
+                    help='Same but for the TEST set.')
     args = ap.parse_args()
 
     if args.device == 'cuda' and not torch.cuda.is_available():
@@ -375,20 +405,23 @@ def main():
     if args.do_enumerate:
         print(f'ENUMERATING every reachable position at plies '
                f'0..{args.max_ply - 1} via BFS...')
-        Xnp_tr, Snp_tr, _, Tnp_tr = enumerate_opening_positions(
+        Xnp_tr, Snp_tr, _, Tnp_tr = load_or_sample(
+            args.cache_tr, enumerate_opening_positions,
             max_ply=args.max_ply, verbose=True)
         print(f'  enumeration done, {Xnp_tr.shape[0]} training positions '
                f'({time.time() - t0:.1f}s total)')
     else:
         print(f'sampling {args.num_train_games} train games, ply '
                f'0..{args.max_ply - 1}...')
-        Xnp_tr, Snp_tr, _, Tnp_tr = sample_opening_positions(
+        Xnp_tr, Snp_tr, _, Tnp_tr = load_or_sample(
+            args.cache_tr, sample_opening_positions,
             args.num_train_games, max_ply=args.max_ply, seed=args.seed)
         print(f'  train={Xnp_tr.shape[0]}  ({time.time() - t0:.1f}s)')
 
     t0 = time.time()
     print(f'sampling {args.num_test_games} test games...')
-    Xnp_te, Snp_te, _, Tnp_te = sample_opening_positions(
+    Xnp_te, Snp_te, _, Tnp_te = load_or_sample(
+        args.cache_te, sample_opening_positions,
         args.num_test_games, max_ply=args.max_ply,
         seed=args.seed + 1_000_000)
     print(f'  test={Xnp_te.shape[0]}  ({time.time() - t0:.1f}s)')

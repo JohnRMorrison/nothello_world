@@ -28,7 +28,7 @@ NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
 MIN_LEAF=${4:-50}     # bumped again; endgame trees grow bigger than opening
-N_JOBS=${5:-4}        # 4 workers, each with a full data copy; 240 GB is enough
+N_JOBS=${5:-1}        # single-threaded tree fit — no worker copies, safest
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -42,6 +42,11 @@ echo "============================================"
 
 OUT="ckpts_endgame/endgame_tree_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}.pt"
 
+# Cache the sampled positions so reruns skip the ~15-min sampling step.
+mkdir -p ckpts_endgame/cache
+CACHE_TR="ckpts_endgame/cache/endgame_g${NUM_TRAIN}_tr.npz"
+CACHE_TE="ckpts_endgame/cache/endgame_g${NUM_TEST}_te.npz"
+
 CUDA_VISIBLE_DEVICES=0 python endgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
     --num-test-games ${NUM_TEST} \
@@ -51,6 +56,8 @@ CUDA_VISIBLE_DEVICES=0 python endgame_tree_mlp.py \
     --tree-n-jobs ${N_JOBS} \
     --probe-epochs 30 \
     --device cuda \
+    --cache-tr ${CACHE_TR} \
+    --cache-te ${CACHE_TE} \
     --out ${OUT}
 
 echo "Completed at: $(date)"
