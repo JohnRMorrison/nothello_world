@@ -29,20 +29,29 @@ NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
 MIN_LEAF=${4:-5}       # 4th arg: min_samples_leaf (caps tree explosion)
+MODE=${5:-sample}      # 5th arg: 'sample' (default) or 'enum' (BFS all positions)
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
 echo "Node:              $(hostname)"
 echo "Started at:        $(date)"
-echo "num_train_games:   ${NUM_TRAIN}"
+echo "mode:              ${MODE}"
+echo "num_train_games:   ${NUM_TRAIN} (ignored if mode=enum)"
 echo "num_test_games:    ${NUM_TEST}"
 echo "tree_max_depth:    ${MAX_DEPTH}"
 echo "min_samples_leaf:  ${MIN_LEAF}"
 echo "============================================"
 
-OUT="ckpts_opening/opening_tree_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}.pt"
+if [ "${MODE}" = "enum" ]; then
+    OUT="ckpts_opening/opening_tree_enum_d${MAX_DEPTH}_ml${MIN_LEAF}.pt"
+    ENUM_FLAG="--enumerate"
+else
+    OUT="ckpts_opening/opening_tree_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}.pt"
+    ENUM_FLAG=""
+fi
 
 CUDA_VISIBLE_DEVICES=0 python opening_tree_mlp.py \
+    ${ENUM_FLAG} \
     --num-train-games ${NUM_TRAIN} \
     --num-test-games ${NUM_TEST} \
     --max-ply 10 \

@@ -95,6 +95,85 @@ def sample_opening_positions(num_games, max_ply=10, seed=42):
              np.array(Ts, dtype=np.int32))
 
 
+def enumerate_opening_positions(max_ply=10, verbose=True):
+    """BFS all distinct board positions reachable at plies 0..max_ply-1.
+
+    Dedup key is (board_state_bytes, side_to_move) — one entry per distinct
+    board position, regardless of how many move orderings reach it.  For
+    each unique position we keep ONE canonical move history (the first one
+    the BFS encountered) and use it to compute the played_even features.
+
+    Note: distinct move orderings that reach the same board state can have
+    different played_even features (parity of specific cells' placements
+    can differ).  Using the canonical prefix means the training set covers
+    every reachable board state exactly once, with one specific
+    played_even encoding.  This is an approximation vs. exhaustive
+    (state × history) enumeration, but it captures every state.
+    """
+    initial = OthelloBoardState()
+    key0 = (initial.state.tobytes(), int(initial.next_hand_color))
+    frontier = {key0: (initial.state.copy(),
+                        int(initial.next_hand_color), [])}
+
+    Xs, Ss, Ts = [], [], []
+
+    for ply in range(max_ply):
+        t0 = time.time()
+        for _key, (state_arr, side, prefix) in frontier.items():
+            mover_color = side     # +1 for black to move, -1 for white
+            raw = state_arr.flatten().astype(np.int8)
+            lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
+            lbl[raw == mover_color] = 1
+            lbl[raw == -mover_color] = 2
+            Xs.append(playedeven_features(prefix))
+            Ss.append(lbl)
+            Ts.append(ply)
+
+        if verbose:
+            print(f'  ply {ply:2d}:  {len(frontier):>10d} positions  '
+                   f'(+{time.time() - t0:.1f}s extract)')
+
+        if ply == max_ply - 1:
+            break
+
+        # Expand to the next ply.
+        t0 = time.time()
+        next_frontier = {}
+        for _key, (state_arr, side, prefix) in frontier.items():
+            b = OthelloBoardState()
+            b.state = state_arr.copy()
+            b.next_hand_color = side
+            valid = b.get_valid_moves()
+            if not valid:
+                # Pass.
+                b.update([])
+                valid = b.get_valid_moves()
+                if not valid:
+                    continue   # terminal
+                # After a pass we don't add moves to prefix (no move played);
+                # BUT we still want to enumerate the post-pass position at
+                # the next ply.  For simplicity, treat pass as if it skipped
+                # to the opponent's move.
+            for mv in valid:
+                nb = OthelloBoardState()
+                nb.state = state_arr.copy()
+                nb.next_hand_color = side
+                nb.update([mv])
+                new_key = (nb.state.tobytes(), int(nb.next_hand_color))
+                if new_key not in next_frontier:
+                    next_frontier[new_key] = (nb.state.copy(),
+                                                int(nb.next_hand_color),
+                                                prefix + [mv])
+        if verbose:
+            print(f'    expand → {len(next_frontier):>10d} '
+                   f'({time.time() - t0:.1f}s)')
+        frontier = next_frontier
+
+    return (np.stack(Xs), np.stack(Ss),
+             np.array([], dtype=np.int8),        # parity unused
+             np.array(Ts, dtype=np.int32))
+
+
 # ------------------------------------------------------------------------------
 # Trees → paths → hidden layer
 # ------------------------------------------------------------------------------
@@ -258,6 +337,11 @@ def main():
     ap.add_argument('--num-train-games', type=int, default=5000)
     ap.add_argument('--num-test-games', type=int, default=2000)
     ap.add_argument('--max-ply', type=int, default=10)
+    ap.add_argument('--enumerate', dest='do_enumerate', action='store_true',
+                    help='Use BFS to enumerate every reachable board position '
+                          'at plies 0..max_ply-1 instead of sampling random '
+                          'games for the training set.  The test set is '
+                          'unchanged (random games).')
     ap.add_argument('--tree-max-depth', type=int, default=8)
     ap.add_argument('--tree-min-samples-leaf', type=int, default=1)
     ap.add_argument('--tree-n-jobs', type=int, default=1)
@@ -273,16 +357,27 @@ def main():
     device = torch.device(args.device)
     print(f'device: {device}')
 
-    print(f'sampling {args.num_train_games} train + '
-           f'{args.num_test_games} test games, ply 0..{args.max_ply - 1}...')
     t0 = time.time()
-    Xnp_tr, Snp_tr, _, Tnp_tr = sample_opening_positions(
-        args.num_train_games, max_ply=args.max_ply, seed=args.seed)
+    if args.do_enumerate:
+        print(f'ENUMERATING every reachable position at plies '
+               f'0..{args.max_ply - 1} via BFS...')
+        Xnp_tr, Snp_tr, _, Tnp_tr = enumerate_opening_positions(
+            max_ply=args.max_ply, verbose=True)
+        print(f'  enumeration done, {Xnp_tr.shape[0]} training positions '
+               f'({time.time() - t0:.1f}s total)')
+    else:
+        print(f'sampling {args.num_train_games} train games, ply '
+               f'0..{args.max_ply - 1}...')
+        Xnp_tr, Snp_tr, _, Tnp_tr = sample_opening_positions(
+            args.num_train_games, max_ply=args.max_ply, seed=args.seed)
+        print(f'  train={Xnp_tr.shape[0]}  ({time.time() - t0:.1f}s)')
+
+    t0 = time.time()
+    print(f'sampling {args.num_test_games} test games...')
     Xnp_te, Snp_te, _, Tnp_te = sample_opening_positions(
         args.num_test_games, max_ply=args.max_ply,
         seed=args.seed + 1_000_000)
-    print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
-           f'({time.time() - t0:.1f}s)')
+    print(f'  test={Xnp_te.shape[0]}  ({time.time() - t0:.1f}s)')
 
     # --- Train per-cell decision trees ---
     print(f'\ntraining per-cell trees (max_depth={args.tree_max_depth}, '
