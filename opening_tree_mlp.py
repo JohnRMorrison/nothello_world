@@ -267,14 +267,14 @@ class OpeningTreeMLP(nn.Module):
         self.register_buffer('b', torch.from_numpy(biases).to(device))
         self.path_info = path_info
 
-    def forward(self, x, batch=4096, out_device='cpu',
+    def forward(self, x, batch=256, out_device='cpu',
                  out_dtype=torch.bool):
         """Compute hidden activations in chunks.
 
-        By default the output tensor is bool on CPU — this keeps memory
-        usage tractable when H is large (e.g. 70K).  Downstream (probe)
-        code should move per-batch slices to the compute device and cast
-        to float there.
+        Default batch is small (256) because H can grow into the 100k+
+        range for endgame/midgame, and the per-batch matmul on GPU costs
+        `batch × H × 4` bytes.  batch=256 with H=200k = 200 MB — safe on
+        a 10 GB GPU.
         """
         H = self.hidden_dim
         N = x.shape[0]

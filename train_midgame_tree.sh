@@ -34,6 +34,7 @@ MIN_LEAF=${4:-50}     # bumped from 5 — 800k midgame positions blow RAM otherw
 PLY_MIN=${5:-10}
 PLY_MAX=${6:-50}
 STAB=${7:-nostab}
+N_JOBS=${8:-8}        # reduced from 16; midgame trees peak higher with stability
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -65,7 +66,7 @@ CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
     --ply-max ${PLY_MAX} \
     --tree-max-depth ${MAX_DEPTH} \
     --tree-min-samples-leaf ${MIN_LEAF} \
-    --tree-n-jobs 16 \
+    --tree-n-jobs ${N_JOBS} \
     --probe-epochs 30 \
     --device cuda \
     --out ${OUT}

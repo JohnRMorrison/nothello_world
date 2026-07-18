@@ -27,7 +27,8 @@ cd $SLURM_SUBMIT_DIR
 NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
-MIN_LEAF=${4:-20}     # bumped from 5 — caps H to fit in RAM at 200k+ positions
+MIN_LEAF=${4:-50}     # bumped again; endgame trees grow bigger than opening
+N_JOBS=${5:-8}        # reduced from 16 to lower peak RAM during parallel fit
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -47,7 +48,7 @@ CUDA_VISIBLE_DEVICES=0 python endgame_tree_mlp.py \
     --endgame-ply 10 \
     --tree-max-depth ${MAX_DEPTH} \
     --tree-min-samples-leaf ${MIN_LEAF} \
-    --tree-n-jobs 16 \
+    --tree-n-jobs ${N_JOBS} \
     --probe-epochs 30 \
     --device cuda \
     --out ${OUT}
