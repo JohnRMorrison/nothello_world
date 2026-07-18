@@ -9,7 +9,7 @@
 #SBATCH --job-name=endgame_tree
 #SBATCH -c 16
 #SBATCH --time=6:00:00
-#SBATCH --mem=120GB
+#SBATCH --mem=240GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/endgame_tree_%j.out
 #SBATCH --account=nklab
@@ -28,7 +28,7 @@ NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
 MIN_LEAF=${4:-50}     # bumped again; endgame trees grow bigger than opening
-N_JOBS=${5:-8}        # reduced from 16 to lower peak RAM during parallel fit
+N_JOBS=${5:-4}        # 4 workers, each with a full data copy; 240 GB is enough
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"

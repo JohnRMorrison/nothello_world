@@ -12,7 +12,7 @@
 #SBATCH --job-name=midgame_tree
 #SBATCH -c 16
 #SBATCH --time=6:00:00
-#SBATCH --mem=120GB
+#SBATCH --mem=240GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/midgame_tree_%j.out
 #SBATCH --account=nklab
@@ -34,7 +34,7 @@ MIN_LEAF=${4:-50}     # bumped from 5 — 800k midgame positions blow RAM otherw
 PLY_MIN=${5:-10}
 PLY_MAX=${6:-50}
 STAB=${7:-nostab}
-N_JOBS=${8:-8}        # reduced from 16; midgame trees peak higher with stability
+N_JOBS=${8:-4}        # 4 workers × ~40 GB each fits under 240 GB comfortably
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
