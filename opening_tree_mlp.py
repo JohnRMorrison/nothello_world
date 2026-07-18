@@ -35,25 +35,37 @@ C60_TO_C64 = {i: c for i, c in enumerate(NON_CENTER_64)}
 STATE_NAMES = ['empty', 'mine', 'opp']
 
 
-def compute_input_dim(when_bucket_size=None):
-    """Base 121 (played + even + mover_parity), plus 60*n_buckets if
-    --when-bucket-size is set."""
-    if not when_bucket_size:
-        return 121
-    n_buckets = (TURNS + when_bucket_size - 1) // when_bucket_size
-    return 121 + 60 * n_buckets
+def compute_input_dim(when_bucket_size=None, use_move_grid=False):
+    """Base 121 (played + even + mover_parity), plus one of:
+      - when-buckets: 60 * n_buckets features
+      - move grid: 60 * 60 = 3600 features (bit per (turn, non-center-cell))
+    Use only one of the two.
+    """
+    dim = 121
+    if use_move_grid:
+        dim += TURNS * 60           # 60 turns × 60 non-center cells
+    elif when_bucket_size:
+        n_buckets = (TURNS + when_bucket_size - 1) // when_bucket_size
+        dim += 60 * n_buckets
+    return dim
 
 
-def playedeven_features(prefix, when_bucket_size=None):
+def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False):
     """Return input features for a game prefix.
 
     Base 121-d: 60 played + 60 even + 1 mover_parity.
-    Optional bucket block (added after position 120):
-      For each of 60 non-center cells and each of n_buckets turn-range
-      buckets, one bit that is 1 iff the cell was placed in that
-      bucket.  bucket k covers turns [k*bucket_size, (k+1)*bucket_size).
+    Optional temporal block (mutually exclusive):
+      when-buckets: for each non-center cell C and each bucket k, one bit
+                    that fires iff C was played at some turn in
+                    [k*bucket_size, (k+1)*bucket_size).
+      move grid:    for each turn t (0..59) and each non-center cell C, one
+                    bit that fires iff the move at turn t was cell C.  At
+                    most 60 bits set out of 3600 (one per played move).
+                    Direct temporal encoding — no threshold reasoning
+                    required, one bit per (specific turn, specific cell)
+                    event.
     """
-    input_dim = compute_input_dim(when_bucket_size)
+    input_dim = compute_input_dim(when_bucket_size, use_move_grid)
     feat = np.zeros(input_dim, dtype=np.float32)
     for t, c in enumerate(prefix):
         if c not in C64_TO_C60:
@@ -62,7 +74,9 @@ def playedeven_features(prefix, when_bucket_size=None):
         feat[i] = 1.0
         if t % 2 == 0:
             feat[60 + i] = 1.0
-        if when_bucket_size:
+        if use_move_grid:
+            feat[121 + t * 60 + i] = 1.0
+        elif when_bucket_size:
             bucket = t // when_bucket_size
             feat[121 + bucket * 60 + i] = 1.0
     feat[120] = 1.0 if len(prefix) % 2 == 1 else 0.0
@@ -113,7 +127,7 @@ def load_or_sample(cache_path, sampler_fn, *args, **kwargs):
 
 
 def sample_opening_positions(num_games, max_ply=10, seed=42,
-                              when_bucket_size=None):
+                              when_bucket_size=None, use_move_grid=False):
     rng = np.random.RandomState(seed)
     Xs, Ss, Ps, Ts = [], [], [], []
     for _ in range(num_games):
@@ -132,7 +146,8 @@ def sample_opening_positions(num_games, max_ply=10, seed=42,
             lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
             lbl[raw == mover_color] = 1
             lbl[raw == -mover_color] = 2
-            Xs.append(playedeven_features(prefix, when_bucket_size))
+            Xs.append(playedeven_features(prefix, when_bucket_size,
+                                            use_move_grid))
             Ss.append(lbl)
             Ps.append(parity)
             Ts.append(len(prefix))
@@ -227,21 +242,25 @@ def enumerate_opening_positions(max_ply=10, verbose=True):
 # Trees → paths → hidden layer
 # ------------------------------------------------------------------------------
 
-def _fit_one_tree(X, y, max_depth, min_samples_leaf):
+def _fit_one_tree(X, y, max_depth, min_samples_leaf, max_features=None):
     tree = DecisionTreeClassifier(max_depth=max_depth, random_state=0,
-                                    min_samples_leaf=min_samples_leaf)
+                                    min_samples_leaf=min_samples_leaf,
+                                    max_features=max_features)
     tree.fit(X, y)
     return tree
 
 
-def train_per_cell_trees(X, S, max_depth, min_samples_leaf=1, n_jobs=1):
+def train_per_cell_trees(X, S, max_depth, min_samples_leaf=1, n_jobs=1,
+                          max_features=None):
     """Train 64 decision trees, optionally in parallel across cells."""
     if n_jobs == 1:
-        return [_fit_one_tree(X, S[:, c], max_depth, min_samples_leaf)
+        return [_fit_one_tree(X, S[:, c], max_depth, min_samples_leaf,
+                              max_features)
                 for c in range(BOARD_CELLS)]
     from joblib import Parallel, delayed
     return Parallel(n_jobs=n_jobs)(
-        delayed(_fit_one_tree)(X, S[:, c], max_depth, min_samples_leaf)
+        delayed(_fit_one_tree)(X, S[:, c], max_depth, min_samples_leaf,
+                                max_features)
         for c in range(BOARD_CELLS))
 
 
@@ -426,6 +445,18 @@ def main():
                           '(covering turns [k*B, (k+1)*B)), one bit that '
                           'is 1 iff C was placed in that bucket.  Input '
                           'dim becomes 121 + 60 * ceil(60/B).')
+    ap.add_argument('--use-move-grid', action='store_true',
+                    help='If set, add 3600 move-grid features to input '
+                          '(bit per (turn, non-center-cell)).  Mutually '
+                          'exclusive with --when-bucket-size.  Direct '
+                          'temporal encoding, one bit per specific move '
+                          'event.  Input dim becomes 3721.')
+    ap.add_argument('--tree-max-features', default=None,
+                    help='Passed to sklearn DecisionTreeClassifier.  '
+                          "'sqrt' considers only sqrt(D) features per "
+                          "split (huge speedup at high D).  'log2', an "
+                          "integer, or a float in (0,1] also accepted.  "
+                          'Default None = all features (slow at D>500).')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='If set, keep only the top-K most frequently '
                           'trained-on paths per cell (frequency-based rule '
@@ -460,7 +491,8 @@ def main():
         Xnp_tr, Snp_tr, _, Tnp_tr = load_or_sample(
             args.cache_tr, sample_opening_positions,
             args.num_train_games, max_ply=args.max_ply, seed=args.seed,
-            when_bucket_size=args.when_bucket_size)
+            when_bucket_size=args.when_bucket_size,
+            use_move_grid=args.use_move_grid)
         print(f'  train={Xnp_tr.shape[0]}  ({time.time() - t0:.1f}s)')
 
     t0 = time.time()
@@ -469,7 +501,8 @@ def main():
         args.cache_te, sample_opening_positions,
         args.num_test_games, max_ply=args.max_ply,
         seed=args.seed + 1_000_000,
-        when_bucket_size=args.when_bucket_size)
+        when_bucket_size=args.when_bucket_size,
+        use_move_grid=args.use_move_grid)
     print(f'  test={Xnp_te.shape[0]}  ({time.time() - t0:.1f}s)')
 
     # --- Train per-cell decision trees ---
@@ -477,11 +510,22 @@ def main():
            f'min_samples_leaf={args.tree_min_samples_leaf}, '
            f'n_jobs={args.tree_n_jobs})...')
     t0 = time.time()
+    # Parse --tree-max-features: 'sqrt', 'log2', int, or float
+    mf = args.tree_max_features
+    if mf is not None and mf not in ('sqrt', 'log2', 'auto'):
+        try:
+            mf = int(mf)
+        except ValueError:
+            try:
+                mf = float(mf)
+            except ValueError:
+                pass
     trees = train_per_cell_trees(
         Xnp_tr, Snp_tr,
         max_depth=args.tree_max_depth,
         min_samples_leaf=args.tree_min_samples_leaf,
-        n_jobs=args.tree_n_jobs)
+        n_jobs=args.tree_n_jobs,
+        max_features=mf)
     print(f'  ({time.time() - t0:.1f}s)')
 
     # Per-cell tree accuracy on test (before path extraction).

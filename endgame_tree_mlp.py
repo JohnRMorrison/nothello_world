@@ -57,7 +57,7 @@ CELL_CLASS = {c: cell_class(c) for c in range(64)}
 # ------------------------------------------------------------------------------
 
 def sample_endgame_positions(num_games, endgame_ply=10, seed=42,
-                               when_bucket_size=None):
+                               when_bucket_size=None, use_move_grid=False):
     """Play random games to completion, extract the LAST `endgame_ply`
     positions of each game.  Returns (X, S, plies) with:
       X: (N, 120) played_even features
@@ -84,7 +84,7 @@ def sample_endgame_positions(num_games, endgame_ply=10, seed=42,
             lbl[raw == mover_color] = 1
             lbl[raw == -mover_color] = 2
             game_positions.append((
-                playedeven_features(prefix, when_bucket_size),
+                playedeven_features(prefix, when_bucket_size, use_move_grid),
                 lbl, len(prefix)))
             move = valid[rng.randint(len(valid))]
             board.update([move])
@@ -132,6 +132,8 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='endgame_tree_mlp.pt')
     ap.add_argument('--when-bucket-size', type=int, default=None)
+    ap.add_argument('--use-move-grid', action='store_true')
+    ap.add_argument('--tree-max-features', default=None)
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -153,12 +155,14 @@ def main():
     Xnp_tr, Snp_tr, Tnp_tr = load_or_sample(
         args.cache_tr, sample_endgame_positions,
         args.num_train_games, endgame_ply=args.endgame_ply, seed=args.seed,
-        when_bucket_size=args.when_bucket_size)
+        when_bucket_size=args.when_bucket_size,
+        use_move_grid=args.use_move_grid)
     Xnp_te, Snp_te, Tnp_te = load_or_sample(
         args.cache_te, sample_endgame_positions,
         args.num_test_games, endgame_ply=args.endgame_ply,
         seed=args.seed + 1_000_000,
-        when_bucket_size=args.when_bucket_size)
+        when_bucket_size=args.when_bucket_size,
+        use_move_grid=args.use_move_grid)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
     print(f'  training ply range: [{Tnp_tr.min()}, {Tnp_tr.max()}]  '
@@ -169,11 +173,21 @@ def main():
            f'min_samples_leaf={args.tree_min_samples_leaf}, '
            f'n_jobs={args.tree_n_jobs})...')
     t0 = time.time()
+    mf = args.tree_max_features
+    if mf is not None and mf not in ('sqrt', 'log2', 'auto'):
+        try:
+            mf = int(mf)
+        except ValueError:
+            try:
+                mf = float(mf)
+            except ValueError:
+                pass
     trees = train_per_cell_trees(
         Xnp_tr, Snp_tr,
         max_depth=args.tree_max_depth,
         min_samples_leaf=args.tree_min_samples_leaf,
-        n_jobs=args.tree_n_jobs)
+        n_jobs=args.tree_n_jobs,
+        max_features=mf)
     print(f'  ({time.time() - t0:.1f}s)')
 
     # Per-cell tree accuracy on test + break down by cell class.

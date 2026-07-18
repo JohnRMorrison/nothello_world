@@ -40,7 +40,8 @@ from endgame_tree_mlp import (
 # ------------------------------------------------------------------------------
 
 def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
-                                when_bucket_size=None):
+                                when_bucket_size=None,
+                                use_move_grid=False):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) with:
       X: (N, 120) played_even features
@@ -67,7 +68,8 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                 lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
                 lbl[raw == mover_color] = 1
                 lbl[raw == -mover_color] = 2
-                Xs.append(playedeven_features(prefix, when_bucket_size))
+                Xs.append(playedeven_features(prefix, when_bucket_size,
+                                                use_move_grid))
                 Ss.append(lbl)
                 Ts.append(ply)
             move = valid[rng.randint(len(valid))]
@@ -206,6 +208,11 @@ def main():
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='midgame_tree_mlp.pt')
     ap.add_argument('--when-bucket-size', type=int, default=None)
+    ap.add_argument('--use-move-grid', action='store_true',
+                    help='Add 3600 move-grid features (bit per (turn, cell)).')
+    ap.add_argument('--tree-max-features', default=None,
+                    help='Passed to sklearn: sqrt/log2/int/float.  Use with '
+                          '--use-move-grid to keep tree fit tractable.')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -229,12 +236,14 @@ def main():
         args.cache_tr, sample_midgame_positions,
         args.num_train_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed,
-        when_bucket_size=args.when_bucket_size)
+        when_bucket_size=args.when_bucket_size,
+        use_move_grid=args.use_move_grid)
     Xnp_te, Snp_te, Tnp_te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed + 1_000_000,
-        when_bucket_size=args.when_bucket_size)
+        when_bucket_size=args.when_bucket_size,
+        use_move_grid=args.use_move_grid)
 
     # If a cache from a wider ply range was loaded, narrow it to the current
     # args range.  Lets a single (10, 50) cache serve any [a, b) subwindow.
@@ -258,11 +267,21 @@ def main():
            f'min_samples_leaf={args.tree_min_samples_leaf}, '
            f'n_jobs={args.tree_n_jobs})...')
     t0 = time.time()
+    mf = args.tree_max_features
+    if mf is not None and mf not in ('sqrt', 'log2', 'auto'):
+        try:
+            mf = int(mf)
+        except ValueError:
+            try:
+                mf = float(mf)
+            except ValueError:
+                pass
     trees = train_per_cell_trees(
         Xnp_tr, Snp_tr,
         max_depth=args.tree_max_depth,
         min_samples_leaf=args.tree_min_samples_leaf,
-        n_jobs=args.tree_n_jobs)
+        n_jobs=args.tree_n_jobs,
+        max_features=mf)
     print(f'  ({time.time() - t0:.1f}s)')
 
     tree_correct_per_cell = np.zeros(BOARD_CELLS)
