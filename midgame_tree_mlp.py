@@ -228,6 +228,17 @@ def main():
                     help='L1 regularization strength for probe.  If > 0, '
                           'penalizes |probe.weight| to select a sparse '
                           'subset of hidden units.')
+    ap.add_argument('--boost-count-rounds', type=int, default=0,
+                    help='If > 0, iteratively add residual-correlated count '
+                          'candidates to hidden layer.  Requires a candidate '
+                          'pool (--include-count-nodes / --random-count-nodes).')
+    ap.add_argument('--boost-count-per-round', type=int, default=200,
+                    help='Number of top-scoring candidates added per '
+                          'boosting round.')
+    ap.add_argument('--boost-candidate-pool', type=int, default=10000,
+                    help='If boosting, size of the random candidate pool from '
+                          'which residual-correlated features are selected. '
+                          'Structured pool is always included.')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -428,6 +439,99 @@ def main():
            f'max={fire_rate.max().item()*100:.2f}%')
     print(f'  dead units: {int((fire_rate == 0).sum().item())} / '
            f'{len(all_meta)}')
+
+    # ---- Optional: greedy residual boosting ----
+    if args.boost_count_rounds > 0:
+        print(f'\ngreedy residual-boosting: {args.boost_count_rounds} rounds '
+               f'× {args.boost_count_per_round} candidates/round...')
+        # Build candidate pool: structured + random.
+        cand_pool = build_structured_count_nodes()
+        if args.boost_candidate_pool > 0:
+            rn = build_random_count_nodes(args.boost_candidate_pool,
+                                           seed=args.random_count_seed + 1)
+            cand_pool.extend(rn)
+        print(f'  candidate pool: {len(cand_pool)} nodes')
+
+        # Skip candidates already added (via --include-count-nodes /
+        # --random-count-nodes).  Use names.
+        used_names = {n[0] for n in count_nodes_used}
+        cand_pool = [c for c in cand_pool if c[0] not in used_names]
+        print(f'  after removing already-included: {len(cand_pool)}')
+
+        # Compute candidate activations once.
+        played_tr = Xnp_tr[:, :60]; even_tr = Xnp_tr[:, 60:120]
+        played_te = Xnp_te[:, :60]; even_te = Xnp_te[:, 60:120]
+        print(f'  computing candidate activations...')
+        t0 = time.time()
+        CA_tr = compute_count_activations(cand_pool, played_tr, even_tr)
+        CA_te = compute_count_activations(cand_pool, played_te, even_te)
+        print(f'    CA_tr {CA_tr.shape} '
+               f'({CA_tr.nbytes / 1e9:.2f} GB)  '
+               f'({time.time() - t0:.1f}s)')
+
+        added_mask = np.zeros(len(cand_pool), dtype=bool)
+
+        for round_i in range(args.boost_count_rounds):
+            print(f'\n  round {round_i + 1}/{args.boost_count_rounds}')
+            # Fit probe on current H.
+            probe = train_probe(H_tr, S_tr, H_te, S_te,
+                                  epochs=max(args.probe_epochs // 2, 10),
+                                  device=device, l1_lambda=args.probe_l1)
+            # Compute residuals on training set (chunked, CPU-safe).
+            device_probe = next(probe.parameters()).device
+            residuals = np.zeros(
+                (H_tr.shape[0], BOARD_CELLS * 3), dtype=np.float32)
+            S_onehot = np.zeros(residuals.shape, dtype=np.float32)
+            for i in range(0, H_tr.shape[0], 4096):
+                h = H_tr[i:i + 4096].to(device=device_probe,
+                                          dtype=torch.float32)
+                with torch.no_grad():
+                    logits = probe(h).view(-1, BOARD_CELLS, 3)
+                    probs = torch.softmax(logits, dim=-1).view(
+                        -1, BOARD_CELLS * 3).cpu().numpy()
+                residuals[i:i + 4096] = probs
+                # onehot
+                s = S_tr[i:i + 4096].numpy()
+                for k, s_arr in enumerate(s):
+                    for c, cls in enumerate(s_arr):
+                        S_onehot[i + k, c * 3 + int(cls)] = 1.0
+            # residuals = onehot - probs (positive = probe underpredicts)
+            residuals = S_onehot - residuals
+
+            # Score each unused candidate: |cand_act.T @ residuals| summed
+            # across output.
+            scores = np.zeros(len(cand_pool), dtype=np.float64)
+            for i in range(0, H_tr.shape[0], 4096):
+                r_chunk = residuals[i:i + 4096]           # (b, 192)
+                a_chunk = CA_tr[i:i + 4096].astype(np.float32)  # (b, M)
+                # (M, 192) += a_chunk.T @ r_chunk
+                scores += np.abs(a_chunk.T @ r_chunk).sum(axis=1)
+            # Mask already-added candidates.
+            scores[added_mask] = -1
+            top_j = np.argsort(-scores)[:args.boost_count_per_round]
+            top_j = top_j[scores[top_j] > 0]      # skip if all scored 0
+            added_mask[top_j] = True
+            print(f'    adding {len(top_j)} candidates (top score '
+                   f'{scores[top_j[0]]:.1f})')
+
+            # Append to H_tr, H_te.
+            new_tr = torch.from_numpy(CA_tr[:, top_j])
+            new_te = torch.from_numpy(CA_te[:, top_j])
+            H_tr = torch.cat([H_tr, new_tr], dim=1)
+            H_te = torch.cat([H_te, new_te], dim=1)
+            for j in top_j:
+                all_meta.append({
+                    'kind': 'count_node_boosted',
+                    'name': cand_pool[j][0],
+                    'parity': cand_pool[j][2],
+                    'threshold': cand_pool[j][3],
+                    'round': round_i,
+                })
+            print(f'    H_tr now {tuple(H_tr.shape)}  '
+                   f'H_te now {tuple(H_te.shape)}')
+
+        # Free candidate activation storage.
+        del CA_tr, CA_te, residuals, S_onehot
 
     print('\ntraining linear probe on hidden layer...')
     if args.probe_l1 > 0:
