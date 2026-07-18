@@ -56,7 +56,8 @@ CELL_CLASS = {c: cell_class(c) for c in range(64)}
 # Endgame position sampling
 # ------------------------------------------------------------------------------
 
-def sample_endgame_positions(num_games, endgame_ply=10, seed=42):
+def sample_endgame_positions(num_games, endgame_ply=10, seed=42,
+                               when_bucket_size=None):
     """Play random games to completion, extract the LAST `endgame_ply`
     positions of each game.  Returns (X, S, plies) with:
       X: (N, 120) played_even features
@@ -83,7 +84,8 @@ def sample_endgame_positions(num_games, endgame_ply=10, seed=42):
             lbl[raw == mover_color] = 1
             lbl[raw == -mover_color] = 2
             game_positions.append((
-                playedeven_features(prefix), lbl, len(prefix)))
+                playedeven_features(prefix, when_bucket_size),
+                lbl, len(prefix)))
             move = valid[rng.randint(len(valid))]
             board.update([move])
             prefix.append(move)
@@ -129,6 +131,7 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='endgame_tree_mlp.pt')
+    ap.add_argument('--when-bucket-size', type=int, default=None)
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -149,11 +152,13 @@ def main():
     t0 = time.time()
     Xnp_tr, Snp_tr, Tnp_tr = load_or_sample(
         args.cache_tr, sample_endgame_positions,
-        args.num_train_games, endgame_ply=args.endgame_ply, seed=args.seed)
+        args.num_train_games, endgame_ply=args.endgame_ply, seed=args.seed,
+        when_bucket_size=args.when_bucket_size)
     Xnp_te, Snp_te, Tnp_te = load_or_sample(
         args.cache_te, sample_endgame_positions,
         args.num_test_games, endgame_ply=args.endgame_ply,
-        seed=args.seed + 1_000_000)
+        seed=args.seed + 1_000_000,
+        when_bucket_size=args.when_bucket_size)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
     print(f'  training ply range: [{Tnp_tr.min()}, {Tnp_tr.max()}]  '
@@ -187,12 +192,13 @@ def main():
     print('\nextracting paths → hidden units...')
     all_w, all_b, all_meta = [], [], []
     per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
+    input_dim = Xnp_tr.shape[1]
     for c in range(BOARD_CELLS):
         paths = extract_paths(trees[c])
         paths = prune_paths_by_count(paths, args.top_k_per_cell)
         per_cell_leaf_counts[c] = len(paths)
         for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
-            w, b = path_to_weight(conditions)
+            w, b = path_to_weight(conditions, input_dim=input_dim)
             all_w.append(w); all_b.append(b)
             all_meta.append({
                 'cell': c, 'path_idx': path_idx,

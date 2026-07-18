@@ -25,6 +25,7 @@ from data.othello import OthelloBoardState
 
 
 BOARD_CELLS = 64
+TURNS = 60
 INPUT_DIM_BASE = 120               # 60 played + 60 even
 INPUT_DIM = 121                    # 60 played + 60 even + 1 mover_parity
 CENTER_64 = {27, 28, 35, 36}
@@ -34,18 +35,26 @@ C60_TO_C64 = {i: c for i, c in enumerate(NON_CENTER_64)}
 STATE_NAMES = ['empty', 'mine', 'opp']
 
 
-def playedeven_features(prefix):
-    """Return 121-d input: 60 played + 60 even + 1 mover_parity.
+def compute_input_dim(when_bucket_size=None):
+    """Base 121 (played + even + mover_parity), plus 60*n_buckets if
+    --when-bucket-size is set."""
+    if not when_bucket_size:
+        return 121
+    n_buckets = (TURNS + when_bucket_size - 1) // when_bucket_size
+    return 121 + 60 * n_buckets
 
-    mover_parity = 0 iff it is black's turn to move (i.e., an even number of
-    moves have been made so far); = 1 iff white's turn.  This is directly
-    inferable from `len(prefix)` at extraction time.
 
-    The mover-parity bit lets a decision tree split on it at depth 1 and
-    disambiguate mine/opp labels without having to compute an XOR of the
-    60 played bits — which is what depth 15 could not do at high ply.
+def playedeven_features(prefix, when_bucket_size=None):
+    """Return input features for a game prefix.
+
+    Base 121-d: 60 played + 60 even + 1 mover_parity.
+    Optional bucket block (added after position 120):
+      For each of 60 non-center cells and each of n_buckets turn-range
+      buckets, one bit that is 1 iff the cell was placed in that
+      bucket.  bucket k covers turns [k*bucket_size, (k+1)*bucket_size).
     """
-    feat = np.zeros(INPUT_DIM, dtype=np.float32)
+    input_dim = compute_input_dim(when_bucket_size)
+    feat = np.zeros(input_dim, dtype=np.float32)
     for t, c in enumerate(prefix):
         if c not in C64_TO_C60:
             continue
@@ -53,6 +62,9 @@ def playedeven_features(prefix):
         feat[i] = 1.0
         if t % 2 == 0:
             feat[60 + i] = 1.0
+        if when_bucket_size:
+            bucket = t // when_bucket_size
+            feat[121 + bucket * 60 + i] = 1.0
     feat[120] = 1.0 if len(prefix) % 2 == 1 else 0.0
     return feat
 
@@ -100,10 +112,8 @@ def load_or_sample(cache_path, sampler_fn, *args, **kwargs):
     return result
 
 
-def sample_opening_positions(num_games, max_ply=10, seed=42):
-    """Play random games; for each game extract positions at plies 0..max_ply-1.
-    At each position: features (120,), state labels (64,) as mine/opp/empty
-    relative to the current mover, and metadata (parity, ply)."""
+def sample_opening_positions(num_games, max_ply=10, seed=42,
+                              when_bucket_size=None):
     rng = np.random.RandomState(seed)
     Xs, Ss, Ps, Ts = [], [], [], []
     for _ in range(num_games):
@@ -122,7 +132,7 @@ def sample_opening_positions(num_games, max_ply=10, seed=42):
             lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
             lbl[raw == mover_color] = 1
             lbl[raw == -mover_color] = 2
-            Xs.append(playedeven_features(prefix))
+            Xs.append(playedeven_features(prefix, when_bucket_size))
             Ss.append(lbl)
             Ps.append(parity)
             Ts.append(len(prefix))
@@ -410,6 +420,12 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='opening_tree_mlp.pt')
+    ap.add_argument('--when-bucket-size', type=int, default=None,
+                    help='If set, add turn-range bucket features to input.  '
+                          'For each non-center cell C and each bucket k '
+                          '(covering turns [k*B, (k+1)*B)), one bit that '
+                          'is 1 iff C was placed in that bucket.  Input '
+                          'dim becomes 121 + 60 * ceil(60/B).')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='If set, keep only the top-K most frequently '
                           'trained-on paths per cell (frequency-based rule '
@@ -443,7 +459,8 @@ def main():
                f'0..{args.max_ply - 1}...')
         Xnp_tr, Snp_tr, _, Tnp_tr = load_or_sample(
             args.cache_tr, sample_opening_positions,
-            args.num_train_games, max_ply=args.max_ply, seed=args.seed)
+            args.num_train_games, max_ply=args.max_ply, seed=args.seed,
+            when_bucket_size=args.when_bucket_size)
         print(f'  train={Xnp_tr.shape[0]}  ({time.time() - t0:.1f}s)')
 
     t0 = time.time()
@@ -451,7 +468,8 @@ def main():
     Xnp_te, Snp_te, _, Tnp_te = load_or_sample(
         args.cache_te, sample_opening_positions,
         args.num_test_games, max_ply=args.max_ply,
-        seed=args.seed + 1_000_000)
+        seed=args.seed + 1_000_000,
+        when_bucket_size=args.when_bucket_size)
     print(f'  test={Xnp_te.shape[0]}  ({time.time() - t0:.1f}s)')
 
     # --- Train per-cell decision trees ---
@@ -478,13 +496,14 @@ def main():
     print('\nextracting paths → hidden units...')
     all_w, all_b, all_meta = [], [], []
     per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
+    input_dim = Xnp_tr.shape[1]
     for c in range(BOARD_CELLS):
         paths = extract_paths(trees[c])
         n_all = len(paths)
         paths = prune_paths_by_count(paths, args.top_k_per_cell)
         per_cell_leaf_counts[c] = len(paths)
         for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
-            w, b = path_to_weight(conditions)
+            w, b = path_to_weight(conditions, input_dim=input_dim)
             all_w.append(w); all_b.append(b)
             all_meta.append({
                 'cell': c, 'path_idx': path_idx,

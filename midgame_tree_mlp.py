@@ -39,7 +39,8 @@ from endgame_tree_mlp import (
 # Mid-game position sampling
 # ------------------------------------------------------------------------------
 
-def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42):
+def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
+                                when_bucket_size=None):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) with:
       X: (N, 120) played_even features
@@ -66,7 +67,7 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42):
                 lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
                 lbl[raw == mover_color] = 1
                 lbl[raw == -mover_color] = 2
-                Xs.append(playedeven_features(prefix))
+                Xs.append(playedeven_features(prefix, when_bucket_size))
                 Ss.append(lbl)
                 Ts.append(ply)
             move = valid[rng.randint(len(valid))]
@@ -204,6 +205,7 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='midgame_tree_mlp.pt')
+    ap.add_argument('--when-bucket-size', type=int, default=None)
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -226,11 +228,13 @@ def main():
     Xnp_tr, Snp_tr, Tnp_tr = load_or_sample(
         args.cache_tr, sample_midgame_positions,
         args.num_train_games, ply_min=args.ply_min,
-        ply_max=args.ply_max, seed=args.seed)
+        ply_max=args.ply_max, seed=args.seed,
+        when_bucket_size=args.when_bucket_size)
     Xnp_te, Snp_te, Tnp_te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
-        ply_max=args.ply_max, seed=args.seed + 1_000_000)
+        ply_max=args.ply_max, seed=args.seed + 1_000_000,
+        when_bucket_size=args.when_bucket_size)
 
     # If a cache from a wider ply range was loaded, narrow it to the current
     # args range.  Lets a single (10, 50) cache serve any [a, b) subwindow.
@@ -276,12 +280,13 @@ def main():
     print('\nextracting paths → hidden units...')
     all_w, all_b, all_meta = [], [], []
     per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
+    input_dim = Xnp_tr.shape[1]
     for c in range(BOARD_CELLS):
         paths = extract_paths(trees[c])
         paths = prune_paths_by_count(paths, args.top_k_per_cell)
         per_cell_leaf_counts[c] = len(paths)
         for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
-            w, b = path_to_weight(conditions)
+            w, b = path_to_weight(conditions, input_dim=input_dim)
             all_w.append(w); all_b.append(b)
             all_meta.append({
                 'kind': 'tree_path',
