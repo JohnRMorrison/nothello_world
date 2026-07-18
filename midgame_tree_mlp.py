@@ -54,7 +54,8 @@ from order_nodes import (
 
 def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                                 when_bucket_size=None,
-                                use_move_grid=False):
+                                use_move_grid=False,
+                                recent_Ks=None):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) with:
       X: (N, 120) played_even features
@@ -82,7 +83,8 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                 lbl[raw == mover_color] = 1
                 lbl[raw == -mover_color] = 2
                 Xs.append(playedeven_features(prefix, when_bucket_size,
-                                                use_move_grid))
+                                                use_move_grid,
+                                                recent_Ks=recent_Ks))
                 Ss.append(lbl)
                 Ts.append(ply)
             move = valid[rng.randint(len(valid))]
@@ -223,6 +225,13 @@ def main():
     ap.add_argument('--when-bucket-size', type=int, default=None)
     ap.add_argument('--use-move-grid', action='store_true',
                     help='Add 3600 move-grid features (bit per (turn, cell)).')
+    ap.add_argument('--input-recent-Ks', default='',
+                    help='Comma-separated K values.  For each K, appends 60 '
+                          'bits (one per non-center cell) that fire iff the '
+                          'cell was played in the last K turns.  Trees fit '
+                          'on the enlarged input directly — no separate '
+                          'order-node hidden bank needed.  E.g., "5" gives '
+                          'played+even+recent = 60x3 input (+ mover_parity).')
     ap.add_argument('--tree-max-features', default=None,
                     help='Passed to sklearn: sqrt/log2/int/float.  Use with '
                           '--use-move-grid to keep tree fit tractable.')
@@ -343,6 +352,12 @@ def main():
     print(f'device: {device}')
     print(f'ply range: [{args.ply_min}, {args.ply_max})')
 
+    recent_Ks = tuple(int(k) for k in args.input_recent_Ks.split(',')
+                        if k.strip()) or None
+    if recent_Ks:
+        print(f'input includes recent bits for K in {recent_Ks} — '
+               f'{60 * len(recent_Ks)} extra cols per position')
+
     print(f'sampling {args.num_train_games} train + '
            f'{args.num_test_games} test games...')
     t0 = time.time()
@@ -351,13 +366,15 @@ def main():
         args.num_train_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed,
         when_bucket_size=args.when_bucket_size,
-        use_move_grid=args.use_move_grid)
+        use_move_grid=args.use_move_grid,
+        recent_Ks=recent_Ks)
     Xnp_te, Snp_te, Tnp_te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed + 1_000_000,
         when_bucket_size=args.when_bucket_size,
-        use_move_grid=args.use_move_grid)
+        use_move_grid=args.use_move_grid,
+        recent_Ks=recent_Ks)
 
     # If a cache from a wider ply range was loaded, narrow it to the current
     # args range.  Lets a single (10, 50) cache serve any [a, b) subwindow.

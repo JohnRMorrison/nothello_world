@@ -35,11 +35,14 @@ C60_TO_C64 = {i: c for i, c in enumerate(NON_CENTER_64)}
 STATE_NAMES = ['empty', 'mine', 'opp']
 
 
-def compute_input_dim(when_bucket_size=None, use_move_grid=False):
-    """Base 121 (played + even + mover_parity), plus one of:
-      - when-buckets: 60 * n_buckets features
-      - move grid: 60 * 60 = 3600 features (bit per (turn, non-center-cell))
-    Use only one of the two.
+def compute_input_dim(when_bucket_size=None, use_move_grid=False,
+                        recent_Ks=None):
+    """Base 121 (played + even + mover_parity), plus optionally:
+      - when-buckets: 60 * n_buckets features (mutex with move grid).
+      - move grid: 60 * 60 = 3600 features (mutex with when-buckets).
+      - recent_Ks: 60 * len(recent_Ks) features — for each K in the list,
+        one per-cell bit indicating whether that cell was played in the
+        last K turns of the prefix.  Composes with either mutex block.
     """
     dim = 121
     if use_move_grid:
@@ -47,25 +50,28 @@ def compute_input_dim(when_bucket_size=None, use_move_grid=False):
     elif when_bucket_size:
         n_buckets = (TURNS + when_bucket_size - 1) // when_bucket_size
         dim += 60 * n_buckets
+    if recent_Ks:
+        dim += 60 * len(recent_Ks)
     return dim
 
 
-def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False):
+def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
+                          recent_Ks=None):
     """Return input features for a game prefix.
 
     Base 121-d: 60 played + 60 even + 1 mover_parity.
-    Optional temporal block (mutually exclusive):
+    Optional temporal blocks (compose):
       when-buckets: for each non-center cell C and each bucket k, one bit
                     that fires iff C was played at some turn in
-                    [k*bucket_size, (k+1)*bucket_size).
+                    [k*bucket_size, (k+1)*bucket_size).  Mutex with movegrid.
       move grid:    for each turn t (0..59) and each non-center cell C, one
                     bit that fires iff the move at turn t was cell C.  At
-                    most 60 bits set out of 3600 (one per played move).
-                    Direct temporal encoding — no threshold reasoning
-                    required, one bit per (specific turn, specific cell)
-                    event.
+                    most 60 bits set out of 3600.  Mutex with when-buckets.
+      recent_Ks:    for each K in the list, one per-cell bit indicating
+                    whether that cell was played in prefix[T-K:T].  Composes
+                    with either mutex block above.
     """
-    input_dim = compute_input_dim(when_bucket_size, use_move_grid)
+    input_dim = compute_input_dim(when_bucket_size, use_move_grid, recent_Ks)
     feat = np.zeros(input_dim, dtype=np.float32)
     for t, c in enumerate(prefix):
         if c not in C64_TO_C60:
@@ -80,21 +86,50 @@ def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False):
             bucket = t // when_bucket_size
             feat[121 + bucket * 60 + i] = 1.0
     feat[120] = 1.0 if len(prefix) % 2 == 1 else 0.0
+    if recent_Ks:
+        # Offset of the recent block: past any mutex temporal block.
+        if use_move_grid:
+            base = 121 + TURNS * 60
+        elif when_bucket_size:
+            n_buckets = (TURNS + when_bucket_size - 1) // when_bucket_size
+            base = 121 + 60 * n_buckets
+        else:
+            base = 121
+        T = len(prefix)
+        for k_idx, K in enumerate(recent_Ks):
+            t_lo = max(0, T - K)
+            for t in range(t_lo, T):
+                c = prefix[t]
+                if c in C64_TO_C60:
+                    feat[base + k_idx * 60 + C64_TO_C60[c]] = 1.0
     return feat
 
 
-def feature_name(feat_idx):
+def feature_name(feat_idx, recent_Ks=None):
     """Return a human-readable name for a played_even feature index."""
     if feat_idx == 120:
         return 'mover_parity'
     if feat_idx < 60:
         cell = C60_TO_C64[feat_idx]
-    else:
+    elif feat_idx < 120:
         cell = C60_TO_C64[feat_idx - 60]
-    col = 'ABCDEFGH'[cell % 8]
-    row = str(cell // 8 + 1)
-    prefix = 'played' if feat_idx < 60 else 'even'
-    return f'{prefix}[{col}{row}]'
+    else:
+        cell = None
+    if cell is not None:
+        col = 'ABCDEFGH'[cell % 8]
+        row = str(cell // 8 + 1)
+        prefix = 'played' if feat_idx < 60 else 'even'
+        return f'{prefix}[{col}{row}]'
+    if recent_Ks:
+        rel = feat_idx - 121
+        k_idx, i = divmod(rel, 60)
+        if 0 <= k_idx < len(recent_Ks):
+            K = recent_Ks[k_idx]
+            cell = C60_TO_C64[i]
+            col = 'ABCDEFGH'[cell % 8]
+            row = str(cell // 8 + 1)
+            return f'recent{K}[{col}{row}]'
+    return f'feat[{feat_idx}]'
 
 
 # ------------------------------------------------------------------------------
