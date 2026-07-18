@@ -99,7 +99,70 @@ def build_structured_count_nodes():
 
 
 # ------------------------------------------------------------------------------
-# Random pool
+# Compact structured banks (K=1, any parity) — small enough for a ReLU probe.
+# ------------------------------------------------------------------------------
+
+def build_neighborhood_count_nodes():
+    """60 count nodes: one 3x3 8-neighborhood per non-center cell, K=1, any
+    parity.  Each: "at least 1 cell in C's 8-neighborhood is played"."""
+    nodes = []
+    for c64 in NON_CENTER_64:
+        r0, c0 = c64 // 8, c64 % 8
+        box_cells = set()
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r0 + dr, c0 + dc
+                if 0 <= nr < 8 and 0 <= nc < 8:
+                    box_cells.add(nr * 8 + nc)
+        if not (box_cells - CENTER_64):
+            continue
+        alg = _algebraic(c64)
+        nodes.append(
+            (f'nbhd{alg}_any_k1',
+             _cells_to_c60_mask(box_cells), None, 1))
+    return nodes
+
+
+def build_ray_count_nodes():
+    """Line-rays across the board: rows, columns, and both diagonals.  All
+    K=1, any parity.  ~46 nodes."""
+    nodes = []
+    for r in range(8):
+        row_cells = set(r * 8 + c for c in range(8)) - CENTER_64
+        if row_cells:
+            nodes.append(
+                (f'ray_row{r + 1}_any_k1',
+                 _cells_to_c60_mask(row_cells), None, 1))
+    for c in range(8):
+        col_cells = set(r * 8 + c for r in range(8)) - CENTER_64
+        if col_cells:
+            nodes.append(
+                (f'ray_col{"ABCDEFGH"[c]}_any_k1',
+                 _cells_to_c60_mask(col_cells), None, 1))
+    # Main diagonals (r - c = d), d ∈ [-7, 7].  Skip length-1 corner
+    # diagonals — those equal the single played bit, redundant with input.
+    for d in range(-7, 8):
+        diag_cells = set(r * 8 + (r - d) for r in range(8)
+                          if 0 <= r - d < 8) - CENTER_64
+        if len(diag_cells) >= 2:
+            nodes.append(
+                (f'ray_diag{d:+d}_any_k1',
+                 _cells_to_c60_mask(diag_cells), None, 1))
+    # Anti-diagonals (r + c = s), s ∈ [0, 14].
+    for s in range(15):
+        adiag_cells = set(r * 8 + (s - r) for r in range(8)
+                           if 0 <= s - r < 8) - CENTER_64
+        if len(adiag_cells) >= 2:
+            nodes.append(
+                (f'ray_adiag{s}_any_k1',
+                 _cells_to_c60_mask(adiag_cells), None, 1))
+    return nodes
+
+
+# ------------------------------------------------------------------------------
+# Tree-derived pool
 # ------------------------------------------------------------------------------
 
 def build_tree_derived_count_nodes(path_info):

@@ -37,7 +37,9 @@ from endgame_tree_mlp import (
 )
 from count_nodes import (
     build_structured_count_nodes, build_random_count_nodes,
-    build_tree_derived_count_nodes, compute_count_activations,
+    build_tree_derived_count_nodes,
+    build_neighborhood_count_nodes, build_ray_count_nodes,
+    compute_count_activations,
 )
 
 
@@ -237,6 +239,14 @@ def main():
                           'over the union of cells appearing in C\'s top-K '
                           'tree paths.  Each node ties directly to a '
                           'specific decoding decision.')
+    ap.add_argument('--include-neighborhood-count-nodes', action='store_true',
+                    help='Append compact per-cell 8-neighborhood bank '
+                          '(60 K=1 any-parity units).  Small enough to '
+                          'compare against the tree pool at low noise.')
+    ap.add_argument('--include-ray-count-nodes', action='store_true',
+                    help='Append line-ray bank (rows + cols + diagonals + '
+                          'anti-diagonals; ~46 K=1 any-parity units).  '
+                          'Captures directional flanking-like structure.')
     ap.add_argument('--random-count-nodes', type=int, default=0,
                     help='Number of random-subset count nodes to add.')
     ap.add_argument('--random-count-seed', type=int, default=42)
@@ -466,12 +476,22 @@ def main():
     # ---- Optionally append count-node bank ----
     count_nodes_used = []
     if (args.include_count_nodes or args.random_count_nodes > 0
-            or args.include_tree_derived_count_nodes):
+            or args.include_tree_derived_count_nodes
+            or args.include_neighborhood_count_nodes
+            or args.include_ray_count_nodes):
         print('\nbuilding count-node bank...')
         if args.include_count_nodes:
             count_nodes_used.extend(build_structured_count_nodes())
             print(f'  structured count nodes: '
                    f'{len(count_nodes_used)}')
+        if args.include_neighborhood_count_nodes:
+            nb = build_neighborhood_count_nodes()
+            count_nodes_used.extend(nb)
+            print(f'  neighborhood count nodes: {len(nb)}')
+        if args.include_ray_count_nodes:
+            ry = build_ray_count_nodes()
+            count_nodes_used.extend(ry)
+            print(f'  ray count nodes:         {len(ry)}')
         if args.include_tree_derived_count_nodes:
             tree_nodes = build_tree_derived_count_nodes(all_meta)
             count_nodes_used.extend(tree_nodes)
