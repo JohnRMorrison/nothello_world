@@ -241,12 +241,11 @@ def main():
                           'specific decoding decision.')
     ap.add_argument('--include-neighborhood-count-nodes', action='store_true',
                     help='Append compact per-cell 8-neighborhood bank '
-                          '(60 K=1 any-parity units).  Small enough to '
-                          'compare against the tree pool at low noise.')
+                          '(60 regions × 3 parity variants = 180 K=1 units).')
     ap.add_argument('--include-ray-count-nodes', action='store_true',
                     help='Append line-ray bank (rows + cols + diagonals + '
-                          'anti-diagonals; ~46 K=1 any-parity units).  '
-                          'Captures directional flanking-like structure.')
+                          'anti-diagonals; 42 rays × 3 parity variants = '
+                          '126 K=1 units).  Captures directional structure.')
     ap.add_argument('--random-count-nodes', type=int, default=0,
                     help='Number of random-subset count nodes to add.')
     ap.add_argument('--random-count-seed', type=int, default=42)

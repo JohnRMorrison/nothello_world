@@ -102,9 +102,16 @@ def build_structured_count_nodes():
 # Compact structured banks (K=1, any parity) — small enough for a ReLU probe.
 # ------------------------------------------------------------------------------
 
+_PARITY_VARIANTS = [('black', 0), ('white', 1), ('any', None)]
+
+
 def build_neighborhood_count_nodes():
-    """60 count nodes: one 3x3 8-neighborhood per non-center cell, K=1, any
-    parity.  Each: "at least 1 cell in C's 8-neighborhood is played"."""
+    """Per-cell 3x3 8-neighborhood bank, K=1, one node per parity variant.
+    60 spatial regions × 3 variants (black / white / any) = 180 nodes.
+
+    Under ReLU, black and white carry distinct information from any:
+    any = max(0, black + white - 0.5) is nonlinear in the color-specific
+    counts, so the probe cannot recover per-color signal from any alone."""
     nodes = []
     for c64 in NON_CENTER_64:
         r0, c0 = c64 // 8, c64 % 8
@@ -119,45 +126,46 @@ def build_neighborhood_count_nodes():
         if not (box_cells - CENTER_64):
             continue
         alg = _algebraic(c64)
-        nodes.append(
-            (f'nbhd{alg}_any_k1',
-             _cells_to_c60_mask(box_cells), None, 1))
+        mask = _cells_to_c60_mask(box_cells)
+        for p_label, parity in _PARITY_VARIANTS:
+            nodes.append((f'nbhd{alg}_{p_label}_k1', mask, parity, 1))
     return nodes
 
 
 def build_ray_count_nodes():
-    """Line-rays across the board: rows, columns, and both diagonals.  All
-    K=1, any parity.  ~46 nodes."""
+    """Line-rays across the board: rows, columns, and both diagonals.  One
+    node per parity variant.  42 spatial rays × 3 variants = 126 nodes.
+
+    Black/white variants are distinct from any under ReLU (see
+    build_neighborhood_count_nodes for reasoning)."""
     nodes = []
+
+    def _add(name_stem, cells):
+        if not cells:
+            return
+        mask = _cells_to_c60_mask(cells)
+        for p_label, parity in _PARITY_VARIANTS:
+            nodes.append((f'{name_stem}_{p_label}_k1', mask, parity, 1))
+
     for r in range(8):
-        row_cells = set(r * 8 + c for c in range(8)) - CENTER_64
-        if row_cells:
-            nodes.append(
-                (f'ray_row{r + 1}_any_k1',
-                 _cells_to_c60_mask(row_cells), None, 1))
+        _add(f'ray_row{r + 1}',
+             set(r * 8 + c for c in range(8)) - CENTER_64)
     for c in range(8):
-        col_cells = set(r * 8 + c for r in range(8)) - CENTER_64
-        if col_cells:
-            nodes.append(
-                (f'ray_col{"ABCDEFGH"[c]}_any_k1',
-                 _cells_to_c60_mask(col_cells), None, 1))
+        _add(f'ray_col{"ABCDEFGH"[c]}',
+             set(r * 8 + c for r in range(8)) - CENTER_64)
     # Main diagonals (r - c = d), d ∈ [-7, 7].  Skip length-1 corner
     # diagonals — those equal the single played bit, redundant with input.
     for d in range(-7, 8):
         diag_cells = set(r * 8 + (r - d) for r in range(8)
                           if 0 <= r - d < 8) - CENTER_64
         if len(diag_cells) >= 2:
-            nodes.append(
-                (f'ray_diag{d:+d}_any_k1',
-                 _cells_to_c60_mask(diag_cells), None, 1))
+            _add(f'ray_diag{d:+d}', diag_cells)
     # Anti-diagonals (r + c = s), s ∈ [0, 14].
     for s in range(15):
         adiag_cells = set(r * 8 + (s - r) for r in range(8)
                            if 0 <= s - r < 8) - CENTER_64
         if len(adiag_cells) >= 2:
-            nodes.append(
-                (f'ray_adiag{s}_any_k1',
-                 _cells_to_c60_mask(adiag_cells), None, 1))
+            _add(f'ray_adiag{s}', adiag_cells)
     return nodes
 
 
