@@ -368,7 +368,7 @@ class OpeningTreeMLP(nn.Module):
 # ------------------------------------------------------------------------------
 
 def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
-                 weight_decay=1e-4, device=None, l1_lambda=0.0):
+                 weight_decay=1e-4, device=None, l1_lambda=0.0, seed=0):
     """Train linear probe.  H_* may be on CPU (as bool) and S_* on CPU (as
     int64) — batches are moved to `device` (or the probe's device) and cast
     to float / long as needed.
@@ -376,18 +376,23 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
     If l1_lambda > 0, adds L1 penalty to probe.weight, encouraging a sparse
     subset of hidden units.  Post-training, weights below 1e-4 can be
     treated as "not selected".
+
+    seed controls probe initialization + batch order.  For a multi-seed
+    ensemble, wrap this in a loop and average softmax(probe(H)) across seeds.
     """
     hidden = H_tr.shape[1]
     if device is None:
         device = torch.device(
             'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
     probe = nn.Linear(hidden, BOARD_CELLS * 3).to(device)
     opt = torch.optim.AdamW(probe.parameters(), lr=lr,
                               weight_decay=weight_decay)
     ce = nn.CrossEntropyLoss()
     N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
     for _ in range(epochs):
-        perm = torch.randperm(N)
+        perm = torch.randperm(N, generator=g)
         for i in range(0, N, batch):
             idx = perm[i:i + batch]
             h = H_tr[idx].to(device=device, dtype=torch.float32)
@@ -398,6 +403,57 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
                 loss = loss + l1_lambda * probe.weight.abs().mean()
             opt.zero_grad(); loss.backward(); opt.step()
     return probe
+
+
+def train_probe_ensemble(H_tr, S_tr, H_te, S_te, n_seeds=1, **kwargs):
+    """Train `n_seeds` probes with different seeds.  Returns list of probes.
+
+    Callers can then average softmax probabilities across probes for
+    ensemble prediction, or evaluate each probe individually.
+    """
+    if n_seeds <= 1:
+        return [train_probe(H_tr, S_tr, H_te, S_te, seed=0, **kwargs)]
+    probes = []
+    for s in range(n_seeds):
+        probes.append(train_probe(H_tr, S_tr, H_te, S_te, seed=s, **kwargs))
+    return probes
+
+
+def evaluate_ensemble(probes, H, S, T=None, batch=512):
+    """Evaluate an ensemble of probes by averaging softmax probabilities.
+    Returns (mean_acc, per_cell_acc, by_ply_dict, per_probe_accs)."""
+    device = next(probes[0].parameters()).device
+    N = H.shape[0]
+    accum_probs = torch.zeros(N, BOARD_CELLS, 3, dtype=torch.float32)
+    per_probe_correct = [0 for _ in probes]
+    per_probe_total = 0
+    S_cpu = S.cpu() if S.is_cuda else S
+    for i in range(0, N, batch):
+        h = H[i:i + batch].to(device=device, dtype=torch.float32)
+        s_batch = S_cpu[i:i + batch].long()
+        for pi, probe in enumerate(probes):
+            with torch.no_grad():
+                logits = probe(h).view(-1, BOARD_CELLS, 3)
+                probs = torch.softmax(logits, dim=-1).cpu()
+                accum_probs[i:i + batch] += probs
+                per_probe_correct[pi] += (probs.argmax(dim=-1)
+                                            == s_batch).sum().item()
+        per_probe_total += s_batch.numel()
+    accum_probs /= len(probes)
+    preds = accum_probs.argmax(dim=-1)
+    correct = (preds == S_cpu).float()
+    acc = correct.mean().item()
+    per_cell = correct.mean(dim=0).numpy()
+    by_ply = {}
+    if T is not None:
+        T_cpu = T.cpu() if T.is_cuda else T
+        for ply in range(int(T_cpu.max().item()) + 1):
+            mask = (T_cpu == ply)
+            if mask.any():
+                by_ply[ply] = (int(mask.sum().item()),
+                                correct[mask].mean().item())
+    per_probe_accs = [c / per_probe_total for c in per_probe_correct]
+    return acc, per_cell, by_ply, per_probe_accs
 
 
 def evaluate(probe, H, S, T=None, batch=512):

@@ -25,7 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
-    train_per_cell_trees, train_probe, evaluate, OpeningTreeMLP,
+    train_per_cell_trees, train_probe, train_probe_ensemble,
+    evaluate, evaluate_ensemble, OpeningTreeMLP,
     load_or_sample, prune_paths_by_count,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
     C64_TO_C60, C60_TO_C64, STATE_NAMES,
@@ -239,6 +240,10 @@ def main():
                     help='If boosting, size of the random candidate pool from '
                           'which residual-correlated features are selected. '
                           'Structured pool is always included.')
+    ap.add_argument('--probe-seeds', type=int, default=1,
+                    help='Train this many probes with different seeds and '
+                          'ensemble their softmax outputs.  Averages out '
+                          'noise-feature-fitting from any single init.')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -536,25 +541,46 @@ def main():
     print('\ntraining linear probe on hidden layer...')
     if args.probe_l1 > 0:
         print(f'  using L1 regularization: lambda={args.probe_l1}')
-    probe = train_probe(H_tr, S_tr, H_te, S_te,
-                          epochs=args.probe_epochs, device=device,
-                          l1_lambda=args.probe_l1)
+    print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}')
+    probes = train_probe_ensemble(
+        H_tr, S_tr, H_te, S_te,
+        n_seeds=args.probe_seeds,
+        epochs=args.probe_epochs, device=device,
+        l1_lambda=args.probe_l1)
+    probe = probes[0]     # for legacy references
 
-    acc_tr, _, _ = evaluate(probe, H_tr, S_tr)
-    acc_te, per_cell_te, by_ply = evaluate(probe, H_te, S_te, T_te)
+    # Individual + ensemble accuracy.
+    acc_tr, _, _, per_seed_tr = evaluate_ensemble(probes, H_tr, S_tr)
+    acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
+        probes, H_te, S_te, T_te)
     print(f'\nresults:')
-    print(f'  hidden dim H = {mlp.hidden_dim}')
-    print(f'  train per-cell acc: {100*acc_tr:.4f}%')
-    print(f'  test  per-cell acc: {100*acc_te:.4f}%')
+    print(f'  hidden dim H = {H_tr.shape[1]} (tree paths + added units)')
+    if args.probe_seeds > 1:
+        print(f'  per-seed test acc: '
+               f'{[f"{100*a:.2f}%" for a in per_seed_te]}')
+        print(f'  per-seed range: '
+               f'[{100*min(per_seed_te):.2f}%, '
+               f'{100*max(per_seed_te):.2f}%]')
+        print(f'  ensemble train acc: {100*acc_tr:.4f}%')
+        print(f'  ensemble test  acc: {100*acc_te:.4f}%')
+    else:
+        print(f'  train per-cell acc: {100*acc_tr:.4f}%')
+        print(f'  test  per-cell acc: {100*acc_te:.4f}%')
 
-    device_probe = next(probe.parameters()).device
+    # Use ensemble predictions for per-class breakdown.
+    device_probe = next(probes[0].parameters()).device
     preds_te = torch.empty(H_te.shape[0], BOARD_CELLS, dtype=torch.long,
                              device='cpu')
     with torch.no_grad():
-        for i in range(0, H_te.shape[0], 4096):
-            h = H_te[i:i + 4096].to(device=device_probe, dtype=torch.float32)
-            preds_te[i:i + 4096] = probe(h).view(-1, BOARD_CELLS, 3
-                                                    ).argmax(dim=-1).cpu()
+        for i in range(0, H_te.shape[0], 512):
+            h = H_te[i:i + 512].to(device=device_probe,
+                                     dtype=torch.float32)
+            probs_acc = torch.zeros(h.shape[0], BOARD_CELLS, 3,
+                                      dtype=torch.float32)
+            for p in probes:
+                logits = p(h).view(-1, BOARD_CELLS, 3)
+                probs_acc += torch.softmax(logits, dim=-1).cpu()
+            preds_te[i:i + 512] = probs_acc.argmax(dim=-1)
     cls_break = per_class_accuracy(preds_te, S_te)
     print(f'\n  test acc by cell class:')
     for cls, (n_cells, acc) in cls_break.items():
