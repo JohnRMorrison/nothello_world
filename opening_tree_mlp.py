@@ -406,7 +406,8 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
 
 
 def train_probe_sklearn(H_tr, S_tr, H_te, S_te, C=1.0, n_jobs=1,
-                           max_iter=1000, verbose=True):
+                           max_iter=1000, verbose=True,
+                           subsample_train=None):
     """Fit sklearn LogisticRegression per cell using the LBFGS solver.
 
     LBFGS provably converges to the global optimum for the convex logistic
@@ -434,9 +435,17 @@ def train_probe_sklearn(H_tr, S_tr, H_te, S_te, C=1.0, n_jobs=1,
     H_tr_np = _to_np(H_tr)
     S_tr_np = _to_np(S_tr)
 
+    # Optional subsample to bound memory + fit time.  Each joblib worker
+    # copies the whole H_tr_np, so at scale we can OOM.
+    if subsample_train is not None and subsample_train < H_tr_np.shape[0]:
+        rng = np.random.RandomState(0)
+        idx = rng.choice(H_tr_np.shape[0], subsample_train, replace=False)
+        H_tr_np = H_tr_np[idx]
+        S_tr_np = S_tr_np[idx]
+        if verbose:
+            print(f'  subsampled train to {H_tr_np.shape[0]} rows')
+
     def fit_one(c):
-        # multi_class removed in newer sklearn; solver 'lbfgs' handles
-        # multinomial automatically when the target has >2 classes.
         lr = LogisticRegression(solver='lbfgs', C=C, max_iter=max_iter)
         lr.fit(H_tr_np, S_tr_np[:, c])
         return lr

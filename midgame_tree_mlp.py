@@ -261,8 +261,12 @@ def main():
                           'is undertraining.')
     ap.add_argument('--sklearn-C', type=float, default=1.0,
                     help='sklearn LogisticRegression C (inverse L2).')
-    ap.add_argument('--sklearn-n-jobs', type=int, default=8,
-                    help='Parallelize the 64 per-cell LR fits.')
+    ap.add_argument('--sklearn-n-jobs', type=int, default=2,
+                    help='Parallelize the 64 per-cell LR fits.  Each worker '
+                          'copies H_tr, so keep this small at high H.')
+    ap.add_argument('--sklearn-subsample-train', type=int, default=200000,
+                    help='If set, subsample this many training rows before '
+                          'fitting sklearn LR to bound memory/time.')
     ap.add_argument('--count-features-as-input', action='store_true',
                     help='Add count-node activations to the raw input X '
                           '(before tree fitting) instead of appending to '
@@ -598,7 +602,8 @@ def main():
                f'C={args.sklearn_C}   n_jobs={args.sklearn_n_jobs}')
         sk_models = train_probe_sklearn(
             H_tr, S_tr, H_te, S_te,
-            C=args.sklearn_C, n_jobs=args.sklearn_n_jobs)
+            C=args.sklearn_C, n_jobs=args.sklearn_n_jobs,
+            subsample_train=args.sklearn_subsample_train)
         # For consistency with downstream code we use ensemble containers
         # but fill with the sklearn models.
         probes = None      # legacy variable, unused with sklearn path
