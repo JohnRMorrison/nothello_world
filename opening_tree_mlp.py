@@ -368,10 +368,14 @@ class OpeningTreeMLP(nn.Module):
 # ------------------------------------------------------------------------------
 
 def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
-                 weight_decay=1e-4, device=None):
+                 weight_decay=1e-4, device=None, l1_lambda=0.0):
     """Train linear probe.  H_* may be on CPU (as bool) and S_* on CPU (as
     int64) — batches are moved to `device` (or the probe's device) and cast
     to float / long as needed.
+
+    If l1_lambda > 0, adds L1 penalty to probe.weight, encouraging a sparse
+    subset of hidden units.  Post-training, weights below 1e-4 can be
+    treated as "not selected".
     """
     hidden = H_tr.shape[1]
     if device is None:
@@ -390,6 +394,8 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
             y = S_tr[idx].to(device=device, dtype=torch.long)
             logits = probe(h).view(-1, BOARD_CELLS, 3)
             loss = ce(logits.reshape(-1, 3), y.reshape(-1))
+            if l1_lambda > 0:
+                loss = loss + l1_lambda * probe.weight.abs().mean()
             opt.zero_grad(); loss.backward(); opt.step()
     return probe
 

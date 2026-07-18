@@ -33,6 +33,10 @@ from opening_tree_mlp import (
 from endgame_tree_mlp import (
     CORNERS_64, cell_class, CELL_CLASS, per_class_accuracy,
 )
+from count_nodes import (
+    build_structured_count_nodes, build_random_count_nodes,
+    compute_count_activations,
+)
 
 
 # ------------------------------------------------------------------------------
@@ -213,6 +217,17 @@ def main():
     ap.add_argument('--tree-max-features', default=None,
                     help='Passed to sklearn: sqrt/log2/int/float.  Use with '
                           '--use-move-grid to keep tree fit tractable.')
+    ap.add_argument('--include-count-nodes', action='store_true',
+                    help='Append structured count-node bank (~1800 units) '
+                          'to the hidden layer.  Each node is "at least K '
+                          'cells in region R are played at parity P".')
+    ap.add_argument('--random-count-nodes', type=int, default=0,
+                    help='Number of random-subset count nodes to add.')
+    ap.add_argument('--random-count-seed', type=int, default=42)
+    ap.add_argument('--probe-l1', type=float, default=0.0,
+                    help='L1 regularization strength for probe.  If > 0, '
+                          'penalizes |probe.weight| to select a sparse '
+                          'subset of hidden units.')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -359,6 +374,50 @@ def main():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
+    # ---- Optionally append count-node bank ----
+    count_nodes_used = []
+    if args.include_count_nodes or args.random_count_nodes > 0:
+        print('\nbuilding count-node bank...')
+        if args.include_count_nodes:
+            count_nodes_used.extend(build_structured_count_nodes())
+            print(f'  structured count nodes: '
+                   f'{len(count_nodes_used)}')
+        if args.random_count_nodes > 0:
+            rn = build_random_count_nodes(args.random_count_nodes,
+                                            seed=args.random_count_seed)
+            count_nodes_used.extend(rn)
+            print(f'  random count nodes:     {len(rn)}')
+
+        # Extract played + even from the raw played_even features (positions
+        # 0..60 and 60..120).
+        played_tr = Xnp_tr[:, :60]
+        even_tr = Xnp_tr[:, 60:120]
+        played_te = Xnp_te[:, :60]
+        even_te = Xnp_te[:, 60:120]
+
+        t0 = time.time()
+        CN_tr = compute_count_activations(count_nodes_used, played_tr,
+                                            even_tr)
+        CN_te = compute_count_activations(count_nodes_used, played_te,
+                                            even_te)
+        print(f'  count activations: '
+               f'CN_tr {CN_tr.shape} '
+               f'({CN_tr.nbytes / 1e9:.2f} GB)  '
+               f'CN_te {CN_te.shape}  '
+               f'({time.time() - t0:.1f}s)')
+
+        CN_tr_t = torch.from_numpy(CN_tr)
+        CN_te_t = torch.from_numpy(CN_te)
+        H_tr = torch.cat([H_tr, CN_tr_t], dim=1)
+        H_te = torch.cat([H_te, CN_te_t], dim=1)
+        print(f'  combined H_tr {tuple(H_tr.shape)}  '
+               f'H_te {tuple(H_te.shape)}')
+        del CN_tr_t, CN_te_t, CN_tr, CN_te
+        # Also record count-node metadata in path_info.
+        for n in count_nodes_used:
+            all_meta.append({'kind': 'count_node', 'name': n[0],
+                              'parity': n[2], 'threshold': n[3]})
+
     counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
     for i in range(0, H_tr.shape[0], 512):
         counts += H_tr[i:i + 512].to(torch.int64).sum(dim=0)
@@ -371,8 +430,11 @@ def main():
            f'{len(all_meta)}')
 
     print('\ntraining linear probe on hidden layer...')
+    if args.probe_l1 > 0:
+        print(f'  using L1 regularization: lambda={args.probe_l1}')
     probe = train_probe(H_tr, S_tr, H_te, S_te,
-                          epochs=args.probe_epochs, device=device)
+                          epochs=args.probe_epochs, device=device,
+                          l1_lambda=args.probe_l1)
 
     acc_tr, _, _ = evaluate(probe, H_tr, S_tr)
     acc_te, per_cell_te, by_ply = evaluate(probe, H_te, S_te, T_te)
