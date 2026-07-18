@@ -41,6 +41,11 @@ from count_nodes import (
     build_neighborhood_count_nodes, build_ray_count_nodes,
     compute_count_activations,
 )
+from order_nodes import (
+    movegrid_from_flat,
+    build_turn_bucket, build_recency, build_ordinal,
+    build_pairwise_order, build_streak,
+)
 
 
 # ------------------------------------------------------------------------------
@@ -246,6 +251,29 @@ def main():
                     help='Append line-ray bank (rows + cols + diagonals + '
                           'anti-diagonals; 42 rays × 3 parity variants = '
                           '126 K=1 units).  Captures directional structure.')
+    # ----- Order-aware hidden-unit banks (require --use-move-grid) -----
+    ap.add_argument('--include-turn-bucket-nodes', action='store_true',
+                    help='cell c played in turn window at parity P. '
+                          '60 × #buckets × 3 parities units.')
+    ap.add_argument('--turn-bucket-size', type=int, default=10)
+    ap.add_argument('--include-recency-nodes', action='store_true',
+                    help='cell c played within last K turns of T. '
+                          '60 × #Ks units.')
+    ap.add_argument('--recency-Ks', default='1,2,5,10,20',
+                    help='Comma-separated list of K values for recency.')
+    ap.add_argument('--include-ordinal-nodes', action='store_true',
+                    help='cell c was the K-th move (== raw movegrid). '
+                          '3600 units.')
+    ap.add_argument('--include-pairwise-order-nodes', action='store_true',
+                    help='cell A played before cell B, restricted to '
+                          'spatially-close pairs.')
+    ap.add_argument('--pairwise-max-chebyshev', type=int, default=2,
+                    help='Chebyshev-distance cutoff for pairwise-order + '
+                          'streak pairs.')
+    ap.add_argument('--include-streak-nodes', action='store_true',
+                    help='cell A and B played within N turns, restricted '
+                          'to spatially-close pairs.')
+    ap.add_argument('--streak-N-gap', type=int, default=3)
     ap.add_argument('--random-count-nodes', type=int, default=0,
                     help='Number of random-subset count nodes to add.')
     ap.add_argument('--random-count-seed', type=int, default=42)
@@ -342,6 +370,31 @@ def main():
     Xnp_te, Snp_te, Tnp_te = _narrow(Xnp_te, Snp_te, Tnp_te)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
+
+    # ---- Split off movegrid for order-aware hidden banks ----
+    # Order-feature builders need the (N, 60, 60) movegrid; trees still fit
+    # on the 121-d played_even part so the tree-path baseline is preserved.
+    order_flags_on = (args.include_turn_bucket_nodes
+                      or args.include_recency_nodes
+                      or args.include_ordinal_nodes
+                      or args.include_pairwise_order_nodes
+                      or args.include_streak_nodes)
+    movegrid_tr = movegrid_te = None
+    if order_flags_on:
+        if not args.use_move_grid:
+            raise ValueError('--include-*-order-nodes requires '
+                              '--use-move-grid to be set at sampling time.')
+        if args.when_bucket_size:
+            raise ValueError('--include-*-order-nodes is incompatible with '
+                              '--when-bucket-size (both consume the movegrid '
+                              'slot).')
+        print('extracting movegrid + slicing Xnp to played_even for tree fit')
+        movegrid_tr = movegrid_from_flat(Xnp_tr).astype(np.uint8)
+        movegrid_te = movegrid_from_flat(Xnp_te).astype(np.uint8)
+        Xnp_tr = np.ascontiguousarray(Xnp_tr[:, :121])
+        Xnp_te = np.ascontiguousarray(Xnp_te[:, :121])
+        print(f'  movegrid_tr {movegrid_tr.shape}  '
+               f'Xnp_tr sliced → {Xnp_tr.shape}')
 
     # --- Optionally append count features to raw input (Option B) ---
     if args.count_features_as_input:
@@ -530,6 +583,47 @@ def main():
         for n in count_nodes_used:
             all_meta.append({'kind': 'count_node', 'name': n[0],
                               'parity': n[2], 'threshold': n[3]})
+
+    # ---- Optionally append order-aware banks (movegrid-based) ----
+    if order_flags_on:
+        print('\nbuilding order-aware banks...')
+        recency_Ks = tuple(int(k) for k in args.recency_Ks.split(','))
+        order_builders = []
+        if args.include_turn_bucket_nodes:
+            order_builders.append(('turn_bucket',
+                lambda mg, cur: build_turn_bucket(
+                    mg, bucket_size=args.turn_bucket_size, use_relu=use_relu)))
+        if args.include_recency_nodes:
+            order_builders.append(('recency',
+                lambda mg, cur: build_recency(
+                    mg, current_turns=cur, Ks=recency_Ks, use_relu=use_relu)))
+        if args.include_ordinal_nodes:
+            order_builders.append(('ordinal',
+                lambda mg, cur: build_ordinal(mg, use_relu=use_relu)))
+        if args.include_pairwise_order_nodes:
+            order_builders.append(('pairwise_order',
+                lambda mg, cur: build_pairwise_order(
+                    mg, max_chebyshev=args.pairwise_max_chebyshev,
+                    use_relu=use_relu)))
+        if args.include_streak_nodes:
+            order_builders.append(('streak',
+                lambda mg, cur: build_streak(
+                    mg, max_chebyshev=args.pairwise_max_chebyshev,
+                    N_gap=args.streak_N_gap, use_relu=use_relu)))
+        for label, fn in order_builders:
+            t0 = time.time()
+            Otr, meta_o = fn(movegrid_tr, Tnp_tr)
+            Ote, _ = fn(movegrid_te, Tnp_te)
+            print(f'  {label:18s} {Otr.shape[1]:5d} units  '
+                   f'{Otr.nbytes / 1e9:.2f} GB tr  '
+                   f'fire={(Otr > 0).mean() * 100:.2f}%  '
+                   f'({time.time() - t0:.1f}s)')
+            H_tr = torch.cat([H_tr, torch.from_numpy(Otr)], dim=1)
+            H_te = torch.cat([H_te, torch.from_numpy(Ote)], dim=1)
+            all_meta.extend(meta_o)
+            del Otr, Ote
+        print(f'  combined H_tr {tuple(H_tr.shape)}  '
+               f'H_te {tuple(H_te.shape)}')
 
     # Diagnostic: "firing rate" (fraction >0) works for both bool and float.
     fire_counts = torch.zeros(H_tr.shape[1], dtype=torch.int64)
