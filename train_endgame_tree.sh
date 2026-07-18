@@ -27,7 +27,7 @@ cd $SLURM_SUBMIT_DIR
 NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
-MIN_LEAF=${4:-5}
+MIN_LEAF=${4:-20}     # bumped from 5 — caps H to fit in RAM at 200k+ positions
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"

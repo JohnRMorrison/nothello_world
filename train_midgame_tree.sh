@@ -30,7 +30,7 @@ cd $SLURM_SUBMIT_DIR
 NUM_TRAIN=${1:-20000}
 NUM_TEST=${2:-5000}
 MAX_DEPTH=${3:-15}
-MIN_LEAF=${4:-5}
+MIN_LEAF=${4:-50}     # bumped from 5 — 800k midgame positions blow RAM otherwise
 PLY_MIN=${5:-10}
 PLY_MAX=${6:-50}
 STAB=${7:-nostab}

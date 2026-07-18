@@ -25,7 +25,8 @@ from data.othello import OthelloBoardState
 
 
 BOARD_CELLS = 64
-INPUT_DIM = 120                    # 60 played + 60 even
+INPUT_DIM_BASE = 120               # 60 played + 60 even
+INPUT_DIM = 121                    # 60 played + 60 even + 1 mover_parity
 CENTER_64 = {27, 28, 35, 36}
 NON_CENTER_64 = sorted(set(range(64)) - CENTER_64)
 C64_TO_C60 = {c: i for i, c in enumerate(NON_CENTER_64)}
@@ -34,6 +35,16 @@ STATE_NAMES = ['empty', 'mine', 'opp']
 
 
 def playedeven_features(prefix):
+    """Return 121-d input: 60 played + 60 even + 1 mover_parity.
+
+    mover_parity = 0 iff it is black's turn to move (i.e., an even number of
+    moves have been made so far); = 1 iff white's turn.  This is directly
+    inferable from `len(prefix)` at extraction time.
+
+    The mover-parity bit lets a decision tree split on it at depth 1 and
+    disambiguate mine/opp labels without having to compute an XOR of the
+    60 played bits — which is what depth 15 could not do at high ply.
+    """
     feat = np.zeros(INPUT_DIM, dtype=np.float32)
     for t, c in enumerate(prefix):
         if c not in C64_TO_C60:
@@ -42,11 +53,14 @@ def playedeven_features(prefix):
         feat[i] = 1.0
         if t % 2 == 0:
             feat[60 + i] = 1.0
+    feat[120] = 1.0 if len(prefix) % 2 == 1 else 0.0
     return feat
 
 
 def feature_name(feat_idx):
     """Return a human-readable name for a played_even feature index."""
+    if feat_idx == 120:
+        return 'mover_parity'
     if feat_idx < 60:
         cell = C60_TO_C64[feat_idx]
     else:
