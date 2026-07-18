@@ -325,6 +325,11 @@ def main():
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
+    ap.add_argument('--skip-tree-fit', action='store_true',
+                    help='Skip per-cell tree fit + path extraction entirely. '
+                          'Hidden layer starts empty (N, 0); only count / '
+                          'order banks contribute.  Ablation: how much do '
+                          'the tree paths add on top of order features?')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
@@ -420,108 +425,115 @@ def main():
         print(f'  input dim now: {Xnp_tr.shape[1]}')
         del CF_tr, CF_te
 
-    # --- Train per-cell trees ---
-    print(f'\ntraining per-cell trees (max_depth={args.tree_max_depth}, '
-           f'min_samples_leaf={args.tree_min_samples_leaf}, '
-           f'n_jobs={args.tree_n_jobs})...')
-    t0 = time.time()
-    mf = args.tree_max_features
-    if mf is not None and mf not in ('sqrt', 'log2', 'auto'):
-        try:
-            mf = int(mf)
-        except ValueError:
-            try:
-                mf = float(mf)
-            except ValueError:
-                pass
-    trees = train_per_cell_trees(
-        Xnp_tr, Snp_tr,
-        max_depth=args.tree_max_depth,
-        min_samples_leaf=args.tree_min_samples_leaf,
-        n_jobs=args.tree_n_jobs,
-        max_features=mf)
-    print(f'  ({time.time() - t0:.1f}s)')
-
-    tree_correct_per_cell = np.zeros(BOARD_CELLS)
-    for c in range(BOARD_CELLS):
-        preds = trees[c].predict(Xnp_te)
-        tree_correct_per_cell[c] = (preds == Snp_te[:, c]).mean()
-    print(f'  aggregate per-cell tree test acc: '
-           f'{100*tree_correct_per_cell.mean():.4f}%')
-    for cls in ('corner', 'edge', 'inner'):
-        cell_ids = [c for c in range(64) if CELL_CLASS[c] == cls]
-        print(f'    {cls:6s} ({len(cell_ids)} cells):  '
-               f'{100*tree_correct_per_cell[cell_ids].mean():.4f}%')
-
-    # --- Extract paths ---
-    print('\nextracting paths → hidden units...')
-    all_w, all_b, all_meta = [], [], []
-    per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
-    input_dim = Xnp_tr.shape[1]
-    for c in range(BOARD_CELLS):
-        paths = extract_paths(trees[c])
-        paths = prune_paths_by_count(paths, args.top_k_per_cell)
-        per_cell_leaf_counts[c] = len(paths)
-        for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
-            w, b = path_to_weight(conditions, input_dim=input_dim)
-            all_w.append(w); all_b.append(b)
-            all_meta.append({
-                'kind': 'tree_path',
-                'cell': c, 'path_idx': path_idx,
-                'conditions': conditions, 'leaf_class': leaf_class,
-                'depth': len(conditions),
-                'leaf_counts': leaf_counts,
-                'cell_class': CELL_CLASS[c],
-            })
-    n_tree_units = len(all_meta)
-
-    if args.add_stability:
-        print('  adding stability feature bank...')
-        Ws, Bs, meta_s = build_stability_features(device)
-        all_w.extend(Ws)
-        all_b.extend(Bs.tolist())
-        all_meta.extend(meta_s)
-        print(f'  stability units added: {Ws.shape[0]}')
-
-    W = np.stack(all_w); B = np.array(all_b, dtype=np.float32)
-    print(f'  total hidden units: {len(all_meta)}   '
-           f'(tree={n_tree_units}, stability='
-           f'{len(all_meta) - n_tree_units})')
-    print(f'  leaves per tree: mean={per_cell_leaf_counts.mean():.1f}  '
-           f'max={per_cell_leaf_counts.max()}  '
-           f'min={per_cell_leaf_counts.min()}')
-
-    depths = np.array([m['depth'] for m in all_meta
-                        if m.get('kind') == 'tree_path'])
-    print(f'  tree-path depths: mean={depths.mean():.2f}  '
-           f'max={depths.max()}  min={depths.min()}')
-
-    mlp = OpeningTreeMLP(W, B, all_meta, device)
-
-    X_tr = torch.from_numpy(Xnp_tr).to(device)
-    X_te = torch.from_numpy(Xnp_te).to(device)
     S_tr = torch.from_numpy(Snp_tr)
     S_te = torch.from_numpy(Snp_te)
     T_te = torch.from_numpy(Tnp_te)
-
     use_relu = args.hidden_activation == 'relu'
-    if use_relu:
-        act_dtype = torch.float32
-        print('\ncomputing hidden activations (ReLU, float32 on CPU)...')
+    act_dtype = torch.float32 if use_relu else torch.bool
+
+    if args.skip_tree_fit:
+        print('\n--skip-tree-fit: no tree pipeline; H starts empty (N, 0)')
+        all_meta = []
+        H_tr = torch.zeros(Xnp_tr.shape[0], 0, dtype=act_dtype)
+        H_te = torch.zeros(Xnp_te.shape[0], 0, dtype=act_dtype)
     else:
-        act_dtype = torch.bool
-        print('\ncomputing hidden activations (step, bool on CPU)...')
-    t0 = time.time()
-    H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
-                 use_relu=use_relu)
-    H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
-                 use_relu=use_relu)
+        # --- Train per-cell trees ---
+        print(f'\ntraining per-cell trees '
+               f'(max_depth={args.tree_max_depth}, '
+               f'min_samples_leaf={args.tree_min_samples_leaf}, '
+               f'n_jobs={args.tree_n_jobs})...')
+        t0 = time.time()
+        mf = args.tree_max_features
+        if mf is not None and mf not in ('sqrt', 'log2', 'auto'):
+            try:
+                mf = int(mf)
+            except ValueError:
+                try:
+                    mf = float(mf)
+                except ValueError:
+                    pass
+        trees = train_per_cell_trees(
+            Xnp_tr, Snp_tr,
+            max_depth=args.tree_max_depth,
+            min_samples_leaf=args.tree_min_samples_leaf,
+            n_jobs=args.tree_n_jobs,
+            max_features=mf)
+        print(f'  ({time.time() - t0:.1f}s)')
+
+        tree_correct_per_cell = np.zeros(BOARD_CELLS)
+        for c in range(BOARD_CELLS):
+            preds = trees[c].predict(Xnp_te)
+            tree_correct_per_cell[c] = (preds == Snp_te[:, c]).mean()
+        print(f'  aggregate per-cell tree test acc: '
+               f'{100*tree_correct_per_cell.mean():.4f}%')
+        for cls in ('corner', 'edge', 'inner'):
+            cell_ids = [c for c in range(64) if CELL_CLASS[c] == cls]
+            print(f'    {cls:6s} ({len(cell_ids)} cells):  '
+                   f'{100*tree_correct_per_cell[cell_ids].mean():.4f}%')
+
+        # --- Extract paths ---
+        print('\nextracting paths → hidden units...')
+        all_w, all_b, all_meta = [], [], []
+        per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
+        input_dim = Xnp_tr.shape[1]
+        for c in range(BOARD_CELLS):
+            paths = extract_paths(trees[c])
+            paths = prune_paths_by_count(paths, args.top_k_per_cell)
+            per_cell_leaf_counts[c] = len(paths)
+            for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
+                w, b = path_to_weight(conditions, input_dim=input_dim)
+                all_w.append(w); all_b.append(b)
+                all_meta.append({
+                    'kind': 'tree_path',
+                    'cell': c, 'path_idx': path_idx,
+                    'conditions': conditions, 'leaf_class': leaf_class,
+                    'depth': len(conditions),
+                    'leaf_counts': leaf_counts,
+                    'cell_class': CELL_CLASS[c],
+                })
+        n_tree_units = len(all_meta)
+
+        if args.add_stability:
+            print('  adding stability feature bank...')
+            Ws, Bs, meta_s = build_stability_features(device)
+            all_w.extend(Ws)
+            all_b.extend(Bs.tolist())
+            all_meta.extend(meta_s)
+            print(f'  stability units added: {Ws.shape[0]}')
+
+        W = np.stack(all_w); B = np.array(all_b, dtype=np.float32)
+        print(f'  total hidden units: {len(all_meta)}   '
+               f'(tree={n_tree_units}, stability='
+               f'{len(all_meta) - n_tree_units})')
+        print(f'  leaves per tree: mean={per_cell_leaf_counts.mean():.1f}  '
+               f'max={per_cell_leaf_counts.max()}  '
+               f'min={per_cell_leaf_counts.min()}')
+
+        depths = np.array([m['depth'] for m in all_meta
+                            if m.get('kind') == 'tree_path'])
+        print(f'  tree-path depths: mean={depths.mean():.2f}  '
+               f'max={depths.max()}  min={depths.min()}')
+
+        mlp = OpeningTreeMLP(W, B, all_meta, device)
+
+        X_tr = torch.from_numpy(Xnp_tr).to(device)
+        X_te = torch.from_numpy(Xnp_te).to(device)
+
+        if use_relu:
+            print('\ncomputing hidden activations (ReLU, float32 on CPU)...')
+        else:
+            print('\ncomputing hidden activations (step, bool on CPU)...')
+        t0 = time.time()
+        H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
+                     use_relu=use_relu)
+        H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
+                     use_relu=use_relu)
     print(f'  H_tr {tuple(H_tr.shape)} '
            f'({H_tr.element_size() * H_tr.nelement() / 1e9:.2f} GB)  '
            f'H_te {tuple(H_te.shape)} '
-           f'({H_te.element_size() * H_te.nelement() / 1e9:.2f} GB)  '
-           f'({time.time() - t0:.1f}s)')
-    del X_tr, X_te
+           f'({H_te.element_size() * H_te.nelement() / 1e9:.2f} GB)')
+    if not args.skip_tree_fit:
+        del X_tr, X_te
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 

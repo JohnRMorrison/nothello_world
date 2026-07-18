@@ -48,8 +48,19 @@ case "${VARIANT}" in
         TAG="tb"
         ;;
     recency)
+        # Now with parity variants (60 × 5 × 3 = 900 units).
         VARIANT_FLAGS="--include-recency-nodes --recency-Ks 1,2,5,10,20"
         TAG="rec"
+        ;;
+    recency_wide)
+        # Wider K sweep (60 × 7 × 3 = 1260 units).
+        VARIANT_FLAGS="--include-recency-nodes --recency-Ks 1,2,5,10,20,30,40"
+        TAG="rec_wide"
+        ;;
+    recency_only)
+        # Ablation: recency alone, no tree paths.
+        VARIANT_FLAGS="--include-recency-nodes --recency-Ks 1,2,5,10,20,30,40 --skip-tree-fit"
+        TAG="rec_only"
         ;;
     ordinal)
         VARIANT_FLAGS="--include-ordinal-nodes"

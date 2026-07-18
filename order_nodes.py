@@ -113,27 +113,39 @@ def build_turn_bucket(movegrid, bucket_size=10, use_relu=False):
 
 def build_recency(movegrid, current_turns, Ks=(1, 2, 5, 10, 20),
                     use_relu=False):
+    """cell c played within last K turns of T at parity P.
+    60 cells × #Ks × 3 parity variants (black / white / any) units.
+
+    Parity split mirrors the count-node fix — under ReLU K=1, any is
+    nonlinear in the per-color counts and can't be linearly decomposed."""
     N = movegrid.shape[0]
     turns = np.arange(60)[None, :]                    # (1, 60)
     T = current_turns[:, None].astype(np.int32)       # (N, 1)
-    H = 60 * len(Ks)
+    parities = [(None, 'any'), (0, 'black'), (1, 'white')]
+    H = 60 * len(Ks) * len(parities)
     out = np.zeros((N, H), dtype=_act_dtype(use_relu))
     meta = []
     idx = 0
     for K in Ks:
-        # (N, 60) mask over turns: t ∈ [T-K, T)
-        m = ((turns >= (T - K)) & (turns < T)).astype(np.int32)
-        # (N, 60) — for each cell, count of movegrid[n, t, c] where mask[n, t].
-        counts = np.einsum('nt,ntc->nc', m, movegrid.astype(np.int32))
-        for cell60 in range(60):
-            out[:, idx] = _threshold_k1(counts[:, cell60], use_relu)
-            meta.append({
-                'kind': 'recency',
-                'name': f'rec_{_algebraic_c60(cell60)}_K{K}',
-                'cell60': cell60,
-                'K': K,
-            })
-            idx += 1
+        # (N, 60) window mask: t ∈ [T-K, T)
+        window = ((turns >= (T - K)) & (turns < T)).astype(np.int32)
+        for parity, p_label in parities:
+            if parity is None:
+                m = window
+            else:
+                parity_mask = (turns % 2 == parity).astype(np.int32)
+                m = window * parity_mask
+            counts = np.einsum('nt,ntc->nc', m, movegrid.astype(np.int32))
+            for cell60 in range(60):
+                out[:, idx] = _threshold_k1(counts[:, cell60], use_relu)
+                meta.append({
+                    'kind': 'recency',
+                    'name': f'rec_{_algebraic_c60(cell60)}_K{K}_{p_label}',
+                    'cell60': cell60,
+                    'K': K,
+                    'parity': parity,
+                })
+                idx += 1
     return out, meta
 
 
