@@ -231,6 +231,21 @@ def main():
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
         ply_max=args.ply_max, seed=args.seed + 1_000_000)
+
+    # If a cache from a wider ply range was loaded, narrow it to the current
+    # args range.  Lets a single (10, 50) cache serve any [a, b) subwindow.
+    def _narrow(X, S, T):
+        mask = (T >= args.ply_min) & (T < args.ply_max)
+        if mask.all():
+            return X, S, T
+        n_before = X.shape[0]
+        X = X[mask]; S = S[mask]; T = T[mask]
+        print(f'  filtered cache: {n_before} → {X.shape[0]} positions '
+               f'in ply [{args.ply_min}, {args.ply_max})')
+        return X, S, T
+
+    Xnp_tr, Snp_tr, Tnp_tr = _narrow(Xnp_tr, Snp_tr, Tnp_tr)
+    Xnp_te, Snp_te, Tnp_te = _narrow(Xnp_te, Snp_te, Tnp_te)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
 
