@@ -405,6 +405,90 @@ def train_probe(H_tr, S_tr, H_te, S_te, epochs=25, lr=0.01, batch=512,
     return probe
 
 
+def train_probe_sklearn(H_tr, S_tr, H_te, S_te, C=1.0, n_jobs=1,
+                           max_iter=1000, verbose=True):
+    """Fit sklearn LogisticRegression per cell using the LBFGS solver.
+
+    LBFGS provably converges to the global optimum for the convex logistic
+    loss.  If AdamW-based probes drop when features are added but LBFGS
+    doesn't, the AdamW is undertrained.
+
+    Returns list of 64 fitted LR models.
+
+    Args:
+      C: inverse L2 regularization (larger = less regularization).
+      n_jobs: parallelize the 64 per-cell fits.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from joblib import Parallel, delayed
+
+    def _to_np(t):
+        if hasattr(t, 'numpy'):
+            arr = t.numpy()
+        else:
+            arr = t
+        if arr.dtype == np.bool_:
+            arr = arr.astype(np.float32)
+        return arr
+
+    H_tr_np = _to_np(H_tr)
+    S_tr_np = _to_np(S_tr)
+
+    def fit_one(c):
+        # multi_class removed in newer sklearn; solver 'lbfgs' handles
+        # multinomial automatically when the target has >2 classes.
+        lr = LogisticRegression(solver='lbfgs', C=C, max_iter=max_iter)
+        lr.fit(H_tr_np, S_tr_np[:, c])
+        return lr
+
+    t0 = time.time()
+    if n_jobs == 1:
+        models = [fit_one(c) for c in range(BOARD_CELLS)]
+    else:
+        models = Parallel(n_jobs=n_jobs)(
+            delayed(fit_one)(c) for c in range(BOARD_CELLS))
+    if verbose:
+        print(f'  sklearn LR (LBFGS) fit {BOARD_CELLS} cells in '
+               f'{time.time() - t0:.1f}s')
+    return models
+
+
+def evaluate_sklearn(models, H, S, T=None, batch=8192):
+    """Evaluate 64 sklearn per-cell LR models.  Returns (mean_acc,
+    per_cell_acc, by_ply)."""
+    if hasattr(H, 'numpy'):
+        H_np = H.numpy()
+    else:
+        H_np = H
+    if H_np.dtype == np.bool_:
+        H_np = H_np.astype(np.float32)
+    if hasattr(S, 'numpy'):
+        S_np = S.numpy()
+    else:
+        S_np = S
+    N = H_np.shape[0]
+    preds = np.zeros((N, BOARD_CELLS), dtype=np.int64)
+    # Predictions per cell — chunk to avoid huge memory allocations.
+    for c in range(BOARD_CELLS):
+        for i in range(0, N, batch):
+            preds[i:i + batch, c] = models[c].predict(H_np[i:i + batch])
+    correct = (preds == S_np).astype(np.float32)
+    acc = float(correct.mean())
+    per_cell = correct.mean(axis=0)
+    by_ply = {}
+    if T is not None:
+        if hasattr(T, 'numpy'):
+            T_np = T.numpy()
+        else:
+            T_np = T
+        for ply in range(int(T_np.max()) + 1):
+            mask = (T_np == ply)
+            if mask.any():
+                by_ply[ply] = (int(mask.sum()),
+                                float(correct[mask].mean()))
+    return acc, per_cell, by_ply
+
+
 def train_probe_ensemble(H_tr, S_tr, H_te, S_te, n_seeds=1, **kwargs):
     """Train `n_seeds` probes with different seeds.  Returns list of probes.
 

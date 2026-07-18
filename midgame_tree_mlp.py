@@ -26,7 +26,8 @@ from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
     train_per_cell_trees, train_probe, train_probe_ensemble,
-    evaluate, evaluate_ensemble, OpeningTreeMLP,
+    train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
+    OpeningTreeMLP,
     load_or_sample, prune_paths_by_count,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
     C64_TO_C60, C60_TO_C64, STATE_NAMES,
@@ -244,6 +245,23 @@ def main():
                     help='Train this many probes with different seeds and '
                           'ensemble their softmax outputs.  Averages out '
                           'noise-feature-fitting from any single init.')
+    ap.add_argument('--probe-solver', default='adamw',
+                    choices=['adamw', 'sklearn'],
+                    help='adamw = current AdamW probe.  sklearn = 64 '
+                          'per-cell sklearn LogisticRegression (LBFGS) '
+                          'fits.  sklearn is convex and provably converges '
+                          'to global optimum; use to check whether adamw '
+                          'is undertraining.')
+    ap.add_argument('--sklearn-C', type=float, default=1.0,
+                    help='sklearn LogisticRegression C (inverse L2).')
+    ap.add_argument('--sklearn-n-jobs', type=int, default=8,
+                    help='Parallelize the 64 per-cell LR fits.')
+    ap.add_argument('--count-features-as-input', action='store_true',
+                    help='Add count-node activations to the raw input X '
+                          '(before tree fitting) instead of appending to '
+                          'the hidden layer.  Trees can then split on them '
+                          'and choose which are useful.  Uses the structured '
+                          'pool + --random-count-nodes count.')
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
@@ -292,6 +310,30 @@ def main():
     Xnp_te, Snp_te, Tnp_te = _narrow(Xnp_te, Snp_te, Tnp_te)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
+
+    # --- Optionally append count features to raw input (Option B) ---
+    if args.count_features_as_input:
+        cf_nodes = build_structured_count_nodes()
+        if args.random_count_nodes > 0:
+            rn = build_random_count_nodes(args.random_count_nodes,
+                                            seed=args.random_count_seed)
+            cf_nodes.extend(rn)
+        print(f'\ncomputing {len(cf_nodes)} count features to append to '
+               f'raw input...')
+        t0 = time.time()
+        played_tr = Xnp_tr[:, :60]; even_tr = Xnp_tr[:, 60:120]
+        played_te = Xnp_te[:, :60]; even_te = Xnp_te[:, 60:120]
+        CF_tr = compute_count_activations(cf_nodes, played_tr, even_tr)
+        CF_te = compute_count_activations(cf_nodes, played_te, even_te)
+        print(f'  CF_tr {CF_tr.shape} '
+               f'({CF_tr.nbytes / 1e9:.2f} GB)  '
+               f'({time.time() - t0:.1f}s)')
+        Xnp_tr = np.concatenate(
+            [Xnp_tr, CF_tr.astype(np.float32)], axis=1)
+        Xnp_te = np.concatenate(
+            [Xnp_te, CF_te.astype(np.float32)], axis=1)
+        print(f'  input dim now: {Xnp_tr.shape[1]}')
+        del CF_tr, CF_te
 
     # --- Train per-cell trees ---
     print(f'\ntraining per-cell trees (max_depth={args.tree_max_depth}, '
@@ -539,48 +581,79 @@ def main():
         del CA_tr, CA_te, residuals, S_onehot
 
     print('\ntraining linear probe on hidden layer...')
-    if args.probe_l1 > 0:
-        print(f'  using L1 regularization: lambda={args.probe_l1}')
-    print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}')
-    probes = train_probe_ensemble(
-        H_tr, S_tr, H_te, S_te,
-        n_seeds=args.probe_seeds,
-        epochs=args.probe_epochs, device=device,
-        l1_lambda=args.probe_l1)
-    probe = probes[0]     # for legacy references
-
-    # Individual + ensemble accuracy.
-    acc_tr, _, _, per_seed_tr = evaluate_ensemble(probes, H_tr, S_tr)
-    acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
-        probes, H_te, S_te, T_te)
-    print(f'\nresults:')
-    print(f'  hidden dim H = {H_tr.shape[1]} (tree paths + added units)')
-    if args.probe_seeds > 1:
-        print(f'  per-seed test acc: '
-               f'{[f"{100*a:.2f}%" for a in per_seed_te]}')
-        print(f'  per-seed range: '
-               f'[{100*min(per_seed_te):.2f}%, '
-               f'{100*max(per_seed_te):.2f}%]')
-        print(f'  ensemble train acc: {100*acc_tr:.4f}%')
-        print(f'  ensemble test  acc: {100*acc_te:.4f}%')
+    if args.probe_solver == 'sklearn':
+        print(f'  solver: sklearn LR (LBFGS)   '
+               f'C={args.sklearn_C}   n_jobs={args.sklearn_n_jobs}')
+        sk_models = train_probe_sklearn(
+            H_tr, S_tr, H_te, S_te,
+            C=args.sklearn_C, n_jobs=args.sklearn_n_jobs)
+        # For consistency with downstream code we use ensemble containers
+        # but fill with the sklearn models.
+        probes = None      # legacy variable, unused with sklearn path
+        probe = None
     else:
+        if args.probe_l1 > 0:
+            print(f'  using L1 regularization: lambda={args.probe_l1}')
+        print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}')
+        probes = train_probe_ensemble(
+            H_tr, S_tr, H_te, S_te,
+            n_seeds=args.probe_seeds,
+            epochs=args.probe_epochs, device=device,
+            l1_lambda=args.probe_l1)
+        probe = probes[0]     # for legacy references
+        sk_models = None
+
+    # Evaluate.
+    if sk_models is not None:
+        acc_tr, _, _ = evaluate_sklearn(sk_models, H_tr, S_tr)
+        acc_te, per_cell_te, by_ply = evaluate_sklearn(
+            sk_models, H_te, S_te, T_te)
+        print(f'\nresults:')
+        print(f'  hidden dim H = {H_tr.shape[1]} (sklearn LR probe)')
         print(f'  train per-cell acc: {100*acc_tr:.4f}%')
         print(f'  test  per-cell acc: {100*acc_te:.4f}%')
+    else:
+        acc_tr, _, _, per_seed_tr = evaluate_ensemble(probes, H_tr, S_tr)
+        acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
+            probes, H_te, S_te, T_te)
+        print(f'\nresults:')
+        print(f'  hidden dim H = {H_tr.shape[1]} (tree paths + added units)')
+        if args.probe_seeds > 1:
+            print(f'  per-seed test acc: '
+                   f'{[f"{100*a:.2f}%" for a in per_seed_te]}')
+            print(f'  per-seed range: '
+                   f'[{100*min(per_seed_te):.2f}%, '
+                   f'{100*max(per_seed_te):.2f}%]')
+            print(f'  ensemble train acc: {100*acc_tr:.4f}%')
+            print(f'  ensemble test  acc: {100*acc_te:.4f}%')
+        else:
+            print(f'  train per-cell acc: {100*acc_tr:.4f}%')
+            print(f'  test  per-cell acc: {100*acc_te:.4f}%')
 
-    # Use ensemble predictions for per-class breakdown.
-    device_probe = next(probes[0].parameters()).device
-    preds_te = torch.empty(H_te.shape[0], BOARD_CELLS, dtype=torch.long,
-                             device='cpu')
-    with torch.no_grad():
-        for i in range(0, H_te.shape[0], 512):
-            h = H_te[i:i + 512].to(device=device_probe,
-                                     dtype=torch.float32)
-            probs_acc = torch.zeros(h.shape[0], BOARD_CELLS, 3,
-                                      dtype=torch.float32)
-            for p in probes:
-                logits = p(h).view(-1, BOARD_CELLS, 3)
-                probs_acc += torch.softmax(logits, dim=-1).cpu()
-            preds_te[i:i + 512] = probs_acc.argmax(dim=-1)
+    # Per-cell class predictions for the corner/edge/inner breakdown.
+    if sk_models is not None:
+        H_te_np = H_te.numpy()
+        if H_te_np.dtype == np.bool_:
+            H_te_np = H_te_np.astype(np.float32)
+        preds_te_np = np.zeros((H_te.shape[0], BOARD_CELLS),
+                                 dtype=np.int64)
+        for c in range(BOARD_CELLS):
+            preds_te_np[:, c] = sk_models[c].predict(H_te_np)
+        preds_te = torch.from_numpy(preds_te_np)
+    else:
+        device_probe = next(probes[0].parameters()).device
+        preds_te = torch.empty(H_te.shape[0], BOARD_CELLS, dtype=torch.long,
+                                 device='cpu')
+        with torch.no_grad():
+            for i in range(0, H_te.shape[0], 512):
+                h = H_te[i:i + 512].to(device=device_probe,
+                                         dtype=torch.float32)
+                probs_acc = torch.zeros(h.shape[0], BOARD_CELLS, 3,
+                                          dtype=torch.float32)
+                for p in probes:
+                    logits = p(h).view(-1, BOARD_CELLS, 3)
+                    probs_acc += torch.softmax(logits, dim=-1).cpu()
+                preds_te[i:i + 512] = probs_acc.argmax(dim=-1)
     cls_break = per_class_accuracy(preds_te, S_te)
     print(f'\n  test acc by cell class:')
     for cls, (n_cells, acc) in cls_break.items():
@@ -600,7 +673,7 @@ def main():
 
     torch.save({
         'W': mlp.W.cpu(), 'b': mlp.b.cpu(),
-        'probe_state': probe.state_dict(),
+        'probe_state': probe.state_dict() if probe is not None else None,
         'path_info': all_meta,
         'per_cell_leaf_counts': per_cell_leaf_counts,
         'per_cell_tree_acc': tree_correct_per_cell.tolist(),
