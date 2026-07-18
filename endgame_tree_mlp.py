@@ -27,7 +27,7 @@ from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
     train_per_cell_trees, train_probe, evaluate, OpeningTreeMLP,
-    load_or_sample,
+    load_or_sample, prune_paths_by_count,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
     C64_TO_C60, C60_TO_C64, STATE_NAMES,
 )
@@ -129,6 +129,9 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='endgame_tree_mlp.pt')
+    ap.add_argument('--top-k-per-cell', type=int, default=None,
+                    help='Keep only the top-K most frequently trained-on '
+                          'paths per cell.  Total H becomes at most 64 * K.')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
@@ -186,6 +189,7 @@ def main():
     per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
     for c in range(BOARD_CELLS):
         paths = extract_paths(trees[c])
+        paths = prune_paths_by_count(paths, args.top_k_per_cell)
         per_cell_leaf_counts[c] = len(paths)
         for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
             w, b = path_to_weight(conditions)
@@ -194,6 +198,7 @@ def main():
                 'cell': c, 'path_idx': path_idx,
                 'conditions': conditions, 'leaf_class': leaf_class,
                 'depth': len(conditions), 'leaf_counts': leaf_counts,
+                'train_count': sum(leaf_counts),
                 'cell_class': CELL_CLASS[c],
             })
     W = np.stack(all_w); B = np.array(all_b, dtype=np.float32)
@@ -232,7 +237,7 @@ def main():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    fire_rate = H_tr.float().mean(dim=0)
+    fire_rate = H_tr.sum(dim=0).float() / H_tr.shape[0]
     print(f'  per-unit firing rate on train: '
            f'mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '

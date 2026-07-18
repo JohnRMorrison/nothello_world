@@ -260,6 +260,28 @@ def extract_paths(tree):
     return paths
 
 
+def prune_paths_by_count(paths, top_k):
+    """Sort paths by total training count (sum of leaf class distribution)
+    and return only the top_k.  Rare paths — those that cover very few
+    training examples — are typically noise-fit; keeping only the
+    frequent ones reduces H, cuts overfit, and makes the resulting rule
+    set inspectable.
+
+    Args:
+      paths: list of (conditions, leaf_class, leaf_counts) as returned by
+             extract_paths().
+      top_k: if None or >= len(paths), returns paths unchanged.
+    Returns:
+      list of paths sorted DESCENDING by training count, length min(top_k,
+      len(paths)).  Each path retains its original (conditions,
+      leaf_class, leaf_counts) tuple.
+    """
+    if top_k is None or top_k >= len(paths):
+        return paths
+    scored = sorted(paths, key=lambda p: -sum(p[2]))
+    return scored[:top_k]
+
+
 def path_to_weight(conditions, input_dim=INPUT_DIM):
     """Encode a path as a 0/±1 weight vector + bias.
 
@@ -388,6 +410,12 @@ def main():
     ap.add_argument('--device', default='cpu')
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--out', default='opening_tree_mlp.pt')
+    ap.add_argument('--top-k-per-cell', type=int, default=None,
+                    help='If set, keep only the top-K most frequently '
+                          'trained-on paths per cell (frequency-based rule '
+                          'pruning).  Total H becomes at most 64 * K.  '
+                          'Reduces overfit + memory; makes the rule set '
+                          'inspectable.')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set. '
                           'If exists, skip sampling.  If not, sample + save.')
@@ -452,6 +480,8 @@ def main():
     per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
     for c in range(BOARD_CELLS):
         paths = extract_paths(trees[c])
+        n_all = len(paths)
+        paths = prune_paths_by_count(paths, args.top_k_per_cell)
         per_cell_leaf_counts[c] = len(paths)
         for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
             w, b = path_to_weight(conditions)
@@ -461,9 +491,12 @@ def main():
                 'conditions': conditions, 'leaf_class': leaf_class,
                 'depth': len(conditions),
                 'leaf_counts': leaf_counts,
+                'train_count': sum(leaf_counts),
             })
     W = np.stack(all_w); B = np.array(all_b, dtype=np.float32)
-    print(f'  total hidden units: {len(all_meta)}')
+    print(f'  total hidden units: {len(all_meta)}'
+           + (f'  (top-{args.top_k_per_cell} per cell)'
+              if args.top_k_per_cell else ''))
     print(f'  leaves per tree: mean={per_cell_leaf_counts.mean():.1f}  '
            f'max={per_cell_leaf_counts.max()}  '
            f'min={per_cell_leaf_counts.min()}')
@@ -494,7 +527,9 @@ def main():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    fire_rate = H_tr.float().mean(dim=0)
+    # H_tr is bool; take the sum along dim 0 (int64, ~1 MB), then divide.
+    # Avoids materializing an (N, H) float32 tensor of ~540 GB.
+    fire_rate = H_tr.sum(dim=0).float() / H_tr.shape[0]
     print(f'  per-unit firing rate on train: mean={fire_rate.mean().item()*100:.2f}%  '
            f'min={fire_rate.min().item()*100:.4f}%  '
            f'max={fire_rate.max().item()*100:.2f}%')
