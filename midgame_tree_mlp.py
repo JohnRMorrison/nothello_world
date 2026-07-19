@@ -62,12 +62,41 @@ from flanking_patterns import (
 # Mid-game position sampling
 # ------------------------------------------------------------------------------
 
+def load_games_from_pickles(num_games, pickle_dir, seed=42):
+    """Load `num_games` game prefixes from the pre-generated synthetic
+    pickle files.  Much faster than playing games from scratch (roughly
+    100K games per pickle file, ~10 sec to load one file vs. hours to
+    play 100K games)."""
+    import glob
+    import pickle
+    files = sorted(glob.glob(os.path.join(pickle_dir, '*.pickle')))
+    if not files:
+        raise ValueError(f'no .pickle files in {pickle_dir}')
+    print(f'  loading games from {len(files)} pickle files in {pickle_dir}')
+    rng = np.random.RandomState(seed)
+    # Shuffle files so the seed selection is diverse.
+    files_shuffled = rng.permutation(files)
+    games = []
+    for path in files_shuffled:
+        if len(games) >= num_games:
+            break
+        with open(path, 'rb') as f:
+            file_games = pickle.load(f)
+        games.extend(file_games)
+        if len(games) % 500_000 == 0 or len(games) >= num_games:
+            print(f'    loaded {len(games)} games so far...')
+    games = games[:num_games]
+    print(f'  loaded {len(games)} games total')
+    return games
+
+
 def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                                 when_bucket_size=None,
                                 use_move_grid=False,
                                 recent_Ks=None,
                                 collect_legal_moves=False,
-                                canonicalize_mover=False):
+                                canonicalize_mover=False,
+                                pickle_dir=None):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) — or (X, S, T, L) if collect_legal_moves — with:
       X: (N, ...) played_even features
@@ -77,39 +106,84 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
     """
     rng = np.random.RandomState(seed)
     Xs, Ss, Ts, Ls = [], [], [], []
-    for _ in range(num_games):
+    # Choose game source: pre-generated pickles (fast, real-play) OR
+    # live random-play (slow, deterministic given seed).
+    if pickle_dir is not None:
+        pregen_games = load_games_from_pickles(num_games, pickle_dir,
+                                                    seed=seed)
+    else:
+        pregen_games = None
+    for g_idx in range(num_games):
         board = OthelloBoardState()
         prefix = []
-        for turn in range(60):
-            valid = board.get_valid_moves()
-            if not valid:
-                board.update([])
+        if pregen_games is not None:
+            # Replay the loaded game move-by-move.
+            game_moves = pregen_games[g_idx]
+            for move in game_moves:
                 valid = board.get_valid_moves()
                 if not valid:
+                    board.update([])
+                    valid = board.get_valid_moves()
+                    if not valid:
+                        break
+                ply = len(prefix)
+                if ply_min <= ply < ply_max:
+                    parity = ply % 2
+                    mover_color = 1 if parity == 0 else -1
+                    raw = board.state.flatten().astype(np.int8)
+                    lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
+                    lbl[raw == mover_color] = 1
+                    lbl[raw == -mover_color] = 2
+                    Xs.append(playedeven_features(
+                        prefix, when_bucket_size,
+                        use_move_grid,
+                        recent_Ks=recent_Ks,
+                        canonicalize_mover=canonicalize_mover))
+                    Ss.append(lbl)
+                    Ts.append(ply)
+                    if collect_legal_moves:
+                        lmask = np.zeros(BOARD_CELLS, dtype=np.uint8)
+                        for m in valid:
+                            lmask[m] = 1
+                        Ls.append(lmask)
+                if move not in valid:
+                    # The pre-generated game may include a move that is
+                    # not valid in this board — should not happen for
+                    # well-formed synthetic data, but bail defensively.
                     break
-            ply = len(prefix)
-            if ply_min <= ply < ply_max:
-                parity = turn % 2
-                mover_color = 1 if parity == 0 else -1
-                raw = board.state.flatten().astype(np.int8)
-                lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
-                lbl[raw == mover_color] = 1
-                lbl[raw == -mover_color] = 2
-                Xs.append(playedeven_features(
-                    prefix, when_bucket_size,
-                    use_move_grid,
-                    recent_Ks=recent_Ks,
-                    canonicalize_mover=canonicalize_mover))
-                Ss.append(lbl)
-                Ts.append(ply)
-                if collect_legal_moves:
-                    lmask = np.zeros(BOARD_CELLS, dtype=np.uint8)
-                    for m in valid:
-                        lmask[m] = 1
-                    Ls.append(lmask)
-            move = valid[rng.randint(len(valid))]
-            board.update([move])
-            prefix.append(move)
+                board.update([move])
+                prefix.append(move)
+        else:
+            for turn in range(60):
+                valid = board.get_valid_moves()
+                if not valid:
+                    board.update([])
+                    valid = board.get_valid_moves()
+                    if not valid:
+                        break
+                ply = len(prefix)
+                if ply_min <= ply < ply_max:
+                    parity = turn % 2
+                    mover_color = 1 if parity == 0 else -1
+                    raw = board.state.flatten().astype(np.int8)
+                    lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
+                    lbl[raw == mover_color] = 1
+                    lbl[raw == -mover_color] = 2
+                    Xs.append(playedeven_features(
+                        prefix, when_bucket_size,
+                        use_move_grid,
+                        recent_Ks=recent_Ks,
+                        canonicalize_mover=canonicalize_mover))
+                    Ss.append(lbl)
+                    Ts.append(ply)
+                    if collect_legal_moves:
+                        lmask = np.zeros(BOARD_CELLS, dtype=np.uint8)
+                        for m in valid:
+                            lmask[m] = 1
+                        Ls.append(lmask)
+                move = valid[rng.randint(len(valid))]
+                board.update([move])
+                prefix.append(move)
     if not Xs:
         raise RuntimeError(
             f'no positions extracted; ply range [{ply_min},{ply_max}) '
@@ -433,6 +507,14 @@ def main():
                           'Hidden layer starts empty (N, 0); only count / '
                           'order banks contribute.  Ablation: how much do '
                           'the tree paths add on top of order features?')
+    ap.add_argument('--pickle-dir', default=None,
+                    help='Directory of pre-generated .pickle files with '
+                          'synthetic games (used by the MLP baseline).  '
+                          'Load ~100K games per pickle from disk instead '
+                          'of playing games from scratch (which is ~44h '
+                          'for 6M games).  With this, 6M games loads in '
+                          '~15 min.  Recommended: '
+                          'data/othello_synthetic/')
     ap.add_argument('--load-trees-from', default=None,
                     help='Path to a previously-saved checkpoint (.pt).  '
                           'Reuses W, b, and tree_path metadata from the '
@@ -492,7 +574,8 @@ def main():
         use_move_grid=args.use_move_grid,
         recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal,
-        canonicalize_mover=args.canonicalize_mover)
+        canonicalize_mover=args.canonicalize_mover,
+        pickle_dir=args.pickle_dir)
     te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
@@ -501,7 +584,8 @@ def main():
         use_move_grid=args.use_move_grid,
         recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal,
-        canonicalize_mover=args.canonicalize_mover)
+        canonicalize_mover=args.canonicalize_mover,
+        pickle_dir=args.pickle_dir)
     if collect_legal:
         Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = tr
         Xnp_te, Snp_te, Tnp_te, Lnp_te = te
