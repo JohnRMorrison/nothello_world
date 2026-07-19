@@ -89,7 +89,7 @@ OUT="ckpts_midgame/midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_
 CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_L_tr.npz"
 CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_L_te.npz"
 
-CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
     --num-test-games ${NUM_TEST} \
     --ply-min ${PLY_MIN} \
