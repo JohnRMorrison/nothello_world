@@ -95,6 +95,31 @@ def pattern_target(pattern):
     return pattern['target']
 
 
+def true_pattern_activations(patterns, state_labels):
+    """Compute ground-truth pattern activations from TRUE state.
+
+    Under our mine/opp convention: class 0=empty, class 1=mine (mover),
+    class 2=opp.  Pattern P fires iff:
+      target cell is empty (class 0)
+      each opp cell has class 2 (opponent)
+      terminal cell has class 1 (mover)
+
+    state_labels: (N, 64) int array.
+    Returns: (N, K) uint8 where K = len(patterns).
+    """
+    N = state_labels.shape[0]
+    K = len(patterns)
+    out = np.zeros((N, K), dtype=np.uint8)
+    for j, pat in enumerate(patterns):
+        target_empty = (state_labels[:, pat['target']] == 0)
+        opps_ok = np.ones(N, dtype=bool)
+        for o in pat['opponents']:
+            opps_ok = opps_ok & (state_labels[:, o] == 2)
+        term_ok = (state_labels[:, pat['terminal']] == 1)
+        out[:, j] = (target_empty & opps_ok & term_ok).astype(np.uint8)
+    return out
+
+
 def patterns_by_target(patterns):
     """Group patterns by target cell.  Returns dict {cell: [pattern_idx, ...]}."""
     from collections import defaultdict

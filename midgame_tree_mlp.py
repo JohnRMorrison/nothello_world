@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
-    train_per_cell_trees, train_probe, train_probe_ensemble,
+    train_per_cell_trees, train_pattern_trees, train_probe, train_probe_ensemble,
     train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
     train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
     evaluate_legal_ensemble, legal_accuracy_from_state,
@@ -51,7 +51,7 @@ from order_nodes import (
 )
 from flanking_patterns import (
     load_patterns, compute_pattern_activations, patterns_by_target,
-    legal_from_state_probs_via_patterns,
+    legal_from_state_probs_via_patterns, true_pattern_activations,
 )
 
 
@@ -389,13 +389,19 @@ def main():
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
     ap.add_argument('--tree-target', default='state',
-                    choices=['state', 'legal'],
-                    help='What per-cell trees predict.  state (default): '
-                          '3-class {empty, mine, opp} — tree paths become '
-                          'state-decoding features.  legal: 2-class '
-                          '{illegal, legal} — tree paths encode flanking-'
-                          'like conjunctions predictive of legality.  Only '
-                          'meaningful with --task legal or --task both.')
+                    choices=['state', 'legal', 'patterns'],
+                    help='What trees predict.  state (default): 64 per-cell '
+                          'trees, 3-class {empty, mine, opp}.  legal: 64 '
+                          'per-cell trees, 2-class {illegal, legal}.  '
+                          'patterns: 960 per-pattern trees, each predicting '
+                          'whether that flanking pattern is currently active '
+                          'in the true board state.  patterns requires '
+                          '--include-flanking-patterns.')
+    ap.add_argument('--pattern-n-trees', type=int, default=1,
+                    help='For --tree-target patterns: how many bagged trees '
+                          'to fit per pattern.  1 = single tree per pattern '
+                          '(deterministic).  >1 = bagged ensemble with '
+                          'bootstrap sampling.')
     ap.add_argument('--task', default='state',
                     choices=['state', 'legal', 'both'],
                     help='state (default): train state-decoding probe only. '
@@ -588,7 +594,50 @@ def main():
                     mf = float(mf)
                 except ValueError:
                     pass
-        if args.tree_target == 'legal':
+        pattern_trees = None
+        patterns_list = None
+        if args.tree_target == 'patterns':
+            if not args.include_flanking_patterns:
+                raise ValueError('--tree-target patterns requires '
+                                  '--include-flanking-patterns.')
+            patterns_list = load_patterns(args.include_flanking_patterns)
+            print(f'  loaded {len(patterns_list)} patterns')
+            print(f'  computing true pattern activations from state '
+                   f'labels ...')
+            pt_tr = true_pattern_activations(patterns_list, Snp_tr)
+            pt_te = true_pattern_activations(patterns_list, Snp_te)
+            fire_rate_tr = 100 * pt_tr.mean()
+            print(f'    activation fire rate on train: '
+                   f'{fire_rate_tr:.3f}%   '
+                   f'per-pattern min: {100 * pt_tr.mean(0).min():.3f}%   '
+                   f'max: {100 * pt_tr.mean(0).max():.3f}%')
+            print(f'  fitting {args.pattern_n_trees} tree(s) per pattern '
+                   f'({len(patterns_list)} patterns × '
+                   f'{args.pattern_n_trees} = '
+                   f'{len(patterns_list) * args.pattern_n_trees} trees)...')
+            pattern_trees = train_pattern_trees(
+                Xnp_tr, pt_tr,
+                n_trees_per_pattern=args.pattern_n_trees,
+                max_depth=args.tree_max_depth,
+                min_samples_leaf=args.tree_min_samples_leaf,
+                n_jobs=args.tree_n_jobs,
+                max_features=mf,
+                class_weight='balanced')
+            print(f'  ({time.time() - t0:.1f}s)')
+
+            # Aggregate-per-pattern tree accuracy (majority vote across
+            # the pattern's trees).
+            K = len(patterns_list)
+            tree_correct_per_pattern = np.zeros(K)
+            for j in range(K):
+                votes = np.zeros(Xnp_te.shape[0], dtype=np.float32)
+                for tree in pattern_trees[j]:
+                    votes += tree.predict(Xnp_te).astype(np.float32)
+                pred = (votes / len(pattern_trees[j]) > 0.5).astype(np.uint8)
+                tree_correct_per_pattern[j] = (pred == pt_te[:, j]).mean()
+            print(f'  aggregate per-pattern tree test acc: '
+                   f'{100 * tree_correct_per_pattern.mean():.4f}%')
+        elif args.tree_target == 'legal':
             if Lnp_tr is None:
                 raise ValueError('--tree-target legal requires --task legal '
                                   'or --task both to collect legal masks.')
@@ -598,47 +647,76 @@ def main():
         else:
             tree_target_tr = Snp_tr
             tree_target_te = Snp_te
-        trees = train_per_cell_trees(
-            Xnp_tr, tree_target_tr,
-            max_depth=args.tree_max_depth,
-            min_samples_leaf=args.tree_min_samples_leaf,
-            n_jobs=args.tree_n_jobs,
-            max_features=mf)
-        print(f'  ({time.time() - t0:.1f}s)')
 
-        tree_correct_per_cell = np.zeros(BOARD_CELLS)
-        for c in range(BOARD_CELLS):
-            preds = trees[c].predict(Xnp_te)
-            tree_correct_per_cell[c] = (preds == tree_target_te[:, c]).mean()
-        target_label = ('legal-move'
-                        if args.tree_target == 'legal' else 'state')
-        print(f'  aggregate per-cell tree test acc ({target_label}): '
-               f'{100*tree_correct_per_cell.mean():.4f}%')
-        for cls in ('corner', 'edge', 'inner'):
-            cell_ids = [c for c in range(64) if CELL_CLASS[c] == cls]
-            print(f'    {cls:6s} ({len(cell_ids)} cells):  '
-                   f'{100*tree_correct_per_cell[cell_ids].mean():.4f}%')
+        if args.tree_target != 'patterns':
+            trees = train_per_cell_trees(
+                Xnp_tr, tree_target_tr,
+                max_depth=args.tree_max_depth,
+                min_samples_leaf=args.tree_min_samples_leaf,
+                n_jobs=args.tree_n_jobs,
+                max_features=mf)
+            print(f'  ({time.time() - t0:.1f}s)')
+
+            tree_correct_per_cell = np.zeros(BOARD_CELLS)
+            for c in range(BOARD_CELLS):
+                preds = trees[c].predict(Xnp_te)
+                tree_correct_per_cell[c] = (
+                    preds == tree_target_te[:, c]).mean()
+            target_label = ('legal-move'
+                            if args.tree_target == 'legal' else 'state')
+            print(f'  aggregate per-cell tree test acc ({target_label}): '
+                   f'{100*tree_correct_per_cell.mean():.4f}%')
+            for cls in ('corner', 'edge', 'inner'):
+                cell_ids = [c for c in range(64) if CELL_CLASS[c] == cls]
+                print(f'    {cls:6s} ({len(cell_ids)} cells):  '
+                       f'{100*tree_correct_per_cell[cell_ids].mean():.4f}%')
 
         # --- Extract paths ---
         print('\nextracting paths → hidden units...')
         all_w, all_b, all_meta = [], [], []
-        per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
         input_dim = Xnp_tr.shape[1]
-        for c in range(BOARD_CELLS):
-            paths = extract_paths(trees[c])
-            paths = prune_paths_by_count(paths, args.top_k_per_cell)
-            per_cell_leaf_counts[c] = len(paths)
-            for path_idx, (conditions, leaf_class, leaf_counts) in enumerate(paths):
-                w, b = path_to_weight(conditions, input_dim=input_dim)
-                all_w.append(w); all_b.append(b)
-                all_meta.append({
-                    'kind': 'tree_path',
-                    'cell': c, 'path_idx': path_idx,
-                    'conditions': conditions, 'leaf_class': leaf_class,
-                    'depth': len(conditions),
-                    'leaf_counts': leaf_counts,
-                    'cell_class': CELL_CLASS[c],
-                })
+        if args.tree_target == 'patterns':
+            per_pattern_leaf_counts = np.zeros(len(patterns_list), dtype=int)
+            for j, tree_list in enumerate(pattern_trees):
+                for tree_idx, tree in enumerate(tree_list):
+                    paths = extract_paths(tree)
+                    paths = prune_paths_by_count(paths, args.top_k_per_cell)
+                    per_pattern_leaf_counts[j] += len(paths)
+                    for path_idx, (conditions, leaf_class,
+                                     leaf_counts) in enumerate(paths):
+                        w, b = path_to_weight(conditions,
+                                                 input_dim=input_dim)
+                        all_w.append(w); all_b.append(b)
+                        all_meta.append({
+                            'kind': 'pattern_path',
+                            'pattern': j,
+                            'tree_idx': tree_idx,
+                            'path_idx': path_idx,
+                            'target_cell': patterns_list[j]['target'],
+                            'conditions': conditions,
+                            'leaf_class': leaf_class,
+                            'depth': len(conditions),
+                            'leaf_counts': leaf_counts,
+                        })
+            per_cell_leaf_counts = per_pattern_leaf_counts
+        else:
+            per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
+            for c in range(BOARD_CELLS):
+                paths = extract_paths(trees[c])
+                paths = prune_paths_by_count(paths, args.top_k_per_cell)
+                per_cell_leaf_counts[c] = len(paths)
+                for path_idx, (conditions, leaf_class,
+                                 leaf_counts) in enumerate(paths):
+                    w, b = path_to_weight(conditions, input_dim=input_dim)
+                    all_w.append(w); all_b.append(b)
+                    all_meta.append({
+                        'kind': 'tree_path',
+                        'cell': c, 'path_idx': path_idx,
+                        'conditions': conditions, 'leaf_class': leaf_class,
+                        'depth': len(conditions),
+                        'leaf_counts': leaf_counts,
+                        'cell_class': CELL_CLASS[c],
+                    })
         n_tree_units = len(all_meta)
 
         if args.add_stability:
@@ -961,7 +1039,11 @@ def main():
         # Free candidate activation storage.
         del CA_tr, CA_te, residuals, S_onehot
 
-    skip_state_probe = (args.tree_target == 'legal')
+    skip_state_probe = (args.tree_target in ('legal', 'patterns'))
+    # Downstream save code expects tree_correct_per_cell — for patterns mode,
+    # define it from the per-pattern accuracies.
+    if args.tree_target == 'patterns' and not args.skip_tree_fit:
+        tree_correct_per_cell = tree_correct_per_pattern
     if skip_state_probe:
         print(f'\ntree-target=legal → skipping state probe (tree paths do '
                f'not distinguish state).')
@@ -1167,6 +1249,53 @@ def main():
         elif 'derived' in modes:
             print(f'\nskipping derived legal (no state predictions '
                    f'available under tree-target=legal)')
+
+        if 'patterns_probor' in modes and args.tree_target == 'patterns':
+            print(f'\ncomputing legal-move via prob-OR over '
+                   f'per-pattern tree probabilities...')
+            # For each pattern j: average over the pattern's trees'
+            # predict_proba to get P(pattern fires).
+            K = len(patterns_list)
+            pat_probs = np.zeros((H_te.shape[0], K), dtype=np.float32)
+            for j, tree_list in enumerate(pattern_trees):
+                for tree in tree_list:
+                    proba = tree.predict_proba(Xnp_te)
+                    # class ordering may be [0] or [0, 1]; take the "1"
+                    # column when present.
+                    if proba.shape[1] == 2:
+                        pat_probs[:, j] += proba[:, 1]
+                    else:
+                        # single-class tree — its prediction is always
+                        # that class.  Predict = tree.classes_[0].
+                        if int(tree.classes_[0]) == 1:
+                            pat_probs[:, j] += 1.0
+                pat_probs[:, j] /= len(tree_list)
+            # Prob-OR combine per target cell.
+            by_tgt = patterns_by_target(patterns_list)
+            per_cell_legal = np.zeros((H_te.shape[0], BOARD_CELLS),
+                                          dtype=np.float32)
+            for cell, pattern_ids in by_tgt.items():
+                per_cell_legal[:, cell] = (
+                    1.0 - np.prod(1.0 - pat_probs[:, pattern_ids],
+                                      axis=1))
+            preds_legal = (per_cell_legal > 0.5).astype(np.uint8)
+            L_te_np = L_te.numpy() if hasattr(L_te, 'numpy') else L_te
+            correct = (preds_legal == L_te_np).astype(np.float32)
+            per_cell = correct.mean(axis=0)
+            mean_acc = float(correct.mean())
+            aux = {'position_perfect':
+                     float(correct.all(axis=1).mean())}
+            T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
+            by_ply = {}
+            per_pos = correct.mean(axis=1)
+            for lo in range(int(T_np.min()) // 10 * 10,
+                              int(T_np.max()) + 1, 10):
+                mask = (T_np >= lo) & (T_np < lo + 10)
+                if mask.any():
+                    by_ply[(lo, lo + 10)] = (int(mask.sum()),
+                                                float(per_pos[mask].mean()))
+            aux['by_ply'] = by_ply
+            _print_legal_report('PatPO ', mean_acc, per_cell, aux)
 
         if ('state_probor' in modes and not skip_state_probe
                 and args.include_flanking_patterns):

@@ -324,6 +324,58 @@ def train_per_cell_trees(X, S, max_depth, min_samples_leaf=1, n_jobs=1,
         for c in range(BOARD_CELLS))
 
 
+def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
+                             max_features, class_weight, seed, bootstrap):
+    """Fit a single (optionally bagged) tree targeting one pattern's
+    activation.  When bootstrap is True the training rows are resampled
+    with replacement — this is what makes ensembles diverse."""
+    if bootstrap:
+        rng = np.random.RandomState(seed)
+        idx = rng.choice(X.shape[0], X.shape[0], replace=True)
+        X = X[idx]; y = y[idx]
+    tree = DecisionTreeClassifier(
+        max_depth=max_depth,
+        min_samples_leaf=min_samples_leaf,
+        max_features=max_features,
+        class_weight=class_weight,
+        random_state=seed)
+    tree.fit(X, y)
+    return tree
+
+
+def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
+                          min_samples_leaf=50, n_jobs=1, max_features=None,
+                          class_weight='balanced'):
+    """Fit `n_trees_per_pattern` trees per pattern.
+
+    X: (N, D) input features.
+    target: (N, K) uint8 — per-pattern binary activation.
+
+    For each pattern j, we fit `n_trees_per_pattern` trees.  When
+    n_trees_per_pattern > 1, trees are bagged (bootstrapped) so that
+    ensemble aggregation is meaningful.
+
+    Returns: list of length K, each entry a list of `n_trees_per_pattern`
+    fitted DecisionTreeClassifier instances.
+    """
+    K = target.shape[1]
+    bootstrap = (n_trees_per_pattern > 1)
+
+    def one_pattern(j):
+        return [_fit_one_pattern_tree(X, target[:, j], max_depth,
+                                          min_samples_leaf, max_features,
+                                          class_weight,
+                                          seed=j * 1000 + k,
+                                          bootstrap=bootstrap)
+                for k in range(n_trees_per_pattern)]
+
+    if n_jobs == 1:
+        return [one_pattern(j) for j in range(K)]
+    from joblib import Parallel, delayed
+    return Parallel(n_jobs=n_jobs)(delayed(one_pattern)(j)
+                                       for j in range(K))
+
+
 def extract_paths(tree):
     """Return list of (conditions, leaf_class, leaf_counts) tuples.
     conditions: list of (feature_idx, required_value 0-or-1).
