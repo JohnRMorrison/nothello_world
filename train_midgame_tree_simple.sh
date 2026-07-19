@@ -67,11 +67,19 @@ case "${VARIANT}" in
         BANK_KS="1,2,5,10,20"
         TAG="bank_multi"
         ;;
+    bank_multi_probor)
+        # bank_multi with the noisy-OR state readout instead of linear.
+        BANK_KS="1,2,5,10,20"
+        TAG="bank_multi_probor"
+        STATE_READOUT="probor"
+        ;;
     *)
-        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi"
+        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi bank_multi_probor"
         exit 1
         ;;
 esac
+
+STATE_READOUT=${STATE_READOUT:-linear}
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -116,6 +124,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --hidden-activation relu \
     --probe-epochs 100 \
     --probe-seeds 5 \
+    --state-readout ${STATE_READOUT} \
     ${RECENT_FLAG} \
     --device cuda \
     --cache-tr ${CACHE_TR} \

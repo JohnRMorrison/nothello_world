@@ -29,6 +29,7 @@ from opening_tree_mlp import (
     train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
     train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
     evaluate_legal_ensemble, legal_accuracy_from_state,
+    train_probe_state_probor_ensemble, evaluate_state_probor_ensemble,
     OpeningTreeMLP,
     load_or_sample, prune_paths_by_count,
     BOARD_CELLS, INPUT_DIM, CENTER_64, NON_CENTER_64,
@@ -324,6 +325,15 @@ def main():
                     help='Train this many probes with different seeds and '
                           'ensemble their softmax outputs.  Averages out '
                           'noise-feature-fitting from any single init.')
+    ap.add_argument('--state-readout', default='linear',
+                    choices=['linear', 'probor'],
+                    help='linear (default): AdamW linear probe with softmax '
+                          '+ cross-entropy.  probor: StateNoisyOrHead — '
+                          'per-(unit, cell, class) non-negative rates, '
+                          'combined by prob-OR, normalized across 3 '
+                          'classes, trained with NLL.  probor forces each '
+                          'unit to VOTE FOR classes only, no cancellation.')
+    ap.add_argument('--probor-lr', type=float, default=0.05)
     ap.add_argument('--probe-solver', default='adamw',
                     choices=['adamw', 'sklearn'],
                     help='adamw = current AdamW probe.  sklearn = 64 '
@@ -873,12 +883,20 @@ def main():
     else:
         if args.probe_l1 > 0:
             print(f'  using L1 regularization: lambda={args.probe_l1}')
-        print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}')
-        probes = train_probe_ensemble(
-            H_tr, S_tr, H_te, S_te,
-            n_seeds=args.probe_seeds,
-            epochs=args.probe_epochs, device=device,
-            l1_lambda=args.probe_l1)
+        print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}   '
+               f'readout: {args.state_readout}')
+        if args.state_readout == 'probor':
+            probes = train_probe_state_probor_ensemble(
+                H_tr, S_tr,
+                n_seeds=args.probe_seeds,
+                epochs=args.probe_epochs, lr=args.probor_lr,
+                device=device)
+        else:
+            probes = train_probe_ensemble(
+                H_tr, S_tr, H_te, S_te,
+                n_seeds=args.probe_seeds,
+                epochs=args.probe_epochs, device=device,
+                l1_lambda=args.probe_l1)
         probe = probes[0]     # for legacy references
         sk_models = None
 
@@ -891,6 +909,11 @@ def main():
         print(f'  hidden dim H = {H_tr.shape[1]} (sklearn LR probe)')
         print(f'  train per-cell acc: {100*acc_tr:.4f}%')
         print(f'  test  per-cell acc: {100*acc_te:.4f}%')
+    elif args.state_readout == 'probor':
+        acc_tr, _, _, per_seed_tr = evaluate_state_probor_ensemble(
+            probes, H_tr, S_tr)
+        acc_te, per_cell_te, by_ply, per_seed_te = (
+            evaluate_state_probor_ensemble(probes, H_te, S_te, T_te))
     else:
         acc_tr, _, _, per_seed_tr = evaluate_ensemble(probes, H_tr, S_tr)
         acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
@@ -930,8 +953,13 @@ def main():
                 probs_acc = torch.zeros(h.shape[0], BOARD_CELLS, 3,
                                           dtype=torch.float32)
                 for p in probes:
-                    logits = p(h).view(-1, BOARD_CELLS, 3)
-                    probs_acc += torch.softmax(logits, dim=-1).cpu()
+                    out = p(h)
+                    if args.state_readout == 'probor':
+                        # NoisyOrHead output is already normalized (b, 64, 3).
+                        probs_acc += out.cpu()
+                    else:
+                        logits = out.view(-1, BOARD_CELLS, 3)
+                        probs_acc += torch.softmax(logits, dim=-1).cpu()
                 preds_te[i:i + 512] = probs_acc.argmax(dim=-1)
     cls_break = per_class_accuracy(preds_te, S_te)
     print(f'\n  test acc by cell class:')

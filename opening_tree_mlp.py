@@ -698,6 +698,117 @@ class NoisyOrHead(nn.Module):
         return 1.0 - torch.exp(-(h @ w))
 
 
+class StateNoisyOrHead(nn.Module):
+    """3-way per-cell noisy-OR state readout.
+
+    Each hidden unit i has a non-negative rate w_{i,c,k} for each cell C
+    and class k (empty / mine / opp).  Per-class scores combine by prob-OR:
+        P_k(C, h) = 1 - exp(-Sigma_i w_{i,c,k} * h_i)
+    Then normalized across k for a valid distribution:
+        P(C = k | h) = P_k / (P_0 + P_1 + P_2)
+    Trained with NLL loss.
+
+    Parameter count matches a linear probe: H x C x 3 = H x 192.  The
+    non-negativity constraint + noisy-OR combination means each unit i
+    can only VOTE FOR classes (with rate w >= 0) — no negative weights,
+    no cancellation.  Interpretable as "unit i contributes to cell C
+    being class k at rate w_{i,c,k}".
+    """
+    def __init__(self, H, C=BOARD_CELLS, n_classes=3):
+        super().__init__()
+        self.C = C
+        self.n_classes = n_classes
+        # softplus(-9) ~ 1.2e-4 → per-class score starts near 0, so all
+        # classes start ~equiprobable after normalization.
+        self.raw = nn.Parameter(
+            torch.randn(H, C * n_classes) * 0.01 - 9.0)
+
+    def forward(self, h):
+        w = F.softplus(self.raw)           # (H, C * K)
+        lam = h @ w                        # (N, C * K)  all >= 0
+        P = 1.0 - torch.exp(-lam)          # (N, C * K)
+        P = P.view(-1, self.C, self.n_classes)
+        P = P / (P.sum(dim=-1, keepdim=True) + 1e-9)
+        return P
+
+
+def train_probe_state_probor(H_tr, S_tr, epochs=25, lr=0.05, batch=512,
+                                 weight_decay=0.0, device=None, seed=0):
+    """Train the StateNoisyOrHead with NLL on the normalized class
+    probabilities."""
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = StateNoisyOrHead(H_tr.shape[1]).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            y = S_tr[idx].to(device=device, dtype=torch.long)   # (b, 64)
+            P = probe(h).clamp(1e-9, 1 - 1e-9)                   # (b, 64, 3)
+            loss = F.nll_loss(torch.log(P).view(-1, 3), y.view(-1))
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_state_probor_ensemble(H_tr, S_tr, n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_state_probor(
+            H_tr, S_tr, seed=0, **kwargs)]
+    return [train_probe_state_probor(H_tr, S_tr, seed=s, **kwargs)
+            for s in range(n_seeds)]
+
+
+def evaluate_state_probor_ensemble(probes, H, S, T=None, batch=512):
+    """Average per-cell class probabilities across seeds; argmax.
+
+    Returns (mean_acc, per_cell_acc, by_ply, per_seed_accs).
+    Matches the signature of evaluate_ensemble.
+    """
+    device = next(probes[0].parameters()).device
+    N = H.shape[0]
+    accum = torch.zeros(N, BOARD_CELLS, 3, dtype=torch.float32)
+    S_cpu = S.cpu() if S.is_cuda else S
+    for i in range(0, N, batch):
+        h = H[i:i + batch].to(device=device, dtype=torch.float32)
+        P = torch.zeros(h.shape[0], BOARD_CELLS, 3,
+                          dtype=torch.float32, device=device)
+        for probe in probes:
+            with torch.no_grad():
+                P = P + probe(h)
+        P = P / len(probes)
+        accum[i:i + batch] = P.cpu()
+    preds = accum.argmax(dim=-1)
+    correct = (preds == S_cpu).float()
+    per_cell = correct.mean(dim=0).numpy()
+    mean_acc = correct.mean().item()
+    by_ply = {}
+    if T is not None:
+        T_cpu = T.cpu() if T.is_cuda else T
+        for ply in range(int(T_cpu.min().item()),
+                            int(T_cpu.max().item()) + 1):
+            mask = (T_cpu == ply)
+            if mask.any():
+                by_ply[ply] = (int(mask.sum().item()),
+                                correct[mask].mean().item())
+    # per-seed accuracies (independent argmax per probe)
+    per_seed = []
+    for probe in probes:
+        preds_s = torch.empty(N, BOARD_CELLS, dtype=torch.long)
+        with torch.no_grad():
+            for i in range(0, N, batch):
+                h = H[i:i + batch].to(device=device, dtype=torch.float32)
+                preds_s[i:i + batch] = probe(h).argmax(dim=-1).cpu()
+        per_seed.append((preds_s == S_cpu).float().mean().item())
+    return mean_acc, per_cell, by_ply, per_seed
+
+
 def train_probe_legal_probor(H_tr, L_tr, epochs=25, lr=0.05, batch=512,
                                  weight_decay=0.0, device=None, seed=0):
     if device is None:
