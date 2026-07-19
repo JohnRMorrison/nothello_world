@@ -163,6 +163,14 @@ case "${VARIANT}" in
         RECENT_ARG="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1"
         TAG="pattern_trees_no_recent"
         ;;
+    pattern_trees_no_recent_canonical)
+        # Mine/yours moveset: replaces `even` with `placed_as_mover` so
+        # trees see mover-relative color directly, no need to condition
+        # on mover_parity internally.  Cleanest structure for flanking
+        # patterns (which are mover-relative by definition).
+        RECENT_ARG="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        TAG="pattern_trees_no_recent_canonical"
+        ;;
     bank_multi_flanking_legaltrees_patterntrees)
         # Combined bank: legal-target trees (3200 leaves) + pattern-target
         # trees (48000 leaves) + hand-crafted flanking pattern activations
