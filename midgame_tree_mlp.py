@@ -909,17 +909,21 @@ def main():
         print(f'  hidden dim H = {H_tr.shape[1]} (sklearn LR probe)')
         print(f'  train per-cell acc: {100*acc_tr:.4f}%')
         print(f'  test  per-cell acc: {100*acc_te:.4f}%')
-    elif args.state_readout == 'probor':
-        acc_tr, _, _, per_seed_tr = evaluate_state_probor_ensemble(
-            probes, H_tr, S_tr)
-        acc_te, per_cell_te, by_ply, per_seed_te = (
-            evaluate_state_probor_ensemble(probes, H_te, S_te, T_te))
     else:
-        acc_tr, _, _, per_seed_tr = evaluate_ensemble(probes, H_tr, S_tr)
-        acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
-            probes, H_te, S_te, T_te)
+        if args.state_readout == 'probor':
+            acc_tr, _, _, per_seed_tr = evaluate_state_probor_ensemble(
+                probes, H_tr, S_tr)
+            acc_te, per_cell_te, by_ply, per_seed_te = (
+                evaluate_state_probor_ensemble(
+                    probes, H_te, S_te, T_te))
+        else:
+            acc_tr, _, _, per_seed_tr = evaluate_ensemble(
+                probes, H_tr, S_tr)
+            acc_te, per_cell_te, by_ply, per_seed_te = evaluate_ensemble(
+                probes, H_te, S_te, T_te)
         print(f'\nresults:')
-        print(f'  hidden dim H = {H_tr.shape[1]} (tree paths + added units)')
+        print(f'  hidden dim H = {H_tr.shape[1]} (tree paths + added units, '
+               f'readout={args.state_readout})')
         if args.probe_seeds > 1:
             print(f'  per-seed test acc: '
                    f'{[f"{100*a:.2f}%" for a in per_seed_te]}')
