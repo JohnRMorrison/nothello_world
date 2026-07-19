@@ -49,6 +49,9 @@ from order_nodes import (
     build_turn_bucket, build_recency, build_ordinal,
     build_pairwise_order, build_streak,
 )
+from flanking_patterns import (
+    load_patterns, compute_pattern_activations, patterns_by_target,
+)
 
 
 # ------------------------------------------------------------------------------
@@ -244,6 +247,14 @@ def main():
                           'on the enlarged input directly — no separate '
                           'order-node hidden bank needed.  E.g., "5" gives '
                           'played+even+recent = 60x3 input (+ mover_parity).')
+    ap.add_argument('--include-flanking-patterns', default='',
+                    help='Path to a .pt file with 960 hand-crafted flanking '
+                          'patterns.  Each pattern encodes an Othello '
+                          'legality rule as a conjunction on moveset+parity; '
+                          'activations are concatenated to the hidden layer '
+                          'as 960 extra binary units.  Combined with '
+                          '--task legal or --task both to train legal-move '
+                          'probes over these + tree paths.')
     ap.add_argument('--recent-Ks-as-hidden', default='',
                     help='Comma-separated K values.  Same recent bits as '
                           '--input-recent-Ks, but excluded from tree input '
@@ -676,6 +687,50 @@ def main():
         print(f'  combined H_tr {tuple(H_tr.shape)}  '
                f'H_te {tuple(H_te.shape)}')
         del rb_tr, rb_te, recent_hidden_tr, recent_hidden_te
+
+    # ---- Optionally append flanking-pattern hidden bank ----
+    # 960 hand-crafted Othello legality rules as {0/1} moveset+parity
+    # conjunctions.  Each unit fires iff the pattern's conjunction is
+    # satisfied under placement=current-color approximation.
+    if args.include_flanking_patterns:
+        print(f'\nloading flanking patterns from '
+               f'{args.include_flanking_patterns}...')
+        patterns = load_patterns(args.include_flanking_patterns)
+        print(f'  {len(patterns)} patterns loaded')
+        # played/even/mp come straight from the first 121 cols of Xnp.
+        played_tr = Xnp_tr[:, :60].astype(np.uint8)
+        even_tr = Xnp_tr[:, 60:120].astype(np.uint8)
+        mp_tr = Xnp_tr[:, 120].astype(np.uint8)
+        played_te = Xnp_te[:, :60].astype(np.uint8)
+        even_te = Xnp_te[:, 60:120].astype(np.uint8)
+        mp_te = Xnp_te[:, 120].astype(np.uint8)
+        t0 = time.time()
+        FP_tr = compute_pattern_activations(patterns, played_tr, even_tr,
+                                                 mp_tr)
+        FP_te = compute_pattern_activations(patterns, played_te, even_te,
+                                                 mp_te)
+        print(f'  activations: FP_tr {FP_tr.shape} '
+               f'({FP_tr.nbytes / 1e9:.2f} GB)  '
+               f'fire={100*FP_tr.mean():.3f}%  '
+               f'({time.time() - t0:.1f}s)')
+        H_tr = torch.cat([H_tr, torch.from_numpy(FP_tr).to(act_dtype)],
+                             dim=1)
+        H_te = torch.cat([H_te, torch.from_numpy(FP_te).to(act_dtype)],
+                             dim=1)
+        for j, pat in enumerate(patterns):
+            all_meta.append({
+                'kind': 'flanking_pattern',
+                'name': (f'flank_t{pat["target"]}_o{pat["opponents"]}'
+                          f'_x{pat["terminal"]}_d{pat["direction"]}'),
+                'target': pat['target'],
+                'opponents': pat['opponents'],
+                'terminal': pat['terminal'],
+                'direction': pat['direction'],
+                'length': pat['length'],
+            })
+        print(f'  combined H_tr {tuple(H_tr.shape)}  '
+               f'H_te {tuple(H_te.shape)}')
+        del FP_tr, FP_te
 
     # ---- Optionally append count-node bank ----
     count_nodes_used = []

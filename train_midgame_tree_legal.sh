@@ -77,6 +77,19 @@ case "${VARIANT}" in
         TAG="bank_multi_legaltrees"
         TREE_TARGET="legal"
         ;;
+    bank_multi_flanking)
+        # bank_multi + 960 hand-crafted flanking patterns as extra hidden
+        # units (Option 3): trees for state, recent bits, 960 patterns.
+        # Legal probes read the enlarged hidden layer.
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
+        TAG="bank_multi_flanking"
+        ;;
+    bank_multi_flanking_legaltrees)
+        # Both: trees fit for legal + 960 flanking-pattern hidden units.
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
+        TAG="bank_multi_flanking_legaltrees"
+        TREE_TARGET="legal"
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1
@@ -105,9 +118,11 @@ TREE_TARGET=${TREE_TARGET:-state}
 OUT="ckpts_midgame/midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}.pt"
 # bank_multi_legaltrees shares cache with bank_multi (same Xnp sample).
 CACHE_TAG=${TAG}
-if [ "${TAG}" = "bank_multi_legaltrees" ]; then
-    CACHE_TAG="bank_multi"
-fi
+case "${TAG}" in
+    bank_multi_legaltrees|bank_multi_flanking|bank_multi_flanking_legaltrees)
+        CACHE_TAG="bank_multi"
+        ;;
+esac
 CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_tr.npz"
 CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_te.npz"
 
