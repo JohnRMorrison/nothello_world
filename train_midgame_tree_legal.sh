@@ -161,6 +161,13 @@ echo "task:              both"
 echo "============================================"
 
 TREE_TARGET=${TREE_TARGET:-state}
+# Pass PICKLE_DIR env var to load synthetic games from disk instead of
+# playing them from scratch.  Enables scaling to millions of games in
+# minutes instead of days.
+PICKLE_ARG=""
+if [ -n "${PICKLE_DIR:-}" ]; then
+    PICKLE_ARG="--pickle-dir ${PICKLE_DIR}"
+fi
 # Pattern-tree fitting is embarrassingly parallel over 960 (or 9600 with
 # bagging) trees.  State/legal per-cell trees are fewer (64) but each
 # joblib worker holds a copy of Xnp, so we default to 1 to avoid OOM.
@@ -201,6 +208,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --legal-modes ${LEGAL_MODES_OVERRIDE:-bce,probor,derived,state_probor,patterns_probor,patterns_structured_probor,cells_structured_probor,patterns_linear_probor} \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \
+    ${PICKLE_ARG} \
     --device cuda \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \
