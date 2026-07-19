@@ -139,6 +139,44 @@ case "${VARIANT}" in
         RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 10 --pattern-class-weight none"
         TAG="pattern_trees_bag10_unbalanced"
         ;;
+    pattern_trees_depth20)
+        # Deeper pattern trees; may discover finer flanking conjunctions.
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1"
+        TAG="pattern_trees_depth20"
+        # depth override via the 4th positional arg (MAX_DEPTH).  User can
+        # invoke as: sbatch ... pattern_trees_depth20 20000 5000 20 50 ...
+        ;;
+    pattern_trees_leaf10)
+        # Looser pruning; leaves must have >= 10 samples rather than 50.
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1"
+        TAG="pattern_trees_leaf10"
+        ;;
+    pattern_trees_rf)
+        # RandomForestClassifier per pattern (10 estimators with feature
+        # subsampling), instead of hand-bagged plain trees.
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 10 --pattern-use-random-forest"
+        TAG="pattern_trees_rf"
+        ;;
+    pattern_trees_no_recent)
+        # Pure moveset: played + even + mover_parity only (121-d).  No
+        # recency bits in the tree input.  Cleanest paper baseline.
+        RECENT_ARG="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1"
+        TAG="pattern_trees_no_recent"
+        ;;
+    bank_multi_flanking_legaltrees_patterntrees)
+        # Combined bank: legal-target trees (3200 leaves) + pattern-target
+        # trees (48000 leaves) + hand-crafted flanking pattern activations
+        # (960).  Two-stage: fit legal trees first, save checkpoint; then
+        # RE-run with --tree-target patterns AND --load-trees-from that
+        # checkpoint to combine.  Requires new tree-target=both mode; for
+        # now, easier to run pattern_trees + StruPO and separately eval
+        # bank_multi_legaltrees + BCE, and compare.
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1"
+        TAG="bank_multi_flanking_legaltrees_patterntrees"
+        echo "NOTE: combined bank not fully implemented — this variant"
+        echo "runs pattern_trees; use bank_multi_flanking_legaltrees separately"
+        echo "for the legal-tree comparison numbers."
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1

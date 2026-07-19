@@ -479,6 +479,12 @@ def main():
                           'to fit per pattern.  1 = single tree per pattern '
                           '(deterministic).  >1 = bagged ensemble with '
                           'bootstrap sampling.')
+    ap.add_argument('--pattern-use-random-forest', action='store_true',
+                    help='Fit one sklearn RandomForestClassifier per '
+                          'pattern (with n_estimators = --pattern-n-trees) '
+                          'instead of hand-bagged DecisionTreeClassifiers. '
+                          'RF adds per-split feature subsampling for more '
+                          'diverse trees within each pattern ensemble.')
     ap.add_argument('--pattern-class-weight', default='balanced',
                     choices=['balanced', 'none'],
                     help='For --tree-target patterns: class weighting.  '
@@ -813,7 +819,8 @@ def main():
                 min_samples_leaf=args.tree_min_samples_leaf,
                 n_jobs=args.tree_n_jobs,
                 max_features=mf,
-                class_weight=cw)
+                class_weight=cw,
+                use_random_forest=args.pattern_use_random_forest)
             print(f'  ({time.time() - t0:.1f}s)')
 
             # Aggregate-per-pattern tree accuracy (majority vote across

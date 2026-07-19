@@ -345,23 +345,42 @@ def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
 
 def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                           min_samples_leaf=50, n_jobs=1, max_features=None,
-                          class_weight='balanced'):
+                          class_weight='balanced', use_random_forest=False):
     """Fit `n_trees_per_pattern` trees per pattern.
 
     X: (N, D) input features.
     target: (N, K) uint8 — per-pattern binary activation.
 
-    For each pattern j, we fit `n_trees_per_pattern` trees.  When
-    n_trees_per_pattern > 1, trees are bagged (bootstrapped) so that
-    ensemble aggregation is meaningful.
+    For each pattern j:
+      - If use_random_forest=False (default): fit `n_trees_per_pattern`
+        DecisionTreeClassifiers.  When >1, they are bagged via bootstrap
+        for ensemble diversity.
+      - If use_random_forest=True: fit ONE sklearn RandomForestClassifier
+        with `n_estimators=n_trees_per_pattern`.  RF automatically bootstraps
+        rows AND subsamples features per split, so trees inside the forest
+        are more diverse than plain bagging.
 
-    Returns: list of length K, each entry a list of `n_trees_per_pattern`
-    fitted DecisionTreeClassifier instances.
+    Returns: list of length K, each entry a list of fitted trees.  For
+    RandomForest, the "list" is the tree_ list inside the forest, wrapped
+    so downstream code can treat each tree individually.
     """
     K = target.shape[1]
     bootstrap = (n_trees_per_pattern > 1)
 
     def one_pattern(j):
+        if use_random_forest:
+            from sklearn.ensemble import RandomForestClassifier
+            rf = RandomForestClassifier(
+                n_estimators=n_trees_per_pattern,
+                max_depth=max_depth,
+                min_samples_leaf=min_samples_leaf,
+                max_features=max_features,
+                class_weight=class_weight,
+                bootstrap=True,
+                n_jobs=1,   # outer parallelism handles pattern-level
+                random_state=j * 1000)
+            rf.fit(X, target[:, j])
+            return list(rf.estimators_)   # unwrap to a list of trees
         return [_fit_one_pattern_tree(X, target[:, j], max_depth,
                                           min_samples_leaf, max_features,
                                           class_weight,
