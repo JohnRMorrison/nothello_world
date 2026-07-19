@@ -28,6 +28,7 @@ from opening_tree_mlp import (
     train_per_cell_trees, train_pattern_trees, train_probe, train_probe_ensemble,
     train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
     train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
+    train_probe_legal_patterns_structured_ensemble,
     evaluate_legal_ensemble, legal_accuracy_from_state,
     train_probe_state_probor_ensemble, evaluate_state_probor_ensemble,
     OpeningTreeMLP,
@@ -1313,6 +1314,53 @@ def main():
                                                 float(per_pos[mask].mean()))
             aux['by_ply'] = by_ply
             _print_legal_report('PatPO ', mean_acc, per_cell, aux)
+
+        if ('patterns_structured_probor' in modes
+                and args.tree_target == 'patterns'):
+            print(f'\ntraining structured pattern-probor probe (per-'
+                   f'pattern linear over leaves → sigmoid → prob-OR per '
+                   f'cell)...')
+            t0 = time.time()
+            struct_probes = (
+                train_probe_legal_patterns_structured_ensemble(
+                    H_tr, L_tr, all_meta, patterns_list,
+                    n_seeds=args.probe_seeds,
+                    epochs=args.legal_probe_epochs,
+                    device=device))
+            print(f'  ({time.time() - t0:.1f}s)')
+            # Ensemble by averaging per-cell probabilities.
+            device_probe = next(struct_probes[0].parameters()).device
+            N_te = H_te.shape[0]
+            accum = torch.zeros(N_te, BOARD_CELLS, dtype=torch.float32)
+            for i in range(0, N_te, 512):
+                h = H_te[i:i + 512].to(device=device_probe,
+                                         dtype=torch.float32)
+                probs = torch.zeros(h.shape[0], BOARD_CELLS,
+                                      dtype=torch.float32,
+                                      device=device_probe)
+                for p in struct_probes:
+                    with torch.no_grad():
+                        probs = probs + p(h)
+                probs = probs / len(struct_probes)
+                accum[i:i + 512] = probs.cpu()
+            preds_struct = (accum > 0.5).to(torch.uint8)
+            L_te_np = L_te.numpy() if hasattr(L_te, 'numpy') else L_te
+            correct = (preds_struct.numpy() == L_te_np).astype(np.float32)
+            per_cell = correct.mean(axis=0)
+            mean_acc = float(correct.mean())
+            aux = {'position_perfect':
+                     float(correct.all(axis=1).mean())}
+            T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
+            by_ply = {}
+            per_pos = correct.mean(axis=1)
+            for lo in range(int(T_np.min()) // 10 * 10,
+                              int(T_np.max()) + 1, 10):
+                mask = (T_np >= lo) & (T_np < lo + 10)
+                if mask.any():
+                    by_ply[(lo, lo + 10)] = (int(mask.sum()),
+                                                float(per_pos[mask].mean()))
+            aux['by_ply'] = by_ply
+            _print_legal_report('StruPO', mean_acc, per_cell, aux)
 
         if ('state_probor' in modes and not skip_state_probe
                 and args.include_flanking_patterns):

@@ -753,6 +753,124 @@ def train_probe_legal_bce_ensemble(H_tr, L_tr, n_seeds=1, **kwargs):
             for s in range(n_seeds)]
 
 
+class PatternProbOrHead(nn.Module):
+    """Structured prob-OR head for legal-move prediction over pattern trees.
+
+    Groups the hidden units by which pattern's tree they came from.  For
+    each pattern j:
+        p_j(h) = sigmoid( w_j . h_j + b_j )
+    where h_j is the subvector of h containing only pattern j's leaves.
+    Then per target cell C:
+        P(cell C legal | h) = 1 - Π_{j : target(j) = C} (1 - p_j(h))
+
+    The linear layer per pattern learns to weight "definitively fire"
+    leaves higher.  Prob-OR grouped by target cell captures the "any
+    pattern for C fires" logic natively.
+
+    Parameter count = (# pattern-path hidden units) + (# patterns) biases.
+    Much smaller than a flat BCE probe on the same features.
+    """
+    def __init__(self, hidden_meta, patterns_list):
+        super().__init__()
+        from collections import defaultdict
+        idx_by_pat = defaultdict(list)
+        for i, m in enumerate(hidden_meta):
+            if m.get('kind') == 'pattern_path':
+                idx_by_pat[m['pattern']].append(i)
+        # Sort for reproducibility.
+        self.pattern_ids = sorted(idx_by_pat.keys())
+        # Flat concatenation of leaf-indices + per-pattern boundaries.
+        flat = []
+        boundaries = [0]
+        for j in self.pattern_ids:
+            flat.extend(idx_by_pat[j])
+            boundaries.append(len(flat))
+        self.register_buffer('idx_flat',
+                                torch.tensor(flat, dtype=torch.long))
+        self.register_buffer('boundaries',
+                                torch.tensor(boundaries, dtype=torch.long))
+        # One weight per leaf, one bias per pattern.
+        self.leaf_weights = nn.Parameter(
+            torch.randn(len(flat)) * 0.05)
+        self.pattern_biases = nn.Parameter(
+            torch.full((len(self.pattern_ids),), -3.0))
+        # Precompute per-cell gather + mask for vectorized prob-OR.
+        pat_id_to_pos = {j: pos for pos, j in enumerate(self.pattern_ids)}
+        by_tgt = {}
+        for j, pat in enumerate(patterns_list):
+            by_tgt.setdefault(pat['target'], []).append(j)
+        max_per_cell = max((len(pids) for pids in by_tgt.values()),
+                             default=0)
+        cell_pat_indices = torch.zeros(BOARD_CELLS, max_per_cell,
+                                          dtype=torch.long)
+        cell_pat_mask = torch.zeros(BOARD_CELLS, max_per_cell,
+                                        dtype=torch.bool)
+        for cell in range(BOARD_CELLS):
+            positions = [pat_id_to_pos[j] for j in by_tgt.get(cell, [])
+                          if j in pat_id_to_pos]
+            for k, pos in enumerate(positions):
+                cell_pat_indices[cell, k] = pos
+                cell_pat_mask[cell, k] = True
+        self.register_buffer('cell_pat_indices', cell_pat_indices)
+        self.register_buffer('cell_pat_mask', cell_pat_mask)
+
+    def forward(self, h):
+        N = h.shape[0]
+        n_patterns = len(self.boundaries) - 1
+        # Contributions: element-wise multiply then segment-sum.
+        h_flat = h[:, self.idx_flat]              # (N, total_leaves)
+        contrib = h_flat * self.leaf_weights      # (N, total_leaves)
+        pat_logits = torch.empty(N, n_patterns,
+                                    dtype=torch.float32, device=h.device)
+        for j in range(n_patterns):
+            s, e = int(self.boundaries[j].item()), \
+                int(self.boundaries[j + 1].item())
+            pat_logits[:, j] = contrib[:, s:e].sum(dim=1)
+        pat_logits = pat_logits + self.pattern_biases
+        pat_probs = torch.sigmoid(pat_logits)     # (N, n_patterns)
+        # Prob-OR per cell.  Gather + mask + product.
+        gathered = pat_probs[:, self.cell_pat_indices]        # (N, C, max)
+        one_minus = torch.where(
+            self.cell_pat_mask.unsqueeze(0), 1.0 - gathered,
+            torch.ones_like(gathered))
+        return 1.0 - one_minus.prod(dim=2)                     # (N, C)
+
+
+def train_probe_legal_patterns_structured(H_tr, L_tr, meta, patterns_list,
+                                             epochs=25, lr=1e-3, batch=512,
+                                             weight_decay=1e-4, device=None,
+                                             seed=0):
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = PatternProbOrHead(meta, patterns_list).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            l = L_tr[idx].to(device=device, dtype=torch.float32)
+            p = probe(h).clamp(1e-6, 1 - 1e-6)
+            loss = F.binary_cross_entropy(p, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_legal_patterns_structured_ensemble(
+        H_tr, L_tr, meta, patterns_list, n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_legal_patterns_structured(
+            H_tr, L_tr, meta, patterns_list, seed=0, **kwargs)]
+    return [train_probe_legal_patterns_structured(
+        H_tr, L_tr, meta, patterns_list, seed=s, **kwargs)
+        for s in range(n_seeds)]
+
+
 class NoisyOrHead(nn.Module):
     """Noisy-OR / prob-OR combination of per-(unit, output-cell) votes.
 
