@@ -57,7 +57,7 @@ def compute_input_dim(when_bucket_size=None, use_move_grid=False,
 
 
 def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
-                          recent_Ks=None):
+                          recent_Ks=None, canonicalize_mover=False):
     """Return input features for a game prefix.
 
     Base 121-d: 60 played + 60 even + 1 mover_parity.
@@ -71,22 +71,46 @@ def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
       recent_Ks:    for each K in the list, one per-cell bit indicating
                     whether that cell was played in prefix[T-K:T].  Composes
                     with either mutex block above.
+
+    canonicalize_mover: if True, replace the absolute-color parity encoding
+      (even + mover_parity) with a mover-relative encoding:
+        feat[60 + i] = placed_as_mover[c]
+                     = 1 iff cell c was placed by whichever side is now
+                       to move next.
+      feat[120] (mover_parity) is set to 0, since parity is now baked into
+      the per-cell bit.  Total dim unchanged at 121-d (constant last bit).
+      This lets structurally-identical color-swapped positions have IDENTICAL
+      feature vectors, and lets each tree see 800k rows in one representation
+      rather than partitioning capacity by mover.
     """
     input_dim = compute_input_dim(when_bucket_size, use_move_grid, recent_Ks)
     feat = np.zeros(input_dim, dtype=np.float32)
+    T = len(prefix)
+    mp = T % 2                             # 0 if BLACK to move, 1 if WHITE
     for t, c in enumerate(prefix):
         if c not in C64_TO_C60:
             continue
         i = C64_TO_C60[c]
         feat[i] = 1.0
-        if t % 2 == 0:
-            feat[60 + i] = 1.0
+        parity = t % 2                     # 0 for even (BLACK) turn
+        if canonicalize_mover:
+            # placed_as_mover: 1 iff this move belongs to the current mover.
+            # BLACK plays even turns (parity=0) and BLACK-to-move is mp=0;
+            # WHITE plays odd turns (parity=1) and WHITE-to-move is mp=1.
+            # So cell was placed by mover iff parity == mp.
+            if parity == mp:
+                feat[60 + i] = 1.0
+        else:
+            if parity == 0:
+                feat[60 + i] = 1.0
         if use_move_grid:
             feat[121 + t * 60 + i] = 1.0
         elif when_bucket_size:
             bucket = t // when_bucket_size
             feat[121 + bucket * 60 + i] = 1.0
-    feat[120] = 1.0 if len(prefix) % 2 == 1 else 0.0
+    if not canonicalize_mover:
+        feat[120] = 1.0 if T % 2 == 1 else 0.0
+    # else: feat[120] stays 0 — mover_parity now baked into feat[60:120].
     if recent_Ks:
         # Offset of the recent block: past any mutex temporal block.
         if use_move_grid:

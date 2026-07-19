@@ -73,13 +73,21 @@ case "${VARIANT}" in
         TAG="bank_multi_probor"
         STATE_READOUT="probor"
         ;;
+    bank_multi_canonical)
+        # bank_multi + mover-relative parity encoding (Nanda-style split
+        # baked into the input rather than the readout).
+        BANK_KS="1,2,5,10,20"
+        TAG="bank_multi_canonical"
+        CANONICAL_FLAG="--canonicalize-mover"
+        ;;
     *)
-        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi bank_multi_probor"
+        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi bank_multi_probor bank_multi_canonical"
         exit 1
         ;;
 esac
 
 STATE_READOUT=${STATE_READOUT:-linear}
+CANONICAL_FLAG=${CANONICAL_FLAG:-}
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
@@ -108,9 +116,13 @@ else
     RECENT_FLAG=""
     CACHE_TAG="none"
 fi
+CANONICAL_TAG=""
+if [ -n "${CANONICAL_FLAG}" ]; then
+    CANONICAL_TAG="_canon"
+fi
 OUT="ckpts_midgame/midgame_smpl_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}.pt"
-CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}_tr.npz"
-CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}_te.npz"
+CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}${CANONICAL_TAG}_tr.npz"
+CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}${CANONICAL_TAG}_te.npz"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
@@ -126,6 +138,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --probe-seeds 5 \
     --state-readout ${STATE_READOUT} \
     ${RECENT_FLAG} \
+    ${CANONICAL_FLAG} \
     --device cuda \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \

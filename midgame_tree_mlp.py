@@ -63,7 +63,8 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                                 when_bucket_size=None,
                                 use_move_grid=False,
                                 recent_Ks=None,
-                                collect_legal_moves=False):
+                                collect_legal_moves=False,
+                                canonicalize_mover=False):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) — or (X, S, T, L) if collect_legal_moves — with:
       X: (N, ...) played_even features
@@ -91,9 +92,11 @@ def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
                 lbl = np.zeros(BOARD_CELLS, dtype=np.int64)
                 lbl[raw == mover_color] = 1
                 lbl[raw == -mover_color] = 2
-                Xs.append(playedeven_features(prefix, when_bucket_size,
-                                                use_move_grid,
-                                                recent_Ks=recent_Ks))
+                Xs.append(playedeven_features(
+                    prefix, when_bucket_size,
+                    use_move_grid,
+                    recent_Ks=recent_Ks,
+                    canonicalize_mover=canonicalize_mover))
                 Ss.append(lbl)
                 Ts.append(ply)
                 if collect_legal_moves:
@@ -241,6 +244,16 @@ def main():
     ap.add_argument('--when-bucket-size', type=int, default=None)
     ap.add_argument('--use-move-grid', action='store_true',
                     help='Add 3600 move-grid features (bit per (turn, cell)).')
+    ap.add_argument('--canonicalize-mover', action='store_true',
+                    help='Use mover-relative parity encoding: replace even '
+                          'bit with placed_as_mover.  mover_parity bit is '
+                          'zeroed since parity is baked into the per-cell '
+                          'bit.  Structurally-identical color-swapped '
+                          'positions get IDENTICAL feature vectors, so each '
+                          'tree sees all 800k rows in one representation '
+                          'rather than partitioning capacity by mover.  '
+                          'Input-side analog of Nanda-style parity-split '
+                          'probes.')
     ap.add_argument('--input-recent-Ks', default='',
                     help='Comma-separated K values.  For each K, appends 60 '
                           'bits (one per non-center cell) that fire iff the '
@@ -445,7 +458,8 @@ def main():
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
         recent_Ks=sampling_Ks,
-        collect_legal_moves=collect_legal)
+        collect_legal_moves=collect_legal,
+        canonicalize_mover=args.canonicalize_mover)
     te = load_or_sample(
         args.cache_te, sample_midgame_positions,
         args.num_test_games, ply_min=args.ply_min,
@@ -453,7 +467,8 @@ def main():
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
         recent_Ks=sampling_Ks,
-        collect_legal_moves=collect_legal)
+        collect_legal_moves=collect_legal,
+        canonicalize_mover=args.canonicalize_mover)
     if collect_legal:
         Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = tr
         Xnp_te, Snp_te, Tnp_te, Lnp_te = te
