@@ -200,7 +200,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --tree-min-samples-leaf ${MIN_LEAF} \
     --tree-n-jobs ${TREE_N_JOBS} \
     --top-k-per-cell ${TOP_K} \
-    --hidden-activation relu \
+    --hidden-activation ${HIDDEN_ACTIVATION:-relu} \
     --probe-epochs 100 \
     --probe-seeds 5 \
     --task both \
