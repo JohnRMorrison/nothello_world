@@ -51,6 +51,7 @@ from order_nodes import (
 )
 from flanking_patterns import (
     load_patterns, compute_pattern_activations, patterns_by_target,
+    legal_from_state_probs_via_patterns,
 )
 
 
@@ -389,7 +390,11 @@ def main():
                           'all three legal-move predictors on the same H.')
     ap.add_argument('--legal-modes', default='bce,probor,derived',
                     help='For task in {legal,both}: comma-separated subset '
-                          'of {bce, probor, derived} to run.')
+                          'of {bce, probor, derived, state_probor} to run.  '
+                          'state_probor: prob-OR over 960 flanking patterns '
+                          'applied to SOFT state predictions '
+                          '(requires --include-flanking-patterns AND a '
+                          'trained state probe).')
     ap.add_argument('--legal-probe-epochs', type=int, default=50)
     ap.add_argument('--skip-tree-fit', action='store_true',
                     help='Skip per-cell tree fit + path extraction entirely. '
@@ -1147,6 +1152,57 @@ def main():
         elif 'derived' in modes:
             print(f'\nskipping derived legal (no state predictions '
                    f'available under tree-target=legal)')
+
+        if ('state_probor' in modes and not skip_state_probe
+                and args.include_flanking_patterns):
+            print(f'\ncomputing legal-move via prob-OR of 960 flanking '
+                   f'patterns on SOFT state predictions...')
+            # Reuse `patterns` from the include-flanking-patterns branch.
+            # Compute ensemble state probabilities on H_te (already done
+            # implicitly for preds_te, but we need probabilities not argmax).
+            device_probe = next(probes[0].parameters()).device
+            N_te = H_te.shape[0]
+            state_probs = torch.zeros(N_te, BOARD_CELLS, 3,
+                                          dtype=torch.float32)
+            with torch.no_grad():
+                for i in range(0, N_te, 512):
+                    h = H_te[i:i + 512].to(device=device_probe,
+                                             dtype=torch.float32)
+                    accum = torch.zeros(h.shape[0], BOARD_CELLS, 3,
+                                          dtype=torch.float32,
+                                          device=device_probe)
+                    for p in probes:
+                        out = p(h)
+                        if args.state_readout == 'probor':
+                            accum += out
+                        else:
+                            accum += torch.softmax(
+                                out.view(-1, BOARD_CELLS, 3), dim=-1)
+                    accum = accum / len(probes)
+                    state_probs[i:i + 512] = accum.cpu()
+            legal_prob_np = legal_from_state_probs_via_patterns(
+                patterns, state_probs.numpy())
+            preds_legal = (legal_prob_np > 0.5).astype(np.uint8)
+            L_te_np = L_te.numpy() if hasattr(L_te, 'numpy') else L_te
+            correct = (preds_legal == L_te_np).astype(np.float32)
+            per_cell = correct.mean(axis=0)
+            mean_acc = float(correct.mean())
+            aux = {'position_perfect':
+                     float(correct.all(axis=1).mean())}
+            T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
+            by_ply = {}
+            per_pos = correct.mean(axis=1)
+            for lo in range(int(T_np.min()) // 10 * 10,
+                              int(T_np.max()) + 1, 10):
+                mask = (T_np >= lo) & (T_np < lo + 10)
+                if mask.any():
+                    by_ply[(lo, lo + 10)] = (int(mask.sum()),
+                                                 float(per_pos[mask].mean()))
+            aux['by_ply'] = by_ply
+            _print_legal_report('StatPO', mean_acc, per_cell, aux)
+        elif 'state_probor' in modes:
+            print(f'\nskipping state_probor legal (requires state probe + '
+                   f'--include-flanking-patterns)')
 
     torch.save({
         'W': mlp.W.cpu() if not args.skip_tree_fit else None,

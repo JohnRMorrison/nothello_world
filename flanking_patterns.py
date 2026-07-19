@@ -102,3 +102,55 @@ def patterns_by_target(patterns):
     for j, p in enumerate(patterns):
         d[p['target']].append(j)
     return dict(d)
+
+
+def legal_from_state_probs_via_patterns(patterns, state_probs):
+    """Compute per-cell legal-move probability by evaluating each of the 960
+    flanking patterns on the SOFT state predictions, then combining via
+    prob-OR per target cell.
+
+    Under state class convention:
+      class 0 = empty
+      class 1 = mine (mover)
+      class 2 = opp (opponent of mover)
+
+    For pattern P targeting cell C:
+      P(pattern P fires) = P(state[target]  = empty)
+                          · Π P(state[opp]    = opp)   over opponents
+                          · P(state[terminal] = mover)
+
+    Per-cell combination:
+      P(cell C legal) = 1 - Π (1 - P(pattern P fires))
+                        over patterns targeting C
+
+    Args:
+      patterns: list of pattern dicts (as returned by load_patterns).
+      state_probs: (N, 64, 3) numpy array or tensor of soft state
+                    predictions.
+
+    Returns:
+      (N, 64) numpy array of per-cell legal-move probabilities.
+    """
+    if hasattr(state_probs, 'cpu'):
+        state_np = state_probs.cpu().numpy()
+    else:
+        state_np = state_probs
+    N = state_np.shape[0]
+    K = len(patterns)
+    pattern_p = np.zeros((N, K), dtype=np.float32)
+    for j, pat in enumerate(patterns):
+        p_empty = state_np[:, pat['target'], 0]
+        p_term = state_np[:, pat['terminal'], 1]
+        p_opps = np.ones(N, dtype=np.float32)
+        for o in pat['opponents']:
+            p_opps = p_opps * state_np[:, o, 2]
+        pattern_p[:, j] = p_empty * p_opps * p_term
+
+    by_tgt = patterns_by_target(patterns)
+    per_cell = np.zeros((N, 64), dtype=np.float32)
+    for cell, pattern_ids in by_tgt.items():
+        p_per_pat = pattern_p[:, pattern_ids]
+        # Numerically stable: log(1 - x) summation → 1 - exp(sum).
+        # But 1 - Π (1 - p) directly is fine for p in [0, 1].
+        per_cell[:, cell] = 1.0 - np.prod(1.0 - p_per_pat, axis=1)
+    return per_cell
