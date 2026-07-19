@@ -749,9 +749,13 @@ def main():
                f'min={per_cell_leaf_counts.min()}')
 
         depths = np.array([m['depth'] for m in all_meta
-                            if m.get('kind') == 'tree_path'])
-        print(f'  tree-path depths: mean={depths.mean():.2f}  '
-               f'max={depths.max()}  min={depths.min()}')
+                            if m.get('kind') in ('tree_path',
+                                                     'pattern_path')])
+        if depths.size > 0:
+            print(f'  tree-path depths: mean={depths.mean():.2f}  '
+                   f'max={depths.max()}  min={depths.min()}')
+        else:
+            print(f'  tree-path depths: (no paths extracted)')
 
         mlp = OpeningTreeMLP(W, B, all_meta, device)
 

@@ -133,6 +133,15 @@ echo "task:              both"
 echo "============================================"
 
 TREE_TARGET=${TREE_TARGET:-state}
+# Pattern-tree fitting is embarrassingly parallel over 960 (or 9600 with
+# bagging) trees.  State/legal per-cell trees are fewer (64) but each
+# joblib worker holds a copy of Xnp, so we default to 1 to avoid OOM.
+TREE_N_JOBS=${TREE_N_JOBS:-1}
+case "${TAG}" in
+    pattern_trees|pattern_trees_bag10|pattern_trees_unbalanced|pattern_trees_bag10_unbalanced)
+        TREE_N_JOBS=${TREE_N_JOBS_PATTERN:-8}
+        ;;
+esac
 
 # Cache path includes _L suffix so it does not clash with state-only caches
 # that have 3-tuple contents.  The 4th cached array is the legal-move mask.
@@ -154,7 +163,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --ply-max ${PLY_MAX} \
     --tree-max-depth ${MAX_DEPTH} \
     --tree-min-samples-leaf ${MIN_LEAF} \
-    --tree-n-jobs 1 \
+    --tree-n-jobs ${TREE_N_JOBS} \
     --top-k-per-cell ${TOP_K} \
     --hidden-activation relu \
     --probe-epochs 100 \
