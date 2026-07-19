@@ -789,11 +789,18 @@ class PatternProbOrHead(nn.Module):
                                 torch.tensor(flat, dtype=torch.long))
         self.register_buffer('boundaries',
                                 torch.tensor(boundaries, dtype=torch.long))
+        # Per-leaf pattern index — enables the vectorized scatter_add
+        # segment sum instead of a Python loop over patterns.
+        n_patterns = len(self.pattern_ids)
+        leaf_pat_ids = torch.zeros(len(flat), dtype=torch.long)
+        for j in range(n_patterns):
+            leaf_pat_ids[boundaries[j]:boundaries[j + 1]] = j
+        self.register_buffer('leaf_pat_ids', leaf_pat_ids)
         # One weight per leaf, one bias per pattern.
         self.leaf_weights = nn.Parameter(
             torch.randn(len(flat)) * 0.05)
         self.pattern_biases = nn.Parameter(
-            torch.full((len(self.pattern_ids),), -3.0))
+            torch.full((n_patterns,), -3.0))
         # Precompute per-cell gather + mask for vectorized prob-OR.
         pat_id_to_pos = {j: pos for pos, j in enumerate(self.pattern_ids)}
         by_tgt = {}
@@ -817,18 +824,15 @@ class PatternProbOrHead(nn.Module):
     def forward(self, h):
         N = h.shape[0]
         n_patterns = len(self.boundaries) - 1
-        # Contributions: element-wise multiply then segment-sum.
         h_flat = h[:, self.idx_flat]              # (N, total_leaves)
         contrib = h_flat * self.leaf_weights      # (N, total_leaves)
-        pat_logits = torch.empty(N, n_patterns,
-                                    dtype=torch.float32, device=h.device)
-        for j in range(n_patterns):
-            s, e = int(self.boundaries[j].item()), \
-                int(self.boundaries[j + 1].item())
-            pat_logits[:, j] = contrib[:, s:e].sum(dim=1)
+        # Vectorized segment sum via scatter_add — no Python loop.
+        pat_logits = torch.zeros(N, n_patterns,
+                                    dtype=contrib.dtype, device=h.device)
+        pat_ids_expanded = self.leaf_pat_ids.unsqueeze(0).expand(N, -1)
+        pat_logits.scatter_add_(dim=1, index=pat_ids_expanded, src=contrib)
         pat_logits = pat_logits + self.pattern_biases
         pat_probs = torch.sigmoid(pat_logits)     # (N, n_patterns)
-        # Prob-OR per cell.  Gather + mask + product.
         gathered = pat_probs[:, self.cell_pat_indices]        # (N, C, max)
         one_minus = torch.where(
             self.cell_pat_mask.unsqueeze(0), 1.0 - gathered,
@@ -837,7 +841,7 @@ class PatternProbOrHead(nn.Module):
 
 
 def train_probe_legal_patterns_structured(H_tr, L_tr, meta, patterns_list,
-                                             epochs=25, lr=1e-3, batch=512,
+                                             epochs=25, lr=1e-3, batch=2048,
                                              weight_decay=1e-4, device=None,
                                              seed=0):
     if device is None:

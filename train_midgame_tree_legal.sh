@@ -84,6 +84,19 @@ case "${VARIANT}" in
         RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
         TAG="bank_multi_flanking"
         ;;
+    pattern_trees_strupo)
+        # 960 per-pattern trees + StruPO probe (per-pattern linear over
+        # leaves -> sigmoid -> prob-OR per cell).  Assumes trees are
+        # loaded from a prior pattern_trees checkpoint (LOAD_TREES env),
+        # so tree fit is skipped entirely.  Ideal for iterating the
+        # linear weights on a larger training set (100K games).
+        RECENT_ARG="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --skip-state-probe"
+        if [ -n "${LOAD_TREES:-}" ]; then
+            RECENT_ARG="${RECENT_ARG} --load-trees-from ${LOAD_TREES}"
+        fi
+        TAG="pattern_trees_strupo"
+        LEGAL_MODES_OVERRIDE="patterns_structured_probor"
+        ;;
     bank_multi_flanking_linpo)
         # bank_multi_flanking but only trains the LinPO legal probe.
         # Skips the state probe entirely + all other legal predictors,

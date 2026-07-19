@@ -607,15 +607,21 @@ def main():
         W_saved = ck['W']
         b_saved = ck['b']
         meta_saved = ck['path_info']
-        tree_meta = [m for m in meta_saved if m.get('kind') == 'tree_path']
+        # Accept both tree_path (state/legal target) and pattern_path
+        # (patterns target) entries — depending on what target the
+        # checkpoint was trained with.
+        tree_kinds = ('tree_path', 'pattern_path')
+        tree_meta = [m for m in meta_saved
+                      if m.get('kind') in tree_kinds]
         n_saved = len(meta_saved)
         n_tree = len(tree_meta)
+        kinds_found = {m.get('kind') for m in tree_meta}
         print(f'  loaded {n_saved} hidden units total; '
-               f'{n_tree} are tree_path entries (rest re-computed)')
-        # Filter W, b to just the tree-path rows so the mlp we build
+               f'{n_tree} are {kinds_found} entries (rest re-computed)')
+        # Filter W, b to just the tree rows so the mlp we build
         # only produces those.
         tree_row_idx = [i for i, m in enumerate(meta_saved)
-                          if m.get('kind') == 'tree_path']
+                          if m.get('kind') in tree_kinds]
         if isinstance(W_saved, torch.Tensor):
             W_saved = W_saved.numpy()
         if isinstance(b_saved, torch.Tensor):
@@ -643,6 +649,18 @@ def main():
         tree_correct_per_cell = np.array(
             ck.get('per_cell_tree_acc',
                     [0.0] * BOARD_CELLS), dtype=float)
+        # If we're targeting patterns, we need patterns_list for the
+        # StruPO / patterns_probor readouts.  sklearn tree objects are
+        # NOT loaded (only their leaves), so patterns_probor mode (which
+        # calls tree.predict_proba) is unavailable — StruPO works.
+        pattern_trees = None
+        patterns_list = None
+        if 'pattern_path' in kinds_found:
+            if not args.include_flanking_patterns:
+                raise ValueError('--load-trees-from with pattern-path '
+                                  'entries requires --include-flanking-'
+                                  'patterns to reload the pattern list.')
+            patterns_list = load_patterns(args.include_flanking_patterns)
         X_tr = torch.from_numpy(Xnp_tr).to(device)
         X_te = torch.from_numpy(Xnp_te).to(device)
         if use_relu:
@@ -1344,7 +1362,8 @@ def main():
             print(f'\nskipping derived legal (no state predictions '
                    f'available under tree-target=legal)')
 
-        if 'patterns_probor' in modes and args.tree_target == 'patterns':
+        if ('patterns_probor' in modes and args.tree_target == 'patterns'
+                and pattern_trees is not None):
             print(f'\ncomputing legal-move via prob-OR over '
                    f'per-pattern tree probabilities...')
             # For each pattern j: average over the pattern's trees'
