@@ -871,6 +871,98 @@ def train_probe_legal_patterns_structured_ensemble(
         for s in range(n_seeds)]
 
 
+class CellProbOrHead(nn.Module):
+    """Per-cell linear + sigmoid head for legal-move prediction.
+
+    Groups the hidden units by which cell's tree produced them.  For each
+    output cell C:
+        p_C(h) = sigmoid( w_C . h_C + b_C )
+    Independent per-cell readout, no cross-cell weight sharing.
+
+    Total params = sum over cells of (leaves for cell) + 64 biases;
+    typically ~3200 for legaltrees, vs 200k+ for a flat linear readout
+    on the same hidden layer.  Cleaner interpretation: w_C says which of
+    cell C's tree leaves matter for confirming C is legal.
+    """
+    def __init__(self, hidden_meta):
+        super().__init__()
+        from collections import defaultdict
+        idx_by_cell = defaultdict(list)
+        for i, m in enumerate(hidden_meta):
+            if m.get('kind') == 'tree_path' and 'cell' in m:
+                idx_by_cell[m['cell']].append(i)
+        self.cell_ids = sorted(idx_by_cell.keys())
+        flat = []
+        boundaries = [0]
+        for c in self.cell_ids:
+            flat.extend(idx_by_cell[c])
+            boundaries.append(len(flat))
+        self.register_buffer('idx_flat',
+                                torch.tensor(flat, dtype=torch.long))
+        self.register_buffer('boundaries',
+                                torch.tensor(boundaries, dtype=torch.long))
+        self.leaf_weights = nn.Parameter(
+            torch.randn(len(flat)) * 0.05)
+        self.cell_biases = nn.Parameter(torch.zeros(len(self.cell_ids)))
+
+    def forward(self, h):
+        N = h.shape[0]
+        n_cells = len(self.boundaries) - 1
+        h_flat = h[:, self.idx_flat]
+        contrib = h_flat * self.leaf_weights
+        cell_logits = torch.empty(N, n_cells, dtype=torch.float32,
+                                     device=h.device)
+        for c in range(n_cells):
+            s, e = int(self.boundaries[c].item()), \
+                int(self.boundaries[c + 1].item())
+            cell_logits[:, c] = contrib[:, s:e].sum(dim=1)
+        cell_logits = cell_logits + self.cell_biases
+        # Rearrange into full 64-cell output.  If some cells missing
+        # (no leaves), their output stays at sigmoid(0) = 0.5.
+        if n_cells == BOARD_CELLS and self.cell_ids == list(range(BOARD_CELLS)):
+            return torch.sigmoid(cell_logits)
+        full = torch.zeros(N, BOARD_CELLS, dtype=torch.float32,
+                              device=h.device)
+        for pos, cell in enumerate(self.cell_ids):
+            full[:, cell] = cell_logits[:, pos]
+        return torch.sigmoid(full)
+
+
+def train_probe_legal_cells_structured(H_tr, L_tr, meta, epochs=25,
+                                             lr=1e-3, batch=512,
+                                             weight_decay=1e-4, device=None,
+                                             seed=0):
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = CellProbOrHead(meta).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            l = L_tr[idx].to(device=device, dtype=torch.float32)
+            p = probe(h).clamp(1e-6, 1 - 1e-6)
+            loss = F.binary_cross_entropy(p, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_legal_cells_structured_ensemble(H_tr, L_tr, meta,
+                                                    n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_legal_cells_structured(
+            H_tr, L_tr, meta, seed=0, **kwargs)]
+    return [train_probe_legal_cells_structured(H_tr, L_tr, meta,
+                                                    seed=s, **kwargs)
+            for s in range(n_seeds)]
+
+
 class NoisyOrHead(nn.Module):
     """Noisy-OR / prob-OR combination of per-(unit, output-cell) votes.
 
