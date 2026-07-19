@@ -433,6 +433,20 @@ def main():
                           'Hidden layer starts empty (N, 0); only count / '
                           'order banks contribute.  Ablation: how much do '
                           'the tree paths add on top of order features?')
+    ap.add_argument('--load-trees-from', default=None,
+                    help='Path to a previously-saved checkpoint (.pt).  '
+                          'Reuses W, b, and tree_path metadata from the '
+                          'checkpoint instead of re-fitting trees.  Saves '
+                          '~40 min on 100k-game runs.  Requires the input '
+                          'featurization to match the checkpoints (same '
+                          'played+even+mover_parity; recent bits and '
+                          'flanking patterns are re-computed downstream '
+                          'so those can differ).')
+    ap.add_argument('--skip-state-probe', action='store_true',
+                    help='Skip the state probe training + evaluation '
+                          'entirely.  Useful when only running legal-move '
+                          'probes and the state probe would be wasted '
+                          'compute.')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
@@ -586,7 +600,66 @@ def main():
     use_relu = args.hidden_activation == 'relu'
     act_dtype = torch.float32 if use_relu else torch.bool
 
-    if args.skip_tree_fit:
+    if args.load_trees_from:
+        print(f'\n--load-trees-from {args.load_trees_from}: '
+               f'reusing pre-fit trees')
+        ck = torch.load(args.load_trees_from, map_location='cpu')
+        W_saved = ck['W']
+        b_saved = ck['b']
+        meta_saved = ck['path_info']
+        tree_meta = [m for m in meta_saved if m.get('kind') == 'tree_path']
+        n_saved = len(meta_saved)
+        n_tree = len(tree_meta)
+        print(f'  loaded {n_saved} hidden units total; '
+               f'{n_tree} are tree_path entries (rest re-computed)')
+        # Filter W, b to just the tree-path rows so the mlp we build
+        # only produces those.
+        tree_row_idx = [i for i, m in enumerate(meta_saved)
+                          if m.get('kind') == 'tree_path']
+        if isinstance(W_saved, torch.Tensor):
+            W_saved = W_saved.numpy()
+        if isinstance(b_saved, torch.Tensor):
+            b_saved = b_saved.numpy()
+        W = W_saved[tree_row_idx]
+        B = b_saved[tree_row_idx]
+        all_meta = tree_meta
+        n_tree_units = n_tree
+        # Verify input_dim compatibility.
+        if W.shape[1] > Xnp_tr.shape[1]:
+            raise ValueError(
+                f'checkpoint tree weights expect input_dim '
+                f'{W.shape[1]} but current Xnp has only {Xnp_tr.shape[1]} '
+                f'columns; input featurization must match')
+        # If Xnp has MORE columns than expected (e.g., extra recent bits
+        # baked in), pad W with zeros so it ignores those columns.
+        if W.shape[1] < Xnp_tr.shape[1]:
+            pad = np.zeros((W.shape[0], Xnp_tr.shape[1] - W.shape[1]),
+                              dtype=W.dtype)
+            W = np.concatenate([W, pad], axis=1)
+        mlp = OpeningTreeMLP(W, B, all_meta, device)
+        per_cell_leaf_counts = np.array(
+            ck.get('per_cell_leaf_counts',
+                    [0] * BOARD_CELLS), dtype=int)
+        tree_correct_per_cell = np.array(
+            ck.get('per_cell_tree_acc',
+                    [0.0] * BOARD_CELLS), dtype=float)
+        X_tr = torch.from_numpy(Xnp_tr).to(device)
+        X_te = torch.from_numpy(Xnp_te).to(device)
+        if use_relu:
+            print('computing hidden activations (ReLU) from loaded trees...')
+        else:
+            print('computing hidden activations (step) from loaded trees...')
+        t0 = time.time()
+        H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
+                     use_relu=use_relu)
+        H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
+                     use_relu=use_relu)
+        print(f'  H_tr {tuple(H_tr.shape)}  H_te {tuple(H_te.shape)}  '
+               f'({time.time() - t0:.1f}s)')
+        del X_tr, X_te
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+    elif args.skip_tree_fit:
         print('\n--skip-tree-fit: no tree pipeline; H starts empty (N, 0)')
         all_meta = []
         H_tr = torch.zeros(Xnp_tr.shape[0], 0, dtype=act_dtype)
@@ -1059,7 +1132,8 @@ def main():
         # Free candidate activation storage.
         del CA_tr, CA_te, residuals, S_onehot
 
-    skip_state_probe = (args.tree_target in ('legal', 'patterns'))
+    skip_state_probe = (args.tree_target in ('legal', 'patterns')
+                          or args.skip_state_probe)
     # Downstream save code expects tree_correct_per_cell — for patterns mode,
     # define it from the per-pattern accuracies.
     if args.tree_target == 'patterns' and not args.skip_tree_fit:

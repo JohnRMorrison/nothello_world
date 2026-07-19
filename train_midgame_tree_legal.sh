@@ -86,9 +86,16 @@ case "${VARIANT}" in
         ;;
     bank_multi_flanking_linpo)
         # bank_multi_flanking but only trains the LinPO legal probe.
-        # Skips the state probe eval, all other legal predictors — fastest
-        # iteration when we only care about linear -> 960 -> prob-OR.
-        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
+        # Skips the state probe entirely + all other legal predictors,
+        # AND reuses trees from a saved bank_multi_flanking checkpoint
+        # (LOAD_TREES env var) so we don't wait ~40 min for tree refit.
+        # Usage:
+        #   LOAD_TREES=ckpts_midgame/midgame_leg_bank_multi_flanking_g20000_d15_ml50_p10-50.pt \
+        #     sbatch train_midgame_tree_legal.sh bank_multi_flanking_linpo 100000 5000 ...
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --skip-state-probe"
+        if [ -n "${LOAD_TREES:-}" ]; then
+            RECENT_ARG="${RECENT_ARG} --load-trees-from ${LOAD_TREES}"
+        fi
         TAG="bank_multi_flanking_linpo"
         LEGAL_MODES_OVERRIDE="patterns_linear_probor"
         ;;
