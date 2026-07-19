@@ -1546,7 +1546,7 @@ def main():
                     by_ply[(lo, lo + 10)] = (int(mask.sum()),
                                                 float(per_pos[mask].mean()))
             aux['by_ply'] = by_ply
-            _print_legal_report('StruPO', mean_acc, per_cell, aux)
+            _print_legal_report('Linear->ProbOR', mean_acc, per_cell, aux)
 
         if ('cells_structured_probor' in modes
                 and args.tree_target == 'legal'):
