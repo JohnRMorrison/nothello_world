@@ -116,7 +116,12 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
 
     Returns bool tensor on GPU (or float32 under use_relu)."""
     dtype = torch.float32 if use_relu else torch.bool
-    X = torch.from_numpy(X_np).to(device)
+    # Trees were fit on played+even+mover_parity only (input_dim=121);
+    # slice X_np to those columns for the tree forward.  Recent bits are
+    # concatenated separately from X_np[:, 121:].
+    tree_in_dim = mlp.W.shape[1]
+    X = torch.from_numpy(np.ascontiguousarray(X_np[:, :tree_in_dim])
+                            ).to(device)
     H_tree = mlp(X, out_device=device, out_dtype=dtype, use_relu=use_relu)
     del X
     # Recent bits are already in X_np at cols [121:121 + 60*len(recent_Ks)).
