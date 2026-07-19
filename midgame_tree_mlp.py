@@ -243,6 +243,14 @@ def main():
                           'on the enlarged input directly — no separate '
                           'order-node hidden bank needed.  E.g., "5" gives '
                           'played+even+recent = 60x3 input (+ mover_parity).')
+    ap.add_argument('--recent-Ks-as-hidden', default='',
+                    help='Comma-separated K values.  Same recent bits as '
+                          '--input-recent-Ks, but excluded from tree input '
+                          'and instead concatenated to the hidden layer as '
+                          'extra units.  Trees fit on played+even only; the '
+                          'linear probe reads recency directly, bypassing '
+                          'top-K pruning.  Mutually exclusive with '
+                          '--input-recent-Ks.')
     ap.add_argument('--tree-max-features', default=None,
                     help='Passed to sklearn: sqrt/log2/int/float.  Use with '
                           '--use-move-grid to keep tree fit tractable.')
@@ -374,9 +382,20 @@ def main():
 
     recent_Ks = tuple(int(k) for k in args.input_recent_Ks.split(',')
                         if k.strip()) or None
-    if recent_Ks:
-        print(f'input includes recent bits for K in {recent_Ks} — '
-               f'{60 * len(recent_Ks)} extra cols per position')
+    hidden_recent_Ks = tuple(int(k) for k in
+                                args.recent_Ks_as_hidden.split(',')
+                                if k.strip()) or None
+    if recent_Ks and hidden_recent_Ks:
+        raise ValueError('--input-recent-Ks and --recent-Ks-as-hidden '
+                          'are mutually exclusive')
+    # Both flags cause recent bits to be materialized during sampling; the
+    # difference is only whether they're passed to the tree fit or kept
+    # aside for direct concat to the hidden layer.
+    sampling_Ks = recent_Ks or hidden_recent_Ks
+    if sampling_Ks:
+        role = 'tree input' if recent_Ks else 'hidden layer'
+        print(f'sampling recent bits for K in {sampling_Ks} '
+               f'({60 * len(sampling_Ks)} bits) → {role}')
 
     collect_legal = args.task != 'state'
     if collect_legal:
@@ -391,7 +410,7 @@ def main():
         ply_max=args.ply_max, seed=args.seed,
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
-        recent_Ks=recent_Ks,
+        recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal)
     te = load_or_sample(
         args.cache_te, sample_midgame_positions,
@@ -399,7 +418,7 @@ def main():
         ply_max=args.ply_max, seed=args.seed + 1_000_000,
         when_bucket_size=args.when_bucket_size,
         use_move_grid=args.use_move_grid,
-        recent_Ks=recent_Ks,
+        recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal)
     if collect_legal:
         Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = tr
@@ -451,6 +470,22 @@ def main():
         Xnp_tr = np.ascontiguousarray(Xnp_tr[:, :121])
         Xnp_te = np.ascontiguousarray(Xnp_te[:, :121])
         print(f'  movegrid_tr {movegrid_tr.shape}  '
+               f'Xnp_tr sliced → {Xnp_tr.shape}')
+
+    # ---- Split off recent bits for hidden-layer concat ----
+    # If --recent-Ks-as-hidden was used, recent bits were materialized in
+    # Xnp cols [121, 121 + 60*#Ks) at sample time.  Slice them out so trees
+    # fit on played_even only; keep the recent slab for later concat.
+    recent_hidden_tr = recent_hidden_te = None
+    if hidden_recent_Ks:
+        n_recent = 60 * len(hidden_recent_Ks)
+        print(f'slicing recent bits (K={hidden_recent_Ks}, {n_recent} cols) '
+               f'from Xnp for direct hidden-layer concat')
+        recent_hidden_tr = Xnp_tr[:, 121:121 + n_recent].astype(np.uint8)
+        recent_hidden_te = Xnp_te[:, 121:121 + n_recent].astype(np.uint8)
+        Xnp_tr = np.ascontiguousarray(Xnp_tr[:, :121])
+        Xnp_te = np.ascontiguousarray(Xnp_te[:, :121])
+        print(f'  recent_hidden_tr {recent_hidden_tr.shape}  '
                f'Xnp_tr sliced → {Xnp_tr.shape}')
 
     # --- Optionally append count features to raw input (Option B) ---
@@ -588,6 +623,29 @@ def main():
         del X_tr, X_te
     if device.type == 'cuda':
         torch.cuda.empty_cache()
+
+    # ---- Optionally append recent-bits hidden bank ----
+    # Direct probe access to "cell c played in last K turns" bits, bypassing
+    # the tree-path top-K pruning that discards fine-grained recency leaves.
+    if hidden_recent_Ks:
+        print(f'\nappending {recent_hidden_tr.shape[1]} recent-bit hidden '
+               f'units (K={hidden_recent_Ks})...')
+        rb_tr = torch.from_numpy(recent_hidden_tr).to(act_dtype)
+        rb_te = torch.from_numpy(recent_hidden_te).to(act_dtype)
+        H_tr = torch.cat([H_tr, rb_tr], dim=1)
+        H_te = torch.cat([H_te, rb_te], dim=1)
+        for k_idx, K in enumerate(hidden_recent_Ks):
+            for cell60 in range(60):
+                cell64 = C60_TO_C64[cell60]
+                alg = 'ABCDEFGH'[cell64 % 8] + str(cell64 // 8 + 1)
+                all_meta.append({
+                    'kind': 'recent_bit',
+                    'name': f'recent{K}[{alg}]',
+                    'K': K, 'cell60': cell60,
+                })
+        print(f'  combined H_tr {tuple(H_tr.shape)}  '
+               f'H_te {tuple(H_te.shape)}')
+        del rb_tr, rb_te, recent_hidden_tr, recent_hidden_te
 
     # ---- Optionally append count-node bank ----
     count_nodes_used = []

@@ -58,8 +58,17 @@ case "${VARIANT}" in
         RECENT_KS="1,2,5,10,20"
         TAG="multi"
         ;;
+    bank_K5)
+        # Recent bits piped directly to hidden layer, not tree input.
+        BANK_KS="5"
+        TAG="bank_k5"
+        ;;
+    bank_multi)
+        BANK_KS="1,2,5,10,20"
+        TAG="bank_multi"
+        ;;
     *)
-        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi"
+        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi"
         exit 1
         ;;
 esac
@@ -79,9 +88,21 @@ echo "top_k_per_cell:    ${TOP_K}"
 echo "============================================"
 
 # Cache filename includes the recent-Ks tag so different variants don't clash.
+# bank_K5 shares a cache with simple_K5 (same Xnp — both compute recent-K bits
+# at sample time; the flag only differs in how they're consumed downstream).
+if [ -n "${RECENT_KS:-}" ]; then
+    RECENT_FLAG="--input-recent-Ks ${RECENT_KS}"
+    CACHE_TAG=$(echo "${RECENT_KS}" | tr ',' '_')
+elif [ -n "${BANK_KS:-}" ]; then
+    RECENT_FLAG="--recent-Ks-as-hidden ${BANK_KS}"
+    CACHE_TAG=$(echo "${BANK_KS}" | tr ',' '_')
+else
+    RECENT_FLAG=""
+    CACHE_TAG="none"
+fi
 OUT="ckpts_midgame/midgame_smpl_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}.pt"
-CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_tr.npz"
-CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_te.npz"
+CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}_tr.npz"
+CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_rK${CACHE_TAG}_te.npz"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
@@ -95,7 +116,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --hidden-activation relu \
     --probe-epochs 100 \
     --probe-seeds 5 \
-    --input-recent-Ks ${RECENT_KS} \
+    ${RECENT_FLAG} \
     --device cuda \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \
