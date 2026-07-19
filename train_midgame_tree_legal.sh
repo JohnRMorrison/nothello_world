@@ -62,8 +62,16 @@ case "${VARIANT}" in
         RECENT_ARG=""
         TAG="base"
         ;;
+    bank_K5)
+        RECENT_ARG="--recent-Ks-as-hidden 5"
+        TAG="bank_k5"
+        ;;
+    bank_multi)
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20"
+        TAG="bank_multi"
+        ;;
     *)
-        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi base"
+        echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1
         ;;
 esac
