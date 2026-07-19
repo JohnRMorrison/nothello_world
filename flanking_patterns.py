@@ -30,7 +30,7 @@ _CENTER_INITIAL_COLOR = {27: 1, 28: 0, 35: 0, 36: 1}
 
 def load_patterns(path):
     """Load the .pt file and return the list of 960 pattern dicts."""
-    d = torch.load(path, map_location='cpu', weights_only=False)
+    d = torch.load(path, map_location='cpu')
     return d['patterns']
 
 
