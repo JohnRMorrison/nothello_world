@@ -402,6 +402,16 @@ def main():
                           'to fit per pattern.  1 = single tree per pattern '
                           '(deterministic).  >1 = bagged ensemble with '
                           'bootstrap sampling.')
+    ap.add_argument('--pattern-class-weight', default='balanced',
+                    choices=['balanced', 'none'],
+                    help='For --tree-target patterns: class weighting.  '
+                          'balanced (default): weight inversely to class '
+                          'frequency — helps trees notice rare positive '
+                          'examples but risks overpredicting under prob-OR '
+                          'combination.  none: standard weighting; each '
+                          'example equally weighted, so trees may collapse '
+                          'to always-negative on very rare patterns but '
+                          'output calibrated probabilities.')
     ap.add_argument('--task', default='state',
                     choices=['state', 'legal', 'both'],
                     help='state (default): train state-decoding probe only. '
@@ -615,6 +625,9 @@ def main():
                    f'({len(patterns_list)} patterns × '
                    f'{args.pattern_n_trees} = '
                    f'{len(patterns_list) * args.pattern_n_trees} trees)...')
+            cw = (None if args.pattern_class_weight == 'none'
+                    else 'balanced')
+            print(f'  class_weight = {cw}')
             pattern_trees = train_pattern_trees(
                 Xnp_tr, pt_tr,
                 n_trees_per_pattern=args.pattern_n_trees,
@@ -622,7 +635,7 @@ def main():
                 min_samples_leaf=args.tree_min_samples_leaf,
                 n_jobs=args.tree_n_jobs,
                 max_features=mf,
-                class_weight='balanced')
+                class_weight=cw)
             print(f'  ({time.time() - t0:.1f}s)')
 
             # Aggregate-per-pattern tree accuracy (majority vote across

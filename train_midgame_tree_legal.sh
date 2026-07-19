@@ -101,6 +101,16 @@ case "${VARIANT}" in
         RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 10"
         TAG="pattern_trees_bag10"
         ;;
+    pattern_trees_unbalanced)
+        # 960 per-pattern trees with class_weight=none — better calibration
+        # under prob-OR combination.
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --pattern-class-weight none"
+        TAG="pattern_trees_unbalanced"
+        ;;
+    pattern_trees_bag10_unbalanced)
+        RECENT_ARG="--input-recent-Ks 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 10 --pattern-class-weight none"
+        TAG="pattern_trees_bag10_unbalanced"
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1
