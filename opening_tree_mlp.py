@@ -963,6 +963,83 @@ def train_probe_legal_cells_structured_ensemble(H_tr, L_tr, meta,
             for s in range(n_seeds)]
 
 
+class LinearPatternProbOr(nn.Module):
+    """Simplest legal-move readout via 960 patterns:
+
+      Linear(H -> 960) -> sigmoid -> prob-OR per target cell
+
+    Matches the "MLP -> 960 rules -> prob-OR" pattern used in the original
+    MLP baseline.  Fully vectorized: one matrix multiply, one sigmoid, one
+    gather + product.  No Python loops in the forward pass, so runs
+    ~10-20x faster than the per-pattern-loop StruPO head.
+    """
+    def __init__(self, hidden_dim, patterns_list):
+        super().__init__()
+        K = len(patterns_list)
+        self.linear = nn.Linear(hidden_dim, K)
+        from collections import defaultdict
+        by_tgt = defaultdict(list)
+        for j, pat in enumerate(patterns_list):
+            by_tgt[pat['target']].append(j)
+        max_per_cell = max(len(pids) for pids in by_tgt.values())
+        cell_pat_indices = torch.zeros(BOARD_CELLS, max_per_cell,
+                                          dtype=torch.long)
+        cell_pat_mask = torch.zeros(BOARD_CELLS, max_per_cell,
+                                        dtype=torch.bool)
+        for cell in range(BOARD_CELLS):
+            positions = by_tgt.get(cell, [])
+            for k, pos in enumerate(positions):
+                cell_pat_indices[cell, k] = pos
+                cell_pat_mask[cell, k] = True
+        self.register_buffer('cell_pat_indices', cell_pat_indices)
+        self.register_buffer('cell_pat_mask', cell_pat_mask)
+
+    def forward(self, h):
+        pat_probs = torch.sigmoid(self.linear(h))      # (N, K)
+        gathered = pat_probs[:, self.cell_pat_indices] # (N, C, max)
+        one_minus = torch.where(
+            self.cell_pat_mask.unsqueeze(0), 1.0 - gathered,
+            torch.ones_like(gathered))
+        return 1.0 - one_minus.prod(dim=2)             # (N, C)
+
+
+def train_probe_legal_linear_pat_probor(H_tr, L_tr, patterns_list,
+                                            epochs=25, lr=0.01,
+                                            batch=1024, weight_decay=1e-4,
+                                            device=None, seed=0):
+    """Larger default batch (1024) since forward is a single matmul —
+    exploit GPU parallelism."""
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = LinearPatternProbOr(H_tr.shape[1], patterns_list).to(device)
+    opt = torch.optim.AdamW(probe.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            l = L_tr[idx].to(device=device, dtype=torch.float32)
+            p = probe(h).clamp(1e-6, 1 - 1e-6)
+            loss = F.binary_cross_entropy(p, l)
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_legal_linear_pat_probor_ensemble(H_tr, L_tr, patterns_list,
+                                                       n_seeds=1, **kwargs):
+    if n_seeds <= 1:
+        return [train_probe_legal_linear_pat_probor(
+            H_tr, L_tr, patterns_list, seed=0, **kwargs)]
+    return [train_probe_legal_linear_pat_probor(
+        H_tr, L_tr, patterns_list, seed=s, **kwargs)
+        for s in range(n_seeds)]
+
+
 class NoisyOrHead(nn.Module):
     """Noisy-OR / prob-OR combination of per-(unit, output-cell) votes.
 

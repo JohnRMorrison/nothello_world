@@ -30,6 +30,7 @@ from opening_tree_mlp import (
     train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
     train_probe_legal_patterns_structured_ensemble,
     train_probe_legal_cells_structured_ensemble,
+    train_probe_legal_linear_pat_probor_ensemble,
     evaluate_legal_ensemble, legal_accuracy_from_state,
     train_probe_state_probor_ensemble, evaluate_state_probor_ensemble,
     OpeningTreeMLP,
@@ -1406,6 +1407,56 @@ def main():
                                                 float(per_pos[mask].mean()))
             aux['by_ply'] = by_ply
             _print_legal_report('CellPO', mean_acc, per_cell_arr, aux)
+
+        if ('patterns_linear_probor' in modes
+                and args.include_flanking_patterns):
+            # Load patterns (may already be loaded in tree-target=patterns,
+            # but load again here for safety).
+            if 'patterns_list' in dir() and patterns_list is not None:
+                pl = patterns_list
+            else:
+                pl = load_patterns(args.include_flanking_patterns)
+            print(f'\ntraining linear->960 patterns->prob-OR readout '
+                   f'({len(pl)} patterns; batch=1024, faster than StruPO)...')
+            t0 = time.time()
+            lin_probes = train_probe_legal_linear_pat_probor_ensemble(
+                H_tr, L_tr, pl,
+                n_seeds=args.probe_seeds,
+                epochs=args.legal_probe_epochs,
+                device=device)
+            print(f'  ({time.time() - t0:.1f}s)')
+            device_probe = next(lin_probes[0].parameters()).device
+            N_te = H_te.shape[0]
+            accum = torch.zeros(N_te, BOARD_CELLS, dtype=torch.float32)
+            for i in range(0, N_te, 1024):
+                h = H_te[i:i + 1024].to(device=device_probe,
+                                          dtype=torch.float32)
+                probs = torch.zeros(h.shape[0], BOARD_CELLS,
+                                      dtype=torch.float32,
+                                      device=device_probe)
+                for p in lin_probes:
+                    with torch.no_grad():
+                        probs = probs + p(h)
+                probs = probs / len(lin_probes)
+                accum[i:i + 1024] = probs.cpu()
+            preds_lin = (accum > 0.5).to(torch.uint8)
+            L_te_np = L_te.numpy() if hasattr(L_te, 'numpy') else L_te
+            correct = (preds_lin.numpy() == L_te_np).astype(np.float32)
+            per_cell_arr = correct.mean(axis=0)
+            mean_acc = float(correct.mean())
+            aux = {'position_perfect':
+                     float(correct.all(axis=1).mean())}
+            T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
+            by_ply = {}
+            per_pos = correct.mean(axis=1)
+            for lo in range(int(T_np.min()) // 10 * 10,
+                              int(T_np.max()) + 1, 10):
+                mask = (T_np >= lo) & (T_np < lo + 10)
+                if mask.any():
+                    by_ply[(lo, lo + 10)] = (int(mask.sum()),
+                                                float(per_pos[mask].mean()))
+            aux['by_ply'] = by_ply
+            _print_legal_report('LinPO ', mean_acc, per_cell_arr, aux)
 
         if ('state_probor' in modes and not skip_state_probe
                 and args.include_flanking_patterns):
