@@ -84,6 +84,14 @@ case "${VARIANT}" in
         RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
         TAG="bank_multi_flanking"
         ;;
+    bank_multi_flanking_linpo)
+        # bank_multi_flanking but only trains the LinPO legal probe.
+        # Skips the state probe eval, all other legal predictors — fastest
+        # iteration when we only care about linear -> 960 -> prob-OR.
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
+        TAG="bank_multi_flanking_linpo"
+        LEGAL_MODES_OVERRIDE="patterns_linear_probor"
+        ;;
     bank_multi_flanking_legaltrees)
         # Both: trees fit for legal + 960 flanking-pattern hidden units.
         RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt"
@@ -170,7 +178,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --probe-seeds 5 \
     --task both \
     --tree-target ${TREE_TARGET} \
-    --legal-modes bce,probor,derived,state_probor,patterns_probor,patterns_structured_probor,cells_structured_probor,patterns_linear_probor \
+    --legal-modes ${LEGAL_MODES_OVERRIDE:-bce,probor,derived,state_probor,patterns_probor,patterns_structured_probor,cells_structured_probor,patterns_linear_probor} \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \
     --device cuda \
