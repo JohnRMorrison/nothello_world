@@ -70,6 +70,13 @@ case "${VARIANT}" in
         RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20"
         TAG="bank_multi"
         ;;
+    bank_multi_legaltrees)
+        # bank_multi input featurization + trees fit for legality
+        # (Option 1: --tree-target legal).  State probe is skipped.
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20"
+        TAG="bank_multi_legaltrees"
+        TREE_TARGET="legal"
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1
@@ -91,11 +98,18 @@ echo "top_k_per_cell:    ${TOP_K}"
 echo "task:              both"
 echo "============================================"
 
+TREE_TARGET=${TREE_TARGET:-state}
+
 # Cache path includes _L suffix so it does not clash with state-only caches
 # that have 3-tuple contents.  The 4th cached array is the legal-move mask.
 OUT="ckpts_midgame/midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}.pt"
-CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_L_tr.npz"
-CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${TAG}_L_te.npz"
+# bank_multi_legaltrees shares cache with bank_multi (same Xnp sample).
+CACHE_TAG=${TAG}
+if [ "${TAG}" = "bank_multi_legaltrees" ]; then
+    CACHE_TAG="bank_multi"
+fi
+CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_tr.npz"
+CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_te.npz"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
@@ -110,6 +124,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --probe-epochs 100 \
     --probe-seeds 5 \
     --task both \
+    --tree-target ${TREE_TARGET} \
     --legal-modes bce,probor,derived \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \

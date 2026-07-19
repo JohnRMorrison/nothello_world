@@ -363,6 +363,14 @@ def main():
     ap.add_argument('--top-k-per-cell', type=int, default=None,
                     help='Keep only the top-K most frequently trained-on '
                           'paths per cell.  Total H becomes at most 64 * K.')
+    ap.add_argument('--tree-target', default='state',
+                    choices=['state', 'legal'],
+                    help='What per-cell trees predict.  state (default): '
+                          '3-class {empty, mine, opp} — tree paths become '
+                          'state-decoding features.  legal: 2-class '
+                          '{illegal, legal} — tree paths encode flanking-'
+                          'like conjunctions predictive of legality.  Only '
+                          'meaningful with --task legal or --task both.')
     ap.add_argument('--task', default='state',
                     choices=['state', 'legal', 'both'],
                     help='state (default): train state-decoding probe only. '
@@ -549,8 +557,18 @@ def main():
                     mf = float(mf)
                 except ValueError:
                     pass
+        if args.tree_target == 'legal':
+            if Lnp_tr is None:
+                raise ValueError('--tree-target legal requires --task legal '
+                                  'or --task both to collect legal masks.')
+            tree_target_tr = Lnp_tr.astype(np.int64)
+            tree_target_te = Lnp_te.astype(np.int64)
+            print(f'  fitting trees for LEGAL-MOVE target (binary per cell)')
+        else:
+            tree_target_tr = Snp_tr
+            tree_target_te = Snp_te
         trees = train_per_cell_trees(
-            Xnp_tr, Snp_tr,
+            Xnp_tr, tree_target_tr,
             max_depth=args.tree_max_depth,
             min_samples_leaf=args.tree_min_samples_leaf,
             n_jobs=args.tree_n_jobs,
@@ -560,8 +578,10 @@ def main():
         tree_correct_per_cell = np.zeros(BOARD_CELLS)
         for c in range(BOARD_CELLS):
             preds = trees[c].predict(Xnp_te)
-            tree_correct_per_cell[c] = (preds == Snp_te[:, c]).mean()
-        print(f'  aggregate per-cell tree test acc: '
+            tree_correct_per_cell[c] = (preds == tree_target_te[:, c]).mean()
+        target_label = ('legal-move'
+                        if args.tree_target == 'legal' else 'state')
+        print(f'  aggregate per-cell tree test acc ({target_label}): '
                f'{100*tree_correct_per_cell.mean():.4f}%')
         for cls in ('corner', 'edge', 'inner'):
             cell_ids = [c for c in range(64) if CELL_CLASS[c] == cls]
@@ -866,42 +886,56 @@ def main():
         # Free candidate activation storage.
         del CA_tr, CA_te, residuals, S_onehot
 
-    print('\ntraining linear probe on hidden layer...')
-    if args.probe_solver == 'sklearn':
-        print(f'  solver: sklearn LR (LBFGS)   '
-               f'C={args.sklearn_C}   n_jobs={args.sklearn_n_jobs}')
-        sk_models = train_probe_sklearn(
-            H_tr, S_tr, H_te, S_te,
-            C=args.sklearn_C, n_jobs=args.sklearn_n_jobs,
-            subsample_train=args.sklearn_subsample_train,
-            solver=args.sklearn_solver,
-            max_iter=args.sklearn_max_iter)
-        # For consistency with downstream code we use ensemble containers
-        # but fill with the sklearn models.
-        probes = None      # legacy variable, unused with sklearn path
+    skip_state_probe = (args.tree_target == 'legal')
+    if skip_state_probe:
+        print(f'\ntree-target=legal → skipping state probe (tree paths do '
+               f'not distinguish state).')
+        probes = None
         probe = None
-    else:
-        if args.probe_l1 > 0:
-            print(f'  using L1 regularization: lambda={args.probe_l1}')
-        print(f'  epochs: {args.probe_epochs}   seeds: {args.probe_seeds}   '
-               f'readout: {args.state_readout}')
-        if args.state_readout == 'probor':
-            probes = train_probe_state_probor_ensemble(
-                H_tr, S_tr,
-                n_seeds=args.probe_seeds,
-                epochs=args.probe_epochs, lr=args.probor_lr,
-                device=device)
-        else:
-            probes = train_probe_ensemble(
-                H_tr, S_tr, H_te, S_te,
-                n_seeds=args.probe_seeds,
-                epochs=args.probe_epochs, device=device,
-                l1_lambda=args.probe_l1)
-        probe = probes[0]     # for legacy references
         sk_models = None
+        acc_tr = acc_te = 0.0
+        per_cell_te = np.zeros(BOARD_CELLS)
+        by_ply = {}
+        per_seed_te = []
+    else:
+        print('\ntraining linear probe on hidden layer...')
+        if args.probe_solver == 'sklearn':
+            print(f'  solver: sklearn LR (LBFGS)   '
+                   f'C={args.sklearn_C}   n_jobs={args.sklearn_n_jobs}')
+            sk_models = train_probe_sklearn(
+                H_tr, S_tr, H_te, S_te,
+                C=args.sklearn_C, n_jobs=args.sklearn_n_jobs,
+                subsample_train=args.sklearn_subsample_train,
+                solver=args.sklearn_solver,
+                max_iter=args.sklearn_max_iter)
+            probes = None
+            probe = None
+        else:
+            if args.probe_l1 > 0:
+                print(f'  using L1 regularization: '
+                       f'lambda={args.probe_l1}')
+            print(f'  epochs: {args.probe_epochs}   '
+                   f'seeds: {args.probe_seeds}   '
+                   f'readout: {args.state_readout}')
+            if args.state_readout == 'probor':
+                probes = train_probe_state_probor_ensemble(
+                    H_tr, S_tr,
+                    n_seeds=args.probe_seeds,
+                    epochs=args.probe_epochs, lr=args.probor_lr,
+                    device=device)
+            else:
+                probes = train_probe_ensemble(
+                    H_tr, S_tr, H_te, S_te,
+                    n_seeds=args.probe_seeds,
+                    epochs=args.probe_epochs, device=device,
+                    l1_lambda=args.probe_l1)
+            probe = probes[0]
+            sk_models = None
 
     # Evaluate.
-    if sk_models is not None:
+    if skip_state_probe:
+        pass
+    elif sk_models is not None:
         acc_tr, _, _ = evaluate_sklearn(sk_models, H_tr, S_tr)
         acc_te, per_cell_te, by_ply = evaluate_sklearn(
             sk_models, H_te, S_te, T_te)
@@ -937,7 +971,9 @@ def main():
             print(f'  test  per-cell acc: {100*acc_te:.4f}%')
 
     # Per-cell class predictions for the corner/edge/inner breakdown.
-    if sk_models is not None:
+    if skip_state_probe:
+        preds_te = torch.zeros(H_te.shape[0], BOARD_CELLS, dtype=torch.long)
+    elif sk_models is not None:
         H_te_np = H_te.numpy()
         if H_te_np.dtype == np.bool_:
             H_te_np = H_te_np.astype(np.float32)
@@ -965,22 +1001,25 @@ def main():
                         logits = out.view(-1, BOARD_CELLS, 3)
                         probs_acc += torch.softmax(logits, dim=-1).cpu()
                 preds_te[i:i + 512] = probs_acc.argmax(dim=-1)
-    cls_break = per_class_accuracy(preds_te, S_te)
-    print(f'\n  test acc by cell class:')
-    for cls, (n_cells, acc) in cls_break.items():
-        print(f'    {cls:6s} ({n_cells} cells):  {100*acc:.4f}%')
+    if skip_state_probe:
+        cls_break = {}
+    else:
+        cls_break = per_class_accuracy(preds_te, S_te)
+        print(f'\n  test acc by cell class:')
+        for cls, (n_cells, acc) in cls_break.items():
+            print(f'    {cls:6s} ({n_cells} cells):  {100*acc:.4f}%')
 
-    # Ply-bucket breakdown (bucket by 10).
-    print(f'\n  test acc by ply bucket:')
-    ply_arr = T_te.numpy()
-    for lo in range(args.ply_min, args.ply_max, 10):
-        hi = lo + 10
-        mask = (ply_arr >= lo) & (ply_arr < hi)
-        if not mask.any():
-            continue
-        acc_b = (preds_te[mask] == S_te[mask]).float().mean().item()
-        print(f'    [{lo:2d},{hi:2d})  n={int(mask.sum()):6d}  '
-               f'acc={100*acc_b:.4f}%')
+        # Ply-bucket breakdown (bucket by 10).
+        print(f'\n  test acc by ply bucket:')
+        ply_arr = T_te.numpy()
+        for lo in range(args.ply_min, args.ply_max, 10):
+            hi = lo + 10
+            mask = (ply_arr >= lo) & (ply_arr < hi)
+            if not mask.any():
+                continue
+            acc_b = (preds_te[mask] == S_te[mask]).float().mean().item()
+            print(f'    [{lo:2d},{hi:2d})  n={int(mask.sum()):6d}  '
+                   f'acc={100*acc_b:.4f}%')
 
     # ------------------------------------------------------------------
     # Legal-move task: three predictors.
@@ -1045,11 +1084,14 @@ def main():
                 po_probes, H_te, L_te, T=T_te, kind='probor')
             _print_legal_report('probOR', acc, per_cell, aux)
 
-        if 'derived' in modes:
+        if 'derived' in modes and not skip_state_probe:
             print(f'\ndriving legal moves from state predictions...')
             acc, per_cell, aux = legal_accuracy_from_state(
                 preds_te, L_te, T=T_te)
             _print_legal_report('DerivS', acc, per_cell, aux)
+        elif 'derived' in modes:
+            print(f'\nskipping derived legal (no state predictions '
+                   f'available under tree-target=legal)')
 
     torch.save({
         'W': mlp.W.cpu() if not args.skip_tree_fit else None,
