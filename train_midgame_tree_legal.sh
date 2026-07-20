@@ -234,7 +234,14 @@ esac
 
 # Cache path includes _L suffix so it does not clash with state-only caches
 # that have 3-tuple contents.  The 4th cached array is the legal-move mask.
-OUT="ckpts_midgame/midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}.pt"
+ALGO_TAG=""
+if [ -n "${PATTERN_ALGORITHM:-}" ] && [ "${PATTERN_ALGORITHM}" != "dt" ]; then
+    ALGO_TAG="_alg${PATTERN_ALGORITHM}"
+    if [ -n "${PATTERN_N_TREES:-}" ]; then
+        ALGO_TAG="${ALGO_TAG}n${PATTERN_N_TREES}"
+    fi
+fi
+OUT="ckpts_midgame/midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}${ALGO_TAG}.pt"
 # bank_multi_legaltrees shares cache with bank_multi (same Xnp sample).
 CACHE_TAG=${TAG}
 case "${TAG}" in

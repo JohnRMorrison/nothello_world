@@ -345,30 +345,31 @@ def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
 
 def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                           min_samples_leaf=50, n_jobs=1, max_features=None,
-                          class_weight='balanced', use_random_forest=False):
+                          class_weight='balanced', use_random_forest=False,
+                          algorithm='dt', gb_learning_rate=0.1):
     """Fit `n_trees_per_pattern` trees per pattern.
 
-    X: (N, D) input features.
-    target: (N, K) uint8 — per-pattern binary activation.
+    algorithm ∈ {'dt', 'rf', 'et', 'gbm'}:
+      dt  — one or more DecisionTreeClassifier(s), bootstrapped when >1
+      rf  — RandomForestClassifier (also triggered by use_random_forest=True)
+      et  — ExtraTreesClassifier
+      gbm — GradientBoostingClassifier (sklearn); trees are shallow +
+            additive; extract each iteration's tree from .estimators_
 
-    For each pattern j:
-      - If use_random_forest=False (default): fit `n_trees_per_pattern`
-        DecisionTreeClassifiers.  When >1, they are bagged via bootstrap
-        for ensemble diversity.
-      - If use_random_forest=True: fit ONE sklearn RandomForestClassifier
-        with `n_estimators=n_trees_per_pattern`.  RF automatically bootstraps
-        rows AND subsamples features per split, so trees inside the forest
-        are more diverse than plain bagging.
-
-    Returns: list of length K, each entry a list of fitted trees.  For
-    RandomForest, the "list" is the tree_ list inside the forest, wrapped
-    so downstream code can treat each tree individually.
+    Returns: list of length K, each entry a list of fitted sklearn tree
+    objects.  For rf/et/gbm the list contains the ensemble's internal
+    trees so downstream extract_paths just works.
     """
+    # Back-compat: use_random_forest overrides algorithm to 'rf'.
+    if use_random_forest and algorithm == 'dt':
+        algorithm = 'rf'
+
     K = target.shape[1]
     bootstrap = (n_trees_per_pattern > 1)
 
     def one_pattern(j):
-        if use_random_forest:
+        y = target[:, j]
+        if algorithm == 'rf':
             from sklearn.ensemble import RandomForestClassifier
             rf = RandomForestClassifier(
                 n_estimators=n_trees_per_pattern,
@@ -377,11 +378,47 @@ def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                 max_features=max_features,
                 class_weight=class_weight,
                 bootstrap=True,
-                n_jobs=1,   # outer parallelism handles pattern-level
+                n_jobs=1,
                 random_state=j * 1000)
-            rf.fit(X, target[:, j])
-            return list(rf.estimators_)   # unwrap to a list of trees
-        return [_fit_one_pattern_tree(X, target[:, j], max_depth,
+            rf.fit(X, y)
+            return list(rf.estimators_)
+        if algorithm == 'et':
+            from sklearn.ensemble import ExtraTreesClassifier
+            et = ExtraTreesClassifier(
+                n_estimators=n_trees_per_pattern,
+                max_depth=max_depth,
+                min_samples_leaf=min_samples_leaf,
+                max_features=max_features,
+                class_weight=class_weight,
+                bootstrap=False,   # ExtraTrees default
+                n_jobs=1,
+                random_state=j * 1000)
+            et.fit(X, y)
+            return list(et.estimators_)
+        if algorithm == 'gbm':
+            from sklearn.ensemble import GradientBoostingClassifier
+            # For a rare-positive binary target, class_weight isn't native
+            # in GBM; use sample_weight balancing manually.
+            if class_weight == 'balanced':
+                n_pos = int(y.sum())
+                n_neg = len(y) - n_pos
+                w_pos = 0.5 / max(n_pos, 1)
+                w_neg = 0.5 / max(n_neg, 1)
+                sample_weight = np.where(y == 1, w_pos, w_neg)
+            else:
+                sample_weight = None
+            gb = GradientBoostingClassifier(
+                n_estimators=n_trees_per_pattern,
+                max_depth=max_depth,
+                min_samples_leaf=min_samples_leaf,
+                max_features=max_features,
+                learning_rate=gb_learning_rate,
+                random_state=j * 1000)
+            gb.fit(X, y, sample_weight=sample_weight)
+            # gb.estimators_ shape: (n_iterations, 1) DecisionTreeRegressor
+            return [est[0] for est in gb.estimators_]
+        # default: dt
+        return [_fit_one_pattern_tree(X, y, max_depth,
                                           min_samples_leaf, max_features,
                                           class_weight,
                                           seed=j * 1000 + k,

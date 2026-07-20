@@ -485,6 +485,15 @@ def main():
                           'instead of hand-bagged DecisionTreeClassifiers. '
                           'RF adds per-split feature subsampling for more '
                           'diverse trees within each pattern ensemble.')
+    ap.add_argument('--pattern-algorithm', default='dt',
+                    choices=['dt', 'rf', 'et', 'gbm'],
+                    help='Which per-pattern algorithm to use for tree '
+                          'fitting.  dt: DecisionTreeClassifier.  rf: '
+                          'RandomForestClassifier.  et: ExtraTreesClassifier. '
+                          'gbm: sklearn GradientBoostingClassifier '
+                          '(additive shallow trees).')
+    ap.add_argument('--pattern-gb-learning-rate', type=float, default=0.1,
+                    help='GBM only: learning rate.')
     ap.add_argument('--pattern-class-weight', default='balanced',
                     choices=['balanced', 'none'],
                     help='For --tree-target patterns: class weighting.  '
@@ -825,7 +834,9 @@ def main():
                 n_jobs=args.tree_n_jobs,
                 max_features=mf,
                 class_weight=cw,
-                use_random_forest=args.pattern_use_random_forest)
+                use_random_forest=args.pattern_use_random_forest,
+                algorithm=args.pattern_algorithm,
+                gb_learning_rate=args.pattern_gb_learning_rate)
             print(f'  ({time.time() - t0:.1f}s)')
 
             # Aggregate-per-pattern tree accuracy (majority vote across
