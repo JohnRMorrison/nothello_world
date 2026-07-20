@@ -123,17 +123,19 @@ def legal_at_turn(game, turn):
 # Figure 1 & 2: adversarial position + triptych
 # --------------------------------------------------------------------------
 
-def find_t_L(game, T_illegal, C_illegal):
+def find_t_L(game, T_illegal, C_illegal, verbose=False):
     """Return the last same-parity turn t <= T-2 where C was legal, or None."""
-    legals_before = OthelloBoardState()
-    # We only need legality per turn; walk once and cache same-parity legality.
+    board = OthelloBoardState()
     legal_history = {}
     for t in range(T_illegal + 1):
-        legal_history[t] = C_illegal in set(legals_before.get_valid_moves())
+        legal_history[t] = C_illegal in set(board.get_valid_moves())
         if t < T_illegal:
+            mv = int(game[t])
             try:
-                legals_before.umpire(game[t])
-            except Exception:
+                board.umpire(mv)
+            except Exception as e:
+                if verbose:
+                    print(f'    umpire failed at t={t} mv={mv}: {e}')
                 return None
     for t in range(T_illegal - 2, -1, -2):
         if legal_history.get(t, False):
@@ -379,6 +381,14 @@ def main():
                                             ).reshape(8, 8)[C // 8, C % 8])
         picked_t_L = t_L
     else:
+        # Diagnostic pass on first record so we can see any failure mode.
+        _game0 = tuple(adv_games[0])
+        _T0 = int(adv_turns[0])
+        _C0 = int(adv_illegal[0])
+        print(f'DIAG on adv[0]: game_len={len(_game0)}, T={_T0}, C={_C0}, '
+               f'game[0..3]={_game0[:3]}, game[T-1]={_game0[_T0-1] if _T0 > 0 else None}')
+        _tL0 = find_t_L(_game0, _T0, _C0, verbose=True)
+        print(f'  find_t_L returned {_tL0}')
         print(f'Searching {args.adv_search_k} adversarial records for a '
                f'high-persistence example (P_I >= {args.adv_min_p_i})...')
         best = None
