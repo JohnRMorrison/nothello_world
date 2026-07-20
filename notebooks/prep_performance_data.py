@@ -79,20 +79,18 @@ def build_pos_to_token(block_size):
 
 
 @torch.no_grad()
-def probs_at_turn(model, game, turn, block_size, pos_to_token, device):
-    """Model's per-cell probabilities for the move about to be made at `turn`.
+def probs_at_turn(model, game, t, block_size, pos_to_token, device):
+    """Model's per-cell probabilities for the NEXT move given that moves
+    0..t have already been played.  Matches the convention used when the
+    adversarial records were generated (feed t+1 tokens, read logits[t]).
 
-    game[:turn] is the prefix already played.  Returns (64,) float32 renormalised
-    to sum to 1 over the 60 non-center cells.
+    Returns (64,) float32 renormalised to sum to 1 over the 60 non-center
+    cells.
     """
-    if turn == 0:
-        # No context yet -- return uniform over legal opening moves
-        p = np.zeros(64, dtype=np.float32)
-        return p
-    tokens = tokenize_games([game[:turn]],
-                              seq_len=block_size).to(device)
+    L = min(t + 1, block_size)
+    tokens = tokenize_games([game[:L]], seq_len=block_size).to(device)
     logits, _ = model(tokens)
-    probs = F.softmax(logits[0, turn - 1, :], dim=-1).detach().cpu().numpy()
+    probs = F.softmax(logits[0, t, :], dim=-1).detach().cpu().numpy()
     p = np.zeros(64, dtype=np.float32)
     for cell in VALID_MOVES:
         tok = int(pos_to_token[cell])
@@ -104,18 +102,20 @@ def probs_at_turn(model, game, turn, block_size, pos_to_token, device):
     return p
 
 
-def state_at_turn(game, turn):
-    """Board state after moves 0..turn-1 have been played."""
+def state_at_turn(game, t):
+    """Board state AFTER moves 0..t have been played (i.e., the state
+    from which the model would predict move t+1).  Matches probs_at_turn.
+    """
     board = OthelloBoardState()
-    for m in game[:turn]:
-        board.umpire(m)
+    for m in game[:t + 1]:
+        board.umpire(int(m))
     return np.asarray(board.state, dtype=np.int8).copy()
 
 
-def legal_at_turn(game, turn):
+def legal_at_turn(game, t):
     board = OthelloBoardState()
-    for m in game[:turn]:
-        board.umpire(m)
+    for m in game[:t + 1]:
+        board.umpire(int(m))
     return set(board.get_valid_moves())
 
 
@@ -123,22 +123,28 @@ def legal_at_turn(game, turn):
 # Figure 1 & 2: adversarial position + triptych
 # --------------------------------------------------------------------------
 
-def find_t_L(game, T_illegal, C_illegal, verbose=False):
-    """Return the last same-parity turn t <= T-2 where C was legal, or None."""
+def find_t_L(game, T, C_illegal, verbose=False):
+    """Return the last same-parity 'prediction point' t <= T-2 where the
+    NEXT move (t+1) could have been C.
+
+    In the adversarial-record convention, T is the last-played turn index
+    and the model's illegal argmax was for move T+1.  A same-parity
+    earlier prediction point t (t < T, t == T mod 2) is one where the
+    model was predicting a move of the same parity as C.  We want C to
+    have been in the legal-moves-after-game[:t+1] at that point.
+    """
     board = OthelloBoardState()
-    legal_history = {}
-    for t in range(T_illegal + 1):
-        legal_history[t] = C_illegal in set(board.get_valid_moves())
-        if t < T_illegal:
-            mv = int(game[t])
-            try:
-                board.umpire(mv)
-            except Exception as e:
-                if verbose:
-                    print(f'    umpire failed at t={t} mv={mv}: {e}')
-                return None
-    for t in range(T_illegal - 2, -1, -2):
-        if legal_history.get(t, False):
+    legal_after = {}      # legal_after[t] = legals after playing game[0..t]
+    for t in range(T + 1):
+        try:
+            board.umpire(int(game[t]))
+        except Exception as e:
+            if verbose:
+                print(f'    umpire failed at t={t} mv={game[t]}: {e}')
+            return None
+        legal_after[t] = set(board.get_valid_moves())
+    for t in range(T - 2, -1, -2):
+        if C_illegal in legal_after.get(t, set()):
             return t
     return None
 
