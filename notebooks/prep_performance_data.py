@@ -326,10 +326,10 @@ def main():
     ap.add_argument('--adv-index', type=int, default=None,
                     help='Which adversarial record to use.  Default: search '
                           'and pick the best-persistence example.')
-    ap.add_argument('--adv-search-k', type=int, default=300,
+    ap.add_argument('--adv-search-k', type=int, default=1000,
                     help='How many adversarial records to score before '
-                          'picking the best.  Default 300.')
-    ap.add_argument('--adv-min-p-i', type=float, default=0.05,
+                          'picking the best.')
+    ap.add_argument('--adv-min-p-i', type=float, default=0.01,
                     help='Minimum P(C) at t_I to consider a candidate.')
     ap.add_argument('--pickle-dir',
                     default='data/othello_synthetic')
@@ -383,27 +383,60 @@ def main():
                f'high-persistence example (P_I >= {args.adv_min_p_i})...')
         best = None
         best_score = -1.0
+        n_have_tL = 0
+        max_p_i_seen = 0.0
+        top10 = []  # keep the 10 best (score, i, t_L, P_L, P_I)
         for i in range(min(args.adv_search_k, len(adv_games))):
             game = tuple(adv_games[i])
             T = int(adv_turns[i])
             C = int(adv_illegal[i])
+            if T < 2 or T + 1 >= len(game):
+                continue
             try:
-                r = score_persistence_record(game, T, C, model, block_size,
-                                                  pos_to_token, device,
-                                                  min_p_I=args.adv_min_p_i)
-            except Exception as e:
+                t_L = find_t_L(game, T, C)
+            except Exception:
                 continue
-            if r is None:
+            if t_L is None:
                 continue
-            score, t_L, P_L, P_I = r
+            n_have_tL += 1
+            Cr, Cc = C // 8, C % 8
+            try:
+                P_I = float(probs_at_turn(model, game, T, block_size,
+                                              pos_to_token, device
+                                             ).reshape(8, 8)[Cr, Cc])
+            except Exception:
+                continue
+            if P_I > max_p_i_seen:
+                max_p_i_seen = P_I
+            if P_I < args.adv_min_p_i:
+                continue
+            P_L = float(probs_at_turn(model, game, t_L, block_size,
+                                          pos_to_token, device
+                                         ).reshape(8, 8)[Cr, Cc])
+            retention = P_I / max(P_L, 1e-6)
+            score = P_I * retention
+            top10.append((score, i, t_L, P_L, P_I))
+            top10.sort(reverse=True)
+            top10 = top10[:10]
             if score > best_score:
                 best_score = score
                 best = (i, t_L, P_L, P_I)
                 print(f'  new best @ i={i}: P_L={P_L:.3f} '
-                       f'P_I={P_I:.3f} retention={P_I/max(P_L,1e-6):.2f}')
+                       f'P_I={P_I:.3f} retention={retention:.2f}')
+            if (i + 1) % 100 == 0:
+                print(f'  ...{i+1}/{args.adv_search_k} scanned, '
+                       f'{n_have_tL} with t_L, max P_I={max_p_i_seen:.3f}',
+                       flush=True)
+        print(f'\nSearch summary: scanned {min(args.adv_search_k, len(adv_games))}, '
+               f'{n_have_tL} had t_L, max P_I seen = {max_p_i_seen:.3f}')
+        print('Top 10 by score:')
+        for sc, ii, tl, pl, pi in top10:
+            print(f'  i={ii}  P_L={pl:.4f}  P_I={pi:.4f}  '
+                   f'retention={pi/max(pl,1e-6):.3f}  score={sc:.4f}')
         if best is None:
-            raise SystemExit('no adversarial record met the P_I threshold; '
-                              'try lowering --adv-min-p-i')
+            raise SystemExit(f'no adversarial record met P_I >= {args.adv_min_p_i}. '
+                              f'Max P_I seen among {n_have_tL} candidates with t_L '
+                              f'was {max_p_i_seen:.4f}. Try --adv-min-p-i {max_p_i_seen/2:.3f}')
         picked_idx, picked_t_L, picked_P_L, picked_P_I = best
         game = tuple(adv_games[picked_idx])
         T = int(adv_turns[picked_idx])
