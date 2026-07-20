@@ -434,7 +434,10 @@ def main():
             game = tuple(adv_games[i])
             T = int(adv_turns[i])
             C = int(adv_illegal[i])
-            if T < 2 or T + 1 >= len(game):
+            # Adversarial records always have T == len(game) - 1;
+            # only require T >= 2 so we can walk back to a same-parity
+            # earlier prediction point.
+            if T < 2:
                 continue
             try:
                 t_L = find_t_L(game, T, C)
