@@ -283,53 +283,102 @@ def line_len_from_cell(state_8x8, r, c, dr, dc, mover_color):
     return n
 
 
-def build_line_growth_sequence(game, target_cell, direction, model,
-                                 block_size, pos_to_token, device,
-                                 min_ply=5):
-    """Walk through same-parity prediction points from the mover-of-target,
-    record each unique opp-line length in `direction` from `target_cell`,
-    with the model's per-cell probs at that turn.
+def scan_monotonic_growth(game, target_cell, direction, mover_parity,
+                             min_ply=5):
+    """For a fixed (target_cell, direction, mover_parity), return a list of
+    (turn, opp_line_length) for same-parity turns where the target is
+    empty AND has NO valid flank in ANY direction AND the line length is
+    STRICTLY GREATER than at the previously-kept turn.
 
-    Returns list of dicts (one per distinct line length seen).  Ordered by
-    increasing line length.
+    Does NOT invoke the model -- caller runs inference on the returned
+    turns.
     """
     r, c = target_cell // 8, target_cell % 8
     dr, dc = direction
     board = OthelloBoardState()
-    legal_after = {}
-    state_after = {}
+    prev_len = 0
+    kept = []
     for t in range(len(game)):
         try:
             board.umpire(int(game[t]))
         except Exception:
             break
-        legal_after[t] = set(board.get_valid_moves())
-        state_after[t] = np.asarray(board.state, dtype=np.int8).reshape(8, 8).copy()
-
-    # Same parity as the winning target-cell's mover.  At each prediction
-    # point t, mover for the next move is (t+1) % 2 (in absolute-parity
-    # convention: 0=black, 1=white).
-    seen = {}   # line_len -> (t, state, probs)
-    T_max = max(state_after)
-    for t in sorted(state_after):
         if t < min_ply:
             continue
-        st = state_after[t]
-        mover = 1 if (t + 1) % 2 == 0 else -1   # who plays next
-        # Only count when the target cell is empty and the same mover is next
+        # We look at prediction points where the NEXT move is by
+        # mover_parity's mover.  Next move parity = (t+1) % 2.
+        if ((t + 1) % 2) != mover_parity:
+            continue
+        st = np.asarray(board.state, dtype=np.int8).reshape(8, 8)
         if st[r, c] != 0:
             continue
-        n_opps = line_len_from_cell(st, r, c, dr, dc, mover)
-        if n_opps < 1:
+        mover_color = 1 if mover_parity == 0 else -1
+        if has_valid_flank(st, r, c, mover_color):
             continue
-        if n_opps in seen:
-            continue
-        probs = probs_at_turn(model, game, t, block_size,
-                                 pos_to_token, device).reshape(8, 8)
-        seen[n_opps] = {'t': t, 'state': st.copy(),
-                         'probs': probs.astype(np.float32),
-                         'p_target': float(probs[r, c])}
-    return [seen[k] for k in sorted(seen)]
+        L = line_len_from_cell(st, r, c, dr, dc, mover_color)
+        if L > prev_len:
+            kept.append((t, L))
+            prev_len = L
+    return kept
+
+
+def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
+                                     min_seq_len, seed=0, verbose=True):
+    """Search for a game/target/direction where a monotonically increasing
+    opp-line toward `target_cell` unfolds over multiple same-parity
+    prediction points, and the target cell is always empty + has NO valid
+    flank.  Returns dict with game, target_cell, direction, mover_parity,
+    and the (turn, line_len) sequence.
+
+    Ranks by len(sequence) * final_line_len; requires len(sequence) >=
+    min_seq_len and final_line_len >= min_line_final.
+    """
+    rng = np.random.RandomState(seed)
+    best = None
+    best_score = -1
+    n_scanned = 0
+    for pkl in pickle_paths:
+        with open(pkl, 'rb') as f:
+            games = pickle.load(f)
+        order = rng.permutation(len(games))
+        for gi in order:
+            game = tuple(games[gi])
+            if n_scanned >= n_games:
+                break
+            n_scanned += 1
+            for target_cell in VALID_MOVES:
+                for direction in DIRS:
+                    for mover_parity in (0, 1):
+                        seq = scan_monotonic_growth(
+                            game, target_cell, direction, mover_parity)
+                        if len(seq) < min_seq_len:
+                            continue
+                        if seq[-1][1] < min_line_final:
+                            continue
+                        score = len(seq) * seq[-1][1]
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                'game': game,
+                                'target_cell': target_cell,
+                                'direction': direction,
+                                'mover_parity': mover_parity,
+                                'sequence': seq,
+                                'pickle': pkl,
+                                'game_index': int(gi),
+                            }
+                            if verbose:
+                                print(f'  new best game={gi}, '
+                                       f'target={target_cell}, '
+                                       f'dir={direction}, seq_len='
+                                       f'{len(seq)}, final_L={seq[-1][1]}',
+                                       flush=True)
+            if n_scanned >= n_games:
+                break
+        if n_scanned >= n_games:
+            break
+    print(f'  scanned {n_scanned} games for monotonic growth')
+    return best
 
 
 def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
@@ -449,6 +498,14 @@ def main():
     ap.add_argument('--min-line', type=int, default=3)
     ap.add_argument('--flank-top-k', type=int, default=5,
                     help='How many top no-flanker examples to keep.')
+    ap.add_argument('--growth-n-games', type=int, default=500,
+                    help='How many games to scan for a monotonic '
+                          'line-growth game.')
+    ap.add_argument('--growth-min-seq', type=int, default=3,
+                    help='Minimum length of the monotonic (turn, L) '
+                          'sequence.')
+    ap.add_argument('--growth-min-final', type=int, default=3,
+                    help='Minimum final line length in the sequence.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -674,36 +731,58 @@ def main():
         fig3 = {}
     else:
         flank = flank_list[0]   # winner used for the single-figure back-compat
-        # Also compute the line-growth sequence: walk the winning game
-        # and record positions where the opp-line length toward target
-        # increases.
-        target_cell = int(flank['target_cell'][0] * 8 + flank['target_cell'][1])
-        direction = tuple(int(x) for x in flank['direction'])
-        winning_game_idx = flank.get('game_index', 0)
-        # We need the game itself.  flank['state'] etc. is a snapshot; we
-        # cached game_prefix_len but not the game.  Re-run to find it.
-        # For now, use the game the flank was found in.
-        winning_game = flank['_game']
-        seq = build_line_growth_sequence(
-            winning_game, target_cell, direction, model, block_size,
-            pos_to_token, device)
-        print(f'  line-growth: found {len(seq)} distinct line lengths '
-               f'({[s["p_target"] for s in seq] if seq else "none"})')
-        # Pack sequence as arrays
-        if seq:
-            growth_states = np.stack([s['state'] for s in seq]).astype(np.int8)
-            growth_probs = np.stack([s['probs'] for s in seq]).astype(np.float32)
-            growth_turns = np.array([s['t'] for s in seq], dtype=np.int32)
-            growth_line_lens = np.array(list(range(1, len(seq) + 1)),
-                                            dtype=np.int32)
-            growth_p_target = np.array([s['p_target'] for s in seq],
-                                            dtype=np.float32)
-        else:
+
+        # Search for a game with a MONOTONIC opp-line-growth sequence
+        # (target cell always empty AND never has a valid flank).
+        print(f'Searching {len(pkls)} pickle(s), {args.growth_n_games} games '
+               f'each, for a monotonic line-growth game...')
+        mono = find_monotonic_growth_example(
+            pkls,
+            n_games=args.growth_n_games,
+            min_line_final=args.growth_min_final,
+            min_seq_len=args.growth_min_seq,
+            seed=args.search_seed,
+        )
+        if mono is None:
+            print('  no monotonic growth game found; growth_* will be empty.')
             growth_states = np.zeros((0, 8, 8), dtype=np.int8)
             growth_probs = np.zeros((0, 8, 8), dtype=np.float32)
             growth_turns = np.zeros(0, dtype=np.int32)
             growth_line_lens = np.zeros(0, dtype=np.int32)
             growth_p_target = np.zeros(0, dtype=np.float32)
+            growth_meta = np.array([], dtype=object)
+        else:
+            print(f'  best: game_idx={mono["game_index"]} target={mono["target_cell"]} '
+                   f'dir={mono["direction"]} sequence={mono["sequence"]}')
+            mono_game = mono['game']
+            tr = mono['target_cell'] // 8
+            tc = mono['target_cell'] % 8
+            states = []
+            probs_list = []
+            turns_list = []
+            lens_list = []
+            p_target_list = []
+            for (t, L) in mono['sequence']:
+                st = state_at_turn(mono_game, t).reshape(8, 8)
+                pr = probs_at_turn(model, mono_game, t, block_size,
+                                       pos_to_token, device).reshape(8, 8)
+                states.append(st)
+                probs_list.append(pr.astype(np.float32))
+                turns_list.append(t)
+                lens_list.append(L)
+                p_target_list.append(float(pr[tr, tc]))
+            growth_states = np.stack(states).astype(np.int8)
+            growth_probs = np.stack(probs_list).astype(np.float32)
+            growth_turns = np.array(turns_list, dtype=np.int32)
+            growth_line_lens = np.array(lens_list, dtype=np.int32)
+            growth_p_target = np.array(p_target_list, dtype=np.float32)
+            growth_meta = np.array([{
+                'target_cell': mono['target_cell'],
+                'direction': mono['direction'],
+                'mover_parity': mono['mover_parity'],
+                'game_index': mono['game_index'],
+                'game': list(mono['game']),
+            }], dtype=object)
         # Also pack the full top-K flank list.
         K = len(flank_list)
         top_flank_states = np.stack([e['state'] for e in flank_list]).astype(np.int8)
@@ -737,7 +816,20 @@ def main():
             'growth_turns': growth_turns,
             'growth_line_lens': growth_line_lens,
             'growth_p_target': growth_p_target,
+            'growth_meta': growth_meta,
         }
+        # Add growth_target_cell / direction from mono if present (else fall
+        # back to the winning-flank target cell so old notebook code doesn't
+        # crash).
+        if mono is not None:
+            fig3['growth_target_cell'] = np.array(
+                [mono['target_cell'] // 8, mono['target_cell'] % 8],
+                dtype=np.int32)
+            fig3['growth_direction'] = np.array(mono['direction'],
+                                                     dtype=np.int32)
+        else:
+            fig3['growth_target_cell'] = flank['target_cell']
+            fig3['growth_direction'] = flank['direction']
 
     # --- save ---
     out_path = os.path.join(REPO_ROOT, args.out)
