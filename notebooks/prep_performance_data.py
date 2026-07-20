@@ -123,39 +123,55 @@ def legal_at_turn(game, turn):
 # Figure 1 & 2: adversarial position + triptych
 # --------------------------------------------------------------------------
 
-def pick_adversarial_triptych(game, T_illegal, C_illegal, model, block_size,
-                                pos_to_token, device):
-    """Pick a (t_prev, t_I, t_next) triptych around the adversarial choice.
-
-    t_prev  = T_illegal - 2 (same-parity previous turn).  If <0, uses T-1.
-    t_I     = T_illegal (turn at which model chose illegal C)
-    t_next  = T_illegal + 2 (same-parity next turn).  If >=len(game), T+1.
-
-    Also tries to find C's last-legal same-parity turn as t_L (bonus:
-    a more meaningful 'before' if one exists).  Falls back to t_prev
-    otherwise.
-
-    Returns dict with per-turn state, probs, label; or None if T is too
-    close to game boundaries.
-    """
-    legals = {t: legal_at_turn(game, t) for t in range(T_illegal + 1)}
-
-    # Preferred 'before' turn: last same-parity turn where C was legal.
-    t_before = None
+def find_t_L(game, T_illegal, C_illegal):
+    """Return the last same-parity turn t <= T-2 where C was legal, or None."""
+    legals_before = OthelloBoardState()
+    # We only need legality per turn; walk once and cache same-parity legality.
+    legal_history = {}
+    for t in range(T_illegal + 1):
+        legal_history[t] = C_illegal in set(legals_before.get_valid_moves())
+        if t < T_illegal:
+            try:
+                legals_before.umpire(game[t])
+            except Exception:
+                return None
     for t in range(T_illegal - 2, -1, -2):
-        if C_illegal in legals[t]:
-            t_before = t
-            break
-    # Fallback: same-parity previous turn (regardless of C's legality).
-    if t_before is None:
-        for cand in (T_illegal - 2, T_illegal - 1):
-            if cand >= 0:
-                t_before = cand
-                break
-    if t_before is None:
-        return None
+        if legal_history.get(t, False):
+            return t
+    return None
 
-    # 'After' turn: prefer same parity.
+
+def score_persistence_record(game, T, C, model, block_size, pos_to_token,
+                               device, min_p_I=0.05):
+    """Return (score, t_L, P_L, P_I) for one adversarial record.
+
+    Score rewards 'C stays highly probable even though C became illegal':
+      score = P_I * (P_I / max(P_L, 1e-6))
+    Returns None if this record isn't a valid candidate (no t_L, or P_I
+    below threshold).
+    """
+    if T < 2 or T + 1 >= len(game):
+        return None
+    t_L = find_t_L(game, T, C)
+    if t_L is None:
+        return None
+    Cr, Cc = C // 8, C % 8
+    P_I_full = probs_at_turn(model, game, T, block_size,
+                                pos_to_token, device).reshape(8, 8)
+    P_I = float(P_I_full[Cr, Cc])
+    if P_I < min_p_I:
+        return None
+    P_L_full = probs_at_turn(model, game, t_L, block_size,
+                                pos_to_token, device).reshape(8, 8)
+    P_L = float(P_L_full[Cr, Cc])
+    retention = P_I / max(P_L, 1e-6)
+    score = P_I * retention
+    return score, t_L, P_L, P_I
+
+
+def build_triptych_for_index(game, T_illegal, C_illegal, t_L,
+                                model, block_size, pos_to_token, device):
+    """Build the (t_L, T_illegal, t_next) triptych, computing states + probs."""
     t_next = None
     for cand in (T_illegal + 2, T_illegal + 1):
         if cand < len(game):
@@ -164,8 +180,8 @@ def pick_adversarial_triptych(game, T_illegal, C_illegal, model, block_size,
     if t_next is None:
         return None
 
-    turns = [t_before, T_illegal, t_next]
-    labels = ['before', 'illegal chosen', 'after']
+    turns = [t_L, T_illegal, t_next]
+    labels = ['C legal', 'C illegal chosen', 'after']
     states = np.stack([state_at_turn(game, t).reshape(8, 8) for t in turns])
     probs = np.stack([probs_at_turn(model, game, t, block_size,
                                        pos_to_token, device).reshape(8, 8)
@@ -308,8 +324,13 @@ def main():
     ap.add_argument('--adv-npz',
                     default='experiment1_by_depth/adversarial_records.npz')
     ap.add_argument('--adv-index', type=int, default=None,
-                    help='Which adversarial record to use.  Default: first '
-                          'one with a valid triptych.')
+                    help='Which adversarial record to use.  Default: search '
+                          'and pick the best-persistence example.')
+    ap.add_argument('--adv-search-k', type=int, default=300,
+                    help='How many adversarial records to score before '
+                          'picking the best.  Default 300.')
+    ap.add_argument('--adv-min-p-i', type=float, default=0.05,
+                    help='Minimum P(C) at t_I to consider a candidate.')
     ap.add_argument('--pickle-dir',
                     default='data/othello_synthetic')
     ap.add_argument('--search-pickles', type=int, default=2,
@@ -341,30 +362,61 @@ def main():
     adv_illegal = adv['illegal_cells']
     print(f'  {len(adv_games)} records loaded')
 
-    # --- pick an adversarial index that gives a valid triptych ---
-    picked_idx = None
-    trip = None
-    idx_iter = ([args.adv_index] if args.adv_index is not None
-                else range(len(adv_games)))
-    for i in idx_iter:
-        game = tuple(adv_games[i])
-        T = int(adv_turns[i])
-        C = int(adv_illegal[i])
-        try:
-            trip = pick_adversarial_triptych(game, T, C, model, block_size,
-                                                 pos_to_token, device)
-        except Exception as e:
-            print(f'  adv[{i}] failed: {e}')
-            continue
-        if trip is not None:
-            picked_idx = i
-            break
+    # --- pick an adversarial record via persistence search ---
+    if args.adv_index is not None:
+        picked_idx = args.adv_index
+        game = tuple(adv_games[picked_idx])
+        T = int(adv_turns[picked_idx])
+        C = int(adv_illegal[picked_idx])
+        t_L = find_t_L(game, T, C)
+        if t_L is None:
+            raise SystemExit(f'record {picked_idx} has no valid t_L')
+        picked_P_L = float(probs_at_turn(model, game, t_L, block_size,
+                                             pos_to_token, device
+                                            ).reshape(8, 8)[C // 8, C % 8])
+        picked_P_I = float(probs_at_turn(model, game, T, block_size,
+                                             pos_to_token, device
+                                            ).reshape(8, 8)[C // 8, C % 8])
+        picked_t_L = t_L
+    else:
+        print(f'Searching {args.adv_search_k} adversarial records for a '
+               f'high-persistence example (P_I >= {args.adv_min_p_i})...')
+        best = None
+        best_score = -1.0
+        for i in range(min(args.adv_search_k, len(adv_games))):
+            game = tuple(adv_games[i])
+            T = int(adv_turns[i])
+            C = int(adv_illegal[i])
+            try:
+                r = score_persistence_record(game, T, C, model, block_size,
+                                                  pos_to_token, device,
+                                                  min_p_I=args.adv_min_p_i)
+            except Exception as e:
+                continue
+            if r is None:
+                continue
+            score, t_L, P_L, P_I = r
+            if score > best_score:
+                best_score = score
+                best = (i, t_L, P_L, P_I)
+                print(f'  new best @ i={i}: P_L={P_L:.3f} '
+                       f'P_I={P_I:.3f} retention={P_I/max(P_L,1e-6):.2f}')
+        if best is None:
+            raise SystemExit('no adversarial record met the P_I threshold; '
+                              'try lowering --adv-min-p-i')
+        picked_idx, picked_t_L, picked_P_L, picked_P_I = best
+        game = tuple(adv_games[picked_idx])
+        T = int(adv_turns[picked_idx])
+        C = int(adv_illegal[picked_idx])
+
+    print(f'Picked adv[{picked_idx}]: T={T} C={C} t_L={picked_t_L} '
+           f'P_L={picked_P_L:.4f} P_I={picked_P_I:.4f} '
+           f'retention={picked_P_I / max(picked_P_L, 1e-6):.3f}')
+
+    trip = build_triptych_for_index(game, T, C, picked_t_L, model,
+                                          block_size, pos_to_token, device)
     if trip is None:
-        raise SystemExit('could not build a valid triptych for any '
-                          'adversarial record')
-    print(f'Picked adv index {picked_idx}: '
-           f'turns={trip["turns"].tolist()} '
-           f'C={int(adv_illegal[picked_idx])}')
+        raise SystemExit(f'record {picked_idx} has no valid t_next')
 
     C_illegal = int(adv_illegal[picked_idx])
     Cr, Cc = C_illegal // 8, C_illegal % 8
