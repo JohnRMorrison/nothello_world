@@ -63,7 +63,11 @@ if [ -n "${MAX_POSITIONS_PER_FILE:-}" ]; then
 fi
 
 TS=$(date +%Y%m%d_%H%M%S)
-OUT="ckpts_midgame/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TS}.pt"
+# Include the LOAD_TREES basename so parallel jobs with different tree
+# checkpoints don't collide when they share a start-second.  Also
+# include the SLURM job id as a tiebreaker.
+TREE_TAG=$(basename "${LOAD_TREES}" .pt)
+OUT="ckpts_midgame/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TREE_TAG}_j${SLURM_JOB_ID}_${TS}.pt"
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"
