@@ -90,7 +90,7 @@ def load_games_from_pickles(num_games, pickle_dir, seed=42):
     return games
 
 
-def sample_midgame_positions(num_games, ply_min=10, ply_max=50, seed=42,
+def sample_midgame_positions(num_games, ply_min=0, ply_max=60, seed=42,
                                 when_bucket_size=None,
                                 use_move_grid=False,
                                 recent_Ks=None,
@@ -305,8 +305,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--num-train-games', type=int, default=20000)
     ap.add_argument('--num-test-games', type=int, default=5000)
-    ap.add_argument('--ply-min', type=int, default=10)
-    ap.add_argument('--ply-max', type=int, default=50)
+    ap.add_argument('--ply-min', type=int, default=0)
+    ap.add_argument('--ply-max', type=int, default=60)
     ap.add_argument('--tree-max-depth', type=int, default=15)
     ap.add_argument('--tree-min-samples-leaf', type=int, default=5)
     ap.add_argument('--tree-n-jobs', type=int, default=1)

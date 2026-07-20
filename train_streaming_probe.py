@@ -192,8 +192,8 @@ def main():
                     help='linpo: LinearPatternProbOr (Linear H->960 + '
                           'prob-OR).  strupo: PatternProbOrHead (per-'
                           'pattern linear over leaves + prob-OR).')
-    ap.add_argument('--ply-min', type=int, default=10)
-    ap.add_argument('--ply-max', type=int, default=50)
+    ap.add_argument('--ply-min', type=int, default=0)
+    ap.add_argument('--ply-max', type=int, default=60)
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--batch-size', type=int, default=2048)
     ap.add_argument('--lr', type=float, default=1e-3)

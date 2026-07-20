@@ -41,8 +41,8 @@ NUM_TRAIN=${2:-20000}
 NUM_TEST=${3:-5000}
 MAX_DEPTH=${4:-15}
 MIN_LEAF=${5:-50}
-PLY_MIN=${6:-10}
-PLY_MAX=${7:-50}
+PLY_MIN=${6:-0}
+PLY_MAX=${7:-60}
 TOP_K=${8:-50}
 
 case "${VARIANT}" in
