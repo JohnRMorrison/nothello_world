@@ -334,39 +334,46 @@ def build_line_growth_sequence(game, target_cell, direction, model,
 
 def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
                               min_line, block_size, pos_to_token, device,
-                              seed=0):
-    """Search regular games for a position where the model puts >= min_prob
+                              seed=0, top_k=5):
+    """Search regular games for positions where the model puts >= min_prob
     on an EMPTY cell C that has an opponent line of length >= min_line in
     some direction, with NO valid flank in any direction (C is illegal).
 
-    Returns dict with state, probs, target_cell, line_cells, direction,
-    or None.  Picks the highest-prob such case found.
+    Returns list of top_k dicts (best-scoring first) with state, probs,
+    target_cell, line_cells, direction.  Score = p_target * line_length.
     """
     rng = np.random.RandomState(seed)
-    best = None
-    best_score = -1.0
+    top = []   # list of (score, dict) — keep top_k
     n_scanned = 0
+
+    def maybe_push(score, entry):
+        top.append((score, entry))
+        top.sort(key=lambda x: x[0], reverse=True)
+        del top[top_k:]
+
+    def already_have_target(target_cell, game_id):
+        """Deduplicate: don't keep multiple entries from the same game +
+        same target cell (they'd all be the same position)."""
+        for _, e in top:
+            if (int(e['target_cell'][0]) == target_cell[0]
+                    and int(e['target_cell'][1]) == target_cell[1]
+                    and e['_game_id'] == game_id):
+                return True
+        return False
 
     for pkl in pickle_paths:
         with open(pkl, 'rb') as f:
             games = pickle.load(f)
-        # Shuffle order but deterministic
         order = rng.permutation(len(games))
         for gi in order:
             game = tuple(games[gi])
+            game_id = (pkl, int(gi))
             if n_scanned >= n_games:
                 break
             n_scanned += 1
-            # Scan mid/late-game positions; early game rarely has long lines
             for turn in range(15, min(len(game), 55)):
                 st = state_at_turn(game, turn).reshape(8, 8)
-                # state_at_turn(turn) is AFTER moves 0..turn played, so
-                # the next mover has parity (turn+1) % 2.  In absolute
-                # parity, BLACK (mover=+1) has parity 0.
                 mover = 1 if (turn + 1) % 2 == 0 else -1
-                # candidate cells: empty, not legal, with a long opp line
-                # Fetch probs only if we find a candidate to avoid wasted
-                # forward passes.
                 candidates = []
                 for cell in VALID_MOVES:
                     r, c = cell // 8, cell % 8
@@ -385,28 +392,34 @@ def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
                     p = float(probs[r, c])
                     if p < min_prob:
                         continue
+                    if already_have_target((r, c), game_id):
+                        continue
                     score = p * L
-                    if score > best_score:
-                        best_score = score
-                        best = {
-                            'state': st.astype(np.int8),
-                            'probs': probs.astype(np.float32),
-                            'target_cell': np.array([r, c], dtype=np.int32),
-                            'line_cells': np.array(cells, dtype=np.int32),
-                            'direction': np.array(d, dtype=np.int32),
-                            'game_prefix_len': turn,
-                            'p_target': p,
-                            'line_len': L,
-                            '_game': game,     # for line-growth follow-up
-                        }
+                    entry = {
+                        'state': st.astype(np.int8),
+                        'probs': probs.astype(np.float32),
+                        'target_cell': np.array([r, c], dtype=np.int32),
+                        'line_cells': np.array(cells, dtype=np.int32),
+                        'direction': np.array(d, dtype=np.int32),
+                        'game_prefix_len': turn,
+                        'p_target': p,
+                        'line_len': L,
+                        '_game': game,
+                        '_game_id': game_id,
+                    }
+                    maybe_push(score, entry)
             if n_scanned >= n_games:
                 break
         if n_scanned >= n_games:
             break
-    if best is not None:
-        print(f'  best: line_len={best["line_len"]} '
-               f'p_target={best["p_target"]:.4f}  (scanned {n_scanned} games)')
-    return best
+    print(f'  scanned {n_scanned} games; kept top {len(top)}')
+    for k, (sc, e) in enumerate(top):
+        tc = e['target_cell'].tolist()
+        print(f'    #{k+1}: line_len={e["line_len"]} '
+               f'p_target={e["p_target"]:.4f} '
+               f'target_cell=({tc[0]},{tc[1]}) '
+               f'turn={e["game_prefix_len"]} score={sc:.4f}')
+    return [entry for _, entry in top]
 
 
 # --------------------------------------------------------------------------
@@ -434,6 +447,8 @@ def main():
                     help='How many games (per pickle) to scan.')
     ap.add_argument('--min-prob', type=float, default=0.02)
     ap.add_argument('--min-line', type=int, default=3)
+    ap.add_argument('--flank-top-k', type=int, default=5,
+                    help='How many top no-flanker examples to keep.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -643,7 +658,7 @@ def main():
     pkls = pkls[:args.search_pickles]
     print(f'Searching {len(pkls)} pickle file(s), up to '
            f'{args.search_games} games each, for no-flanker-high-P case...')
-    flank = find_no_flanker_example(
+    flank_list = find_no_flanker_example(
         model, pkls,
         n_games=args.search_games,
         min_prob=args.min_prob,
@@ -652,11 +667,13 @@ def main():
         pos_to_token=pos_to_token,
         device=device,
         seed=args.search_seed,
+        top_k=args.flank_top_k,
     )
-    if flank is None:
+    if not flank_list:
         print('  no matching case found; figure 3 will be missing')
         fig3 = {}
     else:
+        flank = flank_list[0]   # winner used for the single-figure back-compat
         # Also compute the line-growth sequence: walk the winning game
         # and record positions where the opp-line length toward target
         # increases.
@@ -687,7 +704,19 @@ def main():
             growth_turns = np.zeros(0, dtype=np.int32)
             growth_line_lens = np.zeros(0, dtype=np.int32)
             growth_p_target = np.zeros(0, dtype=np.float32)
+        # Also pack the full top-K flank list.
+        K = len(flank_list)
+        top_flank_states = np.stack([e['state'] for e in flank_list]).astype(np.int8)
+        top_flank_probs = np.stack([e['probs'] for e in flank_list]).astype(np.float32)
+        top_flank_target_cells = np.stack([e['target_cell'] for e in flank_list])
+        top_flank_directions = np.stack([e['direction'] for e in flank_list])
+        top_flank_p = np.array([e['p_target'] for e in flank_list], dtype=np.float32)
+        top_flank_line_lens = np.array([e['line_len'] for e in flank_list], dtype=np.int32)
+        top_flank_turns = np.array([e['game_prefix_len'] for e in flank_list],
+                                        dtype=np.int32)
+
         fig3 = {
+            # single winner (back-compat)
             'flank_state': flank['state'],
             'flank_probs': flank['probs'],
             'flank_target_cell': flank['target_cell'],
@@ -695,6 +724,14 @@ def main():
             'flank_direction': flank['direction'],
             'flank_p_target': np.float32(flank['p_target']),
             'flank_line_len': np.int32(flank['line_len']),
+            # top-K flanks
+            'top_flank_states': top_flank_states,
+            'top_flank_probs': top_flank_probs,
+            'top_flank_target_cells': top_flank_target_cells,
+            'top_flank_directions': top_flank_directions,
+            'top_flank_p': top_flank_p,
+            'top_flank_line_lens': top_flank_line_lens,
+            'top_flank_turns': top_flank_turns,
             'growth_states': growth_states,
             'growth_probs': growth_probs,
             'growth_turns': growth_turns,
