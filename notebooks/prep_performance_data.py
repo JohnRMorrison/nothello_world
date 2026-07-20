@@ -323,20 +323,26 @@ def scan_monotonic_growth(game, target_cell, direction, mover_parity,
 
 
 def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
-                                     min_seq_len, seed=0, verbose=True):
+                                     min_seq_len, model, block_size,
+                                     pos_to_token, device,
+                                     min_final_p=0.05, seed=0, verbose=True):
     """Search for a game/target/direction where a monotonically increasing
-    opp-line toward `target_cell` unfolds over multiple same-parity
-    prediction points, and the target cell is always empty + has NO valid
-    flank.  Returns dict with game, target_cell, direction, mover_parity,
-    and the (turn, line_len) sequence.
+    opp-line toward `target_cell` unfolds over same-parity prediction
+    points, AND the model puts substantial probability on the target at
+    the final turn (>= min_final_p).
 
-    Ranks by len(sequence) * final_line_len; requires len(sequence) >=
-    min_seq_len and final_line_len >= min_line_final.
+    Returns dict with game, target_cell, direction, mover_parity, and
+    (turn, line_len, p_target) triples.
+
+    Score = p_final * sequence_length -- prefers cases with high P at
+    the longest line while also spanning many turns.
     """
     rng = np.random.RandomState(seed)
     best = None
     best_score = -1
     n_scanned = 0
+    n_candidates = 0
+
     for pkl in pickle_paths:
         with open(pkl, 'rb') as f:
             games = pickle.load(f)
@@ -347,6 +353,7 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                 break
             n_scanned += 1
             for target_cell in VALID_MOVES:
+                r, c = target_cell // 8, target_cell % 8
                 for direction in DIRS:
                     for mover_parity in (0, 1):
                         seq = scan_monotonic_growth(
@@ -355,7 +362,23 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                             continue
                         if seq[-1][1] < min_line_final:
                             continue
-                        score = len(seq) * seq[-1][1]
+                        n_candidates += 1
+                        # Compute P at the FINAL turn only (cheap first-pass
+                        # filter).  If below threshold, skip full sequence.
+                        t_final, L_final = seq[-1]
+                        p_final = float(probs_at_turn(
+                            model, game, t_final, block_size,
+                            pos_to_token, device).reshape(8, 8)[r, c])
+                        if p_final < min_final_p:
+                            continue
+                        # Now compute P at every turn in the sequence.
+                        seq_with_p = []
+                        for (t, L) in seq:
+                            p = float(probs_at_turn(
+                                model, game, t, block_size,
+                                pos_to_token, device).reshape(8, 8)[r, c])
+                            seq_with_p.append((t, L, p))
+                        score = p_final * len(seq)
                         if score > best_score:
                             best_score = score
                             best = {
@@ -363,21 +386,23 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                 'target_cell': target_cell,
                                 'direction': direction,
                                 'mover_parity': mover_parity,
-                                'sequence': seq,
+                                'sequence': seq_with_p,
                                 'pickle': pkl,
                                 'game_index': int(gi),
                             }
                             if verbose:
-                                print(f'  new best game={gi}, '
-                                       f'target={target_cell}, '
-                                       f'dir={direction}, seq_len='
-                                       f'{len(seq)}, final_L={seq[-1][1]}',
+                                print(f'  new best game={gi} '
+                                       f'target={target_cell} '
+                                       f'dir={direction}: seq_len='
+                                       f'{len(seq)} final_L='
+                                       f'{L_final} p_final={p_final:.3f}',
                                        flush=True)
             if n_scanned >= n_games:
                 break
         if n_scanned >= n_games:
             break
-    print(f'  scanned {n_scanned} games for monotonic growth')
+    print(f'  scanned {n_scanned} games; '
+           f'{n_candidates} candidates met (line+seq_len) filter')
     return best
 
 
@@ -506,6 +531,10 @@ def main():
                           'sequence.')
     ap.add_argument('--growth-min-final', type=int, default=3,
                     help='Minimum final line length in the sequence.')
+    ap.add_argument('--growth-min-final-p', type=float, default=0.05,
+                    help='Minimum P(target) at the final turn of a '
+                          'monotonic-growth sequence to consider it a '
+                          'valid candidate.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -741,6 +770,11 @@ def main():
             n_games=args.growth_n_games,
             min_line_final=args.growth_min_final,
             min_seq_len=args.growth_min_seq,
+            model=model,
+            block_size=block_size,
+            pos_to_token=pos_to_token,
+            device=device,
+            min_final_p=args.growth_min_final_p,
             seed=args.search_seed,
         )
         if mono is None:
@@ -762,7 +796,7 @@ def main():
             turns_list = []
             lens_list = []
             p_target_list = []
-            for (t, L) in mono['sequence']:
+            for (t, L, _p) in mono['sequence']:
                 st = state_at_turn(mono_game, t).reshape(8, 8)
                 pr = probs_at_turn(model, mono_game, t, block_size,
                                        pos_to_token, device).reshape(8, 8)
