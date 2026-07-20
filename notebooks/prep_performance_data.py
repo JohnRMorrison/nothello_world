@@ -381,17 +381,36 @@ def main():
                                             ).reshape(8, 8)[C // 8, C % 8])
         picked_t_L = t_L
     else:
-        # Sanity-check P_I inference is working (compute it on adv[0]
-        # regardless of whether t_L exists).
+        # Full inference sanity check on adv[0].
         _game0 = tuple(adv_games[0])
         _T0 = int(adv_turns[0])
         _C0 = int(adv_illegal[0])
-        _P_I0 = float(probs_at_turn(model, _game0, _T0, block_size,
-                                        pos_to_token, device
-                                       ).reshape(8, 8)[_C0 // 8, _C0 % 8])
-        print(f'DIAG adv[0]: game_len={len(_game0)}, T={_T0}, C={_C0}, '
-               f'P(C at T) = {_P_I0:.4f}  <-- should be nontrivial '
-               f'(argmax was C=illegal)')
+        _p_full = probs_at_turn(model, _game0, _T0, block_size,
+                                    pos_to_token, device)
+        _top5 = np.argsort(_p_full)[::-1][:5]
+        print(f'DIAG adv[0]: game_len={len(_game0)}, T={_T0}, C={_C0}')
+        print(f'  P(cell {_C0}) [claimed illegal argmax] = {_p_full[_C0]:.4f}')
+        print(f'  Top-5 cells by our P: '
+               f'{[(int(c), float(_p_full[c])) for c in _top5]}')
+        print(f'  game[T]           = {_game0[_T0]!r}  '
+               f'(actual next move in the recorded game)')
+        # Also test the alternate convention: feed game[:T+1], read logits[T]
+        # (in case mingpt output at position i predicts token i, not i+1).
+        _alt_tokens = tokenize_games(
+            [_game0[:min(_T0 + 1, block_size)]], seq_len=block_size).to(device)
+        with torch.no_grad():
+            _alt_logits, _ = model(_alt_tokens)
+        _alt_probs = F.softmax(_alt_logits[0, _T0, :], dim=-1).cpu().numpy()
+        _alt_p = np.zeros(64, dtype=np.float32)
+        for cell in VALID_MOVES:
+            tok = int(pos_to_token[cell])
+            if tok >= 0:
+                _alt_p[cell] = _alt_probs[tok]
+        _alt_p /= max(_alt_p.sum(), 1e-9)
+        _alt_top5 = np.argsort(_alt_p)[::-1][:5]
+        print(f'  ALT (feed T+1 tokens, read logits[T]):')
+        print(f'    P(cell {_C0}) = {_alt_p[_C0]:.4f}')
+        print(f'    Top-5:        {[(int(c), float(_alt_p[c])) for c in _alt_top5]}')
         print(f'Searching {args.adv_search_k} adversarial records for a '
                f'high-persistence example (P_I >= {args.adv_min_p_i})...')
         best = None
