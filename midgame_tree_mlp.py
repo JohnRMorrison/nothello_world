@@ -535,6 +535,11 @@ def main():
                           'entirely.  Useful when only running legal-move '
                           'probes and the state probe would be wasted '
                           'compute.')
+    ap.add_argument('--skip-inline-legal-probe', action='store_true',
+                    help='Skip the in-job legal-move probe(s).  Trees are '
+                          'still fit and saved.  Use this when the real '
+                          'legal probe will be trained afterward via the '
+                          'streaming pipeline on more games.')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
@@ -1385,6 +1390,35 @@ def main():
     # Legal-move task: three predictors.
     # ------------------------------------------------------------------
     legal_results = {}
+
+    def _save_checkpoint():
+        torch.save({
+            'W': mlp.W.cpu() if not args.skip_tree_fit else None,
+            'b': mlp.b.cpu() if not args.skip_tree_fit else None,
+            'probe_state': probe.state_dict() if probe is not None else None,
+            'path_info': all_meta,
+            'per_cell_leaf_counts': per_cell_leaf_counts
+                if not args.skip_tree_fit else None,
+            'per_cell_tree_acc': tree_correct_per_cell.tolist()
+                if not args.skip_tree_fit else None,
+            'per_class_probe_acc': cls_break,
+            'args': vars(args),
+            'test_acc': acc_te, 'train_acc': acc_tr,
+            'by_ply': by_ply,
+            'legal_results': legal_results,
+        }, args.out)
+
+    # Save immediately after tree fit + state probe, BEFORE the inline
+    # legal probe.  Guarantees the trees survive even if the legal
+    # probe hits the SLURM wall clock.
+    _save_checkpoint()
+    print(f'\nsaved (pre-legal) {args.out}')
+
+    if args.skip_inline_legal_probe:
+        print('--skip-inline-legal-probe set; exiting without training '
+               'the legal probe.  Use the streaming pipeline instead.')
+        return
+
     if args.task != 'state':
         L_tr = torch.from_numpy(Lnp_tr)
         L_te = torch.from_numpy(Lnp_te)
@@ -1693,21 +1727,7 @@ def main():
             print(f'\nskipping state_probor legal (requires state probe + '
                    f'--include-flanking-patterns)')
 
-    torch.save({
-        'W': mlp.W.cpu() if not args.skip_tree_fit else None,
-        'b': mlp.b.cpu() if not args.skip_tree_fit else None,
-        'probe_state': probe.state_dict() if probe is not None else None,
-        'path_info': all_meta,
-        'per_cell_leaf_counts': per_cell_leaf_counts
-            if not args.skip_tree_fit else None,
-        'per_cell_tree_acc': tree_correct_per_cell.tolist()
-            if not args.skip_tree_fit else None,
-        'per_class_probe_acc': cls_break,
-        'args': vars(args),
-        'test_acc': acc_te, 'train_acc': acc_tr,
-        'by_ply': by_ply,
-        'legal_results': legal_results,
-    }, args.out)
+    _save_checkpoint()
     print(f'\nsaved {args.out}')
 
 
