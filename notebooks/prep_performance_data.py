@@ -123,30 +123,46 @@ def legal_at_turn(game, t):
 # Figure 1 & 2: adversarial position + triptych
 # --------------------------------------------------------------------------
 
-def find_t_L(game, T, C_illegal, verbose=False):
-    """Return the last same-parity 'prediction point' t <= T-2 where the
-    NEXT move (t+1) could have been C.
+def find_t_L_and_transition(game, T, C_illegal, verbose=False):
+    """Return (t_L, t_transition, legal_after) or (None, None, None).
 
-    In the adversarial-record convention, T is the last-played turn index
-    and the model's illegal argmax was for move T+1.  A same-parity
-    earlier prediction point t (t < T, t == T mod 2) is one where the
-    model was predicting a move of the same parity as C.  We want C to
-    have been in the legal-moves-after-game[:t+1] at that point.
+    t_L: last same-parity prediction point <= T-2 where C was legal (in
+         legal_after[t_L]).
+    t_transition: earliest same-parity prediction point t > t_L where C
+         is NOT in legal_after[t] -- i.e., C 'became illegal' at
+         t_transition and stayed illegal through T.
     """
     board = OthelloBoardState()
-    legal_after = {}      # legal_after[t] = legals after playing game[0..t]
+    legal_after = {}
     for t in range(T + 1):
         try:
             board.umpire(int(game[t]))
         except Exception as e:
             if verbose:
                 print(f'    umpire failed at t={t} mv={game[t]}: {e}')
-            return None
+            return None, None, None
         legal_after[t] = set(board.get_valid_moves())
+    t_L = None
     for t in range(T - 2, -1, -2):
         if C_illegal in legal_after.get(t, set()):
-            return t
-    return None
+            t_L = t
+            break
+    if t_L is None:
+        return None, None, None
+    # Walk FORWARD from t_L in same-parity steps, find first turn where
+    # C is illegal.
+    t_transition = None
+    for t in range(t_L + 2, T + 1, 2):
+        if C_illegal not in legal_after.get(t, set()):
+            t_transition = t
+            break
+    return t_L, t_transition, legal_after
+
+
+def find_t_L(game, T, C_illegal, verbose=False):
+    """Back-compat wrapper for callers that only need t_L."""
+    t_L, _, _ = find_t_L_and_transition(game, T, C_illegal, verbose)
+    return t_L
 
 
 def score_persistence_record(game, T, C, model, block_size, pos_to_token,
@@ -255,6 +271,67 @@ def longest_opp_line(state_8x8, r, c, mover_color):
     return best_len, best_dir, best_cells
 
 
+def line_len_from_cell(state_8x8, r, c, dr, dc, mover_color):
+    """How many consecutive opp pieces from (r+dr, c+dc) in direction (dr, dc)?"""
+    opp = -mover_color
+    rr, cc = r + dr, c + dc
+    n = 0
+    while 0 <= rr < 8 and 0 <= cc < 8 and state_8x8[rr, cc] == opp:
+        n += 1
+        rr += dr
+        cc += dc
+    return n
+
+
+def build_line_growth_sequence(game, target_cell, direction, model,
+                                 block_size, pos_to_token, device,
+                                 min_ply=5):
+    """Walk through same-parity prediction points from the mover-of-target,
+    record each unique opp-line length in `direction` from `target_cell`,
+    with the model's per-cell probs at that turn.
+
+    Returns list of dicts (one per distinct line length seen).  Ordered by
+    increasing line length.
+    """
+    r, c = target_cell // 8, target_cell % 8
+    dr, dc = direction
+    board = OthelloBoardState()
+    legal_after = {}
+    state_after = {}
+    for t in range(len(game)):
+        try:
+            board.umpire(int(game[t]))
+        except Exception:
+            break
+        legal_after[t] = set(board.get_valid_moves())
+        state_after[t] = np.asarray(board.state, dtype=np.int8).reshape(8, 8).copy()
+
+    # Same parity as the winning target-cell's mover.  At each prediction
+    # point t, mover for the next move is (t+1) % 2 (in absolute-parity
+    # convention: 0=black, 1=white).
+    seen = {}   # line_len -> (t, state, probs)
+    T_max = max(state_after)
+    for t in sorted(state_after):
+        if t < min_ply:
+            continue
+        st = state_after[t]
+        mover = 1 if (t + 1) % 2 == 0 else -1   # who plays next
+        # Only count when the target cell is empty and the same mover is next
+        if st[r, c] != 0:
+            continue
+        n_opps = line_len_from_cell(st, r, c, dr, dc, mover)
+        if n_opps < 1:
+            continue
+        if n_opps in seen:
+            continue
+        probs = probs_at_turn(model, game, t, block_size,
+                                 pos_to_token, device).reshape(8, 8)
+        seen[n_opps] = {'t': t, 'state': st.copy(),
+                         'probs': probs.astype(np.float32),
+                         'p_target': float(probs[r, c])}
+    return [seen[k] for k in sorted(seen)]
+
+
 def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
                               min_line, block_size, pos_to_token, device,
                               seed=0):
@@ -283,7 +360,10 @@ def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
             # Scan mid/late-game positions; early game rarely has long lines
             for turn in range(15, min(len(game), 55)):
                 st = state_at_turn(game, turn).reshape(8, 8)
-                mover = 1 if turn % 2 == 0 else -1
+                # state_at_turn(turn) is AFTER moves 0..turn played, so
+                # the next mover has parity (turn+1) % 2.  In absolute
+                # parity, BLACK (mover=+1) has parity 0.
+                mover = 1 if (turn + 1) % 2 == 0 else -1
                 # candidate cells: empty, not legal, with a long opp line
                 # Fetch probs only if we find a candidate to avoid wasted
                 # forward passes.
@@ -317,6 +397,7 @@ def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
                             'game_prefix_len': turn,
                             'p_target': p,
                             'line_len': L,
+                            '_game': game,     # for line-growth follow-up
                         }
             if n_scanned >= n_games:
                 break
@@ -440,7 +521,7 @@ def main():
             if T < 2:
                 continue
             try:
-                t_L = find_t_L(game, T, C)
+                t_L, t_trans, _ = find_t_L_and_transition(game, T, C)
             except Exception:
                 continue
             if t_L is None:
@@ -462,8 +543,8 @@ def main():
                                          ).reshape(8, 8)[Cr, Cc])
             retention = P_I / max(P_L, 1e-6)
             score = P_I * retention
-            top10.append((score, i, t_L, P_L, P_I))
-            top10.sort(reverse=True)
+            top10.append((score, i, t_L, t_trans, P_L, P_I))
+            top10.sort(key=lambda x: x[0], reverse=True)
             top10 = top10[:10]
             if score > best_score:
                 best_score = score
@@ -477,46 +558,81 @@ def main():
         print(f'\nSearch summary: scanned {min(args.adv_search_k, len(adv_games))}, '
                f'{n_have_tL} had t_L, max P_I seen = {max_p_i_seen:.3f}')
         print('Top 10 by score:')
-        for sc, ii, tl, pl, pi in top10:
-            print(f'  i={ii}  P_L={pl:.4f}  P_I={pi:.4f}  '
+        for sc, ii, tl, tt, pl, pi in top10:
+            print(f'  i={ii}  t_L={tl}  t_transition={tt}  '
+                   f'P_L={pl:.4f}  P_I={pi:.4f}  '
                    f'retention={pi/max(pl,1e-6):.3f}  score={sc:.4f}')
-        if best is None:
+        if best is None or not top10:
             raise SystemExit(f'no adversarial record met P_I >= {args.adv_min_p_i}. '
                               f'Max P_I seen among {n_have_tL} candidates with t_L '
                               f'was {max_p_i_seen:.4f}. Try --adv-min-p-i {max_p_i_seen/2:.3f}')
-        picked_idx, picked_t_L, picked_P_L, picked_P_I = best
-        game = tuple(adv_games[picked_idx])
-        T = int(adv_turns[picked_idx])
-        C = int(adv_illegal[picked_idx])
 
-    print(f'Picked adv[{picked_idx}]: T={T} C={C} t_L={picked_t_L} '
-           f'P_L={picked_P_L:.4f} P_I={picked_P_I:.4f} '
-           f'retention={picked_P_I / max(picked_P_L, 1e-6):.3f}')
+    # --- Build the top-5 payload: 3 boards per record (t_L, t_trans, T) ---
+    top_k = min(5, len(top10)) if args.adv_index is None else 1
+    top_states = np.zeros((top_k, 3, 8, 8), dtype=np.int8)
+    top_probs = np.zeros((top_k, 3, 8, 8), dtype=np.float32)
+    top_turns = np.zeros((top_k, 3), dtype=np.int32)
+    top_legal_at = np.zeros((top_k, 3), dtype=np.uint8)   # is C legal at each moment
+    top_illegal_cells = np.zeros((top_k, 2), dtype=np.int32)
+    top_indices = np.zeros(top_k, dtype=np.int64)
+    top_P_L = np.zeros(top_k, dtype=np.float32)
+    top_P_I = np.zeros(top_k, dtype=np.float32)
 
-    trip = build_triptych_for_index(game, T, C, picked_t_L, model,
-                                          block_size, pos_to_token, device)
-    if trip is None:
-        raise SystemExit(f'record {picked_idx} has no valid t_next')
+    if args.adv_index is not None:
+        selection = [(0, picked_idx, picked_t_L, picked_t_L, picked_P_L, picked_P_I)]
+    else:
+        selection = [(k, top10[k][1], top10[k][2],
+                       top10[k][3] if top10[k][3] is not None else top10[k][2] + 2,
+                       top10[k][4], top10[k][5]) for k in range(top_k)]
 
-    C_illegal = int(adv_illegal[picked_idx])
-    Cr, Cc = C_illegal // 8, C_illegal % 8
+    for k, i, tl, tt, pl, pi in selection:
+        game_k = tuple(adv_games[i])
+        Tk = int(adv_turns[i])
+        Ck = int(adv_illegal[i])
+        Cr, Cc = Ck // 8, Ck % 8
 
-    # Figure 1 data = middle of triptych (t_I)
+        # Compute legal-after for legality checks per moment
+        _, _, legal_after = find_t_L_and_transition(game_k, Tk, Ck)
+        if legal_after is None:
+            continue
+
+        # Ensure t_trans is bounded to <= T
+        if tt is None or tt > Tk:
+            tt = Tk
+
+        moments = [tl, tt, Tk]
+        for m, t in enumerate(moments):
+            top_states[k, m] = state_at_turn(game_k, t).reshape(8, 8)
+            top_probs[k, m] = probs_at_turn(model, game_k, t, block_size,
+                                                pos_to_token, device).reshape(8, 8)
+            top_turns[k, m] = t
+            top_legal_at[k, m] = int(Ck in legal_after.get(t, set()))
+        top_illegal_cells[k] = np.array([Cr, Cc], dtype=np.int32)
+        top_indices[k] = i
+        top_P_L[k] = pl
+        top_P_I[k] = pi
+
+    # Figure 1 kept for back-compat (middle moment of #1)
     fig1 = {
-        'adv_state': trip['states'][1],
-        'adv_probs': trip['probs'][1],
-        'adv_illegal_cell': np.array([Cr, Cc], dtype=np.int32),
-        'adv_turn': trip['turns'][1],
-        'adv_index': np.int64(picked_idx),
+        'adv_state': top_states[0, 1],
+        'adv_probs': top_probs[0, 1],
+        'adv_illegal_cell': top_illegal_cells[0],
+        'adv_turn': top_turns[0, 1],
+        'adv_index': top_indices[0],
     }
 
-    # Triptych data
+    # Top-5 payload (3 boards each) -- this is what the notebook uses
     fig2 = {
-        'trip_states': trip['states'],
-        'trip_probs': trip['probs'],
-        'trip_turns': trip['turns'],
-        'trip_labels': trip['labels'],
-        'trip_illegal_cell': np.array([Cr, Cc], dtype=np.int32),
+        'top_states': top_states,
+        'top_probs': top_probs,
+        'top_turns': top_turns,
+        'top_legal_at': top_legal_at,
+        'top_illegal_cells': top_illegal_cells,
+        'top_indices': top_indices,
+        'top_P_L': top_P_L,
+        'top_P_I': top_P_I,
+        'top_labels': np.array(['t_L (C legal)', 't_transition (C becomes illegal)',
+                                 'T (adversarial move)'], dtype=object),
     }
 
     # --- figure 3: search regular games ---
@@ -541,6 +657,36 @@ def main():
         print('  no matching case found; figure 3 will be missing')
         fig3 = {}
     else:
+        # Also compute the line-growth sequence: walk the winning game
+        # and record positions where the opp-line length toward target
+        # increases.
+        target_cell = int(flank['target_cell'][0] * 8 + flank['target_cell'][1])
+        direction = tuple(int(x) for x in flank['direction'])
+        winning_game_idx = flank.get('game_index', 0)
+        # We need the game itself.  flank['state'] etc. is a snapshot; we
+        # cached game_prefix_len but not the game.  Re-run to find it.
+        # For now, use the game the flank was found in.
+        winning_game = flank['_game']
+        seq = build_line_growth_sequence(
+            winning_game, target_cell, direction, model, block_size,
+            pos_to_token, device)
+        print(f'  line-growth: found {len(seq)} distinct line lengths '
+               f'({[s["p_target"] for s in seq] if seq else "none"})')
+        # Pack sequence as arrays
+        if seq:
+            growth_states = np.stack([s['state'] for s in seq]).astype(np.int8)
+            growth_probs = np.stack([s['probs'] for s in seq]).astype(np.float32)
+            growth_turns = np.array([s['t'] for s in seq], dtype=np.int32)
+            growth_line_lens = np.array(list(range(1, len(seq) + 1)),
+                                            dtype=np.int32)
+            growth_p_target = np.array([s['p_target'] for s in seq],
+                                            dtype=np.float32)
+        else:
+            growth_states = np.zeros((0, 8, 8), dtype=np.int8)
+            growth_probs = np.zeros((0, 8, 8), dtype=np.float32)
+            growth_turns = np.zeros(0, dtype=np.int32)
+            growth_line_lens = np.zeros(0, dtype=np.int32)
+            growth_p_target = np.zeros(0, dtype=np.float32)
         fig3 = {
             'flank_state': flank['state'],
             'flank_probs': flank['probs'],
@@ -549,6 +695,11 @@ def main():
             'flank_direction': flank['direction'],
             'flank_p_target': np.float32(flank['p_target']),
             'flank_line_len': np.int32(flank['line_len']),
+            'growth_states': growth_states,
+            'growth_probs': growth_probs,
+            'growth_turns': growth_turns,
+            'growth_line_lens': growth_line_lens,
+            'growth_p_target': growth_p_target,
         }
 
     # --- save ---
