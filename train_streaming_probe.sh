@@ -46,7 +46,7 @@ BATCH_SIZE=${BATCH_SIZE:-2048}
 LR=${LR:-1e-3}
 PLY_MIN=${PLY_MIN:-0}
 PLY_MAX=${PLY_MAX:-60}
-RECENT_KS=${RECENT_KS:-1,2,5,10,20}
+RECENT_KS=${RECENT_KS-1,2,5,10,20}
 RELU_FLAG=""
 if [ -n "${USE_RELU:-}" ]; then
     RELU_FLAG="--use-relu"

@@ -281,20 +281,23 @@ def main():
         epoch_batches = 0
         for ci, ci_idx in enumerate(order):
             pf = train_subset[ci_idx]
+            print(f'  [{ci + 1}/{len(order)}] starting {os.path.basename(pf)} '
+                   f'(cumulative {time.time() - t0:.0f}s)', flush=True)
             t_load = time.time()
             X, S, T, L = process_pickle_chunk(pf, args.ply_min, args.ply_max,
                                                   recent_Ks=recent_Ks)
             if X is None:
                 continue
             N = X.shape[0]
-            print(f'  [{ci + 1}/{len(order)}] {os.path.basename(pf)}: '
-                   f'{N} positions  (load+extract '
-                   f'{time.time() - t_load:.1f}s)')
+            print(f'    loaded {N} positions in {time.time() - t_load:.1f}s',
+                    flush=True)
             t_hidden = time.time()
             # Process in mini-batches so we don't materialize the full
             # H matrix for the pickle at once (48K columns × 4M rows
             # would blow memory).
             perm = np.random.RandomState(epoch * 100 + ci).permutation(N)
+            n_batches = (N + args.batch_size - 1) // args.batch_size
+            batch_idx = 0
             for i in range(0, N, args.batch_size):
                 idx = perm[i:i + args.batch_size]
                 X_batch = X[idx]
@@ -309,9 +312,17 @@ def main():
                 loss = F.binary_cross_entropy(probs, L_batch)
                 opt.zero_grad(); loss.backward(); opt.step()
                 epoch_loss += loss.item(); epoch_batches += 1
+                batch_idx += 1
+                # Intra-chunk heartbeat every 256 batches so we know we're
+                # not stuck.
+                if batch_idx % 256 == 0:
+                    print(f'      batch {batch_idx}/{n_batches}  '
+                           f'({time.time() - t_hidden:.1f}s so far, '
+                           f'loss={loss.item():.4f})', flush=True)
             del X, S, T, L
             print(f'    trained ({time.time() - t_hidden:.1f}s;   '
-                   f'cumulative time {time.time() - t0:.0f}s)')
+                   f'cumulative time {time.time() - t0:.0f}s)',
+                    flush=True)
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f'  epoch {epoch} avg loss: {avg_loss:.4f}')
         print(f'  eval on {os.path.basename(test_pickle)}...')
