@@ -251,7 +251,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --probe-seeds 5 \
     --task both \
     --tree-target ${TREE_TARGET} \
-    --legal-modes ${LEGAL_MODES_OVERRIDE:-bce,probor,derived,state_probor,patterns_probor,patterns_structured_probor,cells_structured_probor,patterns_linear_probor} \
+    --legal-modes ${LEGAL_MODES_OVERRIDE:-patterns_structured_probor} \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \
     ${PICKLE_ARG} \
