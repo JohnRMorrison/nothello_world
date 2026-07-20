@@ -207,6 +207,14 @@ echo "task:              both"
 echo "============================================"
 
 TREE_TARGET=${TREE_TARGET:-state}
+# For any pattern-tree variant (--tree-target patterns), skip BCE/probOR on
+# the enormous 47K-unit hidden layer (~2h each × 5 seeds), and only train
+# Linear->ProbOR (the readout we care about).  State-tree variants keep the
+# full 8-mode default so DerivS + StatPO + BCE etc. all get their numbers.
+if [[ "${RECENT_ARG:-}" == *"--tree-target patterns"* ]] \
+        && [ -z "${LEGAL_MODES_OVERRIDE:-}" ]; then
+    LEGAL_MODES_OVERRIDE="patterns_structured_probor"
+fi
 # Pass PICKLE_DIR env var to load synthetic games from disk instead of
 # playing them from scratch.  Enables scaling to millions of games in
 # minutes instead of days.
@@ -251,7 +259,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --probe-seeds 5 \
     --task both \
     --tree-target ${TREE_TARGET} \
-    --legal-modes ${LEGAL_MODES_OVERRIDE:-patterns_structured_probor} \
+    --legal-modes ${LEGAL_MODES_OVERRIDE:-bce,probor,derived,state_probor,patterns_probor,patterns_structured_probor,cells_structured_probor,patterns_linear_probor} \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \
     ${PICKLE_ARG} \
