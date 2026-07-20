@@ -125,31 +125,47 @@ def legal_at_turn(game, turn):
 
 def pick_adversarial_triptych(game, T_illegal, C_illegal, model, block_size,
                                 pos_to_token, device):
-    """Pick the (t_L, t_I, t_next) triptych for the given adversarial record.
+    """Pick a (t_prev, t_I, t_next) triptych around the adversarial choice.
 
-    t_I     = T_illegal (the turn at which the model chose illegal C)
-    t_L     = last legal same-parity turn before t_I where C was legal
-    t_next  = t_I + 2 (next same-parity turn)  (falls back to t_I + 1)
+    t_prev  = T_illegal - 2 (same-parity previous turn).  If <0, uses T-1.
+    t_I     = T_illegal (turn at which model chose illegal C)
+    t_next  = T_illegal + 2 (same-parity next turn).  If >=len(game), T+1.
 
-    Returns dict with per-turn state, probs, label; or None if no valid t_L.
+    Also tries to find C's last-legal same-parity turn as t_L (bonus:
+    a more meaningful 'before' if one exists).  Falls back to t_prev
+    otherwise.
+
+    Returns dict with per-turn state, probs, label; or None if T is too
+    close to game boundaries.
     """
-    parity = T_illegal % 2
     legals = {t: legal_at_turn(game, t) for t in range(T_illegal + 1)}
-    # walk backwards from T_illegal - 2 (same parity) to find last legal
-    t_L = None
+
+    # Preferred 'before' turn: last same-parity turn where C was legal.
+    t_before = None
     for t in range(T_illegal - 2, -1, -2):
         if C_illegal in legals[t]:
-            t_L = t
+            t_before = t
             break
-    if t_L is None:
+    # Fallback: same-parity previous turn (regardless of C's legality).
+    if t_before is None:
+        for cand in (T_illegal - 2, T_illegal - 1):
+            if cand >= 0:
+                t_before = cand
+                break
+    if t_before is None:
         return None
 
-    t_next = T_illegal + 2 if T_illegal + 2 < len(game) else T_illegal + 1
-    if t_next >= len(game):
+    # 'After' turn: prefer same parity.
+    t_next = None
+    for cand in (T_illegal + 2, T_illegal + 1):
+        if cand < len(game):
+            t_next = cand
+            break
+    if t_next is None:
         return None
 
-    turns = [t_L, T_illegal, t_next]
-    labels = ['legal', 'illegal chosen', 'after']
+    turns = [t_before, T_illegal, t_next]
+    labels = ['before', 'illegal chosen', 'after']
     states = np.stack([state_at_turn(game, t).reshape(8, 8) for t in turns])
     probs = np.stack([probs_at_turn(model, game, t, block_size,
                                        pos_to_token, device).reshape(8, 8)
