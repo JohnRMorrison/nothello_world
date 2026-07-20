@@ -46,6 +46,102 @@ from flanking_patterns import (
 )
 
 
+# --------------------------------------------------------------------------
+# chunk_ext_*.npz fast path: no OthelloBoardState replay
+# --------------------------------------------------------------------------
+# The 40 chunk_ext_*.npz files under
+#   experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks/
+# hold ~24M pre-simulated games' worth of positions, with:
+#   features  (N, 180) float16 — [played(60), when(60), even(60)]
+#   labels    (N, 64)  int8    — board state, {0=empty, 1=white, 2=black}
+#   positions (N,)     uint8   — turn index (state AFTER move t)
+# The chunk position convention differs from the streaming/pickle convention
+# by exactly 1: chunk position t == streaming position t+1 (since streaming
+# extracts features "before" the move, chunk stores "after" the move).
+
+_PATTERN_ARRAYS_CACHE = None
+
+
+def _get_pattern_arrays():
+    global _PATTERN_ARRAYS_CACHE
+    if _PATTERN_ARRAYS_CACHE is None:
+        from hand_crafted_flanking import enumerate_flanking_patterns
+        from generate_rule_games import precompute_pattern_arrays
+        pats = enumerate_flanking_patterns()
+        _PATTERN_ARRAYS_CACHE = precompute_pattern_arrays(pats)
+    return _PATTERN_ARRAYS_CACHE
+
+
+def process_chunk_ext_file(chunk_path, ply_min, ply_max,
+                              canonicalize_mover=False):
+    """Load one chunk_ext_*.npz file, return (X, S, T, L) as np arrays.
+
+    X: (N, 121) float32 — [played(60), even-or-placed_as_mover(60), mp(1)].
+    S: (N, 64)  int64   — mover-relative state labels (1=mine, 2=opp).
+    T: (N,)     int32   — streaming-convention ply (chunk_position + 1).
+    L: (N, 64)  uint8   — legal-move mask derived from 960 flanking patterns.
+    """
+    from train_pattern_simple import compute_pattern_labels_batch
+
+    z = np.load(chunk_path)
+    positions = z['positions'].astype(np.int64)
+    # chunk position t <=> streaming position t + 1
+    stream_lo = ply_min
+    stream_hi = ply_max
+    chunk_lo = stream_lo - 1
+    chunk_hi = stream_hi - 1
+    mask = (positions >= chunk_lo) & (positions < chunk_hi)
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        z.close()
+        return None, None, None, None
+
+    positions = positions[idx]
+    features = np.asarray(z['features'][idx]).astype(np.float32)
+    labels = np.asarray(z['labels'][idx]).astype(np.int8)
+    z.close()
+
+    stream_pos = (positions + 1).astype(np.int32)
+    played = features[:, :60]                    # (N, 60)
+    even = features[:, 120:180]                  # (N, 60)
+
+    N = len(features)
+    X = np.zeros((N, 121), dtype=np.float32)
+    X[:, :60] = played
+    mover_parity = (stream_pos % 2).astype(np.float32)  # (N,)
+    if canonicalize_mover:
+        # placed_as_mover: cell placed by whichever side is now to move.
+        # Cell was placed at even step  <=>  even[c] == 1  <=>  step parity 0.
+        # Streaming position T is played by parity T % 2, so mover_parity = T % 2.
+        # placed_as_mover = played AND (step_parity == mover_parity)
+        # step_parity == 0  <=>  even == 1  <=>  1 - even == mover_parity when mp == 0
+        # Equivalently: placed_as_mover = played * (even == (1 - mover_parity))
+        target_even = (1.0 - mover_parity)[:, None]      # (N, 1)
+        placed_as_mover = played * (even == target_even)
+        X[:, 60:120] = placed_as_mover
+        # feat[120] stays 0 for canonical (parity baked into cell bits).
+    else:
+        X[:, 60:120] = even
+        X[:, 120] = mover_parity
+
+    # 960-d pattern legality via the vectorized numpy path.
+    targets, terminals, opp_cells, opp_mask = _get_pattern_arrays()
+    pat_labels = compute_pattern_labels_batch(
+        labels, positions, targets, terminals, opp_cells, opp_mask
+    )  # (N, 960) float32
+
+    # 64-d legal-move mask: L[c] = any pattern with target==c fires.
+    L = np.zeros((N, BOARD_CELLS), dtype=np.uint8)
+    for c in range(BOARD_CELLS):
+        pat_ids = np.where(targets == c)[0]
+        if len(pat_ids) > 0:
+            L[:, c] = (pat_labels[:, pat_ids] > 0).any(axis=1).astype(np.uint8)
+
+    # State labels are not used by the streaming probe training loop
+    # (only X, T, L are consumed).  Return None to avoid the cost.
+    return X, None, stream_pos, L
+
+
 def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
     """Load one pickle file, replay each game, extract midgame positions.
 
@@ -144,10 +240,16 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
     return torch.cat(parts, dim=1)
 
 
-def evaluate(probe, eval_pickle, ply_min, ply_max, recent_Ks, mlp,
-                patterns, use_relu, device, batch=1024):
-    X, S, T, L = process_pickle_chunk(eval_pickle, ply_min, ply_max,
-                                          recent_Ks=recent_Ks)
+def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
+                patterns, use_relu, device, batch=1024,
+                use_chunk_ext=False, canonicalize_mover=False):
+    if use_chunk_ext:
+        X, S, T, L = process_chunk_ext_file(
+            eval_path, ply_min, ply_max,
+            canonicalize_mover=canonicalize_mover)
+    else:
+        X, S, T, L = process_pickle_chunk(eval_path, ply_min, ply_max,
+                                              recent_Ks=recent_Ks)
     N = X.shape[0]
     correct_total = 0
     correct_by_ply = defaultdict(lambda: [0, 0])
@@ -180,7 +282,23 @@ def evaluate(probe, eval_pickle, ply_min, ply_max, recent_Ks, mlp,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--load-trees-from', required=True)
-    ap.add_argument('--pickle-dir', required=True)
+    ap.add_argument('--data-source', default='pickle',
+                    choices=['pickle', 'chunk-ext'],
+                    help='pickle: replay games from data/othello_synthetic/*.pickle '
+                          '(slow, ~15+ min/pickle).  chunk-ext: load pre-simulated '
+                          'boards from experiments/.../chunk_ext_*.npz (fast, '
+                          'seconds/chunk).  chunk-ext is preferred unless the '
+                          'chunk files are missing.')
+    ap.add_argument('--pickle-dir', default='data/othello_synthetic')
+    ap.add_argument('--chunk-dir',
+                    default=('experiments/mathematical_transformation_experiments/'
+                             'heuristic_probe_results/feature_chunks'),
+                    help='Directory of chunk_ext_*.npz files (used only when '
+                          '--data-source chunk-ext).')
+    ap.add_argument('--canonicalize-mover', action='store_true',
+                    help='Use mover-relative encoding (placed_as_mover) in '
+                          'the 121-d input.  Required when loading trees '
+                          'trained with --canonicalize-mover.')
     ap.add_argument('--flanking-patterns',
                     default='hand_crafted_flanking_patterns.pt')
     ap.add_argument('--num-train-games', type=int, default=6_000_000)
@@ -225,18 +343,44 @@ def main():
             f'checkpoint tree input_dim={input_dim} > current featurizer '
             f'expected_dim={expected_dim} — recent-Ks may not match')
 
-    # Compute hidden dim by running one small batch through the pipeline.
-    files = sorted(glob.glob(os.path.join(args.pickle_dir, '*.pickle')))
-    if not files:
-        raise ValueError(f'no .pickle files in {args.pickle_dir}')
-    test_pickle = files[-1]
-    train_files = files[:-1]
-    print(f'{len(train_files)} train pickle files + 1 held-out for eval')
+    # Data-source selection: pickle (slow replay) or chunk-ext (fast npz).
+    use_chunk_ext = (args.data_source == 'chunk-ext')
+    if use_chunk_ext:
+        files = sorted(glob.glob(os.path.join(args.chunk_dir,
+                                                  'chunk_ext_*.npz')))
+        if not files:
+            raise ValueError(f'no chunk_ext_*.npz files in {args.chunk_dir}')
+        # Each chunk file holds ~600K games (~32M positions covering [5,59)).
+        games_per_file = 600_000
+        print(f'data source: chunk-ext  ({len(files)} chunk_ext files, '
+               f'~{games_per_file:,} games each)', flush=True)
+    else:
+        files = sorted(glob.glob(os.path.join(args.pickle_dir, '*.pickle')))
+        if not files:
+            raise ValueError(f'no .pickle files in {args.pickle_dir}')
+        games_per_file = 100_000
+        print(f'data source: pickle  ({len(files)} pickle files, '
+               f'~{games_per_file:,} games each)', flush=True)
 
-    # Warm up: process one pickle to figure hidden_dim.
-    print('warmup: processing first pickle to determine hidden dim...')
-    Xw, _, _, _ = process_pickle_chunk(train_files[0], args.ply_min,
-                                            args.ply_max, recent_Ks=recent_Ks)
+    test_file = files[-1]
+    train_files = files[:-1]
+    print(f'{len(train_files)} train files + 1 held-out for eval')
+
+    def load_chunk(path):
+        """Return (X, S, T, L) for one input file, regardless of source."""
+        if use_chunk_ext:
+            return process_chunk_ext_file(
+                path, args.ply_min, args.ply_max,
+                canonicalize_mover=args.canonicalize_mover)
+        return process_pickle_chunk(path, args.ply_min, args.ply_max,
+                                        recent_Ks=recent_Ks)
+
+    # Warm up: process one file to figure hidden_dim.
+    print(f'warmup: processing first file...', flush=True)
+    tw = time.time()
+    Xw, _, _, _ = load_chunk(train_files[0])
+    print(f'  warmup load: {time.time() - tw:.1f}s  '
+           f'positions={Xw.shape[0] if Xw is not None else 0}', flush=True)
     Xw_small = Xw[:64]
     H_small = build_hidden_layer_batch(Xw_small, mlp, patterns,
                                             recent_Ks, args.use_relu, device)
@@ -263,14 +407,12 @@ def main():
     opt = torch.optim.AdamW(probe.parameters(), lr=args.lr,
                               weight_decay=args.weight_decay)
 
-    # How many pickles to use per epoch (100K games each).
-    games_per_pickle = 100_000
-    n_train_pickles = min(len(train_files),
-                            (args.num_train_games + games_per_pickle - 1)
-                            // games_per_pickle)
-    train_subset = train_files[:n_train_pickles]
-    print(f'training on ~{n_train_pickles * games_per_pickle:,} games '
-           f'({n_train_pickles} pickle files)')
+    n_train_files = min(len(train_files),
+                          (args.num_train_games + games_per_file - 1)
+                          // games_per_file)
+    train_subset = train_files[:n_train_files]
+    print(f'training on ~{n_train_files * games_per_file:,} games '
+           f'({n_train_files} files)', flush=True)
 
     t0 = time.time()
     for epoch in range(1, args.epochs + 1):
@@ -284,8 +426,7 @@ def main():
             print(f'  [{ci + 1}/{len(order)}] starting {os.path.basename(pf)} '
                    f'(cumulative {time.time() - t0:.0f}s)', flush=True)
             t_load = time.time()
-            X, S, T, L = process_pickle_chunk(pf, args.ply_min, args.ply_max,
-                                                  recent_Ks=recent_Ks)
+            X, S, T, L = load_chunk(pf)
             if X is None:
                 continue
             N = X.shape[0]
@@ -325,10 +466,12 @@ def main():
                     flush=True)
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f'  epoch {epoch} avg loss: {avg_loss:.4f}')
-        print(f'  eval on {os.path.basename(test_pickle)}...')
-        acc = evaluate(probe, test_pickle, args.ply_min, args.ply_max,
+        print(f'  eval on {os.path.basename(test_file)}...', flush=True)
+        acc = evaluate(probe, test_file, args.ply_min, args.ply_max,
                           recent_Ks, mlp, patterns, args.use_relu, device,
-                          batch=args.batch_size)
+                          batch=args.batch_size,
+                          use_chunk_ext=use_chunk_ext,
+                          canonicalize_mover=args.canonicalize_mover)
 
     torch.save({
         'probe_state': probe.state_dict(),

@@ -37,7 +37,9 @@ mkdir -p logs ckpts_midgame
 cd $SLURM_SUBMIT_DIR
 
 LOAD_TREES=${LOAD_TREES:?Must set LOAD_TREES to a checkpoint path}
+DATA_SOURCE=${DATA_SOURCE:-chunk-ext}
 PICKLE_DIR=${PICKLE_DIR:-data/othello_synthetic}
+CHUNK_DIR=${CHUNK_DIR:-experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks}
 NUM_GAMES=${NUM_GAMES:-6000000}
 NUM_TEST_GAMES=${NUM_TEST_GAMES:-100000}
 PROBE_TYPE=${PROBE_TYPE:-linpo}
@@ -51,6 +53,10 @@ RELU_FLAG=""
 if [ -n "${USE_RELU:-}" ]; then
     RELU_FLAG="--use-relu"
 fi
+CANONICALIZE_FLAG=""
+if [ -n "${CANONICALIZE_MOVER:-}" ]; then
+    CANONICALIZE_FLAG="--canonicalize-mover"
+fi
 
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="ckpts_midgame/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TS}.pt"
@@ -60,19 +66,25 @@ echo "Job ID:            ${SLURM_JOB_ID}"
 echo "Node:              $(hostname)"
 echo "Started at:        $(date)"
 echo "LOAD_TREES:        ${LOAD_TREES}"
+echo "DATA_SOURCE:       ${DATA_SOURCE}"
 echo "PICKLE_DIR:        ${PICKLE_DIR}"
+echo "CHUNK_DIR:         ${CHUNK_DIR}"
 echo "NUM_GAMES:         ${NUM_GAMES}"
 echo "PROBE_TYPE:        ${PROBE_TYPE}"
 echo "EPOCHS:            ${EPOCHS}"
 echo "BATCH_SIZE:        ${BATCH_SIZE}"
+echo "PLY_RANGE:         [${PLY_MIN}, ${PLY_MAX})"
 echo "RECENT_KS:         ${RECENT_KS}"
+echo "canonicalize:      ${CANONICALIZE_MOVER:-<off>}"
 echo "use_relu:          ${USE_RELU:-<step>}"
 echo "OUT:               ${OUT}"
 echo "============================================"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u train_streaming_probe.py \
     --load-trees-from ${LOAD_TREES} \
+    --data-source ${DATA_SOURCE} \
     --pickle-dir ${PICKLE_DIR} \
+    --chunk-dir ${CHUNK_DIR} \
     --num-train-games ${NUM_GAMES} \
     --num-test-games ${NUM_TEST_GAMES} \
     --recent-Ks "${RECENT_KS}" \
@@ -83,6 +95,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u train_streaming_probe.py \
     --batch-size ${BATCH_SIZE} \
     --lr ${LR} \
     ${RELU_FLAG} \
+    ${CANONICALIZE_FLAG} \
     --out ${OUT}
 
 echo "Completed at: $(date)"
