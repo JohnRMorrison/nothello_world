@@ -325,7 +325,8 @@ def scan_monotonic_growth(game, target_cell, direction, mover_parity,
 def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                      min_seq_len, model, block_size,
                                      pos_to_token, device,
-                                     min_final_p=0.05, seed=0, verbose=True):
+                                     min_final_p=0.05, require_contiguous=False,
+                                     seed=0, verbose=True):
     """Search for a game/target/direction where a monotonically increasing
     opp-line toward `target_cell` unfolds over same-parity prediction
     points, AND the model puts substantial probability on the target at
@@ -362,6 +363,11 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                             continue
                         if seq[-1][1] < min_line_final:
                             continue
+                        if require_contiguous:
+                            lens = [L for (_, L) in seq]
+                            expected = list(range(lens[0], lens[-1] + 1))
+                            if lens != expected:
+                                continue
                         n_candidates += 1
                         # Compute P at the FINAL turn only (cheap first-pass
                         # filter).  If below threshold, skip full sequence.
@@ -378,7 +384,11 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                 model, game, t, block_size,
                                 pos_to_token, device).reshape(8, 8)[r, c])
                             seq_with_p.append((t, L, p))
-                        score = p_final * len(seq)
+                        # Score prefers longer sequences AND high final P.
+                        # seq_len^2 rewards games that cover many distinct
+                        # line lengths (denser story), not just the ones
+                        # where line jumps from 2 to 7.
+                        score = p_final * (len(seq) ** 2)
                         if score > best_score:
                             best_score = score
                             best = {
@@ -535,6 +545,10 @@ def main():
                     help='Minimum P(target) at the final turn of a '
                           'monotonic-growth sequence to consider it a '
                           'valid candidate.')
+    ap.add_argument('--growth-require-contiguous', action='store_true',
+                    help='Require the sequence of line lengths to be '
+                          'contiguous (no gaps).  If the game jumps from '
+                          'length 2 to 7, discard.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -775,6 +789,7 @@ def main():
             pos_to_token=pos_to_token,
             device=device,
             min_final_p=args.growth_min_final_p,
+            require_contiguous=args.growth_require_contiguous,
             seed=args.search_seed,
         )
         if mono is None:
