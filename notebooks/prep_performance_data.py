@@ -158,7 +158,10 @@ def score_persistence_record(game, T, C, model, block_size, pos_to_token,
     Returns None if this record isn't a valid candidate (no t_L, or P_I
     below threshold).
     """
-    if T < 2 or T + 1 >= len(game):
+    # Adversarial records always have T == len(game) - 1 (the beam
+    # search stopped at the illegal argmax so there is no game[T+1]);
+    # do NOT require a valid t_next here.
+    if T < 2:
         return None
     t_L = find_t_L(game, T, C)
     if t_L is None:
@@ -179,17 +182,20 @@ def score_persistence_record(game, T, C, model, block_size, pos_to_token,
 
 def build_triptych_for_index(game, T_illegal, C_illegal, t_L,
                                 model, block_size, pos_to_token, device):
-    """Build the (t_L, T_illegal, t_next) triptych, computing states + probs."""
+    """Build the (t_L, T_illegal[, t_next]) panels + probs.  Falls back
+    to two panels if the game ends at T_illegal (typical for
+    adversarial records, where the beam search halted at the illegal)."""
     t_next = None
     for cand in (T_illegal + 2, T_illegal + 1):
         if cand < len(game):
             t_next = cand
             break
-    if t_next is None:
-        return None
 
-    turns = [t_L, T_illegal, t_next]
-    labels = ['C legal', 'C illegal chosen', 'after']
+    turns = [t_L, T_illegal]
+    labels = ['C legal', 'C illegal chosen']
+    if t_next is not None:
+        turns.append(t_next)
+        labels.append('after')
     states = np.stack([state_at_turn(game, t).reshape(8, 8) for t in turns])
     probs = np.stack([probs_at_turn(model, game, t, block_size,
                                        pos_to_token, device).reshape(8, 8)
