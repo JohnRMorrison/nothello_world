@@ -256,11 +256,13 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
 
 def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 patterns, use_relu, device, batch=1024,
-                use_chunk_ext=False, canonicalize_mover=False):
+                use_chunk_ext=False, canonicalize_mover=False,
+                max_positions=None):
     if use_chunk_ext:
         X, S, T, L = process_chunk_ext_file(
             eval_path, ply_min, ply_max,
-            canonicalize_mover=canonicalize_mover)
+            canonicalize_mover=canonicalize_mover,
+            max_positions=max_positions)
     else:
         X, S, T, L = process_pickle_chunk(eval_path, ply_min, ply_max,
                                               recent_Ks=recent_Ks)
@@ -490,11 +492,14 @@ def main():
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f'  epoch {epoch} avg loss: {avg_loss:.4f}')
         print(f'  eval on {os.path.basename(test_file)}...', flush=True)
+        # Cap eval at 500K positions — enough for a stable per-cell
+        # accuracy estimate, keeps eval under ~1 min.
         acc = evaluate(probe, test_file, args.ply_min, args.ply_max,
                           recent_Ks, mlp, patterns, args.use_relu, device,
                           batch=args.batch_size,
                           use_chunk_ext=use_chunk_ext,
-                          canonicalize_mover=args.canonicalize_mover)
+                          canonicalize_mover=args.canonicalize_mover,
+                          max_positions=500_000)
 
     torch.save({
         'probe_state': probe.state_dict(),
