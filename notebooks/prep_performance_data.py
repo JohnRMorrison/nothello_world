@@ -381,14 +381,17 @@ def main():
                                             ).reshape(8, 8)[C // 8, C % 8])
         picked_t_L = t_L
     else:
-        # Diagnostic pass on first record so we can see any failure mode.
+        # Sanity-check P_I inference is working (compute it on adv[0]
+        # regardless of whether t_L exists).
         _game0 = tuple(adv_games[0])
         _T0 = int(adv_turns[0])
         _C0 = int(adv_illegal[0])
-        print(f'DIAG on adv[0]: game_len={len(_game0)}, T={_T0}, C={_C0}, '
-               f'game[0..3]={_game0[:3]}, game[T-1]={_game0[_T0-1] if _T0 > 0 else None}')
-        _tL0 = find_t_L(_game0, _T0, _C0, verbose=True)
-        print(f'  find_t_L returned {_tL0}')
+        _P_I0 = float(probs_at_turn(model, _game0, _T0, block_size,
+                                        pos_to_token, device
+                                       ).reshape(8, 8)[_C0 // 8, _C0 % 8])
+        print(f'DIAG adv[0]: game_len={len(_game0)}, T={_T0}, C={_C0}, '
+               f'P(C at T) = {_P_I0:.4f}  <-- should be nontrivial '
+               f'(argmax was C=illegal)')
         print(f'Searching {args.adv_search_k} adversarial records for a '
                f'high-persistence example (P_I >= {args.adv_min_p_i})...')
         best = None
