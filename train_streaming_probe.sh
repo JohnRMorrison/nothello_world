@@ -57,6 +57,10 @@ CANONICALIZE_FLAG=""
 if [ -n "${CANONICALIZE_MOVER:-}" ]; then
     CANONICALIZE_FLAG="--canonicalize-mover"
 fi
+MAX_POS_FLAG=""
+if [ -n "${MAX_POSITIONS_PER_FILE:-}" ]; then
+    MAX_POS_FLAG="--max-positions-per-file ${MAX_POSITIONS_PER_FILE}"
+fi
 
 TS=$(date +%Y%m%d_%H%M%S)
 OUT="ckpts_midgame/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TS}.pt"
@@ -96,6 +100,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u train_streaming_probe.py \
     --lr ${LR} \
     ${RELU_FLAG} \
     ${CANONICALIZE_FLAG} \
+    ${MAX_POS_FLAG} \
     --out ${OUT}
 
 echo "Completed at: $(date)"

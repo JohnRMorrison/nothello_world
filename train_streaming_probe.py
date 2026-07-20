@@ -73,13 +73,21 @@ def _get_pattern_arrays():
 
 
 def process_chunk_ext_file(chunk_path, ply_min, ply_max,
-                              canonicalize_mover=False):
+                              canonicalize_mover=False,
+                              max_positions=None,
+                              pat_batch=200_000):
     """Load one chunk_ext_*.npz file, return (X, S, T, L) as np arrays.
 
     X: (N, 121) float32 — [played(60), even-or-placed_as_mover(60), mp(1)].
     S: (N, 64)  int64   — mover-relative state labels (1=mine, 2=opp).
     T: (N,)     int32   — streaming-convention ply (chunk_position + 1).
     L: (N, 64)  uint8   — legal-move mask derived from 960 flanking patterns.
+
+    max_positions: hard cap on rows returned; useful for warmup / small
+                    trial runs.  Naive first-N slice after ply filtering.
+    pat_batch: micro-batch size for compute_pattern_labels_batch to keep
+               the (batch, 960) float32 buffer under a few GB.  200K rows
+               × 960 × 4 = ~750 MB per batch.
     """
     from train_pattern_simple import compute_pattern_labels_batch
 
@@ -95,6 +103,8 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
     if len(idx) == 0:
         z.close()
         return None, None, None, None
+    if max_positions is not None and len(idx) > max_positions:
+        idx = idx[:max_positions]
 
     positions = positions[idx]
     features = np.asarray(z['features'][idx]).astype(np.float32)
@@ -124,18 +134,22 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
         X[:, 60:120] = even
         X[:, 120] = mover_parity
 
-    # 960-d pattern legality via the vectorized numpy path.
+    # 960-d pattern legality via the vectorized numpy path — computed in
+    # sub-batches to avoid allocating the full (N, 960) float32 tensor
+    # (which is ~92 GB for a 24M-row chunk).  Reduce to 64-d L on the fly.
     targets, terminals, opp_cells, opp_mask = _get_pattern_arrays()
-    pat_labels = compute_pattern_labels_batch(
-        labels, positions, targets, terminals, opp_cells, opp_mask
-    )  # (N, 960) float32
-
-    # 64-d legal-move mask: L[c] = any pattern with target==c fires.
+    per_cell_pat_ids = [np.where(targets == c)[0] for c in range(BOARD_CELLS)]
     L = np.zeros((N, BOARD_CELLS), dtype=np.uint8)
-    for c in range(BOARD_CELLS):
-        pat_ids = np.where(targets == c)[0]
-        if len(pat_ids) > 0:
-            L[:, c] = (pat_labels[:, pat_ids] > 0).any(axis=1).astype(np.uint8)
+    for start in range(0, N, pat_batch):
+        end = min(start + pat_batch, N)
+        pat = compute_pattern_labels_batch(
+            labels[start:end], positions[start:end],
+            targets, terminals, opp_cells, opp_mask)
+        for c in range(BOARD_CELLS):
+            pids = per_cell_pat_ids[c]
+            if len(pids) > 0:
+                L[start:end, c] = (pat[:, pids] > 0).any(axis=1).astype(np.uint8)
+        del pat
 
     # State labels are not used by the streaming probe training loop
     # (only X, T, L are consumed).  Return None to avoid the cost.
@@ -299,6 +313,12 @@ def main():
                     help='Use mover-relative encoding (placed_as_mover) in '
                           'the 121-d input.  Required when loading trees '
                           'trained with --canonicalize-mover.')
+    ap.add_argument('--max-positions-per-file', type=int, default=None,
+                    help='Cap on positions loaded from each chunk_ext/'
+                          'pickle file.  Useful for trial runs and to bound '
+                          'the 960-d pattern-legality memory.  chunk-ext '
+                          'files have ~24M rows in [10,50); cap at ~4M for '
+                          'a fast trial.')
     ap.add_argument('--flanking-patterns',
                     default='hand_crafted_flanking_patterns.pt')
     ap.add_argument('--num-train-games', type=int, default=6_000_000)
@@ -366,19 +386,22 @@ def main():
     train_files = files[:-1]
     print(f'{len(train_files)} train files + 1 held-out for eval')
 
-    def load_chunk(path):
+    def load_chunk(path, cap=None):
         """Return (X, S, T, L) for one input file, regardless of source."""
+        cap = cap if cap is not None else args.max_positions_per_file
         if use_chunk_ext:
             return process_chunk_ext_file(
                 path, args.ply_min, args.ply_max,
-                canonicalize_mover=args.canonicalize_mover)
+                canonicalize_mover=args.canonicalize_mover,
+                max_positions=cap)
         return process_pickle_chunk(path, args.ply_min, args.ply_max,
                                         recent_Ks=recent_Ks)
 
-    # Warm up: process one file to figure hidden_dim.
-    print(f'warmup: processing first file...', flush=True)
+    # Warm up: process one file to figure hidden_dim.  Cap tightly — we
+    # only need enough rows to derive shapes.
+    print(f'warmup: processing first file (cap 4096 rows)...', flush=True)
     tw = time.time()
-    Xw, _, _, _ = load_chunk(train_files[0])
+    Xw, _, _, _ = load_chunk(train_files[0], cap=4096)
     print(f'  warmup load: {time.time() - tw:.1f}s  '
            f'positions={Xw.shape[0] if Xw is not None else 0}', flush=True)
     Xw_small = Xw[:64]
