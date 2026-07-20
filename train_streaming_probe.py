@@ -104,7 +104,13 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
         z.close()
         return None, None, None, None
     if max_positions is not None and len(idx) > max_positions:
-        idx = idx[:max_positions]
+        # chunk_ext rows are stored in position-major order (all games at
+        # position 5, then all at 6, ...); a plain first-N slice would give
+        # a single-ply subset.  Shuffle first so a capped trial sees the
+        # full ply distribution.
+        rng = np.random.RandomState(0)
+        idx = rng.choice(idx, size=max_positions, replace=False)
+        idx.sort()  # sorted access is faster for the subsequent npz reads
 
     positions = positions[idx]
     features = np.asarray(z['features'][idx]).astype(np.float32)
