@@ -326,6 +326,8 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                      min_seq_len, model, block_size,
                                      pos_to_token, device,
                                      min_final_p=0.05, require_contiguous=False,
+                                     min_consecutive_p=0.01,
+                                     min_consecutive_above=3,
                                      seed=0, verbose=True):
     """Search for a game/target/direction where a monotonically increasing
     opp-line toward `target_cell` unfolds over same-parity prediction
@@ -384,11 +386,25 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                 model, game, t, block_size,
                                 pos_to_token, device).reshape(8, 8)[r, c])
                             seq_with_p.append((t, L, p))
-                        # Score prefers longer sequences AND high final P.
-                        # seq_len^2 rewards games that cover many distinct
-                        # line lengths (denser story), not just the ones
-                        # where line jumps from 2 to 7.
-                        score = p_final * (len(seq) ** 2)
+                        # Filter: require at least `min_consecutive_above`
+                        # consecutive positions with P > `min_consecutive_p`.
+                        # Rewards GRADUAL growth over threshold-jump.
+                        best_run = 0
+                        cur_run = 0
+                        for (_, _, p) in seq_with_p:
+                            if p >= min_consecutive_p:
+                                cur_run += 1
+                                if cur_run > best_run:
+                                    best_run = cur_run
+                            else:
+                                cur_run = 0
+                        if best_run < min_consecutive_above:
+                            continue
+                        # Score prefers longer above-threshold runs.  Break
+                        # ties by final P and by mean P over the run.
+                        run_mean_p = np.mean([p for (_, _, p) in seq_with_p
+                                                  if p >= min_consecutive_p])
+                        score = best_run * 10 + p_final + run_mean_p
                         if score > best_score:
                             best_score = score
                             best = {
@@ -405,7 +421,9 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                        f'target={target_cell} '
                                        f'dir={direction}: seq_len='
                                        f'{len(seq)} final_L='
-                                       f'{L_final} p_final={p_final:.3f}',
+                                       f'{L_final} p_final={p_final:.3f} '
+                                       f'run_above_{min_consecutive_p}='
+                                       f'{best_run}',
                                        flush=True)
             if n_scanned >= n_games:
                 break
@@ -549,6 +567,13 @@ def main():
                     help='Require the sequence of line lengths to be '
                           'contiguous (no gaps).  If the game jumps from '
                           'length 2 to 7, discard.')
+    ap.add_argument('--growth-min-consecutive-p', type=float, default=0.01,
+                    help='Minimum P(target) that counts as "above" for '
+                          'the consecutive-run filter.')
+    ap.add_argument('--growth-min-consecutive-above', type=int, default=3,
+                    help='Require at least K consecutive positions in the '
+                          'sequence with P >= --growth-min-consecutive-p.  '
+                          'Rewards gradual growth over threshold-jump.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -790,6 +815,8 @@ def main():
             device=device,
             min_final_p=args.growth_min_final_p,
             require_contiguous=args.growth_require_contiguous,
+            min_consecutive_p=args.growth_min_consecutive_p,
+            min_consecutive_above=args.growth_min_consecutive_above,
             seed=args.search_seed,
         )
         if mono is None:
