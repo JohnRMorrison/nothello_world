@@ -525,15 +525,27 @@ def extract_paths(tree):
     if isinstance(tree, PreExtractedPaths):
         return tree.paths
     tree_ = tree.tree_
-    classes = tree.classes_
+    # GBM uses DecisionTreeRegressor (no .classes_); its leaves store
+    # raw regression scores.  We treat those as {0, 1} indicator counts
+    # via sign — positive → class 1, negative/zero → class 0.
+    is_regressor = not hasattr(tree, 'classes_')
+    classes = None if is_regressor else tree.classes_
     paths = []
 
     def recurse(node, conditions):
         if tree_.feature[node] == _tree.TREE_UNDEFINED:
-            counts = tree_.value[node][0]
-            majority = classes[int(np.argmax(counts))]
-            paths.append((list(conditions), int(majority),
-                           counts.tolist()))
+            counts_arr = tree_.value[node][0]  # (n_classes,) or (1,)
+            if is_regressor:
+                # Regressor leaf holds a single scalar prediction.
+                pred = float(counts_arr[0])
+                majority = 1 if pred > 0 else 0
+                # Fake counts so downstream prune_paths_by_count works.
+                counts_list = [max(-pred, 0.0), max(pred, 0.0)]
+            else:
+                majority = classes[int(np.argmax(counts_arr))]
+                counts_list = counts_arr.tolist()
+                majority = int(majority)
+            paths.append((list(conditions), majority, counts_list))
             return
         feat = int(tree_.feature[node])
         recurse(tree_.children_left[node], conditions + [(feat, 0)])

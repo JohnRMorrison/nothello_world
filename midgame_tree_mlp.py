@@ -968,6 +968,14 @@ def main():
             all_meta.extend(meta_s)
             print(f'  stability units added: {Ws.shape[0]}')
 
+        if not all_w:
+            raise RuntimeError(
+                'No paths extracted from any tree.  Common causes: '
+                '(a) SkopeRules produced no qualifying rules under the '
+                'given precision/recall thresholds — try lowering '
+                '--pattern-skope-precision-min. '
+                '(b) all trees produced empty leaves.  Aborting before '
+                'np.stack([]) would crash.')
         W = np.stack(all_w); B = np.array(all_b, dtype=np.float32)
         print(f'  total hidden units: {len(all_meta)}   '
                f'(tree={n_tree_units}, stability='
