@@ -554,6 +554,13 @@ def main():
                           'still fit and saved.  Use this when the real '
                           'legal probe will be trained afterward via the '
                           'streaming pipeline on more games.')
+    ap.add_argument('--tree-fit-only', action='store_true',
+                    help='Fit trees + extract paths, save the tree '
+                          'checkpoint, then EXIT.  Skips H_tr computation '
+                          'entirely -- necessary for large NUM_TRAIN where '
+                          'H_tr would blow memory (100K games x 48K units '
+                          '= 200+ GB).  The saved checkpoint is streaming-'
+                          'compatible.')
     ap.add_argument('--cache-tr', default=None,
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
@@ -979,6 +986,22 @@ def main():
             print(f'  tree-path depths: (no paths extracted)')
 
         mlp = OpeningTreeMLP(W, B, all_meta, device)
+
+        if args.tree_fit_only:
+            print('\n--tree-fit-only: saving tree checkpoint and exiting '
+                   'before H_tr computation (skips OOM risk on large data).')
+            torch.save({
+                'W': mlp.W.cpu(),
+                'b': mlp.b.cpu(),
+                'path_info': all_meta,
+                'per_cell_leaf_counts': per_cell_leaf_counts,
+                'per_cell_tree_acc': (tree_correct_per_cell.tolist()
+                                        if args.tree_target != 'patterns'
+                                        else tree_correct_per_pattern.tolist()),
+                'args': vars(args),
+            }, args.out)
+            print(f'saved {args.out}')
+            return
 
         X_tr = torch.from_numpy(Xnp_tr).to(device)
         X_te = torch.from_numpy(Xnp_te).to(device)
