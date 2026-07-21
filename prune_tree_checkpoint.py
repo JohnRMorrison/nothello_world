@@ -32,36 +32,60 @@ def main():
     b = ck['b'].numpy() if isinstance(ck['b'], torch.Tensor) else ck['b']
     meta = ck['path_info']
 
-    # Group leaf indices by pattern id (only 'pattern_path' kind entries
-    # are per-pattern; others like tree_path pass through unchanged).
+    # W-backed entries are only those with kind in {tree_path, pattern_path}.
+    # 'flanking_pattern' entries are informational — the runtime pipeline
+    # computes flanking activations from the patterns list, not from W.
+    W_KINDS = ('tree_path', 'pattern_path')
+    w_backed_idx = [i for i, m in enumerate(meta)
+                    if m.get('kind') in W_KINDS]
+    non_w_backed_idx = [i for i, m in enumerate(meta)
+                        if m.get('kind') not in W_KINDS]
+    if len(w_backed_idx) != len(W):
+        raise ValueError(
+            f'{len(w_backed_idx)} W-backed meta entries but W has '
+            f'{len(W)} rows — mismatch, aborting.')
+
+    # Map meta_index -> W_row for pruning
+    meta_to_w = {mi: wi for wi, mi in enumerate(w_backed_idx)}
+
+    # Group by pattern (only pattern_path entries).
     per_pattern_leaves = defaultdict(list)
     passthrough_idx = []
-    for i, m in enumerate(meta):
+    for i in w_backed_idx:
+        m = meta[i]
         if m.get('kind') == 'pattern_path':
             per_pattern_leaves[m['pattern']].append(i)
         else:
-            passthrough_idx.append(i)
+            passthrough_idx.append(i)   # e.g. tree_path
 
     # Keep top-K per pattern by sum(leaf_counts).
-    keep_idx = list(passthrough_idx)
+    keep_meta_idx = list(passthrough_idx)
     kept_per_pat = {}
     for pat, idx_list in per_pattern_leaves.items():
         scored = sorted(idx_list,
                           key=lambda i: -sum(meta[i]['leaf_counts']))
         keep = scored[:args.top_k]
         kept_per_pat[pat] = len(keep)
-        keep_idx.extend(keep)
-    keep_idx.sort()  # preserve original order
+        keep_meta_idx.extend(keep)
+    keep_meta_idx.sort()
 
-    print(f'Before: {len(meta)} hidden units, '
+    # Corresponding W-row indices.
+    keep_w_idx = [meta_to_w[i] for i in keep_meta_idx]
+
+    print(f'Before: {len(w_backed_idx)} W-backed hidden units '
+           f'(+ {len(non_w_backed_idx)} runtime-only meta), '
            f'{len(per_pattern_leaves)} patterns')
-    print(f'After:  {len(keep_idx)} hidden units, top-{args.top_k} per pattern '
+    print(f'After:  {len(keep_meta_idx)} W-backed hidden units, '
+           f'top-{args.top_k} per pattern '
            f'(mean kept = {np.mean(list(kept_per_pat.values())):.2f})')
 
-    # Subset W, b, meta.
-    W_new = W[keep_idx]
-    b_new = b[keep_idx]
-    meta_new = [meta[i] for i in keep_idx]
+    # Subset W, b, meta.  Keep the non-W-backed meta entries as-is (they
+    # describe the runtime flanking patterns and are still valid).
+    W_new = W[keep_w_idx]
+    b_new = b[keep_w_idx]
+    meta_new = [meta[i] for i in keep_meta_idx]
+    for i in non_w_backed_idx:
+        meta_new.append(meta[i])
 
     # per_cell_leaf_counts needs updating too.
     per_pat_counts = np.zeros(len(per_pattern_leaves), dtype=int)
