@@ -328,6 +328,7 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                                      min_final_p=0.05, require_contiguous=False,
                                      min_consecutive_p=0.01,
                                      min_consecutive_above=3,
+                                     top_k=5,
                                      seed=0, verbose=True):
     """Search for a game/target/direction where a monotonically increasing
     opp-line toward `target_cell` unfolds over same-parity prediction
@@ -341,10 +342,21 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
     the longest line while also spanning many turns.
     """
     rng = np.random.RandomState(seed)
-    best = None
-    best_score = -1
+    top = []   # list of (score, entry_dict), sorted descending
     n_scanned = 0
     n_candidates = 0
+
+    def maybe_push(score, entry):
+        top.append((score, entry))
+        top.sort(key=lambda x: x[0], reverse=True)
+        del top[top_k:]
+
+    def already_have(game_index, target_cell):
+        for _, e in top:
+            if (e['game_index'] == game_index
+                    and e['target_cell'] == target_cell):
+                return True
+        return False
 
     for pkl in pickle_paths:
         with open(pkl, 'rb') as f:
@@ -405,33 +417,43 @@ def find_monotonic_growth_example(pickle_paths, n_games, min_line_final,
                         run_mean_p = np.mean([p for (_, _, p) in seq_with_p
                                                   if p >= min_consecutive_p])
                         score = best_run * 10 + p_final + run_mean_p
-                        if score > best_score:
-                            best_score = score
-                            best = {
-                                'game': game,
-                                'target_cell': target_cell,
-                                'direction': direction,
-                                'mover_parity': mover_parity,
-                                'sequence': seq_with_p,
-                                'pickle': pkl,
-                                'game_index': int(gi),
-                            }
-                            if verbose:
-                                print(f'  new best game={gi} '
-                                       f'target={target_cell} '
-                                       f'dir={direction}: seq_len='
-                                       f'{len(seq)} final_L='
-                                       f'{L_final} p_final={p_final:.3f} '
-                                       f'run_above_{min_consecutive_p}='
-                                       f'{best_run}',
-                                       flush=True)
+                        if already_have(int(gi), target_cell):
+                            continue
+                        entry = {
+                            'game': game,
+                            'target_cell': target_cell,
+                            'direction': direction,
+                            'mover_parity': mover_parity,
+                            'sequence': seq_with_p,
+                            'pickle': pkl,
+                            'game_index': int(gi),
+                            'best_run': best_run,
+                            'p_final': p_final,
+                        }
+                        maybe_push(score, entry)
+                        if verbose:
+                            print(f'  candidate game={gi} '
+                                   f'target={target_cell} '
+                                   f'dir={direction}: seq_len='
+                                   f'{len(seq)} final_L='
+                                   f'{L_final} p_final={p_final:.3f} '
+                                   f'run_above_{min_consecutive_p}='
+                                   f'{best_run}  '
+                                   f'(top pool size: {len(top)})',
+                                   flush=True)
             if n_scanned >= n_games:
                 break
         if n_scanned >= n_games:
             break
     print(f'  scanned {n_scanned} games; '
-           f'{n_candidates} candidates met (line+seq_len) filter')
-    return best
+           f'{n_candidates} candidates met (line+seq_len) filter; '
+           f'kept top {len(top)}')
+    for k, (sc, e) in enumerate(top):
+        print(f'    #{k+1}: game={e["game_index"]} target={e["target_cell"]} '
+               f'dir={e["direction"]}  '
+               f'seq={[(t, L, round(p, 3)) for (t, L, p) in e["sequence"]]}  '
+               f'score={sc:.3f}')
+    return [entry for _, entry in top]   # list of top-K dicts, best first
 
 
 def find_no_flanker_example(model, pickle_paths, n_games, min_prob,
@@ -574,6 +596,8 @@ def main():
                     help='Require at least K consecutive positions in the '
                           'sequence with P >= --growth-min-consecutive-p.  '
                           'Rewards gradual growth over threshold-jump.')
+    ap.add_argument('--growth-top-k', type=int, default=5,
+                    help='How many top monotonic-growth games to keep.')
     ap.add_argument('--search-seed', type=int, default=0)
     ap.add_argument('--out',
                     default='notebooks/talk_data/performance_data.npz')
@@ -804,7 +828,7 @@ def main():
         # (target cell always empty AND never has a valid flank).
         print(f'Searching {len(pkls)} pickle(s), {args.growth_n_games} games '
                f'each, for a monotonic line-growth game...')
-        mono = find_monotonic_growth_example(
+        mono_list = find_monotonic_growth_example(
             pkls,
             n_games=args.growth_n_games,
             min_line_final=args.growth_min_final,
@@ -817,8 +841,10 @@ def main():
             require_contiguous=args.growth_require_contiguous,
             min_consecutive_p=args.growth_min_consecutive_p,
             min_consecutive_above=args.growth_min_consecutive_above,
+            top_k=args.growth_top_k,
             seed=args.search_seed,
         )
+        mono = mono_list[0] if mono_list else None
         if mono is None:
             print('  no monotonic growth game found; growth_* will be empty.')
             growth_states = np.zeros((0, 8, 8), dtype=np.int8)
@@ -859,6 +885,28 @@ def main():
                 'game_index': mono['game_index'],
                 'game': list(mono['game']),
             }], dtype=object)
+
+            # ALSO save the full top-K monotonic-growth list as
+            # top_growth_* so the notebook can render each.
+            top_growth_meta = []
+            top_growth_target_cells = []
+            top_growth_directions = []
+            top_growth_sequences = []   # per game, list of (t, L, p)
+            for e in mono_list:
+                top_growth_target_cells.append(
+                    [e['target_cell'] // 8, e['target_cell'] % 8])
+                top_growth_directions.append(list(e['direction']))
+                top_growth_sequences.append(
+                    [(int(t), int(L), float(p)) for (t, L, p) in e['sequence']])
+                top_growth_meta.append({
+                    'game_index': e['game_index'],
+                    'target_cell': e['target_cell'],
+                    'direction': e['direction'],
+                    'mover_parity': e['mover_parity'],
+                    'game': list(e['game']),
+                    'sequence': [(int(t), int(L), float(p))
+                                    for (t, L, p) in e['sequence']],
+                })
         # Also pack the full top-K flank list.
         K = len(flank_list)
         top_flank_states = np.stack([e['state'] for e in flank_list]).astype(np.int8)
@@ -893,6 +941,8 @@ def main():
             'growth_line_lens': growth_line_lens,
             'growth_p_target': growth_p_target,
             'growth_meta': growth_meta,
+            'top_growth_meta': np.array(top_growth_meta, dtype=object)
+                if mono is not None else np.array([], dtype=object),
         }
         # Add growth_target_cell / direction from mono if present (else fall
         # back to the winning-flank target cell so old notebook code doesn't
