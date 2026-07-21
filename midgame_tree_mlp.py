@@ -486,14 +486,19 @@ def main():
                           'RF adds per-split feature subsampling for more '
                           'diverse trees within each pattern ensemble.')
     ap.add_argument('--pattern-algorithm', default='dt',
-                    choices=['dt', 'rf', 'et', 'gbm'],
-                    help='Which per-pattern algorithm to use for tree '
-                          'fitting.  dt: DecisionTreeClassifier.  rf: '
-                          'RandomForestClassifier.  et: ExtraTreesClassifier. '
-                          'gbm: sklearn GradientBoostingClassifier '
-                          '(additive shallow trees).')
+                    choices=['dt', 'rf', 'et', 'gbm', 'skope'],
+                    help='Per-pattern algorithm.  dt: DecisionTreeClassifier. '
+                          'rf: RandomForestClassifier.  et: ExtraTreesClassifier. '
+                          'gbm: sklearn GradientBoostingClassifier. '
+                          'skope: SkopeRules (rare-positive rule mining).')
     ap.add_argument('--pattern-gb-learning-rate', type=float, default=0.1,
                     help='GBM only: learning rate.')
+    ap.add_argument('--pattern-skope-precision-min', type=float, default=0.5,
+                    help='SkopeRules only: minimum precision for rules '
+                          'to be kept.  Rare-positive patterns may need '
+                          'lower values (e.g., 0.2-0.3).')
+    ap.add_argument('--pattern-skope-recall-min', type=float, default=0.01,
+                    help='SkopeRules only: minimum recall for rules.')
     ap.add_argument('--pattern-class-weight', default='balanced',
                     choices=['balanced', 'none'],
                     help='For --tree-target patterns: class weighting.  '
@@ -836,21 +841,36 @@ def main():
                 class_weight=cw,
                 use_random_forest=args.pattern_use_random_forest,
                 algorithm=args.pattern_algorithm,
-                gb_learning_rate=args.pattern_gb_learning_rate)
+                gb_learning_rate=args.pattern_gb_learning_rate,
+                skope_precision_min=args.pattern_skope_precision_min,
+                skope_recall_min=args.pattern_skope_recall_min)
             print(f'  ({time.time() - t0:.1f}s)')
 
             # Aggregate-per-pattern tree accuracy (majority vote across
             # the pattern's trees).
             K = len(patterns_list)
             tree_correct_per_pattern = np.zeros(K)
+            from opening_tree_mlp import PreExtractedPaths
             for j in range(K):
+                # Skip aggregate accuracy for PreExtractedPaths (skope) --
+                # rule-based algorithms don't have a per-tree predict().
+                if any(isinstance(t, PreExtractedPaths)
+                        for t in pattern_trees[j]):
+                    tree_correct_per_pattern[j] = np.nan
+                    continue
                 votes = np.zeros(Xnp_te.shape[0], dtype=np.float32)
                 for tree in pattern_trees[j]:
                     votes += tree.predict(Xnp_te).astype(np.float32)
                 pred = (votes / len(pattern_trees[j]) > 0.5).astype(np.uint8)
                 tree_correct_per_pattern[j] = (pred == pt_te[:, j]).mean()
-            print(f'  aggregate per-pattern tree test acc: '
-                   f'{100 * tree_correct_per_pattern.mean():.4f}%')
+            valid = ~np.isnan(tree_correct_per_pattern)
+            if valid.any():
+                print(f'  aggregate per-pattern tree test acc: '
+                       f'{100 * tree_correct_per_pattern[valid].mean():.4f}% '
+                       f'({int(valid.sum())}/{K} patterns)')
+            else:
+                print(f'  aggregate per-pattern tree test acc: n/a '
+                       f'(algorithm produces rule-based outputs)')
         elif args.tree_target == 'legal':
             if Lnp_tr is None:
                 raise ValueError('--tree-target legal requires --task legal '

@@ -343,22 +343,86 @@ def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
     return tree
 
 
+_SKOPE_PARSE_RE = None   # compiled lazily inside _skope_parse_rule
+
+
+def _skope_parse_rule(rule_str):
+    """Parse a SkopeRules rule string into our [(feat_idx, val), ...]
+    conditions format.  Expects features named X[:, i] with threshold 0.5
+    (binary features)."""
+    import re
+    global _SKOPE_PARSE_RE
+    if _SKOPE_PARSE_RE is None:
+        _SKOPE_PARSE_RE = re.compile(r'X\[:,\s*(\d+)\]\s*([<>=]+)\s*([\d.]+)')
+    conds = []
+    for conj in rule_str.split(' and '):
+        m = _SKOPE_PARSE_RE.search(conj.strip())
+        if not m:
+            continue
+        feat = int(m.group(1))
+        op = m.group(2)
+        # Binary features + threshold 0.5:
+        #   ">" → feat=1;  "<=" (or "<") → feat=0
+        val = 1 if op == '>' else 0
+        conds.append((feat, val))
+    return conds
+
+
+def _skope_fit_one(X, y, n_estimators, max_depth, precision_min,
+                     recall_min, feature_names, random_state):
+    """Fit SkopeRules for one binary target; return PreExtractedPaths."""
+    # SkopeRules imports sklearn.externals.six -- monkey-patch for modern sklearn.
+    import sys as _sys
+    if 'sklearn.externals.six' not in _sys.modules:
+        try:
+            import six as _six
+            _sys.modules['sklearn.externals.six'] = _six
+        except ImportError:
+            pass
+    from skrules import SkopeRules
+    sr = SkopeRules(
+        feature_names=feature_names,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        precision_min=precision_min,
+        recall_min=recall_min,
+        random_state=random_state,
+    )
+    sr.fit(X, y)
+    paths = []
+    for rule_tuple in sr.rules_:
+        rule_str = rule_tuple[0]
+        # rule_tuple[1] = (precision, recall, ...); use it for leaf_counts proxy.
+        scores = rule_tuple[1]
+        precision = float(scores[0]) if len(scores) > 0 else 0.0
+        recall = float(scores[1]) if len(scores) > 1 else 0.0
+        conds = _skope_parse_rule(rule_str)
+        if not conds:
+            continue
+        # Fake leaf_counts so prune_paths_by_count still works: put the
+        # coverage estimate in the positive-class bin.
+        n_pos = max(int(recall * y.sum()), 1)
+        n_neg = max(int(n_pos * (1 - precision) / max(precision, 1e-6)), 0)
+        paths.append((conds, 1, [n_neg, n_pos]))
+    return PreExtractedPaths(paths)
+
+
 def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                           min_samples_leaf=50, n_jobs=1, max_features=None,
                           class_weight='balanced', use_random_forest=False,
-                          algorithm='dt', gb_learning_rate=0.1):
+                          algorithm='dt', gb_learning_rate=0.1,
+                          skope_precision_min=0.5, skope_recall_min=0.01):
     """Fit `n_trees_per_pattern` trees per pattern.
 
-    algorithm ∈ {'dt', 'rf', 'et', 'gbm'}:
-      dt  — one or more DecisionTreeClassifier(s), bootstrapped when >1
-      rf  — RandomForestClassifier (also triggered by use_random_forest=True)
-      et  — ExtraTreesClassifier
-      gbm — GradientBoostingClassifier (sklearn); trees are shallow +
-            additive; extract each iteration's tree from .estimators_
+    algorithm ∈ {'dt', 'rf', 'et', 'gbm', 'skope'}:
+      dt    — one or more DecisionTreeClassifier(s), bootstrapped when >1
+      rf    — RandomForestClassifier (also triggered by use_random_forest=True)
+      et    — ExtraTreesClassifier
+      gbm   — GradientBoostingClassifier; shallow trees, additive
+      skope — SkopeRules (rare-positive rule mining; filters by precision/recall)
 
-    Returns: list of length K, each entry a list of fitted sklearn tree
-    objects.  For rf/et/gbm the list contains the ensemble's internal
-    trees so downstream extract_paths just works.
+    Returns: list of length K, each entry a list of tree-like objects
+    (sklearn trees for dt/rf/et/gbm; PreExtractedPaths for skope).
     """
     # Back-compat: use_random_forest overrides algorithm to 'rf'.
     if use_random_forest and algorithm == 'dt':
@@ -395,6 +459,16 @@ def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                 random_state=j * 1000)
             et.fit(X, y)
             return list(et.estimators_)
+        if algorithm == 'skope':
+            return [_skope_fit_one(
+                X, y,
+                n_estimators=n_trees_per_pattern,
+                max_depth=max_depth,
+                precision_min=skope_precision_min,
+                recall_min=skope_recall_min,
+                feature_names=None,   # SkopeRules default 'X[:, i]' format
+                random_state=j * 1000,
+            )]
         if algorithm == 'gbm':
             from sklearn.ensemble import GradientBoostingClassifier
             # For a rare-positive binary target, class_weight isn't native
@@ -432,12 +506,24 @@ def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                                        for j in range(K))
 
 
+class PreExtractedPaths:
+    """Lightweight wrapper for algorithms (like SkopeRules) that produce
+    rules directly rather than sklearn trees.  extract_paths() unwraps
+    these transparently."""
+    def __init__(self, paths):
+        self.paths = paths  # list of (conditions, leaf_class, leaf_counts)
+
+
 def extract_paths(tree):
     """Return list of (conditions, leaf_class, leaf_counts) tuples.
     conditions: list of (feature_idx, required_value 0-or-1).
     Feature values are 0/1; sklearn's threshold ~0.5 splits them.  Left =
     feature ≤ 0.5 (i.e., feature = 0); right = feature > 0.5 (feature = 1).
+
+    Accepts sklearn trees OR PreExtractedPaths.
     """
+    if isinstance(tree, PreExtractedPaths):
+        return tree.paths
     tree_ = tree.tree_
     classes = tree.classes_
     paths = []
