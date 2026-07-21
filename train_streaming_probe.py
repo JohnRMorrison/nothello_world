@@ -333,6 +333,11 @@ def main():
     ap.add_argument('--num-test-games', type=int, default=100_000)
     ap.add_argument('--recent-Ks', default='1,2,5,10,20',
                     help='Comma-sep list; empty to disable.')
+    ap.add_argument('--use-pattern-bias', action='store_true',
+                    help='StruPO only: include the learned 960-d '
+                          'per-pattern bias in PatternProbOrHead.  Default '
+                          'off (bias = 0 fixed buffer) -- purer '
+                          '"weights over leaves" architecture.')
     ap.add_argument('--probe-type', default='linpo',
                     choices=['linpo', 'strupo'],
                     help='linpo: LinearPatternProbOr (Linear H->960 + '
@@ -432,7 +437,9 @@ def main():
                 'StruPO requires tree_target=patterns checkpoint (with '
                 'pattern-path meta).  Loaded checkpoint has tree_path '
                 'entries — use --probe-type linpo instead.')
-        probe = PatternProbOrHead(tree_meta, patterns).to(device)
+        probe = PatternProbOrHead(
+            tree_meta, patterns,
+            use_pattern_bias=args.use_pattern_bias).to(device)
         print(f'probe: PatternProbOrHead    params={sum(p.numel() for p in probe.parameters()):,}')
 
     opt = torch.optim.AdamW(probe.parameters(), lr=args.lr,

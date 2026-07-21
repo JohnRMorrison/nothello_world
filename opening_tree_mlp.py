@@ -912,9 +912,10 @@ class PatternProbOrHead(nn.Module):
     Parameter count = (# pattern-path hidden units) + (# patterns) biases.
     Much smaller than a flat BCE probe on the same features.
     """
-    def __init__(self, hidden_meta, patterns_list):
+    def __init__(self, hidden_meta, patterns_list, use_pattern_bias=False):
         super().__init__()
         from collections import defaultdict
+        self.use_pattern_bias = use_pattern_bias
         idx_by_pat = defaultdict(list)
         for i, m in enumerate(hidden_meta):
             if m.get('kind') == 'pattern_path':
@@ -938,11 +939,19 @@ class PatternProbOrHead(nn.Module):
         for j in range(n_patterns):
             leaf_pat_ids[boundaries[j]:boundaries[j + 1]] = j
         self.register_buffer('leaf_pat_ids', leaf_pat_ids)
-        # One weight per leaf, one bias per pattern.
+        # One weight per leaf.  Per-pattern bias is only a Parameter when
+        # use_pattern_bias=True; otherwise a fixed zero buffer (no learned
+        # bias).  This lets us measure how much of the accuracy is
+        # attributable to the learned bias vs. the per-leaf weights alone.
         self.leaf_weights = nn.Parameter(
             torch.randn(len(flat)) * 0.05)
-        self.pattern_biases = nn.Parameter(
-            torch.full((n_patterns,), -3.0))
+        if use_pattern_bias:
+            self.pattern_biases = nn.Parameter(
+                torch.full((n_patterns,), -3.0))
+        else:
+            self.register_buffer(
+                'pattern_biases',
+                torch.zeros(n_patterns, dtype=torch.float32))
         # Precompute per-cell gather + mask for vectorized prob-OR.
         pat_id_to_pos = {j: pos for pos, j in enumerate(self.pattern_ids)}
         by_tgt = {}
