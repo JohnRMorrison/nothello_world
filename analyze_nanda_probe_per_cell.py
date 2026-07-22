@@ -14,7 +14,7 @@ Probe shape (3, 512, 8, 8, 3) = (modes, d_model, rows, cols, classes).
 Usage:
     python analyze_nanda_probe_per_cell.py --n-games 500 --mode parity
 """
-import sys, os, argparse
+import sys, os, argparse, pickle, random
 sys.path.insert(0, '.')
 
 import numpy as np
@@ -24,7 +24,8 @@ from data.othello import OthelloBoardState
 
 sys.path.insert(0, "experiments/mathematical_transformation_experiments")
 from probe_state_pred_for_othello import (
-    tokenize_games, load_games, extract_activations, VOCAB_SIZE, GAME_LEN,
+    tokenize_games, extract_activations, VOCAB_SIZE, GAME_LEN,
+    SYNTHETIC_DIR,
 )
 
 
@@ -32,19 +33,59 @@ CENTER_RC = {(3, 3), (3, 4), (4, 3), (4, 4)}    # d4, e4, d5, e5
 CORNER_RC = {(0, 0), (0, 7), (7, 0), (7, 7)}    # a1, h1, a8, h8
 
 
+def sample_games_from_pool(n_games, seed, n_files=None):
+    """Sample n_games uniformly at random from the full synthetic pool.
+
+    Shuffles the pickle file list with the given seed, then loads pickle
+    files until the pool has enough valid (len==GAME_LEN) games, then
+    randomly samples n_games from that pool.
+    """
+    rng = random.Random(seed)
+    files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
+    rng.shuffle(files)
+    if n_files is not None:
+        files = files[:n_files]
+
+    pool = []
+    used_files = 0
+    for fname in files:
+        with open(os.path.join(SYNTHETIC_DIR, fname), "rb") as f:
+            batch = pickle.load(f)
+        pool.extend(g for g in batch if len(g) == GAME_LEN)
+        used_files += 1
+        if n_files is None and len(pool) >= n_games * 20:
+            break
+
+    if len(pool) < n_games:
+        raise RuntimeError(
+            f"Only {len(pool)} valid games in {used_files} files, "
+            f"need {n_games}")
+
+    idxs = rng.sample(range(len(pool)), n_games)
+    print(f"Sampled {n_games} games uniformly at random from a pool of "
+          f"{len(pool):,} (across {used_files} shuffled pickle files, seed={seed})")
+    return [pool[i] for i in idxs]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", default="ckpts/gpt_nanda_synthetic.ckpt")
     parser.add_argument("--probe", default="mechanistic_interpretability/main_linear_probe.pth")
     parser.add_argument("--layer", type=int, default=6)
-    parser.add_argument("--n-games", type=int, default=500)
-    parser.add_argument("--max-files", type=int, default=2)
+    parser.add_argument("--n-games", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for uniform random game sampling.")
+    parser.add_argument("--max-files", type=int, default=None,
+                        help="Cap the number of pickle files (default: "
+                             "enough for 20x headroom).")
     parser.add_argument("--pos-start", type=int, default=5)
     parser.add_argument("--pos-end",   type=int, default=54)
     parser.add_argument("--mode", default="parity",
                         choices=["mode0", "mode1", "mode2", "parity"],
                         help="Which probe mode to use. 'parity' picks mode0 "
                              "on positions 5,7,9,... and mode1 on 6,8,10,...")
+    parser.add_argument("--data-out", default=None,
+                        help="Path to save per-cell numbers as .npz.")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available()
@@ -67,7 +108,8 @@ if __name__ == "__main__":
     print(f"Loaded OGPT (block_size={block_size}), probing layer {args.layer}")
 
     # Load games and replay to board states
-    games = load_games(max_files=args.max_files)[:args.n_games]
+    games = sample_games_from_pool(
+        n_games=args.n_games, seed=args.seed, n_files=args.max_files)
     print(f"Using {len(games)} games")
 
     states = np.zeros((len(games), GAME_LEN, 8, 8), dtype=np.int8)
@@ -123,6 +165,19 @@ if __name__ == "__main__":
 
     match = (preds == gt_t).numpy()    # (G, T, 8, 8)
     acc = match.mean(axis=(0, 1))      # (8, 8)
+
+    if args.data_out is not None:
+        np.savez(
+            args.data_out,
+            acc=acc,
+            n_games=args.n_games,
+            seed=args.seed,
+            layer=args.layer,
+            mode=args.mode,
+            pos_start=args.pos_start,
+            pos_end=args.pos_end,
+        )
+        print(f"Saved per-cell data to {args.data_out}")
 
     # Print 8x8 grid
     print()
