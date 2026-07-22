@@ -130,11 +130,15 @@ if __name__ == "__main__":
     acts = torch.cat(acts, dim=0)   # (G, T, 512)
     print(f"Activations shape: {tuple(acts.shape)}")
 
-    # Slice to the probe's training position range
-    acts = acts[:, args.pos_start:args.pos_end, :]
-    states_s = states[:, args.pos_start:args.pos_end, :, :]
+    # Slice to the probe's training position range.  Cap pos_end by
+    # activation length so pos_end=60 with block_size=59 doesn't
+    # desync acts (59 turns) and gt (60 turns).
+    pos_end_eff = min(args.pos_end, acts.shape[1])
+    acts = acts[:, args.pos_start:pos_end_eff, :]
+    states_s = states[:, args.pos_start:pos_end_eff, :, :]
     G, T, D = acts.shape
-    print(f"After slicing: G={G}, T={T}, D={D}")
+    print(f"After slicing: G={G}, T={T}, D={D} "
+          f"(pos {args.pos_start}..{pos_end_eff - 1})")
 
     # Ground truth in {0=empty, 1=white(-1), 2=black(+1)}
     gt = np.zeros_like(states_s, dtype=np.int64)
@@ -175,7 +179,7 @@ if __name__ == "__main__":
             layer=args.layer,
             mode=args.mode,
             pos_start=args.pos_start,
-            pos_end=args.pos_end,
+            pos_end=pos_end_eff,
         )
         print(f"Saved per-cell data to {args.data_out}")
 
