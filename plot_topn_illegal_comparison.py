@@ -130,7 +130,8 @@ def plot_count_only(moves, counts, title, output_path, color):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--mlp-ckpt', required=True)
+    ap.add_argument('--mlp-ckpt', default=None,
+                    help="Optional MLP checkpoint. Omit to run OGPT only.")
     ap.add_argument('--mlp-hidden', type=int, default=512)
     ap.add_argument('--ogpt-ckpt', default='ckpts/gpt_nanda_synthetic.ckpt')
     ap.add_argument('--num-games', type=int, default=1000)
@@ -144,8 +145,13 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    print(f"Loading MLP: {args.mlp_ckpt}")
-    mlp = load_mlp(args.mlp_ckpt, args.mlp_hidden, device)
+    run_mlp = args.mlp_ckpt is not None
+    if run_mlp:
+        print(f"Loading MLP: {args.mlp_ckpt}")
+        mlp = load_mlp(args.mlp_ckpt, args.mlp_hidden, device)
+    else:
+        print("No --mlp-ckpt provided; running OGPT only.")
+        mlp = None
 
     print(f"Loading OGPT: {args.ogpt_ckpt}")
     ogpt = load_ogpt(args.ogpt_ckpt, device)
@@ -167,23 +173,27 @@ def main():
         if ogpt_preds is None:
             continue
         # Batched MLP forward across all positions for this game
-        mlp_preds = mlp_predict_per_position(
-            mlp, game, args.k_min, args.k_max, device)
+        if run_mlp:
+            mlp_preds = mlp_predict_per_position(
+                mlp, game, args.k_min, args.k_max, device)
+        else:
+            mlp_preds = None
         for k in range(args.k_min, args.k_max + 1):
             legal = legal_cells_60(game, k)
             if legal is None or len(legal) == 0:
                 continue
             mi = k - args.k_min
-            mlp_pred = int(mlp_preds[mi])
             if k - 1 < len(ogpt_preds):
                 ogpt_pred = ogpt_preds[k - 1]
             else:
                 continue
             totals[mi] += 1
-            if mlp_pred not in legal:
-                mlp_illegal[mi] += 1
             if ogpt_pred not in legal:
                 ogpt_illegal[mi] += 1
+            if run_mlp:
+                mlp_pred = int(mlp_preds[mi])
+                if mlp_pred not in legal:
+                    mlp_illegal[mi] += 1
         if (gi + 1) % 500 == 0:
             rate = (gi + 1) / (time.time() - t0)
             print(f"  {gi+1}/{len(games)} games  "
@@ -194,18 +204,20 @@ def main():
     moves = np.arange(args.k_min, args.k_max + 1)
 
     print()
-    print(f"MLP total illegal:  {mlp_illegal.sum():,}  "
-          f"({mlp_illegal.sum() / max(1, totals.sum()) * 100:.2f}%)")
+    if run_mlp:
+        print(f"MLP total illegal:  {mlp_illegal.sum():,}  "
+              f"({mlp_illegal.sum() / max(1, totals.sum()) * 100:.2f}%)")
     print(f"OGPT total illegal: {ogpt_illegal.sum():,}  "
           f"({ogpt_illegal.sum() / max(1, totals.sum()) * 100:.2f}%)")
     print(f"Total positions:    {totals.sum():,}")
 
-    plot_count_only(
-        moves, mlp_illegal,
-        "Othello-MLP: top-1 prediction is illegal",
-        os.path.join(args.output_dir, "mlp_topn_illegal_by_move.png"),
-        color='#c0504d',
-    )
+    if run_mlp:
+        plot_count_only(
+            moves, mlp_illegal,
+            "Othello-MLP: top-1 prediction is illegal",
+            os.path.join(args.output_dir, "mlp_topn_illegal_by_move.png"),
+            color='#c0504d',
+        )
     plot_count_only(
         moves, ogpt_illegal,
         "Othello-GPT: top-1 prediction is illegal",
