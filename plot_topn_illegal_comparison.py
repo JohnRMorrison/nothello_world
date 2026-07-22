@@ -213,6 +213,21 @@ def main():
         color='#c0504d',
     )
 
+    # Save the per-move data so downstream plotting (e.g. the presentation
+    # notebook) can render without re-running.
+    data_path = os.path.join(args.output_dir, "topn_illegal_by_move.npz")
+    np.savez(
+        data_path,
+        moves=moves,
+        mlp_illegal=mlp_illegal,
+        ogpt_illegal=ogpt_illegal,
+        totals=totals,
+        num_games=len(games),
+        k_min=args.k_min,
+        k_max=args.k_max,
+    )
+    print(f"Saved per-move data to {data_path}")
+
 
 if __name__ == '__main__':
     main()
