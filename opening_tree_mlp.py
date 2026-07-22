@@ -348,12 +348,13 @@ _SKOPE_PARSE_RE = None   # compiled lazily inside _skope_parse_rule
 
 def _skope_parse_rule(rule_str):
     """Parse a SkopeRules rule string into our [(feat_idx, val), ...]
-    conditions format.  Expects features named X[:, i] with threshold 0.5
-    (binary features)."""
+    conditions format.  SkopeRules names features `__C__<i>` by default.
+    Also accepts the older `X[:, i]` format just in case."""
     import re
     global _SKOPE_PARSE_RE
     if _SKOPE_PARSE_RE is None:
-        _SKOPE_PARSE_RE = re.compile(r'X\[:,\s*(\d+)\]\s*([<>=]+)\s*([\d.]+)')
+        _SKOPE_PARSE_RE = re.compile(
+            r'(?:__C__|X\[:,\s*)(\d+)\]?\s*([<>=]+)\s*([\d.]+)')
     conds = []
     for conj in rule_str.split(' and '):
         m = _SKOPE_PARSE_RE.search(conj.strip())
