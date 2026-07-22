@@ -23,7 +23,7 @@ Usage:
         --probe mechanistic_interpretability/main_linear_probe.pth \\
         --n-games 500 --pos-start 5 --pos-end 54
 """
-import sys, os, argparse
+import sys, os, argparse, pickle, random
 sys.path.insert(0, '.')
 
 import numpy as np
@@ -37,8 +37,44 @@ from data.othello import OthelloBoardState
 
 sys.path.insert(0, "experiments/mathematical_transformation_experiments")
 from probe_state_pred_for_othello import (
-    tokenize_games, load_games, extract_activations, VOCAB_SIZE, GAME_LEN,
+    tokenize_games, extract_activations, VOCAB_SIZE, GAME_LEN,
+    SYNTHETIC_DIR,
 )
+
+
+def sample_games_from_pool(n_games, seed, n_files=None):
+    """Sample n_games uniformly at random from the full synthetic pool.
+
+    Shuffles the pickle file list with the given seed, then loads pickle
+    files until the pool has enough valid (len==GAME_LEN) games, then
+    randomly samples n_games from that pool.
+    """
+    rng = random.Random(seed)
+    files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
+    rng.shuffle(files)
+    if n_files is not None:
+        files = files[:n_files]
+
+    pool = []
+    used_files = 0
+    for fname in files:
+        with open(os.path.join(SYNTHETIC_DIR, fname), "rb") as f:
+            batch = pickle.load(f)
+        pool.extend(g for g in batch if len(g) == GAME_LEN)
+        used_files += 1
+        if n_files is None and len(pool) >= n_games * 20:
+            # Have >=20x headroom, that's enough to be effectively uniform
+            break
+
+    if len(pool) < n_games:
+        raise RuntimeError(
+            f"Only {len(pool)} valid games in {used_files} files, "
+            f"need {n_games}")
+
+    idxs = rng.sample(range(len(pool)), n_games)
+    print(f"Sampled {n_games} games uniformly at random from a pool of "
+          f"{len(pool):,} (across {used_files} shuffled pickle files, seed={seed})")
+    return [pool[i] for i in idxs]
 
 
 def main():
@@ -48,13 +84,20 @@ def main():
                         default="mechanistic_interpretability/main_linear_probe.pth")
     parser.add_argument("--layer", type=int, default=6)
     parser.add_argument("--n-games", type=int, default=500)
-    parser.add_argument("--max-files", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=0,
+                        help="RNG seed for uniform random game sampling.")
+    parser.add_argument("--max-files", type=int, default=None,
+                        help="Cap the number of pickle files considered "
+                             "(default: enough to give 20x headroom).")
     parser.add_argument("--pos-start", type=int, default=5)
     parser.add_argument("--pos-end",   type=int, default=54,
                         help="Exclusive upper bound. MLP overall default is "
                              "5..54; matching here for a fair comparison.")
     parser.add_argument("--output",
                         default="experiments/plots/ogpt_overall_by_turn.png")
+    parser.add_argument("--data-out", default=None,
+                        help="Path to save per-turn numbers as .npz "
+                             "(default: swap .png -> .npz on --output).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,8 +115,8 @@ def main():
     model.to(device).eval()
     print(f"Loaded OGPT (block_size={config.block_size}), probing layer {args.layer}")
 
-    games = load_games(max_files=args.max_files)
-    games = [g for g in games if len(g) == GAME_LEN][:args.n_games]
+    games = sample_games_from_pool(
+        n_games=args.n_games, seed=args.seed, n_files=args.max_files)
     print(f"Using {len(games)} games")
 
     # OGPT block_size=59; drop the last token to match model context.
@@ -135,6 +178,23 @@ def main():
     plt.savefig(args.output, dpi=150)
     plt.close()
     print(f"Saved {args.output}")
+
+    data_out = args.data_out
+    if data_out is None:
+        base, _ = os.path.splitext(args.output)
+        data_out = base + ".npz"
+    np.savez(
+        data_out,
+        turns=turns,
+        per_turn_overall=per_turn_overall,
+        per_turn_n=per_turn_n,
+        n_games=args.n_games,
+        seed=args.seed,
+        layer=args.layer,
+        pos_start=args.pos_start,
+        pos_end=args.pos_start + T,
+    )
+    print(f"Saved data to {data_out}")
 
     # Same output format as plot_mlp_overall_by_turn.py:
     print(f"\n{'turn':>4s}  {'n':>8s}  {'overall':>9s}")
