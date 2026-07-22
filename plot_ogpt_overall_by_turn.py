@@ -89,10 +89,11 @@ def main():
     parser.add_argument("--max-files", type=int, default=None,
                         help="Cap the number of pickle files considered "
                              "(default: enough to give 20x headroom).")
-    parser.add_argument("--pos-start", type=int, default=5)
-    parser.add_argument("--pos-end",   type=int, default=54,
-                        help="Exclusive upper bound. MLP overall default is "
-                             "5..54; matching here for a fair comparison.")
+    parser.add_argument("--pos-start", type=int, default=0)
+    parser.add_argument("--pos-end",   type=int, default=60,
+                        help="Exclusive upper bound. Capped internally by "
+                             "activation length (block_size-1=59), so "
+                             "default 60 gives turns 0..58.")
     parser.add_argument("--output",
                         default="experiments/plots/ogpt_overall_by_turn.png")
     parser.add_argument("--data-out", default=None,
