@@ -352,6 +352,17 @@ def main():
     ap.add_argument('--use-relu', action='store_true',
                     help='Default is bool step (memory-efficient).')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--checkpoint-every', type=int, default=5,
+                    help='Write a resume checkpoint to <out>.resume every N '
+                         'chunks (and at each epoch end).  0 disables.  The '
+                         'chunk order is deterministic per epoch, so resume '
+                         'continues from the exact (epoch, chunk) reached.')
+    ap.add_argument('--resume', action='store_true',
+                    help='If a resume checkpoint exists, load probe+optimizer '
+                         'and continue from the saved (epoch, chunk).  Safe to '
+                         'add to a resubmitted job after a walltime timeout.')
+    ap.add_argument('--resume-from', default=None,
+                    help='Explicit resume-checkpoint path (default <out>.resume).')
     args = ap.parse_args()
 
     device = torch.device(
@@ -452,14 +463,49 @@ def main():
     print(f'training on ~{n_train_files * games_per_file:,} games '
            f'({n_train_files} files)', flush=True)
 
+    # --- Resume support: restore probe+optimizer and skip completed chunks ---
+    resume_path = args.resume_from or (args.out + '.resume')
+
+    def save_resume(epoch, chunk_index):
+        if not args.checkpoint_every:
+            return
+        tmp = resume_path + '.tmp'
+        torch.save({'probe_state': probe.state_dict(),
+                    'opt_state': opt.state_dict(),
+                    'epoch': epoch, 'chunk_index': chunk_index,
+                    'args': vars(args)}, tmp)
+        os.replace(tmp, resume_path)     # atomic
+
+    start_epoch, start_chunk = 1, 0
+    if args.resume and os.path.exists(resume_path):
+        rck = torch.load(resume_path, map_location=device)
+        probe.load_state_dict(rck['probe_state'])
+        opt.load_state_dict(rck['opt_state'])
+        start_epoch, start_chunk = rck['epoch'], rck['chunk_index']
+        if start_chunk >= len(train_subset):      # that epoch finished
+            start_epoch += 1
+            start_chunk = 0
+        print(f'RESUMED from {resume_path}: continuing at epoch '
+               f'{start_epoch}, chunk {start_chunk}', flush=True)
+    elif args.resume:
+        print(f'--resume given but no checkpoint at {resume_path}; '
+               f'starting fresh', flush=True)
+
+    acc = None
     t0 = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         print(f'\n=== epoch {epoch}/{args.epochs} ===')
         rng = np.random.RandomState(epoch)
         order = rng.permutation(len(train_subset))
+        resume_skip = start_chunk if epoch == start_epoch else 0
+        if resume_skip:
+            print(f'  skipping first {resume_skip} chunks (already done '
+                   f'this epoch)', flush=True)
         epoch_loss = 0.0
         epoch_batches = 0
         for ci, ci_idx in enumerate(order):
+            if ci < resume_skip:
+                continue
             pf = train_subset[ci_idx]
             print(f'  [{ci + 1}/{len(order)}] starting {os.path.basename(pf)} '
                    f'(cumulative {time.time() - t0:.0f}s)', flush=True)
@@ -502,6 +548,11 @@ def main():
             print(f'    trained ({time.time() - t_hidden:.1f}s;   '
                    f'cumulative time {time.time() - t0:.0f}s)',
                     flush=True)
+            if args.checkpoint_every and (ci + 1) % args.checkpoint_every == 0:
+                save_resume(epoch, ci + 1)
+                print(f'    [ckpt] resume saved @ epoch {epoch} chunk {ci + 1}',
+                        flush=True)
+        save_resume(epoch, len(order))   # epoch-end checkpoint
         avg_loss = epoch_loss / max(epoch_batches, 1)
         print(f'  epoch {epoch} avg loss: {avg_loss:.4f}')
         print(f'  eval on {os.path.basename(test_file)}...', flush=True)
@@ -520,6 +571,9 @@ def main():
         'final_acc': acc,
     }, args.out)
     print(f'\nsaved {args.out}')
+    if args.checkpoint_every and os.path.exists(resume_path):
+        os.remove(resume_path)           # training complete; drop resume file
+        print(f'removed resume checkpoint {resume_path}')
 
 
 if __name__ == '__main__':

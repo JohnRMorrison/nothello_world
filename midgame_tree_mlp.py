@@ -565,7 +565,24 @@ def main():
                     help='Path to .npz cache for the sampled TRAIN set.')
     ap.add_argument('--cache-te', default=None,
                     help='Path to .npz cache for the sampled TEST set.')
+    ap.add_argument('--tree-cache', default=None,
+                    help='Restart aid: path to save the fitted trees to '
+                         'IMMEDIATELY after fitting, and auto-load from on a '
+                         'rerun (skips the ~40-min tree fit).  Combined with '
+                         '--cache-tr/--cache-te (sampling cache), a '
+                         'timed-out job that is resubmitted skips both the '
+                         'sampling and the tree fit and goes straight to the '
+                         'probe stage.  Independent of --load-trees-from '
+                         '(which takes precedence if given).')
     args = ap.parse_args()
+
+    # Restart aid: if a tree cache exists and no explicit --load-trees-from
+    # was given, load the cached trees instead of re-fitting.
+    if not args.load_trees_from and args.tree_cache and \
+            os.path.exists(args.tree_cache):
+        print(f'--tree-cache {args.tree_cache} exists: auto-loading fitted '
+               f'trees (skipping re-fit)', flush=True)
+        args.load_trees_from = args.tree_cache
 
     if args.device == 'cuda' and not torch.cuda.is_available():
         print('warning: CUDA requested but not available; falling back to CPU')
@@ -994,6 +1011,26 @@ def main():
             print(f'  tree-path depths: (no paths extracted)')
 
         mlp = OpeningTreeMLP(W, B, all_meta, device)
+
+        # Restart aid: persist the freshly-fit trees before the (expensive,
+        # OOM-prone) H_tr computation and probe stage, so a timeout after
+        # this point never re-fits.  Same format as --tree-fit-only / the
+        # streaming --load-trees-from loader.
+        if args.tree_cache and not os.path.exists(args.tree_cache):
+            tc_tmp = args.tree_cache + '.tmp'
+            torch.save({
+                'W': mlp.W.cpu(),
+                'b': mlp.b.cpu(),
+                'path_info': all_meta,
+                'per_cell_leaf_counts': per_cell_leaf_counts,
+                'per_cell_tree_acc': (tree_correct_per_cell.tolist()
+                                        if args.tree_target != 'patterns'
+                                        else tree_correct_per_pattern.tolist()),
+                'args': vars(args),
+            }, tc_tmp)
+            os.replace(tc_tmp, args.tree_cache)      # atomic
+            print(f'  [tree-cache] saved fitted trees to {args.tree_cache}',
+                    flush=True)
 
         if args.tree_fit_only:
             print('\n--tree-fit-only: saving tree checkpoint and exiting '
