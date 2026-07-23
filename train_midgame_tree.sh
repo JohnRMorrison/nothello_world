@@ -11,7 +11,7 @@
 
 #SBATCH --job-name=midgame_tree
 #SBATCH -c 16
-#SBATCH --time=6:00:00
+#SBATCH --time=3:00:00
 #SBATCH --mem=240GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/midgame_tree_%j.out
@@ -62,8 +62,12 @@ OUT="ckpts_midgame/midgame_tree_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY
 mkdir -p ckpts_midgame/cache
 CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_tr.npz"
 CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_te.npz"
+# Stable tree cache: fitted trees saved here immediately after fitting and
+# auto-loaded on a resubmit, skipping the ~40-min re-fit.
+TREE_CACHE="ckpts_midgame/cache/midgame_trees_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}${STAB_TAG}.pt"
+echo "TREE_CACHE:        ${TREE_CACHE}"
 
-CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
+CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     ${STAB_FLAG} \
     --num-train-games ${NUM_TRAIN} \
     --num-test-games ${NUM_TEST} \
@@ -76,6 +80,7 @@ CUDA_VISIBLE_DEVICES=0 python midgame_tree_mlp.py \
     --device cuda \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \
+    --tree-cache ${TREE_CACHE} \
     --out ${OUT}
 
 echo "Completed at: $(date)"
