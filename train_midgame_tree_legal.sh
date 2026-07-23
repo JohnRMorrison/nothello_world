@@ -251,6 +251,11 @@ case "${TAG}" in
 esac
 CACHE_TR="ckpts_midgame/cache/midgame_g${NUM_TRAIN}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_tr.npz"
 CACHE_TE="ckpts_midgame/cache/midgame_g${NUM_TEST}_p${PLY_MIN}-${PLY_MAX}_r${CACHE_TAG}_L_te.npz"
+# Stable tree cache (config-keyed, incl. algorithm tag): fitted trees saved
+# here immediately after fitting and auto-loaded on a resubmit, skipping the
+# tree re-fit.  With --cache-tr/--cache-te, a resubmit skips sampling + fit.
+TREE_CACHE="ckpts_midgame/cache/treecache_midgame_leg_${TAG}_g${NUM_TRAIN}_d${MAX_DEPTH}_ml${MIN_LEAF}_p${PLY_MIN}-${PLY_MAX}${ALGO_TAG}.pt"
+echo "TREE_CACHE:        ${TREE_CACHE}"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --num-train-games ${NUM_TRAIN} \
@@ -273,6 +278,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --device cuda \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \
+    --tree-cache ${TREE_CACHE} \
     ${EXTRA_ARGS:-} \
     --out ${OUT}
 

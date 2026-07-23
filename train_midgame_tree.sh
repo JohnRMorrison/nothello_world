@@ -11,7 +11,7 @@
 
 #SBATCH --job-name=midgame_tree
 #SBATCH -c 16
-#SBATCH --time=3:00:00
+#SBATCH --time=6:00:00
 #SBATCH --mem=240GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/midgame_tree_%j.out
