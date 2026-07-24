@@ -96,6 +96,7 @@ def sample_midgame_positions(num_games, ply_min=0, ply_max=60, seed=42,
                                 recent_Ks=None,
                                 collect_legal_moves=False,
                                 canonicalize_mover=False,
+                                time_ordinal=None,
                                 pickle_dir=None):
     """Play random games; extract positions with ply in [ply_min, ply_max).
     Returns (X, S, T) — or (X, S, T, L) if collect_legal_moves — with:
@@ -138,7 +139,8 @@ def sample_midgame_positions(num_games, ply_min=0, ply_max=60, seed=42,
                         prefix, when_bucket_size,
                         use_move_grid,
                         recent_Ks=recent_Ks,
-                        canonicalize_mover=canonicalize_mover))
+                        canonicalize_mover=canonicalize_mover,
+                        time_ordinal=time_ordinal))
                     Ss.append(lbl)
                     Ts.append(ply)
                     if collect_legal_moves:
@@ -173,7 +175,8 @@ def sample_midgame_positions(num_games, ply_min=0, ply_max=60, seed=42,
                         prefix, when_bucket_size,
                         use_move_grid,
                         recent_Ks=recent_Ks,
-                        canonicalize_mover=canonicalize_mover))
+                        canonicalize_mover=canonicalize_mover,
+                        time_ordinal=time_ordinal))
                     Ss.append(lbl)
                     Ts.append(ply)
                     if collect_legal_moves:
@@ -338,6 +341,28 @@ def main():
                           'on the enlarged input directly — no separate '
                           'order-node hidden bank needed.  E.g., "5" gives '
                           'played+even+recent = 60x3 input (+ mover_parity).')
+    ap.add_argument('--time-ordinal', default='none',
+                    choices=['none', 'turn', 'movesago'],
+                    help='Append a 60-d ORDINAL turn-of-play block to the tree '
+                          'input (one numeric feature per non-center cell; -1 if '
+                          'unplayed).  "turn"=absolute ply the cell was placed; '
+                          '"movesago"=T-ply (phase-invariant, pairs with '
+                          '--canonicalize-mover).  Because it is numeric, a '
+                          'DecisionTree splits on thresholds and learns '
+                          'contiguous, data-adaptive time RANGES ("cell C played '
+                          'in turns [12,13]") instead of one-hot point leaves — '
+                          'min_samples_leaf/max_depth act as a time-granularity '
+                          'dial.  Composes with either recency block.')
+    ap.add_argument('--time-ordinal-split-color', action='store_true',
+                    help='Split the --time-ordinal block into two channels per '
+                          'cell (mover / opponent): each holds the play-time '
+                          'only for cells of that color, -1 otherwise (120 cols '
+                          'instead of 60).  Because a player moves on alternate '
+                          'turns, an un-split ordinal band straddles both colors '
+                          '(turns 3,4,5 = me/opp/me); splitting makes each '
+                          "channel same-parity so a threshold band is color-pure "
+                          'by construction — no co-gating with placed_as_mover, '
+                          'no leaf fragmentation.  Requires --canonicalize-mover.')
     ap.add_argument('--include-flanking-patterns', default='',
                     help='Path to a .pt file with 960 hand-crafted flanking '
                           'patterns.  Each pattern encodes an Othello '
@@ -607,6 +632,10 @@ def main():
     if recent_Ks and hidden_recent_Ks:
         raise ValueError('--input-recent-Ks and --recent-Ks-as-hidden '
                           'are mutually exclusive')
+    time_ordinal = args.time_ordinal if args.time_ordinal != 'none' else None
+    if time_ordinal:
+        print(f'time-ordinal block: {time_ordinal} → 60 numeric cols appended '
+               f'to tree input (trees learn adaptive turn ranges)')
     # Both flags cause recent bits to be materialized during sampling; the
     # difference is only whether they're passed to the tree fit or kept
     # aside for direct concat to the hidden layer.
@@ -632,6 +661,7 @@ def main():
         recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal,
         canonicalize_mover=args.canonicalize_mover,
+        time_ordinal=time_ordinal,
         pickle_dir=args.pickle_dir)
     te = load_or_sample(
         args.cache_te, sample_midgame_positions,
@@ -642,6 +672,7 @@ def main():
         recent_Ks=sampling_Ks,
         collect_legal_moves=collect_legal,
         canonicalize_mover=args.canonicalize_mover,
+        time_ordinal=time_ordinal,
         pickle_dir=args.pickle_dir)
     if collect_legal:
         Xnp_tr, Snp_tr, Tnp_tr, Lnp_tr = tr
@@ -669,6 +700,39 @@ def main():
     Xnp_te, Snp_te, Tnp_te, Lnp_te = _narrow(Xnp_te, Snp_te, Tnp_te, Lnp_te)
     print(f'  train={Xnp_tr.shape[0]}  test={Xnp_te.shape[0]}  '
            f'({time.time() - t0:.1f}s)')
+
+    # ---- Set aside the ordinal turn-of-play block ----
+    # playedeven_features appends it as the trailing 60 cols.  Carry it aside
+    # so the movegrid / recent-as-hidden slicing below (which hard-slices Xnp
+    # back to played_even) doesn't drop it; re-append just before the tree fit
+    # so the trees DO see it and can split on turn-of-play thresholds.
+    ordinal_tr = ordinal_te = None
+    if time_ordinal:
+        ordinal_tr = np.ascontiguousarray(Xnp_tr[:, -60:])
+        ordinal_te = np.ascontiguousarray(Xnp_te[:, -60:])
+        Xnp_tr = np.ascontiguousarray(Xnp_tr[:, :-60])
+        Xnp_te = np.ascontiguousarray(Xnp_te[:, :-60])
+        if args.time_ordinal_split_color:
+            # A player moves on alternate turns, so a single ordinal band mixes
+            # colors.  Split into mover/opp channels using placed_as_mover
+            # (Xnp cols 60:120, still present after the ordinal slice above):
+            # each channel keeps the play-time only for its color, -1 else.
+            if not args.canonicalize_mover:
+                raise ValueError('--time-ordinal-split-color requires '
+                                  '--canonicalize-mover (needs placed_as_mover '
+                                  'in Xnp cols 60:120)')
+            def _split_ordinal(ordinal, X):
+                pam = X[:, 60:120] > 0                     # placed_as_mover
+                mover = np.where(pam, ordinal, -1.0).astype(np.float32)
+                opp = np.where(pam, -1.0, ordinal).astype(np.float32)
+                return np.ascontiguousarray(
+                    np.concatenate([mover, opp], axis=1))
+            ordinal_tr = _split_ordinal(ordinal_tr, Xnp_tr)
+            ordinal_te = _split_ordinal(ordinal_te, Xnp_te)
+            print(f'  --time-ordinal-split-color: ordinal split into mover/opp '
+                   f'→ {ordinal_tr.shape[1]} cols')
+        print(f'  set aside ordinal block {ordinal_tr.shape} '
+               f'(Xnp_tr → {Xnp_tr.shape})')
 
     # ---- Split off movegrid for order-aware hidden banks ----
     # Order-feature builders need the (N, 60, 60) movegrid; trees still fit
@@ -752,6 +816,16 @@ def main():
             [Xnp_te, CF_te.astype(np.float32)], axis=1)
         print(f'  input dim now: {Xnp_tr.shape[1]}')
         del CF_tr, CF_te
+
+    # ---- Re-append the ordinal turn-of-play block to the tree input ----
+    # After all played_even hard-slicing, restore the trailing ordinal cols so
+    # the trees fit on [played_even (+ input-recency) + ordinal].
+    if time_ordinal:
+        Xnp_tr = np.ascontiguousarray(
+            np.concatenate([Xnp_tr, ordinal_tr.astype(np.float32)], axis=1))
+        Xnp_te = np.ascontiguousarray(
+            np.concatenate([Xnp_te, ordinal_te.astype(np.float32)], axis=1))
+        print(f'  re-appended ordinal block → tree input dim {Xnp_tr.shape[1]}')
 
     S_tr = torch.from_numpy(Snp_tr)
     S_te = torch.from_numpy(Snp_te)

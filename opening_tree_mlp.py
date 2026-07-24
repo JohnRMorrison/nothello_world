@@ -37,13 +37,19 @@ STATE_NAMES = ['empty', 'mine', 'opp']
 
 
 def compute_input_dim(when_bucket_size=None, use_move_grid=False,
-                        recent_Ks=None):
+                        recent_Ks=None, time_ordinal=None):
     """Base 121 (played + even + mover_parity), plus optionally:
       - when-buckets: 60 * n_buckets features (mutex with move grid).
       - move grid: 60 * 60 = 3600 features (mutex with when-buckets).
       - recent_Ks: 60 * len(recent_Ks) features — for each K in the list,
         one per-cell bit indicating whether that cell was played in the
         last K turns of the prefix.  Composes with either mutex block.
+      - time_ordinal ('turn' | 'movesago'): 60 features — for each non-center
+        cell, the ORDINAL turn it was played (or T - turn for 'movesago'),
+        with -1 for unplayed.  Numeric, so a DecisionTree splits on
+        thresholds and learns contiguous, data-adaptive time RANGES ("cell C
+        played in turns [12,13]") instead of one-hot point leaves.  Always
+        the trailing block.
     """
     dim = 121
     if use_move_grid:
@@ -53,11 +59,14 @@ def compute_input_dim(when_bucket_size=None, use_move_grid=False,
         dim += 60 * n_buckets
     if recent_Ks:
         dim += 60 * len(recent_Ks)
+    if time_ordinal:
+        dim += 60
     return dim
 
 
 def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
-                          recent_Ks=None, canonicalize_mover=False):
+                          recent_Ks=None, canonicalize_mover=False,
+                          time_ordinal=None):
     """Return input features for a game prefix.
 
     Base 121-d: 60 played + 60 even + 1 mover_parity.
@@ -83,7 +92,8 @@ def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
       feature vectors, and lets each tree see 800k rows in one representation
       rather than partitioning capacity by mover.
     """
-    input_dim = compute_input_dim(when_bucket_size, use_move_grid, recent_Ks)
+    input_dim = compute_input_dim(when_bucket_size, use_move_grid, recent_Ks,
+                                    time_ordinal)
     feat = np.zeros(input_dim, dtype=np.float32)
     T = len(prefix)
     mp = T % 2                             # 0 if BLACK to move, 1 if WHITE
@@ -127,10 +137,26 @@ def playedeven_features(prefix, when_bucket_size=None, use_move_grid=False,
                 c = prefix[t]
                 if c in C64_TO_C60:
                     feat[base + k_idx * 60 + C64_TO_C60[c]] = 1.0
+    if time_ordinal:
+        # Trailing 60-d block: per-cell ordinal turn-of-play (numeric).
+        # 'turn'     -> absolute ply t the cell was placed.
+        # 'movesago' -> T - t (phase-invariant recency, composes with
+        #               canonicalize_mover).  Unplayed cells -> -1 so a
+        #               threshold split cleanly separates them; the per-cell
+        #               played bit still lets a tree gate on presence first.
+        ord_base = compute_input_dim(when_bucket_size, use_move_grid, recent_Ks)
+        Tn = len(prefix)
+        feat[ord_base:ord_base + 60] = -1.0
+        for t, c in enumerate(prefix):
+            if c in C64_TO_C60:
+                i = C64_TO_C60[c]                 # each cell placed at most once
+                feat[ord_base + i] = float(Tn - t) if time_ordinal == 'movesago' \
+                    else float(t)
     return feat
 
 
-def feature_name(feat_idx, recent_Ks=None):
+def feature_name(feat_idx, recent_Ks=None, time_ordinal=None,
+                  time_ordinal_split_color=False):
     """Return a human-readable name for a played_even feature index."""
     if feat_idx == 120:
         return 'mover_parity'
@@ -154,6 +180,25 @@ def feature_name(feat_idx, recent_Ks=None):
             col = 'ABCDEFGH'[cell % 8]
             row = str(cell // 8 + 1)
             return f'recent{K}[{col}{row}]'
+    if time_ordinal:
+        # Trailing block; best-effort offset (ignores mutex block, same
+        # simplification the recent branch above makes).  60 cols normally,
+        # 120 when split into mover/opp channels.
+        ord_base = 121 + (60 * len(recent_Ks) if recent_Ks else 0)
+        base_tag = 'movesago' if time_ordinal == 'movesago' else 'playedturn'
+        rel = feat_idx - ord_base
+        if time_ordinal_split_color:
+            if 0 <= rel < 120:
+                role = 'mover' if rel < 60 else 'opp'
+                cell = C60_TO_C64[rel % 60]
+                col = 'ABCDEFGH'[cell % 8]
+                row = str(cell // 8 + 1)
+                return f'{base_tag}_{role}[{col}{row}]'
+        elif 0 <= rel < 60:
+            cell = C60_TO_C64[rel]
+            col = 'ABCDEFGH'[cell % 8]
+            row = str(cell // 8 + 1)
+            return f'{base_tag}[{col}{row}]'
     return f'feat[{feat_idx}]'
 
 
