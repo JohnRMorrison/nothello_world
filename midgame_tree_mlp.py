@@ -1065,7 +1065,12 @@ def main():
            f'H_te {tuple(H_te.shape)} '
            f'({H_te.element_size() * H_te.nelement() / 1e9:.2f} GB)')
     if not args.skip_tree_fit:
-        del X_tr, X_te
+        # The --load-trees-from branch (used by --tree-cache resumes) already
+        # frees X_tr/X_te internally, so guard against a double-delete here.
+        try:
+            del X_tr, X_te
+        except UnboundLocalError:
+            pass
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
