@@ -20,11 +20,12 @@
 
 #SBATCH --job-name=midgame_leg
 #SBATCH -c 16
-#SBATCH --time=6:00:00
+#SBATCH --time=4:00:00
 #SBATCH --mem=240GB
 #SBATCH --gres=gpu:1
 #SBATCH --output=logs/midgame_leg_%j.out
 #SBATCH --account=nklab
+#SBATCH --partition=nklab,burst
 #SBATCH --exclude=ax01,ax02,ax03,ax04,ax05,ax06,ax07,ax09
 
 module load cuda/11.8.0
@@ -35,6 +36,21 @@ export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 mkdir -p logs ckpts_midgame ckpts_midgame/cache
 
 cd $SLURM_SUBMIT_DIR
+
+# Two-stage split so the (non-mid-resumable) tree fit and the GPU readout run
+# as separate, shorter, burst-friendly jobs:
+#   STAGE=fit      -> fit trees on CPU, save --tree-cache, exit (--tree-fit-only).
+#                     No GPU needed — submit with --gres=gpu:0 for easy backfill.
+#   STAGE=readout  -> auto-load the cached bank (skip fit), train the readout on
+#                     GPU.  Depends on the fit job having written the tree-cache.
+#   STAGE=full     -> (default) fit + readout in one job (original behavior).
+STAGE=${STAGE:-full}
+case "${STAGE}" in
+    fit)     STAGE_ARGS="--tree-fit-only"; DEVICE="cpu" ;;
+    readout) STAGE_ARGS="";                DEVICE="cuda" ;;
+    full)    STAGE_ARGS="";                DEVICE="cuda" ;;
+    *) echo "unknown STAGE '${STAGE}' — use fit|readout|full"; exit 1 ;;
+esac
 
 VARIANT=${1:-simple_K5}
 NUM_TRAIN=${2:-20000}
@@ -317,10 +333,11 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u midgame_tree_mlp.py \
     --legal-probe-epochs 100 \
     ${RECENT_ARG} \
     ${PICKLE_ARG} \
-    --device cuda \
+    --device ${DEVICE} \
     --cache-tr ${CACHE_TR} \
     --cache-te ${CACHE_TE} \
     --tree-cache ${TREE_CACHE} \
+    ${STAGE_ARGS} \
     ${EXTRA_ARGS:-} \
     --out ${OUT}
 
