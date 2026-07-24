@@ -352,6 +352,11 @@ def main():
     ap.add_argument('--use-relu', action='store_true',
                     help='Default is bool step (memory-efficient).')
     ap.add_argument('--out', required=True)
+    ap.add_argument('--n-seeds', type=int, default=1,
+                    help='Train N probe heads (different init) simultaneously '
+                         'on the shared hidden layer, then ensemble them at '
+                         'eval.  Near-free vs N separate runs, since the chunk '
+                         'load and hidden-layer build are shared across seeds.')
     ap.add_argument('--checkpoint-every', type=int, default=5,
                     help='Write a resume checkpoint to <out>.resume every N '
                          'chunks (and at each epoch end).  0 disables.  The '
@@ -435,11 +440,13 @@ def main():
     print(f'  hidden_dim={hidden_dim}')
     del Xw, Xw_small, H_small
 
-    # Initialize probe.
-    if args.probe_type == 'linpo':
-        probe = LinearPatternProbOr(hidden_dim, patterns).to(device)
-        print(f'probe: LinearPatternProbOr  params={sum(p.numel() for p in probe.parameters()):,}')
-    else:
+    # Initialize N probe heads (different init) for ensembling.  N=1 is the
+    # original single-probe behavior.  All heads share the same hidden layer
+    # per batch, so the extra cost is only the (cheap) per-head forward/back.
+    def make_probe(seed):
+        torch.manual_seed(1000 + seed)
+        if args.probe_type == 'linpo':
+            return LinearPatternProbOr(hidden_dim, patterns).to(device)
         # StruPO needs full meta list.  We only have tree_meta from
         # the load; pattern-tree meta already has 'pattern' fields.  If
         # tree_meta doesn't have pattern fields, StruPO cannot group.
@@ -448,13 +455,15 @@ def main():
                 'StruPO requires tree_target=patterns checkpoint (with '
                 'pattern-path meta).  Loaded checkpoint has tree_path '
                 'entries — use --probe-type linpo instead.')
-        probe = PatternProbOrHead(
+        return PatternProbOrHead(
             tree_meta, patterns,
             use_pattern_bias=args.use_pattern_bias).to(device)
-        print(f'probe: PatternProbOrHead    params={sum(p.numel() for p in probe.parameters()):,}')
 
-    opt = torch.optim.AdamW(probe.parameters(), lr=args.lr,
-                              weight_decay=args.weight_decay)
+    probes = [make_probe(s) for s in range(args.n_seeds)]
+    opts = [torch.optim.AdamW(p.parameters(), lr=args.lr,
+                                weight_decay=args.weight_decay) for p in probes]
+    print(f'{len(probes)} probe head(s), type={args.probe_type}, '
+           f'params/head={sum(p.numel() for p in probes[0].parameters()):,}')
 
     n_train_files = min(len(train_files),
                           (args.num_train_games + games_per_file - 1)
@@ -470,8 +479,8 @@ def main():
         if not args.checkpoint_every:
             return
         tmp = resume_path + '.tmp'
-        torch.save({'probe_state': probe.state_dict(),
-                    'opt_state': opt.state_dict(),
+        torch.save({'probe_states': [p.state_dict() for p in probes],
+                    'opt_states': [o.state_dict() for o in opts],
                     'epoch': epoch, 'chunk_index': chunk_index,
                     'args': vars(args)}, tmp)
         os.replace(tmp, resume_path)     # atomic
@@ -479,8 +488,13 @@ def main():
     start_epoch, start_chunk = 1, 0
     if args.resume and os.path.exists(resume_path):
         rck = torch.load(resume_path, map_location=device)
-        probe.load_state_dict(rck['probe_state'])
-        opt.load_state_dict(rck['opt_state'])
+        # Back-compat: old single-probe checkpoints used 'probe_state'.
+        p_states = rck.get('probe_states', [rck['probe_state']])
+        o_states = rck.get('opt_states', [rck['opt_state']])
+        for p, st in zip(probes, p_states):
+            p.load_state_dict(st)
+        for o, st in zip(opts, o_states):
+            o.load_state_dict(st)
         start_epoch, start_chunk = rck['epoch'], rck['chunk_index']
         if start_chunk >= len(train_subset):      # that epoch finished
             start_epoch += 1
@@ -533,10 +547,15 @@ def main():
                     device)
                 if H_batch.dtype != torch.float32:
                     H_batch = H_batch.float()
-                probs = probe(H_batch).clamp(1e-6, 1 - 1e-6)
-                loss = F.binary_cross_entropy(probs, L_batch)
-                opt.zero_grad(); loss.backward(); opt.step()
-                epoch_loss += loss.item(); epoch_batches += 1
+                # Shared H_batch (no grad through it) → each head trains
+                # independently on the same batch.
+                last_loss = 0.0
+                for p, o in zip(probes, opts):
+                    probs = p(H_batch).clamp(1e-6, 1 - 1e-6)
+                    loss = F.binary_cross_entropy(probs, L_batch)
+                    o.zero_grad(); loss.backward(); o.step()
+                    last_loss = loss.item()
+                epoch_loss += last_loss; epoch_batches += 1
                 batch_idx += 1
                 # Intra-chunk heartbeat every 256 batches so we know we're
                 # not stuck.
@@ -558,7 +577,9 @@ def main():
         print(f'  eval on {os.path.basename(test_file)}...', flush=True)
         # Cap eval at 500K positions — enough for a stable per-cell
         # accuracy estimate, keeps eval under ~1 min.
-        acc = evaluate(probe, test_file, args.ply_min, args.ply_max,
+        # In-job eval is a single-head diagnostic; the ensemble number comes
+        # from reeval over all saved heads.
+        acc = evaluate(probes[0], test_file, args.ply_min, args.ply_max,
                           recent_Ks, mlp, patterns, args.use_relu, device,
                           batch=args.batch_size,
                           use_chunk_ext=use_chunk_ext,
@@ -566,7 +587,8 @@ def main():
                           max_positions=500_000)
 
     torch.save({
-        'probe_state': probe.state_dict(),
+        'probe_states': [p.state_dict() for p in probes],
+        'probe_state': probes[0].state_dict(),   # back-compat: first head
         'args': vars(args),
         'final_acc': acc,
     }, args.out)

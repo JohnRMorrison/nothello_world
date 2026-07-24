@@ -89,8 +89,14 @@ echo "use_relu:          ${USE_RELU:-<step>}"
 # resubmitted job — which gets a new OUT name — still finds and continues
 # from the previous run's checkpoint.  Removed automatically on completion.
 CHECKPOINT_EVERY=${CHECKPOINT_EVERY:-5}
-RESUME_STATE="ckpts_midgame/resume/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TREE_TAG}.resume"
+N_SEEDS=${N_SEEDS:-1}
+# Multi-seed ensemble: tag OUT/resume so an N-seed run doesn't collide with the
+# single-seed one.  Single-seed naming is unchanged (SEED_TAG empty).
+SEED_TAG=""
+if [ "${N_SEEDS}" != "1" ]; then SEED_TAG="_s${N_SEEDS}"; OUT="${OUT%.pt}${SEED_TAG}.pt"; fi
+RESUME_STATE="ckpts_midgame/resume/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TREE_TAG}${SEED_TAG}.resume"
 mkdir -p ckpts_midgame/resume
+echo "N_SEEDS:           ${N_SEEDS}"
 echo "OUT:               ${OUT}"
 echo "RESUME_STATE:      ${RESUME_STATE}"
 echo "CHECKPOINT_EVERY:  ${CHECKPOINT_EVERY}"
@@ -110,6 +116,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u train_streaming_probe.py \
     --epochs ${EPOCHS} \
     --batch-size ${BATCH_SIZE} \
     --lr ${LR} \
+    --n-seeds ${N_SEEDS} \
     --checkpoint-every ${CHECKPOINT_EVERY} \
     --resume --resume-from ${RESUME_STATE} \
     ${RELU_FLAG} \

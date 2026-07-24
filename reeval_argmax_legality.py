@@ -107,7 +107,11 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         T_batch = T[i:i + batch]
         H = build_hidden_layer_batch(X_batch, mlp, patterns, recent_Ks,
                                           use_relu, device)
-        probs = probe(H.float() if not use_relu else H)
+        Hf = H.float() if not use_relu else H
+        if isinstance(probe, (list, tuple)):        # ensemble: average heads
+            probs = torch.stack([pr(Hf) for pr in probe]).mean(0)
+        else:
+            probs = probe(Hf)
         probs_np = probs.cpu().numpy()
         argmax_cells = probs_np.argmax(axis=1)
         for j in range(X_batch.shape[0]):
@@ -147,14 +151,24 @@ def load_probe(probe_ckpt_path, device):
                                       'hand_crafted_flanking_patterns.pt')))
     hidden_dim = W.shape[0] + len(patterns)   # tree paths + 960 flanking
     probe_type = saved_args.get('probe_type', 'strupo')
-    if probe_type == 'linpo':
-        probe = LinearPatternProbOr(hidden_dim, patterns).to(device)
-    else:
-        probe = PatternProbOrHead(meta, patterns).to(device)
-    probe.load_state_dict(ck['probe_state'])
-    probe.eval()
+    def _build():
+        if probe_type == 'linpo':
+            return LinearPatternProbOr(hidden_dim, patterns).to(device)
+        return PatternProbOrHead(meta, patterns).to(device)
+    # Ensemble: a multi-seed checkpoint stores 'probe_states' (list); a
+    # single-seed one stores 'probe_state'.
+    states = ck.get('probe_states', [ck['probe_state']])
+    probes = []
+    for st in states:
+        pr = _build()
+        pr.load_state_dict(st)
+        pr.eval()
+        probes.append(pr)
+    if len(probes) > 1:
+        print(f'  ensembling {len(probes)} probe heads')
     return {
-        'probe': probe,
+        'probes': probes,
+        'probe': probes[0],
         'mlp': mlp,
         'patterns': patterns,
         'saved_args': saved_args,
@@ -217,7 +231,7 @@ def main():
         recent_Ks = None
         use_relu = info['saved_args'].get('use_relu', False)
         res = evaluate_probe_with_ply(
-            info['probe'], X, L, T, info['mlp'], info['patterns'],
+            info['probes'], X, L, T, info['mlp'], info['patterns'],
             recent_Ks, use_relu, device,
             batch=info['saved_args'].get('batch_size', 2048),
         )
