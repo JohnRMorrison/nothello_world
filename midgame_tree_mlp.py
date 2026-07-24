@@ -964,6 +964,13 @@ def main():
     S_te = torch.from_numpy(Snp_te)
     T_te = torch.from_numpy(Tnp_te)
     use_relu = args.hidden_activation == 'relu'
+    if args.hidden_from_leaves and use_relu:
+        # Leaf one-hot is inherently 0/1 — ReLU float32 wastes 4x memory
+        # (e.g. ~48k leaves x 800k positions = 154GB f32 vs 38GB bool) and
+        # OOMs the node.  Force step/bool for leaf mode.
+        print('  --hidden-from-leaves: forcing step/bool activation '
+               '(leaf membership is binary; ReLU float32 would OOM)')
+        use_relu = False
     act_dtype = torch.float32 if use_relu else torch.bool
 
     if args.load_trees_from:
