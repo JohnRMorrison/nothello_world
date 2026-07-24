@@ -243,6 +243,25 @@ case "${VARIANT}" in
         RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --time-ordinal movesago --time-ordinal-split-color --hidden-from-leaves --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_recent_hidden_ordinal_split_canonical"
         ;;
+    pattern_trees_multioutput_canonical)
+        # ONE multi-output tree jointly fit on all 960 patterns.  Splits are
+        # shared → leaves are board-state regions informative about many
+        # patterns at once (a compact, decorrelated basis: ~hundreds of hidden
+        # units vs ~48k for per-pattern), at the cost of per-pattern sharpness.
+        # Pairs with the dense BCE readout only.  vs 92.08% baseline.
+        RECENT_ARG="--pattern-tree-mode multioutput --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --canonicalize-mover"
+        TAG="pattern_trees_multioutput_canonical"
+        LEGAL_MODES_OVERRIDE="${LEGAL_MODES_OVERRIDE:-bce}"
+        ;;
+    pattern_trees_grouped_canonical)
+        # One multi-output tree per TARGET CELL (~60 trees, ~16 patterns each):
+        # related patterns share a tree, unrelated ones don't over-compromise.
+        # Middle ground between per-pattern and one-tree-for-all.  Dense BCE
+        # readout.  vs 92.08% baseline.
+        RECENT_ARG="--pattern-tree-mode grouped --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --canonicalize-mover"
+        TAG="pattern_trees_grouped_canonical"
+        LEGAL_MODES_OVERRIDE="${LEGAL_MODES_OVERRIDE:-bce}"
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1

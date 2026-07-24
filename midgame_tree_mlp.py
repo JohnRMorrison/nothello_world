@@ -301,6 +301,63 @@ def build_stability_features(device):
     return W, B, meta
 
 
+def fit_multioutput_pattern_trees(Xnp_tr, pt_tr, Xnp_te, pt_te, patterns_list,
+                                    args, max_features, class_weight):
+    """Fit multi-output pattern tree(s) jointly over GROUPS of patterns.
+
+    mode=multioutput → one tree over all 960 targets; mode=grouped → one tree
+    per target cell (over that cell's ~15 patterns).  A joint tree's splits are
+    shared across its targets, so its leaves become board-state regions
+    informative about many patterns at once (a decorrelated basis for the
+    readout), at the cost of per-pattern sharpness.
+
+    Returns (multi_trees, tree_correct_per_pattern):
+      multi_trees: list of (sklearn_tree, group_label, pattern_col_ids)
+      tree_correct_per_pattern: (K,) per-pattern test accuracy.
+    """
+    from sklearn.tree import DecisionTreeClassifier
+    K = len(patterns_list)
+    if args.pattern_tree_mode == 'multioutput':
+        groups = [('all', list(range(K)))]
+    else:  # grouped by target cell
+        from collections import defaultdict
+        by_cell = defaultdict(list)
+        for j, p in enumerate(patterns_list):
+            by_cell[p['target']].append(j)
+        groups = [(f'cell{c}', cols) for c, cols in sorted(by_cell.items())]
+    # class_weight='balanced' is unsafe for many-output trees: sklearn takes the
+    # PRODUCT of per-output balanced weights, so with hundreds of ~1.5%-positive
+    # targets the sample weights underflow to 0 and the tree degenerates to a
+    # single leaf.  Disable it for joint trees (rare-pattern upweighting is
+    # inherently lost when targets are shared).
+    if class_weight is not None:
+        print('  NOTE: class_weight disabled for multi-output '
+               '(product-of-weights underflows across many targets)')
+    print(f'  fitting {len(groups)} multi-output tree(s) '
+           f'(mode={args.pattern_tree_mode}; '
+           f'{"all 960 targets" if len(groups) == 1 else f"~{K // len(groups)} targets/tree"})...')
+    multi_trees = []
+    tree_correct_per_pattern = np.zeros(K)
+    for label, cols in groups:
+        t = DecisionTreeClassifier(
+            max_depth=args.tree_max_depth,
+            min_samples_leaf=args.tree_min_samples_leaf,
+            max_features=max_features,
+            class_weight=None,
+            random_state=0)
+        y = pt_tr[:, cols]
+        t.fit(Xnp_tr, y.ravel() if len(cols) == 1 else y)
+        pred = t.predict(Xnp_te)
+        if pred.ndim == 1:
+            pred = pred[:, None]
+        for k, col in enumerate(cols):
+            tree_correct_per_pattern[col] = (pred[:, k] == pt_te[:, col]).mean()
+        multi_trees.append((t, label, cols))
+    print(f'  multi-output per-pattern test acc: '
+           f'{100 * tree_correct_per_pattern.mean():.4f}% (mean over {K})')
+    return multi_trees, tree_correct_per_pattern
+
+
 def build_H_from_leaves(leaf_build, Xnp, dtype=torch.bool):
     """Hidden layer as TRUE leaf one-hot (honors real/numeric thresholds).
 
@@ -553,6 +610,23 @@ def main():
                           'to fit per pattern.  1 = single tree per pattern '
                           '(deterministic).  >1 = bagged ensemble with '
                           'bootstrap sampling.')
+    ap.add_argument('--pattern-tree-mode', default='per_pattern',
+                    choices=['per_pattern', 'multioutput', 'grouped'],
+                    help='How pattern trees partition the 960 targets. '
+                          'per_pattern (default): one independent tree per '
+                          'pattern — maximally sharp per pattern, but leaves '
+                          'are pattern-specific and the readout sees a '
+                          'fragmented, redundant basis.  multioutput: ONE '
+                          'multi-output tree jointly fit on all 960 (sklearn '
+                          'native) — splits are shared, so leaves are '
+                          'board-state regions informative about many patterns '
+                          'at once (fewer, decorrelated hidden units), at the '
+                          'cost of per-pattern sharpness (rare patterns get '
+                          'averaged out).  grouped: one multi-output tree per '
+                          'target cell (~64 trees over the ~15 patterns each) — '
+                          'related patterns share a tree, unrelated ones do '
+                          'not over-compromise.  multioutput/grouped pair with '
+                          'the dense (bce/linpo) readout, not strupo.')
     ap.add_argument('--pattern-use-random-forest', action='store_true',
                     help='Fit one sklearn RandomForestClassifier per '
                           'pattern (with n_estimators = --pattern-n-trees) '
@@ -992,6 +1066,7 @@ def main():
                     pass
         pattern_trees = None
         patterns_list = None
+        multi_trees = None
         if args.tree_target == 'patterns':
             if not args.include_flanking_patterns:
                 raise ValueError('--tree-target patterns requires '
@@ -1007,53 +1082,62 @@ def main():
                    f'{fire_rate_tr:.3f}%   '
                    f'per-pattern min: {100 * pt_tr.mean(0).min():.3f}%   '
                    f'max: {100 * pt_tr.mean(0).max():.3f}%')
-            print(f'  fitting {args.pattern_n_trees} tree(s) per pattern '
-                   f'({len(patterns_list)} patterns × '
-                   f'{args.pattern_n_trees} = '
-                   f'{len(patterns_list) * args.pattern_n_trees} trees)...')
             cw = (None if args.pattern_class_weight == 'none'
                     else 'balanced')
             print(f'  class_weight = {cw}')
-            pattern_trees = train_pattern_trees(
-                Xnp_tr, pt_tr,
-                n_trees_per_pattern=args.pattern_n_trees,
-                max_depth=args.tree_max_depth,
-                min_samples_leaf=args.tree_min_samples_leaf,
-                n_jobs=args.tree_n_jobs,
-                max_features=mf,
-                class_weight=cw,
-                use_random_forest=args.pattern_use_random_forest,
-                algorithm=args.pattern_algorithm,
-                gb_learning_rate=args.pattern_gb_learning_rate,
-                skope_precision_min=args.pattern_skope_precision_min,
-                skope_recall_min=args.pattern_skope_recall_min)
-            print(f'  ({time.time() - t0:.1f}s)')
-
-            # Aggregate-per-pattern tree accuracy (majority vote across
-            # the pattern's trees).
             K = len(patterns_list)
-            tree_correct_per_pattern = np.zeros(K)
-            from opening_tree_mlp import PreExtractedPaths
-            for j in range(K):
-                # Skip aggregate accuracy for PreExtractedPaths (skope) --
-                # rule-based algorithms don't have a per-tree predict().
-                if any(isinstance(t, PreExtractedPaths)
-                        for t in pattern_trees[j]):
-                    tree_correct_per_pattern[j] = np.nan
-                    continue
-                votes = np.zeros(Xnp_te.shape[0], dtype=np.float32)
-                for tree in pattern_trees[j]:
-                    votes += tree.predict(Xnp_te).astype(np.float32)
-                pred = (votes / len(pattern_trees[j]) > 0.5).astype(np.uint8)
-                tree_correct_per_pattern[j] = (pred == pt_te[:, j]).mean()
-            valid = ~np.isnan(tree_correct_per_pattern)
-            if valid.any():
-                print(f'  aggregate per-pattern tree test acc: '
-                       f'{100 * tree_correct_per_pattern[valid].mean():.4f}% '
-                       f'({int(valid.sum())}/{K} patterns)')
+            multi_trees = None
+            if args.pattern_tree_mode != 'per_pattern':
+                pattern_trees = None
+                multi_trees, tree_correct_per_pattern = \
+                    fit_multioutput_pattern_trees(
+                        Xnp_tr, pt_tr, Xnp_te, pt_te, patterns_list,
+                        args, mf, cw)
+                print(f'  ({time.time() - t0:.1f}s)')
             else:
-                print(f'  aggregate per-pattern tree test acc: n/a '
-                       f'(algorithm produces rule-based outputs)')
+                print(f'  fitting {args.pattern_n_trees} tree(s) per pattern '
+                       f'({len(patterns_list)} patterns × '
+                       f'{args.pattern_n_trees} = '
+                       f'{len(patterns_list) * args.pattern_n_trees} trees)...')
+                pattern_trees = train_pattern_trees(
+                    Xnp_tr, pt_tr,
+                    n_trees_per_pattern=args.pattern_n_trees,
+                    max_depth=args.tree_max_depth,
+                    min_samples_leaf=args.tree_min_samples_leaf,
+                    n_jobs=args.tree_n_jobs,
+                    max_features=mf,
+                    class_weight=cw,
+                    use_random_forest=args.pattern_use_random_forest,
+                    algorithm=args.pattern_algorithm,
+                    gb_learning_rate=args.pattern_gb_learning_rate,
+                    skope_precision_min=args.pattern_skope_precision_min,
+                    skope_recall_min=args.pattern_skope_recall_min)
+                print(f'  ({time.time() - t0:.1f}s)')
+
+                # Aggregate-per-pattern tree accuracy (majority vote across
+                # the pattern's trees).
+                tree_correct_per_pattern = np.zeros(K)
+                from opening_tree_mlp import PreExtractedPaths
+                for j in range(K):
+                    # Skip aggregate accuracy for PreExtractedPaths (skope) --
+                    # rule-based algorithms don't have a per-tree predict().
+                    if any(isinstance(t, PreExtractedPaths)
+                            for t in pattern_trees[j]):
+                        tree_correct_per_pattern[j] = np.nan
+                        continue
+                    votes = np.zeros(Xnp_te.shape[0], dtype=np.float32)
+                    for tree in pattern_trees[j]:
+                        votes += tree.predict(Xnp_te).astype(np.float32)
+                    pred = (votes / len(pattern_trees[j]) > 0.5).astype(np.uint8)
+                    tree_correct_per_pattern[j] = (pred == pt_te[:, j]).mean()
+                valid = ~np.isnan(tree_correct_per_pattern)
+                if valid.any():
+                    print(f'  aggregate per-pattern tree test acc: '
+                           f'{100 * tree_correct_per_pattern[valid].mean():.4f}% '
+                           f'({int(valid.sum())}/{K} patterns)')
+                else:
+                    print(f'  aggregate per-pattern tree test acc: n/a '
+                           f'(algorithm produces rule-based outputs)')
         elif args.tree_target == 'legal':
             if Lnp_tr is None:
                 raise ValueError('--tree-target legal requires --task legal '
@@ -1109,7 +1193,29 @@ def main():
             return pairs
 
         input_dim = Xnp_tr.shape[1]
-        if args.tree_target == 'patterns':
+        if args.tree_target == 'patterns' and multi_trees is not None:
+            # multioutput / grouped: leaves of the joint tree(s) → hidden units.
+            # Each leaf covers many patterns, so meta is per-leaf (not
+            # per-pattern); pair with the dense (bce/linpo) readout.
+            per_cell_leaf_counts = np.zeros(len(multi_trees), dtype=int)
+            for g_idx, (tree, label, cols) in enumerate(multi_trees):
+                pairs = _pair_and_prune(tree)
+                per_cell_leaf_counts[g_idx] = len(pairs)
+                for path_idx, ((conditions, leaf_class,
+                                 leaf_counts), nid) in enumerate(pairs):
+                    w, b = path_to_weight(conditions, input_dim=input_dim)
+                    all_w.append(w); all_b.append(b)
+                    all_meta.append({
+                        'kind': 'pattern_multi',
+                        'group': label,
+                        'patterns': cols,
+                        'path_idx': path_idx,
+                        'conditions': conditions,
+                        'depth': len(conditions),
+                        'leaf_counts': leaf_counts,
+                    })
+                    leaf_build.append((tree, nid))
+        elif args.tree_target == 'patterns':
             per_pattern_leaf_counts = np.zeros(len(patterns_list), dtype=int)
             for j, tree_list in enumerate(pattern_trees):
                 for tree_idx, tree in enumerate(tree_list):

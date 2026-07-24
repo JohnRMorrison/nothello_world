@@ -602,10 +602,19 @@ def extract_paths(tree):
     # via sign — positive → class 1, negative/zero → class 0.
     is_regressor = not hasattr(tree, 'classes_')
     classes = None if is_regressor else tree.classes_
+    # Multi-output tree (one tree jointly predicting many patterns): value[node]
+    # is per-output, so a single leaf_class is meaningless; use total leaf
+    # sample count so prune_paths_by_count still ranks by leaf population.
+    multi = (not is_regressor) and getattr(tree_, 'n_outputs', 1) > 1
     paths = []
 
     def recurse(node, conditions):
         if tree_.feature[node] == _tree.TREE_UNDEFINED:
+            if multi:
+                majority = -1
+                counts_list = [int(tree_.n_node_samples[node])]
+                paths.append((list(conditions), majority, counts_list))
+                return
             counts_arr = tree_.value[node][0]  # (n_classes,) or (1,)
             if is_regressor:
                 # Regressor leaf holds a single scalar prediction.
