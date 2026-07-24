@@ -1354,7 +1354,10 @@ def main():
                           or args.skip_state_probe)
     # Downstream save code expects tree_correct_per_cell — for patterns mode,
     # define it from the per-pattern accuracies.
-    if args.tree_target == 'patterns' and not args.skip_tree_fit:
+    if (args.tree_target == 'patterns' and not args.skip_tree_fit
+            and not args.load_trees_from):
+        # In the --load-trees-from path tree_correct_per_cell is already loaded
+        # from the checkpoint; tree_correct_per_pattern isn't computed (no re-fit).
         tree_correct_per_cell = tree_correct_per_pattern
     if skip_state_probe:
         print(f'\ntree-target=legal → skipping state probe (tree paths do '
