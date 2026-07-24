@@ -171,6 +171,17 @@ case "${VARIANT}" in
         RECENT_ARG="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_no_recent_canonical"
         ;;
+    pattern_trees_recent_hidden_canonical)
+        # Winning canonical recipe + recency as HIDDEN nodes (NOT tree input).
+        # Recent bits are kept aside from the tree fit and concatenated to the
+        # hidden layer, so the linear readout uses them additively while the
+        # trees stay purely geometric.  Distinct TAG -> separate cache/output,
+        # so it compares head-to-head vs pattern_trees_no_recent_canonical to
+        # isolate recency's value without the tree-fragmentation that
+        # --input-recent-Ks caused.
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        TAG="pattern_trees_recent_hidden_canonical"
+        ;;
     bank_multi_flanking_legaltrees_patterntrees)
         # Combined bank: legal-target trees (3200 leaves) + pattern-target
         # trees (48000 leaves) + hand-crafted flanking pattern activations
