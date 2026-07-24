@@ -976,7 +976,7 @@ def main():
         # Accept both tree_path (state/legal target) and pattern_path
         # (patterns target) entries — depending on what target the
         # checkpoint was trained with.
-        tree_kinds = ('tree_path', 'pattern_path')
+        tree_kinds = ('tree_path', 'pattern_path', 'pattern_multi')
         tree_meta = [m for m in meta_saved
                       if m.get('kind') in tree_kinds]
         n_saved = len(meta_saved)
@@ -1285,7 +1285,8 @@ def main():
 
         depths = np.array([m['depth'] for m in all_meta
                             if m.get('kind') in ('tree_path',
-                                                     'pattern_path')])
+                                                     'pattern_path',
+                                                     'pattern_multi')])
         if depths.size > 0:
             print(f'  tree-path depths: mean={depths.mean():.2f}  '
                    f'max={depths.max()}  min={depths.min()}')
