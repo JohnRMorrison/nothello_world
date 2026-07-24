@@ -354,6 +354,14 @@ def main():
                           'linear probe reads recency directly, bypassing '
                           'top-K pruning.  Mutually exclusive with '
                           '--input-recent-Ks.')
+    ap.add_argument('--recent-split-color', action='store_true',
+                    help='For --recent-Ks-as-hidden (canonical only): split '
+                          'each recency bit into mover/opponent by AND-ing with '
+                          'placed_as_mover, so a node means "cell c played by ME '
+                          '/ by YOU within the last K moves" (2x the recency '
+                          'units).  Directly tests the flip-reliability idea: a '
+                          'recently-placed square is unlikely to have flipped, so '
+                          'its placement color approximates its current color.')
     ap.add_argument('--tree-max-features', default=None,
                     help='Passed to sklearn: sqrt/log2/int/float.  Use with '
                           '--use-move-grid to keep tree fit tractable.')
@@ -698,6 +706,24 @@ def main():
                f'from Xnp for direct hidden-layer concat')
         recent_hidden_tr = Xnp_tr[:, 121:121 + n_recent].astype(np.uint8)
         recent_hidden_te = Xnp_te[:, 121:121 + n_recent].astype(np.uint8)
+        if args.recent_split_color:
+            if not args.canonicalize_mover:
+                raise ValueError('--recent-split-color requires '
+                                  '--canonicalize-mover (needs placed_as_mover '
+                                  'in Xnp cols 60:120)')
+            # recent_mover = recent AND placed_as_mover;  recent_opp = recent
+            # AND NOT placed_as_mover.  placed_as_mover is Xnp[:, 60:120].
+            nK = len(hidden_recent_Ks)
+            pam_tr = np.tile(Xnp_tr[:, 60:120].astype(np.uint8), nK)
+            pam_te = np.tile(Xnp_te[:, 60:120].astype(np.uint8), nK)
+            recent_hidden_tr = np.concatenate(
+                [recent_hidden_tr & pam_tr, recent_hidden_tr & (1 - pam_tr)],
+                axis=1)
+            recent_hidden_te = np.concatenate(
+                [recent_hidden_te & pam_te, recent_hidden_te & (1 - pam_te)],
+                axis=1)
+            print(f'  --recent-split-color: recency split into mover/opp → '
+                   f'{recent_hidden_tr.shape[1]} bits')
         Xnp_tr = np.ascontiguousarray(Xnp_tr[:, :121])
         Xnp_te = np.ascontiguousarray(Xnp_te[:, :121])
         print(f'  recent_hidden_tr {recent_hidden_tr.shape}  '
@@ -1084,15 +1110,19 @@ def main():
         rb_te = torch.from_numpy(recent_hidden_te).to(act_dtype)
         H_tr = torch.cat([H_tr, rb_tr], dim=1)
         H_te = torch.cat([H_te, rb_te], dim=1)
-        for k_idx, K in enumerate(hidden_recent_Ks):
-            for cell60 in range(60):
-                cell64 = C60_TO_C64[cell60]
-                alg = 'ABCDEFGH'[cell64 % 8] + str(cell64 // 8 + 1)
-                all_meta.append({
-                    'kind': 'recent_bit',
-                    'name': f'recent{K}[{alg}]',
-                    'K': K, 'cell60': cell60,
-                })
+        roles = ['mover', 'opp'] if args.recent_split_color else ['']
+        for role in roles:
+            for k_idx, K in enumerate(hidden_recent_Ks):
+                for cell60 in range(60):
+                    cell64 = C60_TO_C64[cell60]
+                    alg = 'ABCDEFGH'[cell64 % 8] + str(cell64 // 8 + 1)
+                    nm = (f'recent_{role}{K}[{alg}]' if role
+                          else f'recent{K}[{alg}]')
+                    all_meta.append({
+                        'kind': 'recent_bit',
+                        'name': nm,
+                        'K': K, 'cell60': cell60, 'role': role or 'any',
+                    })
         print(f'  combined H_tr {tuple(H_tr.shape)}  '
                f'H_te {tuple(H_te.shape)}')
         del rb_tr, rb_te, recent_hidden_tr, recent_hidden_te
