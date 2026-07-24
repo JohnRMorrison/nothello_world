@@ -219,14 +219,14 @@ case "${VARIANT}" in
         # play-time as a numeric feature — they learn contiguous, data-adaptive
         # time RANGES ("cell C played in turns [t0,t1]") instead of one-hot
         # point leaves.  Head-to-head vs the 92.08% no-recency BCE baseline.
-        RECENT_ARG="--time-ordinal movesago --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        RECENT_ARG="--time-ordinal movesago --hidden-from-leaves --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_ordinal_canonical"
         ;;
     pattern_trees_recent_hidden_ordinal_canonical)
         # Recency-as-hidden AND ordinal-in-tree-input together: tests whether
         # the learned turn-range splits stack on top of the recency hidden bank
         # (current best, 92.39% BCE).
-        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --time-ordinal movesago --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --time-ordinal movesago --hidden-from-leaves --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_recent_hidden_ordinal_canonical"
         ;;
     pattern_trees_ordinal_split_canonical)
@@ -234,13 +234,13 @@ case "${VARIANT}" in
         # color-pure (a player moves on alternate turns, so an un-split band
         # straddles both colors).  This is the primary ordinal run; the plain
         # pattern_trees_ordinal_canonical is its no-split ablation.  vs 92.08%.
-        RECENT_ARG="--time-ordinal movesago --time-ordinal-split-color --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        RECENT_ARG="--time-ordinal movesago --time-ordinal-split-color --hidden-from-leaves --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_ordinal_split_canonical"
         ;;
     pattern_trees_recent_hidden_ordinal_split_canonical)
         # Split-color ordinal + recency-as-hidden: does color-pure turn-banding
         # stack on top of the recency hidden bank (current best, 92.39% BCE)?
-        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --time-ordinal movesago --time-ordinal-split-color --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
+        RECENT_ARG="--recent-Ks-as-hidden 1,2,5,10,20 --time-ordinal movesago --time-ordinal-split-color --hidden-from-leaves --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --pattern-n-trees 1 --canonicalize-mover"
         TAG="pattern_trees_recent_hidden_ordinal_split_canonical"
         ;;
     *)
@@ -248,6 +248,15 @@ case "${VARIANT}" in
         exit 1
         ;;
 esac
+
+# Leaf-based hidden layer needs the live sklearn trees, so it can't use the
+# fit/readout STAGE split (the readout reloads only the W-based bank).  Force
+# such variants to run as one full job.
+if [[ "${RECENT_ARG}" == *"--hidden-from-leaves"* && "${STAGE}" != "full" ]]; then
+    echo "ERROR: variant '${VARIANT}' uses --hidden-from-leaves, which requires"
+    echo "the trees in memory.  Run with STAGE=full (default), not STAGE=${STAGE}."
+    exit 1
+fi
 
 echo "============================================"
 echo "Job ID:            ${SLURM_JOB_ID}"

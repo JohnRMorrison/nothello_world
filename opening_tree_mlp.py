@@ -560,6 +560,32 @@ class PreExtractedPaths:
         self.paths = paths  # list of (conditions, leaf_class, leaf_counts)
 
 
+def leaf_node_ids(tree):
+    """Sklearn leaf node ids in the SAME order extract_paths() yields paths.
+
+    Mirrors extract_paths' left-then-right recursion, so leaf_node_ids(t)[k]
+    is the node id of the leaf that extract_paths(t)[k] describes.  Used to
+    compute the hidden layer as true leaf one-hot (tree.apply) instead of the
+    ±1 path linearization — which is only exact for binary features and
+    corrupts numeric (e.g. ordinal-time) splits.  Returns None for
+    PreExtractedPaths (rule-based algorithms have no sklearn node structure).
+    """
+    if isinstance(tree, PreExtractedPaths):
+        return None
+    tree_ = tree.tree_
+    ids = []
+
+    def recurse(node):
+        if tree_.feature[node] == _tree.TREE_UNDEFINED:
+            ids.append(node)
+            return
+        recurse(tree_.children_left[node])
+        recurse(tree_.children_right[node])
+
+    recurse(0)
+    return ids
+
+
 def extract_paths(tree):
     """Return list of (conditions, leaf_class, leaf_counts) tuples.
     conditions: list of (feature_idx, required_value 0-or-1).

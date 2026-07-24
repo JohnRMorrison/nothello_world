@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data.othello import OthelloBoardState
 from opening_tree_mlp import (
     playedeven_features, feature_name, path_to_weight, extract_paths,
+    leaf_node_ids,
     train_per_cell_trees, train_pattern_trees, train_probe, train_probe_ensemble,
     train_probe_sklearn, evaluate, evaluate_ensemble, evaluate_sklearn,
     train_probe_legal_bce_ensemble, train_probe_legal_probor_ensemble,
@@ -300,6 +301,34 @@ def build_stability_features(device):
     return W, B, meta
 
 
+def build_H_from_leaves(leaf_build, Xnp, dtype=torch.bool):
+    """Hidden layer as TRUE leaf one-hot (honors real/numeric thresholds).
+
+    leaf_build[c] = (sklearn_tree, leaf_node_id).  Column c fires iff the
+    sample's tree.apply() lands on that leaf.  Pruned leaves aren't columns,
+    so a sample whose leaf was pruned is all-zero across that tree's columns.
+    Unlike the ±1 W·x linearization (exact only for binary features), this is
+    correct for numeric splits (e.g. --time-ordinal bands).  Calls tree.apply
+    once per distinct tree (grouped by id())."""
+    from collections import defaultdict
+    N = Xnp.shape[0]
+    H = np.zeros((N, len(leaf_build)), dtype=bool)
+    cols_by_tree = defaultdict(list)
+    tref = {}
+    for col, (tree, nid) in enumerate(leaf_build):
+        if nid is None:
+            raise ValueError('--hidden-from-leaves needs tree-based algorithms '
+                              '(dt/rf/et/gbm) with sklearn node ids; got a '
+                              'rule-based (skope) tree with no leaf nodes.')
+        cols_by_tree[id(tree)].append((col, nid))
+        tref[id(tree)] = tree
+    for tid, colnodes in cols_by_tree.items():
+        leaves = tref[tid].apply(Xnp)          # (N,) leaf node id per sample
+        for col, nid in colnodes:
+            H[:, col] = (leaves == nid)
+    return torch.from_numpy(H).to(dtype)
+
+
 # ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
@@ -353,6 +382,18 @@ def main():
                           'in turns [12,13]") instead of one-hot point leaves — '
                           'min_samples_leaf/max_depth act as a time-granularity '
                           'dial.  Composes with either recency block.')
+    ap.add_argument('--hidden-from-leaves', action='store_true',
+                    help='Compute the hidden layer as TRUE leaf one-hot '
+                          '(tree.apply) instead of the ±1 path linearization. '
+                          'The linearization is only exact for binary 0/1 '
+                          'features; numeric splits (e.g. --time-ordinal) '
+                          'collapse thresholds to ~0.5 and cancel same-feature '
+                          'bands.  Leaf one-hot honors the real thresholds, so '
+                          'the tree can learn continuous, adaptive time-bands. '
+                          'In-job only (needs the sklearn trees in memory): '
+                          'incompatible with --load-trees-from / --add-stability, '
+                          'and the resulting checkpoint is NOT usable by the '
+                          'W-based streaming / reeval loaders.')
     ap.add_argument('--time-ordinal-split-color', action='store_true',
                     help='Split the --time-ordinal block into two channels per '
                           'cell (mover / opponent): each holds the play-time '
@@ -610,9 +651,11 @@ def main():
     args = ap.parse_args()
 
     # Restart aid: if a tree cache exists and no explicit --load-trees-from
-    # was given, load the cached trees instead of re-fitting.
+    # was given, load the cached trees instead of re-fitting.  Skipped under
+    # --hidden-from-leaves: that mode needs the live sklearn trees (the cache
+    # only holds the W-based bank), so it must always re-fit fresh.
     if not args.load_trees_from and args.tree_cache and \
-            os.path.exists(args.tree_cache):
+            os.path.exists(args.tree_cache) and not args.hidden_from_leaves:
         print(f'--tree-cache {args.tree_cache} exists: auto-loading fitted '
                f'trees (skipping re-fit)', flush=True)
         args.load_trees_from = args.tree_cache
@@ -636,6 +679,22 @@ def main():
     if time_ordinal:
         print(f'time-ordinal block: {time_ordinal} → 60 numeric cols appended '
                f'to tree input (trees learn adaptive turn ranges)')
+    if args.hidden_from_leaves:
+        if args.load_trees_from:
+            raise ValueError('--hidden-from-leaves needs the sklearn trees in '
+                              'memory; incompatible with --load-trees-from '
+                              '(and the fit/readout STAGE split, which reloads '
+                              'the W-based bank).  Run as one full job.')
+        if args.add_stability:
+            raise ValueError('--hidden-from-leaves is incompatible with '
+                              '--add-stability (stability units have no tree).')
+        print('hidden layer: TRUE leaf one-hot (tree.apply) — honors numeric '
+               'thresholds; ±1 linearization bypassed for H (W still saved '
+               'but NOT valid for streaming/reeval loaders).')
+    if time_ordinal and not args.hidden_from_leaves:
+        print('WARNING: --time-ordinal without --hidden-from-leaves — numeric '
+               'splits will be CORRUPTED by the ±1 linearization.  Add '
+               '--hidden-from-leaves.')
     # Both flags cause recent bits to be materialized during sampling; the
     # difference is only whether they're passed to the tree fit or kept
     # aside for direct concat to the hidden layer.
@@ -1032,16 +1091,32 @@ def main():
         # --- Extract paths ---
         print('\nextracting paths → hidden units...')
         all_w, all_b, all_meta = [], [], []
+        # Parallel to all_meta's tree units: (sklearn_tree, leaf_node_id) per
+        # hidden column, so --hidden-from-leaves can compute H as true leaf
+        # one-hot (honoring numeric thresholds) instead of the ±1 W·x.
+        leaf_build = []
+
+        def _pair_and_prune(tree):
+            """Pair extract_paths(tree) with its leaf node ids and apply the
+            SAME top-k-by-count pruning, so meta/W match the non-leaf path."""
+            paths = extract_paths(tree)
+            nids = leaf_node_ids(tree)
+            pairs = (list(zip(paths, nids)) if nids is not None
+                     else [(p, None) for p in paths])
+            tk = args.top_k_per_cell
+            if tk is not None and len(pairs) > tk:
+                pairs = sorted(pairs, key=lambda pn: -sum(pn[0][2]))[:tk]
+            return pairs
+
         input_dim = Xnp_tr.shape[1]
         if args.tree_target == 'patterns':
             per_pattern_leaf_counts = np.zeros(len(patterns_list), dtype=int)
             for j, tree_list in enumerate(pattern_trees):
                 for tree_idx, tree in enumerate(tree_list):
-                    paths = extract_paths(tree)
-                    paths = prune_paths_by_count(paths, args.top_k_per_cell)
-                    per_pattern_leaf_counts[j] += len(paths)
-                    for path_idx, (conditions, leaf_class,
-                                     leaf_counts) in enumerate(paths):
+                    pairs = _pair_and_prune(tree)
+                    per_pattern_leaf_counts[j] += len(pairs)
+                    for path_idx, ((conditions, leaf_class,
+                                     leaf_counts), nid) in enumerate(pairs):
                         w, b = path_to_weight(conditions,
                                                  input_dim=input_dim)
                         all_w.append(w); all_b.append(b)
@@ -1056,15 +1131,15 @@ def main():
                             'depth': len(conditions),
                             'leaf_counts': leaf_counts,
                         })
+                        leaf_build.append((tree, nid))
             per_cell_leaf_counts = per_pattern_leaf_counts
         else:
             per_cell_leaf_counts = np.zeros(BOARD_CELLS, dtype=int)
             for c in range(BOARD_CELLS):
-                paths = extract_paths(trees[c])
-                paths = prune_paths_by_count(paths, args.top_k_per_cell)
-                per_cell_leaf_counts[c] = len(paths)
-                for path_idx, (conditions, leaf_class,
-                                 leaf_counts) in enumerate(paths):
+                pairs = _pair_and_prune(trees[c])
+                per_cell_leaf_counts[c] = len(pairs)
+                for path_idx, ((conditions, leaf_class,
+                                 leaf_counts), nid) in enumerate(pairs):
                     w, b = path_to_weight(conditions, input_dim=input_dim)
                     all_w.append(w); all_b.append(b)
                     all_meta.append({
@@ -1075,6 +1150,7 @@ def main():
                         'leaf_counts': leaf_counts,
                         'cell_class': CELL_CLASS[c],
                     })
+                    leaf_build.append((trees[c], nid))
         n_tree_units = len(all_meta)
 
         if args.add_stability:
@@ -1148,18 +1224,24 @@ def main():
             print(f'saved {args.out}')
             return
 
-        X_tr = torch.from_numpy(Xnp_tr).to(device)
-        X_te = torch.from_numpy(Xnp_te).to(device)
-
-        if use_relu:
-            print('\ncomputing hidden activations (ReLU, float32 on CPU)...')
+        if args.hidden_from_leaves:
+            print('\ncomputing hidden activations (TRUE leaf one-hot via '
+                   'tree.apply — honors numeric thresholds)...')
+            t0 = time.time()
+            H_tr = build_H_from_leaves(leaf_build, Xnp_tr, act_dtype)
+            H_te = build_H_from_leaves(leaf_build, Xnp_te, act_dtype)
         else:
-            print('\ncomputing hidden activations (step, bool on CPU)...')
-        t0 = time.time()
-        H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
-                     use_relu=use_relu)
-        H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
-                     use_relu=use_relu)
+            X_tr = torch.from_numpy(Xnp_tr).to(device)
+            X_te = torch.from_numpy(Xnp_te).to(device)
+            if use_relu:
+                print('\ncomputing hidden activations (ReLU, float32 on CPU)...')
+            else:
+                print('\ncomputing hidden activations (step, bool on CPU)...')
+            t0 = time.time()
+            H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
+                         use_relu=use_relu)
+            H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
+                         use_relu=use_relu)
     print(f'  H_tr {tuple(H_tr.shape)} '
            f'({H_tr.element_size() * H_tr.nelement() / 1e9:.2f} GB)  '
            f'H_te {tuple(H_te.shape)} '
