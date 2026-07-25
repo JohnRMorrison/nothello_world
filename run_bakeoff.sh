@@ -17,9 +17,11 @@ set -u
 DEVICE=${1:-cpu}
 GAMES=${2:-20000}
 PICKLE_DIR=${3:-}
+JOBS=${4:-$(nproc)}          # parallel tree-fitting across cores (960 trees for J1/J3)
 TEST=$(( GAMES / 4 ))
 OUTDIR=bakeoff_out
 mkdir -p "$OUTDIR" logs
+echo "tree-fit parallelism: ${JOBS} cores"
 PICKLE_ARG=""
 if [ -n "${PICKLE_DIR}" ]; then
   PICKLE_ARG="--pickle-dir ${PICKLE_DIR}"
@@ -30,7 +32,7 @@ fi
 COMMON="--include-flanking-patterns hand_crafted_flanking_patterns.pt \
   --tree-target patterns --canonicalize-mover --skip-state-probe \
   --num-train-games ${GAMES} --num-test-games ${TEST} --ply-min 5 --ply-max 54 \
-  --tree-max-depth 15 --tree-min-samples-leaf 50 \
+  --tree-max-depth 15 --tree-min-samples-leaf 50 --tree-n-jobs ${JOBS} \
   --task legal --legal-modes bce --legal-probe-epochs 100 --probe-seeds 1 \
   ${PICKLE_ARG} --device ${DEVICE}"
 TREE_ONLY="--no-flanking-features --max-leaf-nodes 50"
