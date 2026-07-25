@@ -304,7 +304,14 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--load-trees-from', required=True)
+    ap.add_argument('--load-trees-from', default=None,
+                    help='Tree bank checkpoint.  Required unless '
+                          '--flanking-only.')
+    ap.add_argument('--flanking-only', action='store_true',
+                    help='Diagnostic: use ZERO tree units — the hidden layer '
+                          'is the 960 flanking patterns alone (no trees, no '
+                          'recent bits).  Measures what the flanking rules '
+                          'decode by themselves.')
     ap.add_argument('--data-source', default='pickle',
                     choices=['pickle', 'chunk-ext'],
                     help='pickle: replay games from data/othello_synthetic/*.pickle '
@@ -375,12 +382,27 @@ def main():
         'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device: {device}')
 
-    W_tree, b_tree, tree_meta = load_trees(args.load_trees_from)
+    if args.flanking_only:
+        # Zero tree units -> H = flanking patterns only.  Trees were fit on the
+        # 121-d played+even+mover_parity input, so keep input_dim=121 for the
+        # (empty) tree forward; recent bits are forced off for a pure
+        # flanking-only readout.
+        W_tree = np.zeros((0, 121), dtype=np.float32)
+        b_tree = np.zeros((0,), dtype=np.float32)
+        tree_meta = []
+        print('--flanking-only: 0 tree units; H = 960 flanking patterns only '
+              '(recent bits forced off)')
+    else:
+        if not args.load_trees_from:
+            raise ValueError('--load-trees-from is required unless '
+                             '--flanking-only is set.')
+        W_tree, b_tree, tree_meta = load_trees(args.load_trees_from)
     mlp = OpeningTreeMLP(W_tree, b_tree, tree_meta, device)
     input_dim = W_tree.shape[1]
 
-    recent_Ks = tuple(int(k) for k in args.recent_Ks.split(',')
-                        if k.strip()) or None
+    recent_Ks = (None if args.flanking_only else
+                 (tuple(int(k) for k in args.recent_Ks.split(',')
+                        if k.strip()) or None))
     patterns = load_patterns(args.flanking_patterns)
     print(f'loaded {len(patterns)} flanking patterns')
 

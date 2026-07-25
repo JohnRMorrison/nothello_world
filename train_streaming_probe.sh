@@ -36,7 +36,16 @@ mkdir -p logs ckpts_midgame
 
 cd $SLURM_SUBMIT_DIR
 
-LOAD_TREES=${LOAD_TREES:?Must set LOAD_TREES to a checkpoint path}
+# FLANKING_ONLY=1 → no tree bank; hidden layer is the 960 flanking patterns
+# alone (diagnostic).  LOAD_TREES is then optional and ignored.
+FLANKING_ONLY=${FLANKING_ONLY:-}
+FLANK_FLAG=""
+if [ -n "${FLANKING_ONLY}" ]; then
+    FLANK_FLAG="--flanking-only"
+    LOAD_TREES=${LOAD_TREES:-flankingonly}
+else
+    LOAD_TREES=${LOAD_TREES:?Must set LOAD_TREES to a checkpoint path}
+fi
 DATA_SOURCE=${DATA_SOURCE:-chunk-ext}
 PICKLE_DIR=${PICKLE_DIR:-data/othello_synthetic}
 CHUNK_DIR=${CHUNK_DIR:-experiments/mathematical_transformation_experiments/heuristic_probe_results/feature_chunks}
@@ -104,6 +113,7 @@ echo "============================================"
 
 CUDA_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1 python -u train_streaming_probe.py \
     --load-trees-from ${LOAD_TREES} \
+    ${FLANK_FLAG} \
     --data-source ${DATA_SOURCE} \
     --pickle-dir ${PICKLE_DIR} \
     --chunk-dir ${CHUNK_DIR} \
