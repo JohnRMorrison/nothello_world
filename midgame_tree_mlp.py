@@ -342,6 +342,7 @@ def fit_multioutput_pattern_trees(Xnp_tr, pt_tr, Xnp_te, pt_te, patterns_list,
         t = DecisionTreeClassifier(
             max_depth=args.tree_max_depth,
             min_samples_leaf=args.tree_min_samples_leaf,
+            max_leaf_nodes=args.max_leaf_nodes,
             max_features=max_features,
             class_weight=None,
             random_state=0)
@@ -398,6 +399,13 @@ def main():
     ap.add_argument('--ply-max', type=int, default=60)
     ap.add_argument('--tree-max-depth', type=int, default=15)
     ap.add_argument('--tree-min-samples-leaf', type=int, default=5)
+    ap.add_argument('--max-leaf-nodes', type=int, default=None,
+                    help='Cap leaves per tree via BEST-FIRST growth (sklearn '
+                          'max_leaf_nodes) — keeps the highest-impurity-gain '
+                          'leaves.  Strongly preferred over --top-k-per-cell, '
+                          'which prunes by sample count and discards the small '
+                          'leaves that isolate rare pattern firings.  Applies '
+                          'to per-pattern, grouped, and multioutput trees.')
     ap.add_argument('--tree-n-jobs', type=int, default=1)
     ap.add_argument('--probe-epochs', type=int, default=25)
     ap.add_argument('--add-stability-features',
@@ -1111,6 +1119,7 @@ def main():
                     n_trees_per_pattern=args.pattern_n_trees,
                     max_depth=args.tree_max_depth,
                     min_samples_leaf=args.tree_min_samples_leaf,
+                    max_leaf_nodes=args.max_leaf_nodes,
                     n_jobs=args.tree_n_jobs,
                     max_features=mf,
                     class_weight=cw,

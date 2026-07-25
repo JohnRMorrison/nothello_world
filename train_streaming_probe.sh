@@ -39,12 +39,19 @@ cd $SLURM_SUBMIT_DIR
 # FLANKING_ONLY=1 → no tree bank; hidden layer is the 960 flanking patterns
 # alone (diagnostic).  LOAD_TREES is then optional and ignored.
 FLANKING_ONLY=${FLANKING_ONLY:-}
+# NO_FLANKING=1 → drop the 960 flanking patterns; TREE-ONLY hidden layer.
+NO_FLANKING=${NO_FLANKING:-}
 FLANK_FLAG=""
+NOFLANK_TAG=""
 if [ -n "${FLANKING_ONLY}" ]; then
     FLANK_FLAG="--flanking-only"
     LOAD_TREES=${LOAD_TREES:-flankingonly}
 else
     LOAD_TREES=${LOAD_TREES:?Must set LOAD_TREES to a checkpoint path}
+    if [ -n "${NO_FLANKING}" ]; then
+        FLANK_FLAG="--no-flanking"
+        NOFLANK_TAG="_noflank"       # keep OUT/RESUME distinct from with-flanking
+    fi
 fi
 DATA_SOURCE=${DATA_SOURCE:-chunk-ext}
 PICKLE_DIR=${PICKLE_DIR:-data/othello_synthetic}
@@ -75,7 +82,7 @@ TS=$(date +%Y%m%d_%H%M%S)
 # Include the LOAD_TREES basename so parallel jobs with different tree
 # checkpoints don't collide when they share a start-second.  Also
 # include the SLURM job id as a tiebreaker.
-TREE_TAG=$(basename "${LOAD_TREES}" .pt)
+TREE_TAG=$(basename "${LOAD_TREES}" .pt)${NOFLANK_TAG}
 OUT="ckpts_midgame/stream_${PROBE_TYPE}_g${NUM_GAMES}_ep${EPOCHS}_${TREE_TAG}_j${SLURM_JOB_ID}_${TS}.pt"
 
 echo "============================================"

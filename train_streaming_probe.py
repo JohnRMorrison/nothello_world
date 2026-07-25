@@ -227,9 +227,12 @@ def load_trees(ckpt_path):
 
 
 def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
-                                 device):
+                                 device, no_flanking=False):
     """Compute [tree_paths | recent_bits | flanking_patterns] for one
     chunk of positions.
+
+    no_flanking=True drops the 960 flanking patterns from H — a TREE-ONLY
+    hidden layer (the honest "what do the trees decode by themselves" run).
 
     Returns bool tensor on GPU (or float32 under use_relu)."""
     dtype = torch.float32 if use_relu else torch.bool
@@ -248,23 +251,23 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
         recent_t = torch.from_numpy(recent).to(device=device, dtype=dtype)
     else:
         recent_t = None
-    # Flanking patterns.
-    played = X_np[:, :60].astype(np.uint8)
-    even = X_np[:, 60:120].astype(np.uint8)
-    mp = X_np[:, 120].astype(np.uint8)
-    FP_np = compute_pattern_activations(patterns, played, even, mp)
-    FP_t = torch.from_numpy(FP_np).to(device=device, dtype=dtype)
     parts = [H_tree]
     if recent_t is not None:
         parts.append(recent_t)
-    parts.append(FP_t)
+    if not no_flanking:
+        # Flanking patterns.
+        played = X_np[:, :60].astype(np.uint8)
+        even = X_np[:, 60:120].astype(np.uint8)
+        mp = X_np[:, 120].astype(np.uint8)
+        FP_np = compute_pattern_activations(patterns, played, even, mp)
+        parts.append(torch.from_numpy(FP_np).to(device=device, dtype=dtype))
     return torch.cat(parts, dim=1)
 
 
 def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 patterns, use_relu, device, batch=1024,
                 use_chunk_ext=False, canonicalize_mover=False,
-                max_positions=None):
+                max_positions=None, no_flanking=False):
     if use_chunk_ext:
         X, S, T, L = process_chunk_ext_file(
             eval_path, ply_min, ply_max,
@@ -280,7 +283,8 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
         for i in range(0, N, batch):
             X_batch = X[i:i + batch]
             H = build_hidden_layer_batch(X_batch, mlp, patterns,
-                                             recent_Ks, use_relu, device)
+                                             recent_Ks, use_relu, device,
+                                             no_flanking=no_flanking)
             L_batch = torch.from_numpy(L[i:i + batch]).to(device)
             p = probe(H.float() if not use_relu else H)
             preds = (p > 0.5).to(torch.uint8)
@@ -312,6 +316,11 @@ def main():
                           'is the 960 flanking patterns alone (no trees, no '
                           'recent bits).  Measures what the flanking rules '
                           'decode by themselves.')
+    ap.add_argument('--no-flanking', action='store_true',
+                    help='Drop the 960 flanking patterns from the hidden layer '
+                          '— TREE-ONLY readout (trees [+recent] decode by '
+                          'themselves).  Mutually exclusive with '
+                          '--flanking-only.')
     ap.add_argument('--data-source', default='pickle',
                     choices=['pickle', 'chunk-ext'],
                     help='pickle: replay games from data/othello_synthetic/*.pickle '
@@ -377,6 +386,10 @@ def main():
     ap.add_argument('--resume-from', default=None,
                     help='Explicit resume-checkpoint path (default <out>.resume).')
     args = ap.parse_args()
+
+    if args.flanking_only and args.no_flanking:
+        raise ValueError('--flanking-only and --no-flanking are mutually '
+                         'exclusive (that would be an empty hidden layer).')
 
     device = torch.device(
         'cuda' if torch.cuda.is_available() else 'cpu')
@@ -458,7 +471,8 @@ def main():
            f'positions={Xw.shape[0] if Xw is not None else 0}', flush=True)
     Xw_small = Xw[:64]
     H_small = build_hidden_layer_batch(Xw_small, mlp, patterns,
-                                            recent_Ks, args.use_relu, device)
+                                            recent_Ks, args.use_relu, device,
+                                            no_flanking=args.no_flanking)
     hidden_dim = H_small.shape[1]
     print(f'  hidden_dim={hidden_dim}')
     del Xw, Xw_small, H_small
@@ -567,7 +581,7 @@ def main():
                     device=device, dtype=torch.float32)
                 H_batch = build_hidden_layer_batch(
                     X_batch, mlp, patterns, recent_Ks, args.use_relu,
-                    device)
+                    device, no_flanking=args.no_flanking)
                 if H_batch.dtype != torch.float32:
                     H_batch = H_batch.float()
                 # Shared H_batch (no grad through it) → each head trains
@@ -607,7 +621,8 @@ def main():
                           batch=args.batch_size,
                           use_chunk_ext=use_chunk_ext,
                           canonicalize_mover=args.canonicalize_mover,
-                          max_positions=500_000)
+                          max_positions=500_000,
+                          no_flanking=args.no_flanking)
 
     torch.save({
         'probe_states': [p.state_dict() for p in probes],

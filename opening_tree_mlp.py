@@ -370,7 +370,8 @@ def train_per_cell_trees(X, S, max_depth, min_samples_leaf=1, n_jobs=1,
 
 
 def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
-                             max_features, class_weight, seed, bootstrap):
+                             max_features, class_weight, seed, bootstrap,
+                             max_leaf_nodes=None):
     """Fit a single (optionally bagged) tree targeting one pattern's
     activation.  When bootstrap is True the training rows are resampled
     with replacement — this is what makes ensembles diverse."""
@@ -381,6 +382,7 @@ def _fit_one_pattern_tree(X, y, max_depth, min_samples_leaf,
     tree = DecisionTreeClassifier(
         max_depth=max_depth,
         min_samples_leaf=min_samples_leaf,
+        max_leaf_nodes=max_leaf_nodes,
         max_features=max_features,
         class_weight=class_weight,
         random_state=seed)
@@ -457,7 +459,8 @@ def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                           min_samples_leaf=50, n_jobs=1, max_features=None,
                           class_weight='balanced', use_random_forest=False,
                           algorithm='dt', gb_learning_rate=0.1,
-                          skope_precision_min=0.5, skope_recall_min=0.01):
+                          skope_precision_min=0.5, skope_recall_min=0.01,
+                          max_leaf_nodes=None):
     """Fit `n_trees_per_pattern` trees per pattern.
 
     algorithm ∈ {'dt', 'rf', 'et', 'gbm', 'skope'}:
@@ -542,7 +545,8 @@ def train_pattern_trees(X, target, n_trees_per_pattern=1, max_depth=10,
                                           min_samples_leaf, max_features,
                                           class_weight,
                                           seed=j * 1000 + k,
-                                          bootstrap=bootstrap)
+                                          bootstrap=bootstrap,
+                                          max_leaf_nodes=max_leaf_nodes)
                 for k in range(n_trees_per_pattern)]
 
     if n_jobs == 1:
