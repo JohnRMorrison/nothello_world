@@ -11,6 +11,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dir', default='experiments/new_squares')
     ap.add_argument('--out', default='experiments/new_squares/il_curves.png')
+    ap.add_argument('--xscale', default='log', choices=['log', 'linear'],
+                    help='x-axis scale for the vs-step panel.')
     args = ap.parse_args()
 
     coh = json.load(open(os.path.join(args.dir, 'gpt_cond_000.json')))
@@ -23,13 +25,14 @@ def main():
     # Panel A: vs training step (log x) -- the raw learning curves
     ax = axes[0]
     for r, c, lab in styles:
-        steps = [max(s, 1) for s in r['eval_steps']]
+        steps = ([max(s, 1) for s in r['eval_steps']]
+                 if args.xscale == 'log' else r['eval_steps'])
         ax.plot(steps, r['IL_prob'], marker='o', ms=4, color=c, label=lab)
         ax.annotate(f"{r['IL_prob'][-1]:.3f}", (steps[-1], r['IL_prob'][-1]),
                     color=c, fontsize=9, xytext=(4, 0),
                     textcoords='offset points', va='center')
-    ax.set_xscale('log')
-    ax.set_xlabel('training step (log)')
+    ax.set_xscale(args.xscale)
+    ax.set_xlabel(f'training step ({args.xscale})')
     ax.set_ylabel('IL: prob. on legal new-square move')
     ax.set_title('IL learning curve vs step')
     ax.legend(frameon=False, fontsize=9)
