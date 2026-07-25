@@ -262,6 +262,13 @@ case "${VARIANT}" in
         TAG="pattern_trees_grouped_canonical"
         LEGAL_MODES_OVERRIDE="${LEGAL_MODES_OVERRIDE:-bce}"
         ;;
+    flanking_only_readout)
+        # No trees: the 960 hand-crafted flanking rules ARE the hidden layer.
+        # Reference bar for the tree-only bake-off (same inline readout).
+        RECENT_ARG="--skip-tree-fit --include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns --canonicalize-mover --skip-state-probe"
+        TAG="flanking_only_readout"
+        LEGAL_MODES_OVERRIDE="${LEGAL_MODES_OVERRIDE:-bce}"
+        ;;
     *)
         echo "unknown VARIANT '${VARIANT}' — use: simple_K5 simple_K10 simple_multi bank_K5 bank_multi base"
         exit 1
