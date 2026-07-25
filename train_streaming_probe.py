@@ -35,6 +35,23 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+# numpy 2.x (e.g. a RunPod pod) pickles arrays under `numpy._core`; numpy 1.x
+# (the cluster's py3.8 env) has no such module, so torch.load of a cross-fit
+# bank raises ModuleNotFoundError.  Alias the renamed modules so old numpy can
+# unpickle new-numpy banks.  No-op when numpy already has _core.
+if not hasattr(np, '_core'):
+    import importlib as _il
+    try:
+        sys.modules['numpy._core'] = _il.import_module('numpy.core')
+        for _s in ('multiarray', 'numeric', 'umath', 'overrides',
+                    '_multiarray_umath', 'fromnumeric', '_methods'):
+            try:
+                sys.modules['numpy._core.' + _s] = _il.import_module('numpy.core.' + _s)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from data.othello import OthelloBoardState
 from opening_tree_mlp import (
