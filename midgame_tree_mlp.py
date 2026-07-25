@@ -32,6 +32,7 @@ from opening_tree_mlp import (
     train_probe_legal_patterns_structured_ensemble,
     train_probe_legal_cells_structured_ensemble,
     train_probe_legal_linear_pat_probor_ensemble,
+    train_probe_pattern_bce_probor_ensemble,
     evaluate_legal_ensemble, legal_accuracy_from_state,
     train_probe_state_probor_ensemble, evaluate_state_probor_ensemble,
     OpeningTreeMLP,
@@ -2171,6 +2172,69 @@ def main():
                                                 float(per_pos[mask].mean()))
             aux['by_ply'] = by_ply
             _print_legal_report('LinPO ', mean_acc, per_cell_arr, aux)
+
+        if ('patterns_bce_probor' in modes
+                and args.include_flanking_patterns):
+            # 3-STAGE INTERPRETABLE READOUT (option B):
+            #  (2) Linear(H->960)+sigmoid trained with BCE against the 960 TRUE
+            #      pattern firings; (3) prob-OR of the predicted patterns gives
+            #      per-cell legality (inference-only, not trained).
+            pl = (patterns_list if ('patterns_list' in dir()
+                                     and patterns_list is not None)
+                  else load_patterns(args.include_flanking_patterns))
+            pt_tr_t = torch.from_numpy(true_pattern_activations(pl, Snp_tr))
+            print(f'\ntraining pattern-BCE->960->prob-OR readout '
+                   f'({len(pl)} patterns; stage-2 supervised on pattern '
+                   f'firings, prob-OR inference)...')
+            t0 = time.time()
+            bp_probes = train_probe_pattern_bce_probor_ensemble(
+                H_tr, pt_tr_t, pl, n_seeds=args.probe_seeds,
+                epochs=args.legal_probe_epochs, device=device)
+            print(f'  ({time.time() - t0:.1f}s)')
+            dvp = next(bp_probes[0].parameters()).device
+            N_te = H_te.shape[0]
+            accum = torch.zeros(N_te, BOARD_CELLS, dtype=torch.float32)
+            for i in range(0, N_te, 1024):
+                h = H_te[i:i + 1024].to(device=dvp, dtype=torch.float32)
+                pr = torch.zeros(h.shape[0], BOARD_CELLS,
+                                  dtype=torch.float32, device=dvp)
+                for p in bp_probes:
+                    with torch.no_grad():
+                        pr = pr + p(h)          # p.forward == prob-OR legality
+                accum[i:i + 1024] = (pr / len(bp_probes)).cpu()
+            preds_bp = (accum > 0.5).to(torch.uint8)
+            L_te_np = L_te.numpy() if hasattr(L_te, 'numpy') else L_te
+            correct = (preds_bp.numpy() == L_te_np).astype(np.float32)
+            per_cell_arr = correct.mean(axis=0)
+            mean_acc = float(correct.mean())
+            aux = {'position_perfect': float(correct.all(axis=1).mean())}
+            _pb = preds_bp.numpy().astype(np.uint8)
+            _Lb = L_te_np.astype(np.uint8)
+            _tp = int(((_pb == 1) & (_Lb == 1)).sum())
+            _fp = int(((_pb == 1) & (_Lb == 0)).sum())
+            _fn = int(((_pb == 0) & (_Lb == 1)).sum())
+            _rec = _tp / (_tp + _fn) if (_tp + _fn) else 0.0
+            _prec = _tp / (_tp + _fp) if (_tp + _fp) else 0.0
+            aux['legal_recall'] = _rec
+            aux['legal_precision'] = _prec
+            aux['legal_f1'] = (2 * _prec * _rec / (_prec + _rec)
+                               if (_prec + _rec) else 0.0)
+            _has = _Lb.sum(1) > 0
+            _am = accum.numpy()
+            aux['argmax_legal'] = (float(_Lb[np.arange(_Lb.shape[0]),
+                                             _am.argmax(1)][_has].mean())
+                                    if _has.any() else float('nan'))
+            T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
+            by_ply = {}
+            per_pos = correct.mean(axis=1)
+            for lo in range(int(T_np.min()) // 10 * 10,
+                              int(T_np.max()) + 1, 10):
+                mask = (T_np >= lo) & (T_np < lo + 10)
+                if mask.any():
+                    by_ply[(lo, lo + 10)] = (int(mask.sum()),
+                                                float(per_pos[mask].mean()))
+            aux['by_ply'] = by_ply
+            _print_legal_report('PatBCE', mean_acc, per_cell_arr, aux)
 
         if ('state_probor' in modes and not skip_state_probe
                 and args.include_flanking_patterns):

@@ -1292,6 +1292,46 @@ def train_probe_legal_linear_pat_probor_ensemble(H_tr, L_tr, patterns_list,
         for s in range(n_seeds)]
 
 
+def train_probe_pattern_bce_probor(H_tr, pt_tr, patterns_list, epochs=25,
+                                       lr=0.01, batch=1024, weight_decay=1e-4,
+                                       device=None, seed=0):
+    """THE interpretable readout, 3-stage:
+      (1) trees give H (leaves);
+      (2) Linear(H -> 960) + sigmoid trained with BCE against the 960 TRUE
+          PATTERN activations pt_tr (each output learns to detect its pattern);
+      (3) legality = prob-OR of the predicted patterns (probe.forward).
+    Contrast with train_probe_legal_linear_pat_probor, which trains the prob-OR
+    OUTPUT end-to-end against the legal mask.  Here stage 2 is supervised on the
+    patterns themselves; prob-OR (stage 3) is inference-only, not trained."""
+    if device is None:
+        device = torch.device(
+            'cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(seed)
+    probe = LinearPatternProbOr(H_tr.shape[1], patterns_list).to(device)
+    opt = torch.optim.AdamW(probe.linear.parameters(), lr=lr,
+                              weight_decay=weight_decay)
+    bce = nn.BCEWithLogitsLoss()
+    N = H_tr.shape[0]
+    g = torch.Generator().manual_seed(seed)
+    for _ in range(epochs):
+        perm = torch.randperm(N, generator=g)
+        for i in range(0, N, batch):
+            idx = perm[i:i + batch]
+            h = H_tr[idx].to(device=device, dtype=torch.float32)
+            y = pt_tr[idx].to(device=device, dtype=torch.float32)
+            logits = probe.linear(h)                    # (N, 960) pattern logits
+            loss = bce(logits, y)                       # BCE vs pattern targets
+            opt.zero_grad(); loss.backward(); opt.step()
+    return probe
+
+
+def train_probe_pattern_bce_probor_ensemble(H_tr, pt_tr, patterns_list,
+                                                 n_seeds=1, **kwargs):
+    return [train_probe_pattern_bce_probor(H_tr, pt_tr, patterns_list,
+                                               seed=s, **kwargs)
+            for s in range(max(1, n_seeds))]
+
+
 class NoisyOrHead(nn.Module):
     """Noisy-OR / prob-OR combination of per-(unit, output-cell) votes.
 
