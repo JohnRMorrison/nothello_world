@@ -387,6 +387,29 @@ def build_H_from_leaves(leaf_build, Xnp, dtype=torch.bool):
     return torch.from_numpy(H).to(dtype)
 
 
+def _load_bank(path):
+    """torch.load a tree bank.  weights_only=False because banks may embed
+    sklearn tree objects (needed for --hidden-from-leaves reload); these are
+    our own trusted checkpoints.  Falls back for older torch without the kwarg."""
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
+
+
+def serialize_leaf_build(leaf_build):
+    """Make leaf_build persistable so a --hidden-from-leaves bank can train a
+    readout LATER (its ±1 W is invalid for numeric splits, so the leaf one-hot
+    must be rebuilt from the actual sklearn trees).  Returns (unique_trees,
+    leaf_build_idx) where leaf_build_idx[c] = (index-into-unique_trees, nid)."""
+    uniq, id2idx, lb_idx = [], {}, []
+    for tree, nid in leaf_build:
+        if id(tree) not in id2idx:
+            id2idx[id(tree)] = len(uniq); uniq.append(tree)
+        lb_idx.append((id2idx[id(tree)], int(nid) if nid is not None else -1))
+    return uniq, lb_idx
+
+
 # ------------------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------------------
@@ -767,10 +790,16 @@ def main():
                f'to tree input (trees learn adaptive turn ranges)')
     if args.hidden_from_leaves:
         if args.load_trees_from:
-            raise ValueError('--hidden-from-leaves needs the sklearn trees in '
-                              'memory; incompatible with --load-trees-from '
-                              '(and the fit/readout STAGE split, which reloads '
-                              'the W-based bank).  Run as one full job.')
+            # OK only if the bank persisted the sklearn trees (new-format
+            # --tree-fit-only banks do; old W-only banks do not).
+            _peek = _load_bank(args.load_trees_from)
+            if _peek.get('sklearn_trees') is None:
+                raise ValueError(
+                    '--hidden-from-leaves with --load-trees-from needs a bank '
+                    'that saved its sklearn trees.  Re-fit with --tree-fit-only '
+                    'using the current code (old W-only banks are not '
+                    'reloadable for leaf-based H).')
+            del _peek
         if args.add_stability:
             raise ValueError('--hidden-from-leaves is incompatible with '
                               '--add-stability (stability units have no tree).')
@@ -988,7 +1017,7 @@ def main():
     if args.load_trees_from:
         print(f'\n--load-trees-from {args.load_trees_from}: '
                f'reusing pre-fit trees')
-        ck = torch.load(args.load_trees_from, map_location='cpu')
+        ck = _load_bank(args.load_trees_from)
         W_saved = ck['W']
         b_saved = ck['b']
         meta_saved = ck['path_info']
@@ -1046,22 +1075,32 @@ def main():
                                   'entries requires --include-flanking-'
                                   'patterns to reload the pattern list.')
             patterns_list = load_patterns(args.include_flanking_patterns)
-        X_tr = torch.from_numpy(Xnp_tr).to(device)
-        X_te = torch.from_numpy(Xnp_te).to(device)
-        if use_relu:
-            print('computing hidden activations (ReLU) from loaded trees...')
-        else:
-            print('computing hidden activations (step) from loaded trees...')
         t0 = time.time()
-        H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
-                     use_relu=use_relu)
-        H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
-                     use_relu=use_relu)
+        if ck.get('hidden_from_leaves') and ck.get('sklearn_trees') is not None:
+            # Leaf-based bank (e.g. --time-ordinal): rebuild the TRUE leaf
+            # one-hot from the saved sklearn trees — the ±1 W is invalid here.
+            print('computing hidden activations (leaf one-hot from saved '
+                   'sklearn trees — --hidden-from-leaves reload)...')
+            _trees = ck['sklearn_trees']
+            leaf_build = [(_trees[ti], nid) for ti, nid in ck['leaf_build_idx']]
+            H_tr = build_H_from_leaves(leaf_build, Xnp_tr, act_dtype)
+            H_te = build_H_from_leaves(leaf_build, Xnp_te, act_dtype)
+        else:
+            X_tr = torch.from_numpy(Xnp_tr).to(device)
+            X_te = torch.from_numpy(Xnp_te).to(device)
+            if use_relu:
+                print('computing hidden activations (ReLU) from loaded trees...')
+            else:
+                print('computing hidden activations (step) from loaded trees...')
+            H_tr = mlp(X_tr, out_device='cpu', out_dtype=act_dtype,
+                         use_relu=use_relu)
+            H_te = mlp(X_te, out_device='cpu', out_dtype=act_dtype,
+                         use_relu=use_relu)
+            del X_tr, X_te
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
         print(f'  H_tr {tuple(H_tr.shape)}  H_te {tuple(H_te.shape)}  '
                f'({time.time() - t0:.1f}s)')
-        del X_tr, X_te
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
     elif args.skip_tree_fit:
         print('\n--skip-tree-fit: no tree pipeline; H starts empty (N, 0)')
         all_meta = []
@@ -1315,13 +1354,20 @@ def main():
 
         mlp = OpeningTreeMLP(W, B, all_meta, device)
 
-        # Restart aid: persist the freshly-fit trees before the (expensive,
-        # OOM-prone) H_tr computation and probe stage, so a timeout after
-        # this point never re-fits.  Same format as --tree-fit-only / the
-        # streaming --load-trees-from loader.
-        if args.tree_cache and not os.path.exists(args.tree_cache):
-            tc_tmp = args.tree_cache + '.tmp'
-            torch.save({
+        # For --hidden-from-leaves banks the ±1 W is NOT a valid reload (numeric
+        # splits), so persist the sklearn trees + leaf map to rebuild H later.
+        # This is what makes "fit once, train readout later" work for ordinal.
+        _leaf_extra = {}
+        if args.hidden_from_leaves:
+            _sk_trees, _lb_idx = serialize_leaf_build(leaf_build)
+            _leaf_extra = {'sklearn_trees': _sk_trees,
+                            'leaf_build_idx': _lb_idx,
+                            'hidden_from_leaves': True}
+            print(f'  persisting {len(_sk_trees)} sklearn trees for '
+                   f'leaf-based reload (--hidden-from-leaves)')
+
+        def _bank_dict():
+            return {
                 'W': mlp.W.cpu(),
                 'b': mlp.b.cpu(),
                 'path_info': all_meta,
@@ -1330,7 +1376,16 @@ def main():
                                         if args.tree_target != 'patterns'
                                         else tree_correct_per_pattern.tolist()),
                 'args': vars(args),
-            }, tc_tmp)
+                **_leaf_extra,
+            }
+
+        # Restart aid: persist the freshly-fit trees before the (expensive,
+        # OOM-prone) H_tr computation and probe stage, so a timeout after
+        # this point never re-fits.  Same format as --tree-fit-only / the
+        # streaming --load-trees-from loader.
+        if args.tree_cache and not os.path.exists(args.tree_cache):
+            tc_tmp = args.tree_cache + '.tmp'
+            torch.save(_bank_dict(), tc_tmp)
             os.replace(tc_tmp, args.tree_cache)      # atomic
             print(f'  [tree-cache] saved fitted trees to {args.tree_cache}',
                     flush=True)
@@ -1338,16 +1393,7 @@ def main():
         if args.tree_fit_only:
             print('\n--tree-fit-only: saving tree checkpoint and exiting '
                    'before H_tr computation (skips OOM risk on large data).')
-            torch.save({
-                'W': mlp.W.cpu(),
-                'b': mlp.b.cpu(),
-                'path_info': all_meta,
-                'per_cell_leaf_counts': per_cell_leaf_counts,
-                'per_cell_tree_acc': (tree_correct_per_cell.tolist()
-                                        if args.tree_target != 'patterns'
-                                        else tree_correct_per_pattern.tolist()),
-                'args': vars(args),
-            }, args.out)
+            torch.save(_bank_dict(), args.out)
             print(f'saved {args.out}')
             return
 
