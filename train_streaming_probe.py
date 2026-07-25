@@ -217,7 +217,8 @@ def load_trees(ckpt_path):
     if isinstance(b, torch.Tensor):
         b = b.numpy()
     tree_idx = [i for i, m in enumerate(meta)
-                 if m.get('kind') in ('tree_path', 'pattern_path')]
+                 if m.get('kind') in ('tree_path', 'pattern_path',
+                                       'pattern_multi')]
     W_tree = W[tree_idx]
     b_tree = b[tree_idx]
     tree_meta = [meta[i] for i in tree_idx]
