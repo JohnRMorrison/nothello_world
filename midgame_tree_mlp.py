@@ -406,6 +406,10 @@ def main():
                           'which prunes by sample count and discards the small '
                           'leaves that isolate rare pattern firings.  Applies '
                           'to per-pattern, grouped, and multioutput trees.')
+    ap.add_argument('--no-flanking-features', action='store_true',
+                    help='Keep the 960 flanking patterns as tree TARGETS '
+                          '(from --include-flanking-patterns) but do NOT add '
+                          'them as hidden features — a TREE-ONLY readout.')
     ap.add_argument('--tree-n-jobs', type=int, default=1)
     ap.add_argument('--probe-epochs', type=int, default=25)
     ap.add_argument('--add-stability-features',
@@ -1410,7 +1414,10 @@ def main():
     # 960 hand-crafted Othello legality rules as {0/1} moveset+parity
     # conjunctions.  Each unit fires iff the pattern's conjunction is
     # satisfied under placement=current-color approximation.
-    if args.include_flanking_patterns:
+    # --no-flanking-features: keep the 960 patterns as tree TARGETS
+    # (loaded from --include-flanking-patterns) but do NOT add them as
+    # hidden features — a TREE-ONLY readout.
+    if args.include_flanking_patterns and not args.no_flanking_features:
         print(f'\nloading flanking patterns from '
                f'{args.include_flanking_patterns}...')
         patterns = load_patterns(args.include_flanking_patterns)
