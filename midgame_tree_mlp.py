@@ -2143,6 +2143,23 @@ def main():
             mean_acc = float(correct.mean())
             aux = {'position_perfect':
                      float(correct.all(axis=1).mean())}
+            # legal-move metrics on the prob-OR prediction (what we care about)
+            _pb = preds_lin.numpy().astype(np.uint8)
+            _Lb = L_te_np.astype(np.uint8)
+            _tp = int(((_pb == 1) & (_Lb == 1)).sum())
+            _fp = int(((_pb == 1) & (_Lb == 0)).sum())
+            _fn = int(((_pb == 0) & (_Lb == 1)).sum())
+            _rec = _tp / (_tp + _fn) if (_tp + _fn) else 0.0
+            _prec = _tp / (_tp + _fp) if (_tp + _fp) else 0.0
+            aux['legal_recall'] = _rec
+            aux['legal_precision'] = _prec
+            aux['legal_f1'] = (2 * _prec * _rec / (_prec + _rec)
+                               if (_prec + _rec) else 0.0)
+            _has = _Lb.sum(1) > 0
+            _am = accum.numpy()
+            aux['argmax_legal'] = (float(_Lb[np.arange(_Lb.shape[0]),
+                                             _am.argmax(1)][_has].mean())
+                                    if _has.any() else float('nan'))
             T_np = T_te.numpy() if hasattr(T_te, 'numpy') else T_te
             by_ply = {}
             per_pos = correct.mean(axis=1)

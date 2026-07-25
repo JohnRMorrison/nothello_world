@@ -14,7 +14,7 @@ echo "READOUT stage: ${GAMES} games, device=${DEVICE}"
 
 # readout flags shared by every config
 RD="--num-train-games ${GAMES} --num-test-games ${TEST} --ply-min 5 --ply-max 54 \
-  --task legal --legal-modes bce --legal-probe-epochs 100 --probe-seeds 1 \
+  --task legal --legal-modes patterns_linear_probor --legal-probe-epochs 100 --probe-seeds 1 \
   --skip-state-probe --canonicalize-mover --device ${DEVICE}"
 FEAT="--include-flanking-patterns hand_crafted_flanking_patterns.pt --tree-target patterns"
 
@@ -38,14 +38,15 @@ run J3_ordinal ${FEAT} --no-flanking-features \
 
 echo ""
 echo "################  RESULTS (legal-move metrics)  ################"
-printf "%-16s %8s %11s %9s %9s\n" "config" "units" "argmax_leg" "legal_F1" "per_cell"
+printf "%-16s %8s %10s %10s %9s\n" "config" "units" "legal_rec" "legal_F1" "legal_prec"
 for f in J0_flanking J1_perpattern J2_grouped J3_ordinal; do
   log="logs/readout_${f}.out"
   units=$(grep -oE "total hidden units: *[0-9]+" "$log" 2>/dev/null | grep -oE "[0-9]+" | head -1)
   [ -z "$units" ] && units=$(grep -oE "combined H_tr \([0-9]+, [0-9]+\)" "$log" 2>/dev/null | grep -oE ", [0-9]+" | tr -d ', ' | head -1)
   [ -z "$units" ] && units=$(grep -oE "H_tr \([0-9]+, [0-9]+\)" "$log" 2>/dev/null | grep -oE ", [0-9]+" | tr -d ', ' | tail -1)
   pc=$(grep -E "per-cell acc" "$log" 2>/dev/null | grep -oE "[0-9]+\.[0-9]+%" | head -1)
-  am=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "argmax-legal=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
+  rec=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "recall=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
   f1=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "F1=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
-  printf "%-16s %8s %11s %9s %9s\n" "$f" "${units:-?}" "${am:-?}" "${f1:-?}" "${pc:-?}"
+  prc=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "precision=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
+  printf "%-16s %8s %10s %10s %9s\n" "$f" "${units:-?}" "${rec:-?}" "${f1:-?}" "${prc:-?}"
 done

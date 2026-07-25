@@ -295,6 +295,8 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                                               recent_Ks=recent_Ks)
     N = X.shape[0]
     correct_total = 0
+    tp_t = fp_t = fn_t = 0          # legal-move (positive class) tallies
+    am_ok = am_n = 0               # argmax-legality
     correct_by_ply = defaultdict(lambda: [0, 0])
     with torch.no_grad():
         for i in range(0, N, batch):
@@ -307,6 +309,15 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
             preds = (p > 0.5).to(torch.uint8)
             correct = (preds == L_batch).sum().item()
             correct_total += correct
+            Lb = L_batch.to(torch.uint8)
+            tp_t += int(((preds == 1) & (Lb == 1)).sum().item())
+            fp_t += int(((preds == 1) & (Lb == 0)).sum().item())
+            fn_t += int(((preds == 0) & (Lb == 1)).sum().item())
+            has = Lb.sum(1) > 0
+            if bool(has.any()):
+                top = p.argmax(1)
+                am_ok += int(Lb[torch.arange(Lb.shape[0]), top][has].sum().item())
+                am_n += int(has.sum().item())
             T_batch = T[i:i + batch]
             for j in range(X_batch.shape[0]):
                 ply_bucket = int(T_batch[j]) // 10 * 10
@@ -315,7 +326,13 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 correct_by_ply[ply_bucket][1] += 64
     total = N * 64
     acc = correct_total / total
+    rec = tp_t / (tp_t + fn_t) if (tp_t + fn_t) else 0.0
+    prec = tp_t / (tp_t + fp_t) if (tp_t + fp_t) else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
     print(f'  eval per-cell acc: {100*acc:.4f}%  (N={N} positions)')
+    print(f'  eval LEGAL-MOVE: recall={100*rec:.2f}%  precision={100*prec:.2f}%'
+           f'  F1={100*f1:.2f}%  argmax-legal='
+           f'{100*am_ok/am_n if am_n else float("nan"):.2f}%')
     for lo in sorted(correct_by_ply.keys()):
         c, t = correct_by_ply[lo]
         print(f'    ply [{lo:2d},{lo+10:2d})  '
