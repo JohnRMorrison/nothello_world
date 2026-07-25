@@ -56,13 +56,15 @@ run J3_ordinal --time-ordinal movesago --time-ordinal-split-color \
 
 echo ""
 echo "################  RESULTS  ################"
-printf "%-16s %14s %14s\n" "config" "hidden_units" "per_cell_acc"
+printf "%-16s %8s %11s %9s %9s\n" "config" "units" "argmax_leg" "legal_F1" "per_cell"
 for f in J0_flanking J1_perpattern J2_grouped J3_ordinal; do
   log="logs/bakeoff_${f}.out"
   units=$(grep -oE "total hidden units: *[0-9]+" "$log" 2>/dev/null | grep -oE "[0-9]+" | head -1)
   # flanking-only prints no "total hidden units" — read the COMBINED H_tr width
   [ -z "$units" ] && units=$(grep -oE "combined H_tr \([0-9]+, [0-9]+\)" "$log" 2>/dev/null | grep -oE ", [0-9]+" | tr -d ', ' | head -1)
   [ -z "$units" ] && units=$(grep -oE "H_tr \([0-9]+, [0-9]+\)" "$log" 2>/dev/null | grep -oE ", [0-9]+" | tr -d ', ' | tail -1)
-  acc=$(grep -E "BCE .*per-cell acc" "$log" 2>/dev/null | grep -oE "[0-9]+\.[0-9]+%" | head -1)
-  printf "%-16s %14s %14s\n" "$f" "${units:-?}" "${acc:-?}"
+  pc=$(grep -E "per-cell acc" "$log" 2>/dev/null | grep -oE "[0-9]+\.[0-9]+%" | head -1)
+  am=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "argmax-legal=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
+  f1=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | grep -oE "F1=[0-9.]+%" | grep -oE "[0-9.]+%" | head -1)
+  printf "%-16s %8s %11s %9s %9s\n" "$f" "${units:-?}" "${am:-?}" "${f1:-?}" "${pc:-?}"
 done

@@ -1857,7 +1857,13 @@ def main():
                f'{100 * illegal_rate:.2f}%')
 
         def _print_legal_report(tag, acc, per_cell, aux):
-            print(f'  {tag} ensemble test per-cell acc: {100*acc:.4f}%')
+            print(f'  {tag} ensemble test per-cell acc: {100*acc:.4f}%  '
+                   f'(chance {100*illegal_rate:.2f}%)')
+            # legal-move metrics — what we actually care about, not per-cell acc
+            print(f'  {tag} LEGAL-MOVE: recall={100*aux.get("legal_recall",0):.2f}%  '
+                   f'precision={100*aux.get("legal_precision",0):.2f}%  '
+                   f'F1={100*aux.get("legal_f1",0):.2f}%  '
+                   f'argmax-legal={100*aux.get("argmax_legal",float("nan")):.2f}%')
             print(f'  {tag} position-perfect: '
                    f'{100*aux["position_perfect"]:.4f}%')
             for (lo, hi), (n, a) in sorted(aux.get('by_ply', {}).items()):
@@ -1865,6 +1871,10 @@ def main():
                        f'acc={100*a:.4f}%')
             legal_results[tag] = {
                 'test_acc': acc,
+                'legal_recall': aux.get('legal_recall'),
+                'legal_precision': aux.get('legal_precision'),
+                'legal_f1': aux.get('legal_f1'),
+                'argmax_legal': aux.get('argmax_legal'),
                 'position_perfect': aux['position_perfect'],
                 'by_ply': aux.get('by_ply', {}),
                 'per_cell_acc': per_cell.tolist()

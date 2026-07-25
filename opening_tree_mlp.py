@@ -1482,6 +1482,26 @@ def evaluate_legal_ensemble(probes, H, L, T=None, batch=512, kind='bce'):
     mean_acc = correct.mean().item()
     aux = {'position_perfect':
              correct.all(dim=1).float().mean().item()}
+    # ---- legal-move metrics (positive/legal class — the metric that matters,
+    # unlike per-cell acc which is dominated by the ~85% "illegal" majority) ----
+    Lb = L_cpu.to(torch.uint8)
+    tp = int(((preds == 1) & (Lb == 1)).sum())
+    fp = int(((preds == 1) & (Lb == 0)).sum())
+    fn = int(((preds == 0) & (Lb == 1)).sum())
+    rec = tp / (tp + fn) if (tp + fn) else 0.0
+    prec = tp / (tp + fp) if (tp + fp) else 0.0
+    aux['legal_recall'] = rec
+    aux['legal_precision'] = prec
+    aux['legal_f1'] = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
+    # argmax-legality: is the single highest-scored cell actually legal?
+    # (the project's MLP-comparable metric; skip positions with no legal move)
+    has_legal = Lb.sum(dim=1) > 0
+    if int(has_legal.sum()) > 0:
+        top = accum.argmax(dim=1)
+        top_legal = Lb[torch.arange(Lb.shape[0]), top].float()
+        aux['argmax_legal'] = top_legal[has_legal].mean().item()
+    else:
+        aux['argmax_legal'] = float('nan')
     if T is not None:
         T_np = T.numpy() if hasattr(T, 'numpy') else T
         aux['by_ply'] = _by_ply_10(T_np, correct.mean(dim=1).numpy())
