@@ -29,12 +29,14 @@ run J1_A J1_perpattern.pt
 run J1_B J1_perpattern.pt --pattern-bce
 run J2_A J2_grouped.pt
 run J2_B J2_grouped.pt --pattern-bce
+run J3_A J3_ordinal.pt              # ordinal: leaf-based reload + movesago from chunks
+run J3_B J3_ordinal.pt --pattern-bce
 
 echo "waiting..."; wait
 echo "=================================================="
 echo "############  STREAM GRID RESULTS (prob-OR legal recall / F1)  ############"
 printf "%-8s %10s %10s\n" "config" "legal_rec" "legal_F1"
-for f in J0_A J1_A J1_B J2_A J2_B; do
+for f in J0_A J1_A J1_B J2_A J2_B J3_A J3_B; do
   log="logs/stream_${f}.out"
   rec=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | tail -1 | grep -oE "recall=[0-9.]+%" | grep -oE "[0-9.]+%")
   f1=$(grep -E "LEGAL-MOVE" "$log" 2>/dev/null | tail -1 | grep -oE "F1=[0-9.]+%" | grep -oE "[0-9.]+%")

@@ -93,7 +93,8 @@ def _get_pattern_arrays():
 def process_chunk_ext_file(chunk_path, ply_min, ply_max,
                               canonicalize_mover=False,
                               max_positions=None,
-                              pat_batch=200_000):
+                              pat_batch=200_000,
+                              needs_ordinal=False):
     """Load one chunk_ext_*.npz file, return (X, S, T, L) as np arrays.
 
     X: (N, 121) float32 — [played(60), even-or-placed_as_mover(60), mp(1)].
@@ -175,6 +176,18 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
                 L[start:end, c] = (pat[:, pids] > 0).any(axis=1).astype(np.uint8)
         del pat
 
+    # J3 ordinal: append the reconstructed movesago block (cols 121:181).
+    # movesago = positions + 2 - when*60  (played cells; -1 unplayed).
+    # Validated to match playedeven_features(time_ordinal='movesago') exactly.
+    if needs_ordinal:
+        when = features[:, 60:120].astype(np.float32)
+        # movesago is an integer; round to undo float16 storage error in `when`
+        # so it matches the exact-integer values the trees were fit on.
+        movesago = np.where(played > 0,
+                            np.round(positions[:, None] + 2.0 - when * 60.0),
+                            -1.0).astype(np.float32)
+        X = np.concatenate([X, movesago], axis=1)     # (N, 181)
+
     # State labels are not used by the streaming probe training loop
     # (only X, T, L are consumed).  Return None to avoid the cost.
     return X, None, stream_pos, L
@@ -249,8 +262,49 @@ def load_trees(ckpt_path):
     return W_tree, b_tree, tree_meta
 
 
+def load_leaf_build(ckpt_path):
+    """For a --hidden-from-leaves bank (J3 ordinal): return leaf_build =
+    [(sklearn_tree, node_id), ...] so H can be built via tree.apply (the ±1 W is
+    invalid for numeric splits).  Returns None if the bank isn't leaf-based."""
+    try:
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ck = torch.load(ckpt_path, map_location='cpu')
+    if not ck.get('hidden_from_leaves') or ck.get('sklearn_trees') is None:
+        return None
+    trees = ck['sklearn_trees']
+    return [(trees[ti], nid) for ti, nid in ck['leaf_build_idx']]
+
+
+def build_H_from_leaves_np(leaf_build, Xnp):
+    """TRUE leaf one-hot via tree.apply (honors numeric ordinal splits)."""
+    from collections import defaultdict
+    N = Xnp.shape[0]
+    H = np.zeros((N, len(leaf_build)), dtype=bool)
+    cols_by_tree = defaultdict(list); tref = {}
+    for col, (tree, nid) in enumerate(leaf_build):
+        cols_by_tree[id(tree)].append((col, nid)); tref[id(tree)] = tree
+    for tid, colnodes in cols_by_tree.items():
+        leaves = tref[tid].apply(np.ascontiguousarray(Xnp))
+        for col, nid in colnodes:
+            H[:, col] = (leaves == nid)
+    return H
+
+
+def assemble_ordinal_241(X_np):
+    """Build J3's 241-d input from an X that has movesago appended (cols
+    121:181): [played,placed_as_mover,mp(121), mover_movesago(60), opp(60)],
+    split by placed_as_mover — matching the fit's _split_ordinal."""
+    X121 = X_np[:, :121]
+    ord60 = X_np[:, 121:181]
+    pam = X_np[:, 60:120] > 0
+    mover = np.where(pam, ord60, -1.0).astype(np.float32)
+    opp = np.where(pam, -1.0, ord60).astype(np.float32)
+    return np.concatenate([X121, mover, opp], axis=1)
+
+
 def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
-                                 device, no_flanking=False):
+                                 device, no_flanking=False, leaf_build=None):
     """Compute [tree_paths | recent_bits | flanking_patterns] for one
     chunk of positions.
 
@@ -259,6 +313,12 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
 
     Returns bool tensor on GPU (or float32 under use_relu)."""
     dtype = torch.float32 if use_relu else torch.bool
+    # J3 (ordinal, --hidden-from-leaves): H = true leaf one-hot via tree.apply
+    # on the 241-d input (built from X's appended movesago block).  Tree-only.
+    if leaf_build is not None:
+        inp241 = assemble_ordinal_241(X_np)
+        H = build_H_from_leaves_np(leaf_build, inp241)
+        return torch.from_numpy(H).to(device=device, dtype=dtype)
     # Trees were fit on played+even+mover_parity only (input_dim=121);
     # slice X_np to those columns for the tree forward.  Recent bits are
     # concatenated separately from X_np[:, 121:].
@@ -290,12 +350,13 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
 def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 patterns, use_relu, device, batch=1024,
                 use_chunk_ext=False, canonicalize_mover=False,
-                max_positions=None, no_flanking=False):
+                max_positions=None, no_flanking=False,
+                leaf_build=None, needs_ordinal=False):
     if use_chunk_ext:
         X, S, T, L = process_chunk_ext_file(
             eval_path, ply_min, ply_max,
             canonicalize_mover=canonicalize_mover,
-            max_positions=max_positions)
+            max_positions=max_positions, needs_ordinal=needs_ordinal)
     else:
         X, S, T, L = process_pickle_chunk(eval_path, ply_min, ply_max,
                                               recent_Ks=recent_Ks)
@@ -309,7 +370,8 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
             X_batch = X[i:i + batch]
             H = build_hidden_layer_batch(X_batch, mlp, patterns,
                                              recent_Ks, use_relu, device,
-                                             no_flanking=no_flanking)
+                                             no_flanking=no_flanking,
+                                             leaf_build=leaf_build)
             L_batch = torch.from_numpy(L[i:i + batch]).to(device)
             p = probe(H.float() if not use_relu else H)
             preds = (p > 0.5).to(torch.uint8)
@@ -462,17 +524,26 @@ def main():
     mlp = OpeningTreeMLP(W_tree, b_tree, tree_meta, device)
     input_dim = W_tree.shape[1]
 
+    # J3 ordinal (--hidden-from-leaves): use the saved sklearn trees + tree.apply
+    # instead of the (invalid) ±1 W.  needs_ordinal → build the 241-d input.
+    leaf_build = (None if args.flanking_only
+                  else load_leaf_build(args.load_trees_from))
+    needs_ordinal = leaf_build is not None
+    if needs_ordinal:
+        print(f'  leaf-based bank: {len(leaf_build)} leaf units via tree.apply '
+               f'(J3 ordinal; movesago rebuilt from chunks)')
+
     recent_Ks = (None if (args.flanking_only or args.no_recent) else
                  (tuple(int(k) for k in args.recent_Ks.split(',')
                         if k.strip()) or None))
     patterns = load_patterns(args.flanking_patterns)
     print(f'loaded {len(patterns)} flanking patterns')
 
-    # Verify input dim matches.
+    # Verify input dim matches (skip for leaf-based J3 — W is unused there).
     expected_dim = 121
     if recent_Ks:
         expected_dim += 60 * len(recent_Ks)
-    if input_dim > expected_dim:
+    if not needs_ordinal and input_dim > expected_dim:
         raise ValueError(
             f'checkpoint tree input_dim={input_dim} > current featurizer '
             f'expected_dim={expected_dim} — recent-Ks may not match')
@@ -507,7 +578,7 @@ def main():
             return process_chunk_ext_file(
                 path, args.ply_min, args.ply_max,
                 canonicalize_mover=args.canonicalize_mover,
-                max_positions=cap)
+                max_positions=cap, needs_ordinal=needs_ordinal)
         return process_pickle_chunk(path, args.ply_min, args.ply_max,
                                         recent_Ks=recent_Ks)
 
@@ -521,7 +592,8 @@ def main():
     Xw_small = Xw[:64]
     H_small = build_hidden_layer_batch(Xw_small, mlp, patterns,
                                             recent_Ks, args.use_relu, device,
-                                            no_flanking=args.no_flanking)
+                                            no_flanking=args.no_flanking,
+                                            leaf_build=leaf_build)
     hidden_dim = H_small.shape[1]
     print(f'  hidden_dim={hidden_dim}')
     del Xw, Xw_small, H_small
@@ -633,7 +705,8 @@ def main():
                     device=device, dtype=torch.float32)
                 H_batch = build_hidden_layer_batch(
                     X_batch, mlp, patterns, recent_Ks, args.use_relu,
-                    device, no_flanking=args.no_flanking)
+                    device, no_flanking=args.no_flanking,
+                    leaf_build=leaf_build)
                 if H_batch.dtype != torch.float32:
                     H_batch = H_batch.float()
                 # Shared H_batch (no grad through it) → each head trains
@@ -682,7 +755,8 @@ def main():
                           use_chunk_ext=use_chunk_ext,
                           canonicalize_mover=args.canonicalize_mover,
                           max_positions=500_000,
-                          no_flanking=args.no_flanking)
+                          no_flanking=args.no_flanking,
+                          leaf_build=leaf_build, needs_ordinal=needs_ordinal)
 
     torch.save({
         'probe_states': [p.state_dict() for p in probes],
