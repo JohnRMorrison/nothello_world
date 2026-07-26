@@ -53,7 +53,9 @@ if not hasattr(np, '_core'):
         pass
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from data.othello import OthelloBoardState
+# OthelloBoardState is only needed for the pickle-replay path (process_pickle_
+# chunk); import it lazily there so the chunk-ext / leaf-cache path doesn't drag
+# in data.othello's deps (e.g. `pgn`), which a minimal pod may not have.
 from opening_tree_mlp import (
     playedeven_features, LinearPatternProbOr, PatternProbOrHead,
     OpeningTreeMLP, BOARD_CELLS, C64_TO_C60,
@@ -283,6 +285,7 @@ def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
 
     Returns (X, S, T, L, played, even, mp) numpy arrays.
     """
+    from data.othello import OthelloBoardState   # lazy: pickle path only
     with open(pickle_path, 'rb') as f:
         games = pickle.load(f)
     Xs, Ss, Ts, Ls = [], [], [], []
@@ -507,6 +510,93 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
     return acc
 
 
+# ===================== Nanda mine/yours board-state decoder ==================
+# "Nanda-style" = mine/yours, via a parity mode-split (Nanda's tl_probing_v1 /
+# our probe_state_pred_for_othello.py).  Two probes over the ABSOLUTE state
+# {0=empty,1=white,2=black}: an EVEN-ply probe and an ODD-ply probe.  At eval,
+# even-ply rows are decoded by the even probe, odd-ply by the odd probe — each
+# learns the color->mine/yours mapping for its parity, which IS mine/yours.
+# (Nanda's third "all" mode is just his absolute-color baseline and is never
+# used in the reported accuracy, so we omit it.)  Same target/loss/hparams as
+# the transformer decoder → tree-H accuracy directly comparable to the ~95%.
+def make_state_probe(hidden_dim, device):
+    """(modes=2 [even, odd], hidden_dim, 64 cells, 3 options) linear probe."""
+    W = torch.randn(2, hidden_dim, BOARD_CELLS, 3, device=device) \
+        / (hidden_dim ** 0.5)
+    W.requires_grad_(True)
+    return W
+
+
+def _state_forward(W, H):
+    # H (b, hidden) float -> (modes, b, cells, options)
+    return torch.einsum('bh,mhco->mbco', H, W)
+
+
+def state_loss(W, H, S_batch, T_batch):
+    """Per-cell CE: even-ply rows -> even probe (mode 0), odd -> odd (mode 1)."""
+    out = _state_forward(W, H)                      # (2, b, cells, 3)
+    even = (T_batch % 2 == 0)
+    loss = out.new_zeros(())
+    for m, mask in ((0, even), (1, ~even)):
+        if bool(mask.any()):
+            loss = loss + F.cross_entropy(
+                out[m][mask].reshape(-1, 3), S_batch[mask].reshape(-1))
+    return loss
+
+
+def _state_preds(W, H, T_batch):
+    out = _state_forward(W, H)                       # (3, b, cells, 3)
+    even = (T_batch % 2 == 0)
+    preds = torch.zeros(H.shape[0], BOARD_CELLS, dtype=torch.long,
+                        device=H.device)
+    preds[even] = out[0][even].argmax(-1)
+    preds[~even] = out[1][~even].argmax(-1)
+    return preds
+
+
+def evaluate_state(state_probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
+                   patterns, use_relu, device, batch, use_chunk_ext,
+                   canonicalize_mover, max_positions, no_flanking, leaf_build,
+                   needs_ordinal, cache_dir, leaf_index, leaf_index_cache_dir):
+    if use_chunk_ext and leaf_index is not None and leaf_index_cache_dir:
+        X, S, T, L = load_leaf_index_chunk(
+            leaf_index_cache_dir, eval_path, ply_min, ply_max, max_positions)
+    elif use_chunk_ext:
+        X, S, T, L = load_chunk_cached(
+            eval_path, ply_min, ply_max, canonicalize_mover, max_positions,
+            needs_ordinal, cache_dir=cache_dir)
+    else:
+        X, S, T, L = process_pickle_chunk(eval_path, ply_min, ply_max,
+                                              recent_Ks=recent_Ks)
+    N = X.shape[0]
+    correct = total = 0
+    by_ply = defaultdict(lambda: [0, 0])
+    with torch.no_grad():
+        for i in range(0, N, batch):
+            H = build_hidden_layer_batch(
+                X[i:i + batch], mlp, patterns, recent_Ks, use_relu, device,
+                no_flanking=no_flanking, leaf_build=leaf_build,
+                leaf_index=leaf_index)
+            if H.dtype != torch.float32:
+                H = H.float()
+            Tb = torch.from_numpy(T[i:i + batch].astype(np.int64)).to(device)
+            Sb = torch.from_numpy(
+                np.ascontiguousarray(S[i:i + batch]).astype(np.int64)).to(device)
+            preds = _state_preds(state_probe, H, Tb)
+            correct += int((preds == Sb).sum().item()); total += Sb.numel()
+            for j in range(preds.shape[0]):
+                pb = int(T[i + j]) // 10 * 10
+                by_ply[pb][0] += int((preds[j] == Sb[j]).sum().item())
+                by_ply[pb][1] += BOARD_CELLS
+    acc = correct / max(total, 1)
+    print(f'  eval STATE per-cell acc (mine/yours): {100*acc:.4f}%  '
+           f'(N={N} positions)')
+    for lo in sorted(by_ply):
+        c, t = by_ply[lo]
+        print(f'    ply [{lo:2d},{lo+10:2d})  acc={100*c/t:.4f}%')
+    return acc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--load-trees-from', default=None,
@@ -570,6 +660,11 @@ def main():
                     help='linpo: LinearPatternProbOr (Linear H->960 + '
                           'prob-OR).  strupo: PatternProbOrHead (per-'
                           'pattern linear over leaves + prob-OR).')
+    ap.add_argument('--task', default='legal', choices=['legal', 'state'],
+                    help='legal (default): train the legal-move probe (linpo/'
+                          'pattern-bce).  state: train a Nanda-style 3-mode '
+                          'mine/yours board-state decoder on the hidden layer H '
+                          '(per-cell accuracy), instead of the legal probe.')
     ap.add_argument('--ply-min', type=int, default=0)
     ap.add_argument('--ply-max', type=int, default=60)
     ap.add_argument('--epochs', type=int, default=3)
@@ -781,11 +876,26 @@ def main():
             tree_meta, patterns,
             use_pattern_bias=args.use_pattern_bias).to(device)
 
-    probes = [make_probe(s) for s in range(args.n_seeds)]
-    opts = [torch.optim.AdamW(p.parameters(), lr=args.lr,
-                                weight_decay=args.weight_decay) for p in probes]
-    print(f'{len(probes)} probe head(s), type={args.probe_type}, '
-           f'params/head={sum(p.numel() for p in probes[0].parameters()):,}')
+    if args.task == 'state':
+        # Nanda 3-mode mine/yours board decoder on the hidden layer H.
+        torch.manual_seed(1000)
+        state_probe = make_state_probe(hidden_dim, device)
+        state_opt = torch.optim.AdamW([state_probe], lr=1e-4,
+                                       betas=(0.9, 0.99), weight_decay=0.01)
+        probes, opts = [], []
+        print(f'STATE decoder: Nanda mine/yours linear probe '
+               f'(2 x {hidden_dim} x {BOARD_CELLS} x 3), AdamW lr=1e-4 '
+               f'betas=(0.9,0.99) wd=0.01; mine/yours via even/odd mode-split; '
+               f'params={2 * hidden_dim * BOARD_CELLS * 3:,}')
+    else:
+        state_probe = state_opt = None
+        probes = [make_probe(s) for s in range(args.n_seeds)]
+        opts = [torch.optim.AdamW(p.parameters(), lr=args.lr,
+                                    weight_decay=args.weight_decay)
+                for p in probes]
+        print(f'{len(probes)} probe head(s), type={args.probe_type}, '
+               f'params/head='
+               f'{sum(p.numel() for p in probes[0].parameters()):,}')
 
     n_train_files = min(len(train_files),
                           (args.num_train_games + games_per_file - 1)
@@ -803,8 +913,8 @@ def main():
     resume_path = args.resume_from or (args.out + '.resume')
 
     def save_resume(epoch, chunk_index):
-        if not args.checkpoint_every:
-            return
+        if not args.checkpoint_every or args.task == 'state':
+            return                       # state runs are short; no resume
         tmp = resume_path + '.tmp'
         torch.save({'probe_states': [p.state_dict() for p in probes],
                     'opt_states': [o.state_dict() for o in opts],
@@ -813,7 +923,7 @@ def main():
         os.replace(tmp, resume_path)     # atomic
 
     start_epoch, start_chunk = 1, 0
-    if args.resume and os.path.exists(resume_path):
+    if args.resume and args.task != 'state' and os.path.exists(resume_path):
         rck = torch.load(resume_path, map_location=device)
         # Back-compat: old single-probe checkpoints used 'probe_state'.
         p_states = rck.get('probe_states', [rck['probe_state']])
@@ -867,14 +977,30 @@ def main():
             for i in range(0, N, args.batch_size):
                 idx = perm[i:i + args.batch_size]
                 X_batch = X[idx]
-                L_batch = torch.from_numpy(L[idx]).to(
-                    device=device, dtype=torch.float32)
                 H_batch = build_hidden_layer_batch(
                     X_batch, mlp, patterns, recent_Ks, args.use_relu,
                     device, no_flanking=args.no_flanking,
                     leaf_build=leaf_build, leaf_index=leaf_index)
                 if H_batch.dtype != torch.float32:
                     H_batch = H_batch.float()
+                if args.task == 'state':
+                    # Nanda 3-mode mine/yours board decoder on H.
+                    S_batch = torch.from_numpy(
+                        np.ascontiguousarray(S[idx]).astype(np.int64)).to(device)
+                    T_batch = torch.from_numpy(
+                        T[idx].astype(np.int64)).to(device)
+                    loss = state_loss(state_probe, H_batch, S_batch, T_batch)
+                    state_opt.zero_grad(); loss.backward(); state_opt.step()
+                    last_loss = loss.item()
+                    epoch_loss += last_loss; epoch_batches += 1
+                    batch_idx += 1
+                    if batch_idx % 256 == 0:
+                        print(f'      batch {batch_idx}/{n_batches}  '
+                               f'({time.time() - t_hidden:.1f}s so far, '
+                               f'loss={last_loss:.4f})', flush=True)
+                    continue
+                L_batch = torch.from_numpy(L[idx]).to(
+                    device=device, dtype=torch.float32)
                 # Shared H_batch (no grad through it) → each head trains
                 # independently on the same batch.
                 # Option B: per-batch 960 pattern targets from state (cheap;
@@ -922,24 +1048,36 @@ def main():
         # accuracy estimate, keeps eval under ~1 min.
         # In-job eval is a single-head diagnostic; the ensemble number comes
         # from reeval over all saved heads.
-        acc = evaluate(probes[0], test_file, args.ply_min, args.ply_max,
-                          recent_Ks, mlp, patterns, args.use_relu, device,
-                          batch=args.batch_size,
-                          use_chunk_ext=use_chunk_ext,
-                          canonicalize_mover=args.canonicalize_mover,
-                          max_positions=500_000,
-                          no_flanking=args.no_flanking,
-                          leaf_build=leaf_build, needs_ordinal=needs_ordinal,
-                          cache_dir=args.cache_dir,
-                          leaf_index=leaf_index,
-                          leaf_index_cache_dir=args.leaf_index_cache_dir)
+        if args.task == 'state':
+            acc = evaluate_state(
+                state_probe, test_file, args.ply_min, args.ply_max, recent_Ks,
+                mlp, patterns, args.use_relu, device, args.batch_size,
+                use_chunk_ext, args.canonicalize_mover, 500_000,
+                args.no_flanking, leaf_build, needs_ordinal, args.cache_dir,
+                leaf_index, args.leaf_index_cache_dir)
+        else:
+            acc = evaluate(probes[0], test_file, args.ply_min, args.ply_max,
+                              recent_Ks, mlp, patterns, args.use_relu, device,
+                              batch=args.batch_size,
+                              use_chunk_ext=use_chunk_ext,
+                              canonicalize_mover=args.canonicalize_mover,
+                              max_positions=500_000,
+                              no_flanking=args.no_flanking,
+                              leaf_build=leaf_build, needs_ordinal=needs_ordinal,
+                              cache_dir=args.cache_dir,
+                              leaf_index=leaf_index,
+                              leaf_index_cache_dir=args.leaf_index_cache_dir)
 
-    torch.save({
-        'probe_states': [p.state_dict() for p in probes],
-        'probe_state': probes[0].state_dict(),   # back-compat: first head
-        'args': vars(args),
-        'final_acc': acc,
-    }, args.out)
+    if args.task == 'state':
+        torch.save({'state_probe': state_probe.detach().cpu(),
+                    'args': vars(args), 'final_acc': acc}, args.out)
+    else:
+        torch.save({
+            'probe_states': [p.state_dict() for p in probes],
+            'probe_state': probes[0].state_dict(),   # back-compat: first head
+            'args': vars(args),
+            'final_acc': acc,
+        }, args.out)
     print(f'\nsaved {args.out}')
     if args.checkpoint_every and os.path.exists(resume_path):
         os.remove(resume_path)           # training complete; drop resume file
