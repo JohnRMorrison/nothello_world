@@ -388,6 +388,9 @@ def main():
                     default='hand_crafted_flanking_patterns.pt')
     ap.add_argument('--num-train-games', type=int, default=6_000_000)
     ap.add_argument('--num-test-games', type=int, default=100_000)
+    ap.add_argument('--no-recent', action='store_true',
+                    help='Disable recent-K hidden bits entirely (tree-only H). '
+                          'Cleaner than --recent-Ks "" in shell scripts.')
     ap.add_argument('--recent-Ks', default='1,2,5,10,20',
                     help='Comma-sep list; empty to disable.')
     ap.add_argument('--use-pattern-bias', action='store_true',
@@ -459,7 +462,7 @@ def main():
     mlp = OpeningTreeMLP(W_tree, b_tree, tree_meta, device)
     input_dim = W_tree.shape[1]
 
-    recent_Ks = (None if args.flanking_only else
+    recent_Ks = (None if (args.flanking_only or args.no_recent) else
                  (tuple(int(k) for k in args.recent_Ks.split(',')
                         if k.strip()) or None))
     patterns = load_patterns(args.flanking_patterns)
