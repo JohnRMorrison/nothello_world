@@ -60,6 +60,7 @@ from opening_tree_mlp import (
 )
 from flanking_patterns import (
     load_patterns, compute_pattern_activations, patterns_by_target,
+    true_pattern_activations,
 )
 
 
@@ -389,6 +390,12 @@ def main():
                           'per-pattern bias in PatternProbOrHead.  Default '
                           'off (bias = 0 fixed buffer) -- purer '
                           '"weights over leaves" architecture.')
+    ap.add_argument('--pattern-bce', action='store_true',
+                    help='Option B: train the 960 sigmoids with BCE against the '
+                          'TRUE pattern firings (from state), prob-OR is '
+                          'inference-only.  Default (off) = option A: prob-OR '
+                          'output trained end-to-end against the legal mask.  '
+                          'linpo probe-type only.')
     ap.add_argument('--probe-type', default='linpo',
                     choices=['linpo', 'strupo'],
                     help='linpo: LinearPatternProbOr (Linear H->960 + '
@@ -601,6 +608,9 @@ def main():
             N = X.shape[0]
             print(f'    loaded {N} positions in {time.time() - t_load:.1f}s',
                     flush=True)
+            # Option B: 960 pattern targets from true state (BCE on patterns).
+            pt_full = (true_pattern_activations(patterns, S).astype(np.float32)
+                       if args.pattern_bce else None)
             t_hidden = time.time()
             # Process in mini-batches so we don't materialize the full
             # H matrix for the pickle at once (48K columns × 4M rows
@@ -620,10 +630,18 @@ def main():
                     H_batch = H_batch.float()
                 # Shared H_batch (no grad through it) → each head trains
                 # independently on the same batch.
+                pt_batch = (torch.from_numpy(pt_full[idx]).to(device)
+                            if pt_full is not None else None)
                 last_loss = 0.0
                 for p, o in zip(probes, opts):
-                    probs = p(H_batch).clamp(1e-6, 1 - 1e-6)
-                    loss = F.binary_cross_entropy(probs, L_batch)
+                    if pt_batch is not None:
+                        # Option B: BCE on the 960 pattern logits vs true firings
+                        logits = p.linear(H_batch)
+                        loss = F.binary_cross_entropy_with_logits(logits, pt_batch)
+                    else:
+                        # Option A: prob-OR output vs legal mask (end-to-end)
+                        probs = p(H_batch).clamp(1e-6, 1 - 1e-6)
+                        loss = F.binary_cross_entropy(probs, L_batch)
                     o.zero_grad(); loss.backward(); o.step()
                     last_loss = loss.item()
                 epoch_loss += last_loss; epoch_batches += 1
