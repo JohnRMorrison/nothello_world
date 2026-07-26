@@ -188,9 +188,9 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
                             -1.0).astype(np.float32)
         X = np.concatenate([X, movesago], axis=1)     # (N, 181)
 
-    # State labels are not used by the streaming probe training loop
-    # (only X, T, L are consumed).  Return None to avoid the cost.
-    return X, None, stream_pos, L
+    # Return the board-state labels as S (int8, ~1.8 GB) — option B needs them
+    # to compute per-batch pattern targets; option A ignores S.
+    return X, labels, stream_pos, L
 
 
 def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
@@ -630,6 +630,11 @@ def main():
     print(f'training on ~{n_train_files * games_per_file:,} games '
            f'({n_train_files} files)', flush=True)
 
+    # Option B (--pattern-bce): per-batch 960-pattern targets from state.
+    if args.pattern_bce:
+        from train_pattern_simple import compute_pattern_labels_batch as _cplb
+        _pat_arrays = _get_pattern_arrays()   # targets, terminals, opp_*, mask
+
     # --- Resume support: restore probe+optimizer and skip completed chunks ---
     resume_path = args.resume_from or (args.out + '.resume')
 
@@ -688,9 +693,6 @@ def main():
             N = X.shape[0]
             print(f'    loaded {N} positions in {time.time() - t_load:.1f}s',
                     flush=True)
-            # Option B: 960 pattern targets from true state (BCE on patterns).
-            pt_full = (true_pattern_activations(patterns, S).astype(np.float32)
-                       if args.pattern_bce else None)
             t_hidden = time.time()
             # Process in mini-batches so we don't materialize the full
             # H matrix for the pickle at once (48K columns × 4M rows
@@ -711,8 +713,15 @@ def main():
                     H_batch = H_batch.float()
                 # Shared H_batch (no grad through it) → each head trains
                 # independently on the same batch.
-                pt_batch = (torch.from_numpy(pt_full[idx]).to(device)
-                            if pt_full is not None else None)
+                # Option B: per-batch 960 pattern targets from state (cheap;
+                # avoids the ~100 GB full-chunk target matrix).
+                if args.pattern_bce:
+                    pos_b = (T[idx] - 1).astype(np.int64)   # chunk 0-based ply
+                    pt_np = _cplb(S[idx], pos_b, *_pat_arrays)   # (b, 960)
+                    pt_batch = torch.from_numpy(pt_np).to(
+                        device=device, dtype=torch.float32)
+                else:
+                    pt_batch = None
                 last_loss = 0.0
                 for p, o in zip(probes, opts):
                     if pt_batch is not None:
