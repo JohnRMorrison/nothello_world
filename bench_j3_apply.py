@@ -63,6 +63,10 @@ def main():
     ap.add_argument('--big', type=int, default=200_000,
                     help='big batch to model the precompute-once (leaf-cache) '
                          'scenario, where scaling is better')
+    ap.add_argument('--load-cap', type=int, default=10_000_000,
+                    help='cap used when the training cache was BUILT (so we hit '
+                         'it instead of rebuilding).  Must match run_stream_grid '
+                         "MAXPOS.  We only slice --big rows out of it.")
     ap.add_argument('--workers', default='16,32,64,96,192')
     ap.add_argument('--ply-min', type=int, default=5)
     ap.add_argument('--ply-max', type=int, default=54)
@@ -78,10 +82,23 @@ def main():
     print(f'bank: {n_trees} trees, {n_leaves} leaf units (hidden_dim)')
 
     chunk = sorted(glob.glob(os.path.join(args.chunk_dir, 'chunk_ext_*.npz')))[0]
-    print(f'loading a batch from {os.path.basename(chunk)} (via cache)...')
-    X181, S, T, L = tsp.load_chunk_cached(
-        chunk, args.ply_min, args.ply_max, True, args.big,
-        needs_ordinal=True, cache_dir=args.cache_dir)
+    # Read the EXISTING training cache (cap=load_cap) and slice --big rows out
+    # of it -- do NOT request a new cap (that would be a cache miss and rebuild
+    # the whole chunk from the NFS volume).
+    cpath = tsp._chunk_cache_path(args.cache_dir, chunk, args.ply_min,
+                                  args.ply_max, True, args.load_cap)
+    if os.path.exists(cpath):
+        print(f'reading existing cache {os.path.basename(cpath)} '
+              f'(slicing {args.big} rows)...', flush=True)
+        z = np.load(cpath)
+        X181 = z['X'][:args.big].astype(np.float32)   # slice before float cast
+        z.close()
+    else:
+        raise SystemExit(
+            f'no cache at {cpath}\n'
+            f'  (expected cap={args.load_cap}; check --cache-dir / --load-cap '
+            f'match how run_stream_grid_cached built it)')
+    print(f'  got X {X181.shape}', flush=True)
     workers = [int(w) for w in args.workers.split(',')]
 
     for label, nrows in [('per-batch', args.batch), ('big/precompute', args.big)]:
