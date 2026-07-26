@@ -193,6 +193,76 @@ def process_chunk_ext_file(chunk_path, ply_min, ply_max,
     return X, labels, stream_pos, L
 
 
+def _chunk_cache_path(cache_dir, path, ply_min, ply_max, canon, cap):
+    base = os.path.basename(path)
+    cap_s = 'all' if cap is None else str(int(cap))
+    return os.path.join(
+        cache_dir,
+        f'{base}.ply{ply_min}-{ply_max}.cap{cap_s}.'
+        f'canon{int(bool(canon))}.v1.npz')
+
+
+def load_chunk_cached(path, ply_min, ply_max, canonicalize_mover, cap,
+                       needs_ordinal, cache_dir=None):
+    """Return (X, S, T, L) for a chunk_ext file, backed by an on-disk cache.
+
+    The cache stores the ALWAYS-181-d input (base 121 + movesago 60), so a
+    SINGLE cache file serves both base (J0/J1/J2 — X sliced to 121) and ordinal
+    (J3 — full 181) configs, and every epoch after the first is a fast npz read
+    instead of a re-load + 960-pattern recompute.  The expensive part
+    (np.load + compute_pattern_labels_batch for L) happens once per
+    (chunk, ply-range, cap, canon).
+
+    Written atomically (os.replace), so parallel configs racing on the same key
+    never observe a half-written file; a corrupt/partial read just rebuilds.
+    """
+    cpath = (None if not cache_dir else
+             _chunk_cache_path(cache_dir, path, ply_min, ply_max,
+                               canonicalize_mover, cap))
+    X = S = T = L = None
+    if cpath and os.path.exists(cpath):
+        try:
+            z = np.load(cpath)
+            X = z['X'].astype(np.float32)
+            S = z['S'].astype(np.int8)
+            T = z['T'].astype(np.int32)
+            L = z['L'].astype(np.uint8)
+            z.close()
+        except Exception as e:                     # partial/corrupt → rebuild
+            print(f'  [cache] {os.path.basename(cpath)} unreadable ({e}); '
+                   f'rebuilding', flush=True)
+            X = S = T = L = None
+    if X is None:
+        # Build the movesago block (needs_ordinal=True → 181-d) whenever we
+        # need it (ordinal config) OR we're persisting a cache — so the cached
+        # file is method-agnostic (serves base and ordinal alike).  When we are
+        # neither caching nor ordinal, build the lean 121-d directly (old
+        # memory profile).  All X columns are integer-valued (0/1 bits +
+        # integer movesago in [-1, ~53]), so int8 storage is lossless; cast
+        # back to float32 on read.
+        build_ordinal = needs_ordinal or bool(cpath)
+        X, S, T, L = process_chunk_ext_file(
+            path, ply_min, ply_max, canonicalize_mover=canonicalize_mover,
+            max_positions=cap, needs_ordinal=build_ordinal)
+        if X is None:
+            return None, None, None, None
+        if cpath:
+            os.makedirs(cache_dir, exist_ok=True)
+            tmp = f'{cpath}.tmp{os.getpid()}'
+            with open(tmp, 'wb') as fh:
+                np.savez(fh,
+                         X=X.astype(np.int8),
+                         S=np.asarray(S, dtype=np.int8),
+                         T=np.asarray(T, dtype=np.int16),
+                         L=np.asarray(L, dtype=np.uint8))
+            os.replace(tmp, cpath)                 # atomic
+    if not needs_ordinal:
+        # Base configs don't use the movesago block — drop it (contiguous copy
+        # so the 181-d buffer is freed).
+        X = np.ascontiguousarray(X[:, :121])
+    return X, S, T, L
+
+
 def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
     """Load one pickle file, replay each game, extract midgame positions.
 
@@ -351,12 +421,11 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 patterns, use_relu, device, batch=1024,
                 use_chunk_ext=False, canonicalize_mover=False,
                 max_positions=None, no_flanking=False,
-                leaf_build=None, needs_ordinal=False):
+                leaf_build=None, needs_ordinal=False, cache_dir=None):
     if use_chunk_ext:
-        X, S, T, L = process_chunk_ext_file(
-            eval_path, ply_min, ply_max,
-            canonicalize_mover=canonicalize_mover,
-            max_positions=max_positions, needs_ordinal=needs_ordinal)
+        X, S, T, L = load_chunk_cached(
+            eval_path, ply_min, ply_max, canonicalize_mover, max_positions,
+            needs_ordinal, cache_dir=cache_dir)
     else:
         X, S, T, L = process_pickle_chunk(eval_path, ply_min, ply_max,
                                               recent_Ks=recent_Ks)
@@ -496,6 +565,20 @@ def main():
                          'add to a resubmitted job after a walltime timeout.')
     ap.add_argument('--resume-from', default=None,
                     help='Explicit resume-checkpoint path (default <out>.resume).')
+    ap.add_argument('--cache-dir', default=None,
+                    help='Directory for on-disk chunk caches (chunk-ext only). '
+                         'The first pass builds a method-agnostic 181-d cache '
+                         'per (chunk, ply-range, cap, canon); every later epoch '
+                         'AND every other config reuses it — turning a '
+                         'multi-epoch / multi-config run from N re-loads (+ '
+                         '960-pattern recompute) into one.  Strongly '
+                         'recommended whenever --epochs>1 or several configs '
+                         'share the same data.')
+    ap.add_argument('--precompute-cache-only', action='store_true',
+                    help='Build the chunk caches for all train + eval files, '
+                         'then exit.  Run once (serially, e.g. --flanking-only) '
+                         'before launching a parallel grid so every config '
+                         'reads the cache instead of racing to rebuild it.')
     args = ap.parse_args()
 
     if args.flanking_only and args.no_flanking:
@@ -575,12 +658,35 @@ def main():
         """Return (X, S, T, L) for one input file, regardless of source."""
         cap = cap if cap is not None else args.max_positions_per_file
         if use_chunk_ext:
-            return process_chunk_ext_file(
-                path, args.ply_min, args.ply_max,
-                canonicalize_mover=args.canonicalize_mover,
-                max_positions=cap, needs_ordinal=needs_ordinal)
+            return load_chunk_cached(
+                path, args.ply_min, args.ply_max, args.canonicalize_mover, cap,
+                needs_ordinal, cache_dir=args.cache_dir)
         return process_pickle_chunk(path, args.ply_min, args.ply_max,
                                         recent_Ks=recent_Ks)
+
+    # --precompute-cache-only: build the shared cache for every train + eval
+    # file (serially), then exit — so a parallel grid launched afterwards reads
+    # the cache instead of every config racing to rebuild the same chunks.
+    if args.precompute_cache_only:
+        if not use_chunk_ext:
+            raise ValueError('--precompute-cache-only requires '
+                             '--data-source chunk-ext')
+        if not args.cache_dir:
+            raise ValueError('--precompute-cache-only requires --cache-dir')
+        print(f'PRECOMPUTE-CACHE-ONLY → {args.cache_dir}', flush=True)
+        for i, f in enumerate(train_files):
+            t = time.time()
+            X, _, _, _ = load_chunk(f, cap=args.max_positions_per_file)
+            n = 0 if X is None else X.shape[0]
+            print(f'  [{i + 1}/{len(train_files)}] {os.path.basename(f)}: '
+                   f'{n} rows in {time.time() - t:.0f}s', flush=True)
+            del X
+        t = time.time()
+        load_chunk(test_file, cap=500_000)   # match the in-job eval's cap/key
+        print(f'  eval {os.path.basename(test_file)} cached in '
+               f'{time.time() - t:.0f}s', flush=True)
+        print('precompute-cache-only done.', flush=True)
+        return
 
     # Warm up: process one file to figure hidden_dim.  Cap tightly — we
     # only need enough rows to derive shapes.
@@ -765,7 +871,8 @@ def main():
                           canonicalize_mover=args.canonicalize_mover,
                           max_positions=500_000,
                           no_flanking=args.no_flanking,
-                          leaf_build=leaf_build, needs_ordinal=needs_ordinal)
+                          leaf_build=leaf_build, needs_ordinal=needs_ordinal,
+                          cache_dir=args.cache_dir)
 
     torch.save({
         'probe_states': [p.state_dict() for p in probes],
