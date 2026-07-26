@@ -228,7 +228,12 @@ def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
 
 def load_trees(ckpt_path):
     print(f'loading trees from {ckpt_path}...')
-    ck = torch.load(ckpt_path, map_location='cpu')
+    # weights_only=False: our banks embed numpy arrays / sklearn objects; on
+    # PyTorch 2.6 the default weights_only=True rejects them.  Trusted checkpoint.
+    try:
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ck = torch.load(ckpt_path, map_location='cpu')
     W = ck['W']; b = ck['b']; meta = ck['path_info']
     if isinstance(W, torch.Tensor):
         W = W.numpy()
