@@ -11,14 +11,23 @@ EPOCHS=${3:-1}
 mkdir -p stream_out logs
 echo "STREAM GRID: chunks=${CH} games=${GAMES} epochs=${EPOCHS}"
 
-BASE="--no-flanking --no-recent --data-source chunk-ext --chunk-dir ${CH} \
+# --max-positions-per-file caps rows loaded per chunk so 7 configs fit in RAM
+# (28M rows x 7 configs would OOM ~187GB).  10M/chunk x 2 chunks = 20M positions
+# per config — a solid readout scale, and ~10GB/config so all 7 run in parallel.
+MAXPOS=${MAXPOS:-10000000}
+BASE="--no-recent --data-source chunk-ext --chunk-dir ${CH} \
   --canonicalize-mover --ply-min 5 --ply-max 54 --probe-type linpo \
-  --num-train-games ${GAMES} --num-test-games 100000 --epochs ${EPOCHS}"
+  --num-train-games ${GAMES} --num-test-games 100000 --epochs ${EPOCHS} \
+  --max-positions-per-file ${MAXPOS}"
 
 run () {   # $1=label  $2=bank(or FLANK)  $3...=extra
   local label=$1 bank=$2; shift 2
-  local load="--load-trees-from banks/${bank}"
-  [ "$bank" = "FLANK" ] && load="--flanking-only"
+  local load
+  if [ "$bank" = "FLANK" ]; then
+    load="--flanking-only"                       # J0: flanking IS the hidden layer
+  else
+    load="--load-trees-from banks/${bank} --no-flanking"   # tree-only
+  fi
   python -u train_streaming_probe.py ${BASE} ${load} "$@" \
     --out stream_out/${label}.pt > logs/stream_${label}.out 2>&1 &
   echo "  launched ${label} (pid $!)"
