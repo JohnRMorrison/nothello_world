@@ -263,6 +263,21 @@ def load_chunk_cached(path, ply_min, ply_max, canonicalize_mover, cap,
     return X, S, T, L
 
 
+def load_leaf_index_chunk(leaf_cache_dir, path, ply_min, ply_max, cap):
+    """J3 fast path: return (leaves, S, T, L) where `leaves` is the prebuilt
+    (N, n_trees) int16 leaf-id matrix (from build_leaf_cache.py) in place of X.
+    `leaves` is read fully into RAM (random per-batch indexing over an NFS
+    memmap would be slow).  S/T/L come from the .stl.npz saved alongside."""
+    base = os.path.basename(path)
+    stem = f'{base}.ply{ply_min}-{ply_max}.cap{cap}.leaves.i16'
+    lpath = os.path.join(leaf_cache_dir, stem)
+    meta = np.load(lpath + '.meta.npz')
+    N = int(meta['N']); nt = int(meta['n_trees'])
+    leaves = np.fromfile(lpath, dtype=np.int16, count=N * nt).reshape(N, nt)
+    stl = np.load(lpath + '.stl.npz')
+    return leaves, stl['S'], stl['T'].astype(np.int32), stl['L']
+
+
 def process_pickle_chunk(pickle_path, ply_min, ply_max, recent_Ks=None):
     """Load one pickle file, replay each game, extract midgame positions.
 
@@ -374,7 +389,8 @@ def assemble_ordinal_241(X_np):
 
 
 def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
-                                 device, no_flanking=False, leaf_build=None):
+                                 device, no_flanking=False, leaf_build=None,
+                                 leaf_index=None):
     """Compute [tree_paths | recent_bits | flanking_patterns] for one
     chunk of positions.
 
@@ -383,6 +399,15 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
 
     Returns bool tensor on GPU (or float32 under use_relu)."""
     dtype = torch.float32 if use_relu else torch.bool
+    # J3 FAST path (--leaf-index-cache-dir): X_np is the (b, n_trees) leaf-id
+    # matrix from the prebuilt leaf cache; build the one-hot H by gather+compare
+    # (H[:,col] = leaves[:,col_tree_idx[col]] == col_nid[col]) — no tree.apply.
+    # Exact-equal to the tree.apply path (validated in build_leaf_cache).
+    if leaf_index is not None:
+        col_tree_idx, col_nid = leaf_index
+        H = (X_np[:, col_tree_idx] == col_nid[None, :])
+        return torch.from_numpy(np.ascontiguousarray(H)).to(
+            device=device, dtype=dtype)
     # J3 (ordinal, --hidden-from-leaves): H = true leaf one-hot via tree.apply
     # on the 241-d input (built from X's appended movesago block).  Tree-only.
     if leaf_build is not None:
@@ -421,8 +446,12 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
                 patterns, use_relu, device, batch=1024,
                 use_chunk_ext=False, canonicalize_mover=False,
                 max_positions=None, no_flanking=False,
-                leaf_build=None, needs_ordinal=False, cache_dir=None):
-    if use_chunk_ext:
+                leaf_build=None, needs_ordinal=False, cache_dir=None,
+                leaf_index=None, leaf_index_cache_dir=None):
+    if use_chunk_ext and leaf_index is not None and leaf_index_cache_dir:
+        X, S, T, L = load_leaf_index_chunk(
+            leaf_index_cache_dir, eval_path, ply_min, ply_max, max_positions)
+    elif use_chunk_ext:
         X, S, T, L = load_chunk_cached(
             eval_path, ply_min, ply_max, canonicalize_mover, max_positions,
             needs_ordinal, cache_dir=cache_dir)
@@ -440,7 +469,8 @@ def evaluate(probe, eval_path, ply_min, ply_max, recent_Ks, mlp,
             H = build_hidden_layer_batch(X_batch, mlp, patterns,
                                              recent_Ks, use_relu, device,
                                              no_flanking=no_flanking,
-                                             leaf_build=leaf_build)
+                                             leaf_build=leaf_build,
+                                             leaf_index=leaf_index)
             L_batch = torch.from_numpy(L[i:i + batch]).to(device)
             p = probe(H.float() if not use_relu else H)
             preds = (p > 0.5).to(torch.uint8)
@@ -579,6 +609,13 @@ def main():
                          'then exit.  Run once (serially, e.g. --flanking-only) '
                          'before launching a parallel grid so every config '
                          'reads the cache instead of racing to rebuild it.')
+    ap.add_argument('--leaf-index-cache-dir', default=None,
+                    help='J3 FAST path: directory of prebuilt leaf-index caches '
+                         '(from build_leaf_cache.py).  When set (ordinal bank '
+                         'only), H is built by gather+compare over the cached '
+                         '(N,n_trees) leaf-ids instead of walking 960 trees per '
+                         'batch — ~50-100x faster training.  Needs colmap.npz + '
+                         'per-chunk .leaves.i16/.stl.npz in the dir.')
     args = ap.parse_args()
 
     if args.flanking_only and args.no_flanking:
@@ -615,6 +652,16 @@ def main():
     if needs_ordinal:
         print(f'  leaf-based bank: {len(leaf_build)} leaf units via tree.apply '
                f'(J3 ordinal; movesago rebuilt from chunks)')
+
+    # J3 FAST path: load the leaf-index colmap; H then comes from the prebuilt
+    # leaf cache via gather+compare (no per-batch tree.apply).
+    leaf_index = None
+    if args.leaf_index_cache_dir and needs_ordinal:
+        cm = np.load(os.path.join(args.leaf_index_cache_dir, 'colmap.npz'))
+        leaf_index = (cm['col_tree_idx'], cm['col_nid'])
+        print(f'  LEAF-INDEX CACHE: {args.leaf_index_cache_dir} '
+               f'({len(leaf_index[0])} H cols, {int(cm["n_trees"])} trees) — '
+               f'H via gather+compare, no tree.apply')
 
     recent_Ks = (None if (args.flanking_only or args.no_recent) else
                  (tuple(int(k) for k in args.recent_Ks.split(',')
@@ -655,9 +702,14 @@ def main():
     print(f'{len(train_files)} train files + 1 held-out for eval')
 
     def load_chunk(path, cap=None):
-        """Return (X, S, T, L) for one input file, regardless of source."""
+        """Return (X, S, T, L) for one input file, regardless of source.
+        In leaf-index mode X is the (N, n_trees) leaf-id matrix."""
         cap = cap if cap is not None else args.max_positions_per_file
         if use_chunk_ext:
+            if leaf_index is not None:
+                return load_leaf_index_chunk(
+                    args.leaf_index_cache_dir, path, args.ply_min,
+                    args.ply_max, cap)
             return load_chunk_cached(
                 path, args.ply_min, args.ply_max, args.canonicalize_mover, cap,
                 needs_ordinal, cache_dir=args.cache_dir)
@@ -689,20 +741,26 @@ def main():
         return
 
     # Warm up: process one file to figure hidden_dim.  Cap tightly — we
-    # only need enough rows to derive shapes.
-    print(f'warmup: processing first file (cap 4096 rows)...', flush=True)
-    tw = time.time()
-    Xw, _, _, _ = load_chunk(train_files[0], cap=4096)
-    print(f'  warmup load: {time.time() - tw:.1f}s  '
-           f'positions={Xw.shape[0] if Xw is not None else 0}', flush=True)
-    Xw_small = Xw[:64]
-    H_small = build_hidden_layer_batch(Xw_small, mlp, patterns,
-                                            recent_Ks, args.use_relu, device,
-                                            no_flanking=args.no_flanking,
-                                            leaf_build=leaf_build)
-    hidden_dim = H_small.shape[1]
-    print(f'  hidden_dim={hidden_dim}')
-    del Xw, Xw_small, H_small
+    # only need enough rows to derive shapes.  In leaf-index mode hidden_dim is
+    # just the number of H columns (from the colmap) and there is no cap-4096
+    # leaf cache, so skip the warmup entirely.
+    if leaf_index is not None:
+        hidden_dim = len(leaf_index[0])
+        print(f'  hidden_dim={hidden_dim} (from leaf-index colmap)')
+    else:
+        print(f'warmup: processing first file (cap 4096 rows)...', flush=True)
+        tw = time.time()
+        Xw, _, _, _ = load_chunk(train_files[0], cap=4096)
+        print(f'  warmup load: {time.time() - tw:.1f}s  '
+               f'positions={Xw.shape[0] if Xw is not None else 0}', flush=True)
+        Xw_small = Xw[:64]
+        H_small = build_hidden_layer_batch(Xw_small, mlp, patterns,
+                                                recent_Ks, args.use_relu, device,
+                                                no_flanking=args.no_flanking,
+                                                leaf_build=leaf_build)
+        hidden_dim = H_small.shape[1]
+        print(f'  hidden_dim={hidden_dim}')
+        del Xw, Xw_small, H_small
 
     # Initialize N probe heads (different init) for ensembling.  N=1 is the
     # original single-probe behavior.  All heads share the same hidden layer
@@ -814,7 +872,7 @@ def main():
                 H_batch = build_hidden_layer_batch(
                     X_batch, mlp, patterns, recent_Ks, args.use_relu,
                     device, no_flanking=args.no_flanking,
-                    leaf_build=leaf_build)
+                    leaf_build=leaf_build, leaf_index=leaf_index)
                 if H_batch.dtype != torch.float32:
                     H_batch = H_batch.float()
                 # Shared H_batch (no grad through it) → each head trains
@@ -872,7 +930,9 @@ def main():
                           max_positions=500_000,
                           no_flanking=args.no_flanking,
                           leaf_build=leaf_build, needs_ordinal=needs_ordinal,
-                          cache_dir=args.cache_dir)
+                          cache_dir=args.cache_dir,
+                          leaf_index=leaf_index,
+                          leaf_index_cache_dir=args.leaf_index_cache_dir)
 
     torch.save({
         'probe_states': [p.state_dict() for p in probes],
