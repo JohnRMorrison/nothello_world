@@ -249,8 +249,8 @@ def main():
         print(f"    mean {arr.mean():.2f}  median {np.median(arr):.0f}  "
               f"p90 {np.percentile(arr, 90):.0f}  max {arr.max()}")
         print(f"  max decoder accuracy per multiset:")
-        print(f"    mean {dacc_arr.mean():.4f}  median {np.median(dacc_arr):.4f}  "
-              f"min {dacc_arr.min():.4f}")
+        print(f"    mean {np.nanmean(dacc_arr):.4f}  median {np.nanmedian(dacc_arr):.4f}  "
+              f"min {np.nanmin(dacc_arr):.4f}")
         print(f"  distinct-boards distribution:")
         cnt = Counter(arr.tolist())
         for nb in sorted(cnt):
@@ -266,9 +266,9 @@ def main():
             'median_distinct': float(np.median(arr)),
             'p90_distinct': float(np.percentile(arr, 90)),
             'max_distinct': int(arr.max()),
-            'mean_max_decoder_acc': round(float(dacc_arr.mean()), 6),
-            'median_max_decoder_acc': round(float(np.median(dacc_arr)), 6),
-            'min_max_decoder_acc': round(float(dacc_arr.min()), 6),
+            'mean_max_decoder_acc': round(float(np.nanmean(dacc_arr)), 6),
+            'median_max_decoder_acc': round(float(np.nanmedian(dacc_arr)), 6),
+            'min_max_decoder_acc': round(float(np.nanmin(dacc_arr)), 6),
             'mean_valid_trials': round(float(valid_arr.mean()), 1),
             'mean_dead_end_rate': round(float(dead_arr.mean()), 4),
         })
@@ -305,8 +305,8 @@ def main():
     all_valid = np.array([r['n_valid'] for r in moveset_rows], dtype=float)
     kmin, kmax = min(args.positions), max(args.positions)
     print(f"=== OVERALL (positions {kmin}-{kmax}, N={len(all_acc)} movesets) ===")
-    print(f"  mean max_decoder_acc = {all_acc.mean():.4f}  "
-          f"(median {np.median(all_acc):.4f}, min {all_acc.min():.4f})")
+    print(f"  mean max_decoder_acc = {np.nanmean(all_acc):.4f}  "
+          f"(median {np.nanmedian(all_acc):.4f}, min {np.nanmin(all_acc):.4f})")
     print(f"  mean distinct boards = {all_dist.mean():.2f}\n")
     summary_rows.append({
         'k': 'overall', 'n_multisets': len(all_acc),
@@ -315,9 +315,9 @@ def main():
         'median_distinct': float(np.median(all_dist)),
         'p90_distinct': float(np.percentile(all_dist, 90)),
         'max_distinct': int(all_dist.max()),
-        'mean_max_decoder_acc': round(float(all_acc.mean()), 6),
-        'median_max_decoder_acc': round(float(np.median(all_acc)), 6),
-        'min_max_decoder_acc': round(float(all_acc.min()), 6),
+        'mean_max_decoder_acc': round(float(np.nanmean(all_acc)), 6),
+        'median_max_decoder_acc': round(float(np.nanmedian(all_acc)), 6),
+        'min_max_decoder_acc': round(float(np.nanmin(all_acc)), 6),
         'mean_valid_trials': round(float(all_valid.mean()), 1),
         'mean_dead_end_rate': '',
     })
