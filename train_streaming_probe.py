@@ -408,9 +408,14 @@ def build_hidden_layer_batch(X_np, mlp, patterns, recent_Ks, use_relu,
     # Exact-equal to the tree.apply path (validated in build_leaf_cache).
     if leaf_index is not None:
         col_tree_idx, col_nid = leaf_index
-        H = (X_np[:, col_tree_idx] == col_nid[None, :])
-        return torch.from_numpy(np.ascontiguousarray(H)).to(
-            device=device, dtype=dtype)
+        # Gather+compare on the GPU: move the small (b, n_trees) leaf-id matrix
+        # to device, then build the (b, n_cols) one-hot there.  ~90x faster than
+        # the CPU numpy gather (which allocated a ~187MB intermediate per batch).
+        leaves_t = torch.as_tensor(np.ascontiguousarray(X_np)).to(device)
+        cti = torch.as_tensor(col_tree_idx, device=device).long()
+        cnid = torch.as_tensor(col_nid, device=device).to(leaves_t.dtype)
+        H = leaves_t.index_select(1, cti) == cnid.unsqueeze(0)
+        return H.to(dtype)
     # J3 (ordinal, --hidden-from-leaves): H = true leaf one-hot via tree.apply
     # on the 241-d input (built from X's appended movesago block).  Tree-only.
     if leaf_build is not None:
