@@ -931,8 +931,12 @@ def main():
     if args.resume and args.task != 'state' and os.path.exists(resume_path):
         rck = torch.load(resume_path, map_location=device)
         # Back-compat: old single-probe checkpoints used 'probe_state'.
-        p_states = rck.get('probe_states', [rck['probe_state']])
-        o_states = rck.get('opt_states', [rck['opt_state']])
+        # NB: don't use dict.get(k, [rck['probe_state']]) — the default is
+        # evaluated eagerly and KeyErrors when only 'probe_states' exists.
+        p_states = (rck['probe_states'] if 'probe_states' in rck
+                    else [rck['probe_state']])
+        o_states = (rck['opt_states'] if 'opt_states' in rck
+                    else [rck['opt_state']])
         for p, st in zip(probes, p_states):
             p.load_state_dict(st)
         for o, st in zip(opts, o_states):
