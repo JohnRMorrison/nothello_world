@@ -182,7 +182,8 @@ def evaluate_standard_lpm(model, loader, mask, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--condition-id", type=int, required=True, choices=[0, 1])
+    ap.add_argument("--condition-id", type=int, required=True,
+                    choices=[0, 1, 2, 3])   # 2/3 = coherent_all/incoherent_all
     ap.add_argument("--output-dir", type=str, default="experiments/new_squares")
     ap.add_argument("--ckpt", type=str, default="./ckpts/gpt_synthetic.ckpt",
                     help="Pretrained OthelloGPT state_dict to fine-tune.")
