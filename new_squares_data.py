@@ -155,38 +155,46 @@ def _coherent_into_board_candidates(i):
     return cands
 
 
-def _into_board_pool(i, all_into_board):
-    """Coherent into-board rules used for square i.  all_into_board=True uses
-    EVERY reachable coherent flank (count varies per square: 9/12/7...);
-    False keeps the fixed N_INTO_BOARD-rule selection (original design)."""
+def _along_row_pool(i, use_all):
+    """Along-row (new-square -> new-square) rules for square i.  Shared block,
+    identical in both conditions.  use_all=True uses EVERY along-row flank
+    (count varies per square); False keeps the fixed N_ALONG_ROW selection."""
+    cands = _along_row_candidates(i)
+    return cands if use_all else _pick(cands, N_ALONG_ROW)
+
+
+def _into_board_pool(i, use_all):
+    """Coherent into-board rules for square i.  use_all=True uses EVERY
+    reachable coherent flank (count varies per square: 9/12/7...); False keeps
+    the fixed N_INTO_BOARD-rule selection (original design)."""
     cands = _coherent_into_board_candidates(i)
-    return cands if all_into_board else _pick(cands, N_INTO_BOARD)
+    return cands if use_all else _pick(cands, N_INTO_BOARD)
 
 
-def create_coherent_rules(rng=None, all_into_board=False):
-    """Per new square: N_ALONG_ROW shared along-row flanks (reference other new
-    squares) + into-board flanks into the existing board via geometrically-
-    adjacent cells.  Deterministic.  all_into_board=True uses the FULL coherent
-    candidate pool (all geometric relationships; per-square count varies)."""
+def create_coherent_rules(rng=None, use_all=False):
+    """Per new square: shared along-row flanks (reference other new squares) +
+    into-board flanks into the existing board via geometrically-adjacent cells.
+    Deterministic.  use_all=True uses the FULL candidate pools for BOTH blocks
+    (all geometric relationships; per-square count varies)."""
     rules = []
     for i in range(N_NEW):
-        rules.extend(_pick(_along_row_candidates(i), N_ALONG_ROW))
-        rules.extend(_into_board_pool(i, all_into_board))
+        rules.extend(_along_row_pool(i, use_all))
+        rules.extend(_into_board_pool(i, use_all))
     return rules
 
 
-def create_incoherent_rules(rng, all_into_board=False):
-    """Same shared along-row block as coherent, but the into-board flanks
-    reference RANDOM existing cells, matched to coherent's into-board rules
-    ONE-FOR-ONE (same per-square count AND same chain-length distribution).
-    With all_into_board=True this mirrors the full coherent pool, so the two
-    conditions have the identical (unequal) per-square rule distribution and
-    differ ONLY in coherent-geometry vs random-target."""
+def create_incoherent_rules(rng, use_all=False):
+    """Identical shared along-row block as coherent (same pool), but the
+    into-board flanks reference RANDOM existing cells, matched to coherent's
+    into-board rules ONE-FOR-ONE (same per-square count AND chain-length
+    distribution).  use_all=True mirrors the full coherent pools, so the two
+    conditions share the identical (unequal) per-square distribution and differ
+    ONLY in coherent-geometry vs random-target on the into-board block."""
     playable = [c for c in range(64) if c not in CENTER_CELLS]
     rules = []
     for i in range(N_NEW):
-        rules.extend(_pick(_along_row_candidates(i), N_ALONG_ROW))   # identical
-        for r in _into_board_pool(i, all_into_board):
+        rules.extend(_along_row_pool(i, use_all))                    # identical
+        for r in _into_board_pool(i, use_all):
             n_opp = max(1, rule_length(r) - 1)
             cells = rng.choice(playable, size=n_opp + 1, replace=False)
             rules.append({'target': 64 + i,
@@ -197,14 +205,14 @@ def create_incoherent_rules(rng, all_into_board=False):
 
 
 def make_rules(condition_name, rng):
-    """Conditions: 'coherent' / 'incoherent' (fixed N_INTO_BOARD per square),
-    and 'coherent_all' / 'incoherent_all' (full coherent pool; per-square count
-    varies but is IDENTICAL across the two conditions)."""
-    all_ib = condition_name.endswith('_all')
-    base = condition_name[:-4] if all_ib else condition_name
+    """Conditions: 'coherent' / 'incoherent' (fixed N_ALONG_ROW + N_INTO_BOARD
+    per square), and 'coherent_all' / 'incoherent_all' (full candidate pools for
+    both blocks; per-square count varies but is IDENTICAL across the two)."""
+    use_all = condition_name.endswith('_all')
+    base = condition_name[:-4] if use_all else condition_name
     if base == 'coherent':
-        return create_coherent_rules(rng, all_into_board=all_ib)
-    return create_incoherent_rules(rng, all_into_board=all_ib)
+        return create_coherent_rules(rng, use_all=use_all)
+    return create_incoherent_rules(rng, use_all=use_all)
 
 
 # ============================================================================
