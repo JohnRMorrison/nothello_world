@@ -17,13 +17,14 @@
 #   STAGE=train  load the cached data, fine-tune + eval on GPU (tiny footprint)
 #   STAGE=full   both in one job (default; simplest, but holds a GPU during gen)
 #
-# Condition (0=coherent, 1=incoherent) comes from the array task id.
+# Condition comes from the array task id:
+#   0=coherent  1=incoherent  2=coherent_all  3=incoherent_all
 #
 # Recommended (stale-proof) flow -- data first on CPU, then train on GPU:
-#   STAGE=data  sbatch --array=0-1 --gres=gpu:0 --mem=16G new_squares_experiment.sh
-#   STAGE=train sbatch --array=0-1 new_squares_experiment.sh
+#   STAGE=data  sbatch --array=0-3 --gres=gpu:0 --mem=16G new_squares_experiment.sh
+#   STAGE=train sbatch --array=0-3 new_squares_experiment.sh
 # One-shot:
-#   sbatch --array=0-1 new_squares_experiment.sh
+#   sbatch --array=0-3 new_squares_experiment.sh
 
 source activate othello
 cd $SLURM_SUBMIT_DIR
