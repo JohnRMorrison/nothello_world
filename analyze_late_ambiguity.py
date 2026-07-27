@@ -20,6 +20,7 @@ Usage:
         --num-multisets 200 --samples-per-multiset 1000
 """
 import argparse
+import csv
 import os
 import pickle
 import random
@@ -71,21 +72,49 @@ def sample_one_valid_ordering(p0_cells, p1_cells):
 
 def measure_multiset(multiset, n_samples, max_dead_end_retries=5):
     """For a given (p0_cells, p1_cells) multiset, return:
-        n_valid_trials, n_dead_ends, n_distinct_boards"""
+        n_valid_trials, n_dead_ends, board_counts
+    where board_counts is a Counter {board-state bytes: n_times_sampled}.
+    The sample frequency approximates P(board | moveset) because biased-MC
+    uniform-random-legal sampling matches the synthetic data's generation."""
     p0_cells, p1_cells = multiset
-    distinct = set()
+    board_counts = Counter()
     n_valid = 0
     n_dead = 0
     for _ in range(n_samples):
         for _ in range(max_dead_end_retries + 1):
             valid, board = sample_one_valid_ordering(p0_cells, p1_cells)
             if valid:
-                distinct.add(board)
+                board_counts[board] += 1
                 n_valid += 1
                 break
             else:
                 n_dead += 1
-    return n_valid, n_dead, len(distinct)
+    return n_valid, n_dead, board_counts
+
+
+def max_decoder_accuracy(board_counts, state_dtype):
+    """Best per-cell board-state accuracy an ORDER-BLIND decoder can reach on
+    this moveset.  A moveset fixes which cells are occupied; only colours are
+    ambiguous.  For each of the 64 cells the optimal decoder predicts the
+    frequency-weighted MODE value across the consistent boards, so its accuracy
+    on that cell is the mode's probability.  Return the mean over 64 cells.
+    board_counts: Counter {board bytes: n_times_sampled}."""
+    if not board_counts:
+        return float('nan')
+    boards = np.stack([np.frombuffer(b, dtype=state_dtype).reshape(64)
+                       for b in board_counts])            # (D, 64)
+    weights = np.array([board_counts[b] for b in board_counts], dtype=float)
+    total = weights.sum()
+    acc = 0.0
+    for c in range(64):
+        vals = boards[:, c]
+        best = 0.0
+        for v in np.unique(vals):
+            w = weights[vals == v].sum()
+            if w > best:
+                best = w
+        acc += best / total
+    return acc / 64.0
 
 
 def main():
@@ -94,18 +123,37 @@ def main():
                    help='How many random multisets to test per k')
     p.add_argument('--samples-per-multiset', type=int, default=1000)
     p.add_argument('--positions', type=int, nargs='+',
-                   default=[15, 20, 30, 40, 50])
+                   default=[5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55])
     p.add_argument('--num-pickle-files', type=int, default=1)
     p.add_argument('--seed', type=int, default=0)
+    p.add_argument('--out-csv', default=None,
+                   help='Per-k summary CSV: mean/median/p90/max distinct boards.')
+    p.add_argument('--examples-pkl', default=None,
+                   help='Save example movesets + their consistent board states '
+                        '(for diversity plots).')
+    p.add_argument('--n-examples', type=int, default=3,
+                   help='Example movesets to save per k (the MOST diverse).')
+    p.add_argument('--max-example-boards', type=int, default=25,
+                   help='Cap on distinct boards saved per example moveset.')
+    p.add_argument('--per-moveset-csv', default=None,
+                   help='Record EVERY moveset: k, n_valid, n_distinct, and '
+                        'max_decoder_acc (the per-moveset decoder ceiling).')
     args = p.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
+    state_dtype = OthelloBoardState().state.dtype
+
+    def to_board(b):
+        return np.frombuffer(b, dtype=state_dtype).reshape(8, 8).astype(np.int8)
 
     print(f"Loading games...")
     games = load_games(num_files=args.num_pickle_files)
     print(f"  {len(games)} games loaded\n")
 
+    summary_rows = []
+    moveset_rows = []          # one row per moveset (all k)
+    examples = {}
     for k in args.positions:
         eligible = [g for g in games if len(g) > k]
         sample_games = random.sample(eligible,
@@ -116,19 +164,33 @@ def main():
         distinct_counts = []
         valid_trials = []
         dead_end_rates = []
-        for game in tqdm(sample_games, desc=f"k={k}", leave=False):
+        dec_accs = []            # max_decoder_acc per moveset
+        per_k = []   # (n_distinct, prefix, p0, p1, board_counts, mdacc)
+        for idx, game in enumerate(tqdm(sample_games, desc=f"k={k}",
+                                        leave=False)):
             prefix = game[:k]
             p0 = tuple(prefix[0::2])
             p1 = tuple(prefix[1::2])
-            n_valid, n_dead, n_distinct = measure_multiset(
+            n_valid, n_dead, board_counts = measure_multiset(
                 (p0, p1), n_samples=args.samples_per_multiset)
+            n_distinct = len(board_counts)
+            mdacc = max_decoder_accuracy(board_counts, state_dtype)
             distinct_counts.append(n_distinct)
             valid_trials.append(n_valid)
             dead_end_rates.append(n_dead / max(1, n_dead + n_valid))
+            dec_accs.append(mdacc)
+            moveset_rows.append({
+                'k': k, 'moveset_idx': idx, 'n_valid': n_valid,
+                'n_distinct': n_distinct,
+                'max_decoder_acc': round(float(mdacc), 6),
+            })
+            per_k.append((n_distinct, list(prefix), list(p0), list(p1),
+                          board_counts, mdacc))
 
         arr = np.array(distinct_counts)
         valid_arr = np.array(valid_trials)
         dead_arr = np.array(dead_end_rates)
+        dacc_arr = np.array(dec_accs)
 
         print(f"\nk={k} summary (n={len(arr)} multisets, "
               f"{args.samples_per_multiset} sample attempts each):")
@@ -139,6 +201,9 @@ def main():
         print(f"  distinct boards per multiset:")
         print(f"    mean {arr.mean():.2f}  median {np.median(arr):.0f}  "
               f"p90 {np.percentile(arr, 90):.0f}  max {arr.max()}")
+        print(f"  max decoder accuracy per multiset:")
+        print(f"    mean {dacc_arr.mean():.4f}  median {np.median(dacc_arr):.4f}  "
+              f"min {dacc_arr.min():.4f}")
         print(f"  distinct-boards distribution:")
         cnt = Counter(arr.tolist())
         for nb in sorted(cnt):
@@ -146,6 +211,84 @@ def main():
             pct = 100 * n_sets / len(arr)
             print(f"    {nb:>3} boards: {n_sets:>4} multisets ({pct:5.1f}%)")
         print()
+
+        summary_rows.append({
+            'k': k, 'n_multisets': len(arr),
+            'samples_per_multiset': args.samples_per_multiset,
+            'mean_distinct': round(float(arr.mean()), 4),
+            'median_distinct': float(np.median(arr)),
+            'p90_distinct': float(np.percentile(arr, 90)),
+            'max_distinct': int(arr.max()),
+            'mean_max_decoder_acc': round(float(dacc_arr.mean()), 6),
+            'median_max_decoder_acc': round(float(np.median(dacc_arr)), 6),
+            'min_max_decoder_acc': round(float(dacc_arr.min()), 6),
+            'mean_valid_trials': round(float(valid_arr.mean()), 1),
+            'mean_dead_end_rate': round(float(dead_arr.mean()), 4),
+        })
+
+        # Keep the most-diverse example movesets (+ their board arrays) for k.
+        per_k.sort(key=lambda t: t[0], reverse=True)
+        ex_list = []
+        for n_distinct, prefix, p0, p1, board_counts, mdacc in \
+                per_k[:args.n_examples]:
+            items = board_counts.most_common(args.max_example_boards)
+            boards = [to_board(b) for b, _ in items]
+            counts = [c for _, c in items]
+            ex_list.append({
+                'k': k, 'n_distinct': n_distinct,
+                'max_decoder_acc': float(mdacc),
+                'moveset_prefix': prefix,   # one valid ordering (the played game)
+                'p0_cells': p0, 'p1_cells': p1,
+                'boards': boards,           # list of (8, 8) int8 arrays
+                'board_counts': counts,     # sample frequency of each board
+            })
+        examples[k] = ex_list
+
+    # Overall aggregate across ALL sampled movesets (e.g. a 5-54 estimate when
+    # --positions spans that range).  Each moveset weighted equally.
+    all_acc = np.array([r['max_decoder_acc'] for r in moveset_rows], dtype=float)
+    all_dist = np.array([r['n_distinct'] for r in moveset_rows], dtype=float)
+    all_valid = np.array([r['n_valid'] for r in moveset_rows], dtype=float)
+    kmin, kmax = min(args.positions), max(args.positions)
+    print(f"=== OVERALL (positions {kmin}-{kmax}, N={len(all_acc)} movesets) ===")
+    print(f"  mean max_decoder_acc = {all_acc.mean():.4f}  "
+          f"(median {np.median(all_acc):.4f}, min {all_acc.min():.4f})")
+    print(f"  mean distinct boards = {all_dist.mean():.2f}\n")
+    summary_rows.append({
+        'k': 'overall', 'n_multisets': len(all_acc),
+        'samples_per_multiset': args.samples_per_multiset,
+        'mean_distinct': round(float(all_dist.mean()), 4),
+        'median_distinct': float(np.median(all_dist)),
+        'p90_distinct': float(np.percentile(all_dist, 90)),
+        'max_distinct': int(all_dist.max()),
+        'mean_max_decoder_acc': round(float(all_acc.mean()), 6),
+        'median_max_decoder_acc': round(float(np.median(all_acc)), 6),
+        'min_max_decoder_acc': round(float(all_acc.min()), 6),
+        'mean_valid_trials': round(float(all_valid.mean()), 1),
+        'mean_dead_end_rate': '',
+    })
+
+    if args.out_csv:
+        with open(args.out_csv, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+            w.writeheader()
+            w.writerows(summary_rows)
+        print(f"saved summary CSV -> {args.out_csv}")
+
+    if args.per_moveset_csv:
+        with open(args.per_moveset_csv, 'w', newline='') as f:
+            w = csv.DictWriter(f, fieldnames=list(moveset_rows[0].keys()))
+            w.writeheader()
+            w.writerows(moveset_rows)
+        print(f"saved per-moveset CSV -> {args.per_moveset_csv}  "
+              f"({len(moveset_rows)} movesets)")
+
+    if args.examples_pkl:
+        with open(args.examples_pkl, 'wb') as f:
+            pickle.dump(examples, f)
+        n_ex = sum(len(v) for v in examples.values())
+        print(f"saved examples -> {args.examples_pkl}  ({n_ex} example movesets, "
+              f"each with its distinct board states)")
 
 
 if __name__ == '__main__':
