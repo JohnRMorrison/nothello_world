@@ -528,7 +528,9 @@ def generate_condition(condition_id, output_dir, legal_budget, seed,
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--condition-id', type=int, required=True,
-                    choices=[0, 1], help='0=coherent, 1=incoherent')
+                    choices=[0, 1, 2, 3],
+                    help='0=coherent, 1=incoherent, 2=coherent_all, '
+                         '3=incoherent_all')
     ap.add_argument('--output-dir', default='experiments/new_squares')
     ap.add_argument('--new-square-legal-budget', type=int, default=300000,
                     help='Control 1: positions with >=1 new square legal, '
