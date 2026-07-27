@@ -170,6 +170,22 @@ def main():
     summary_rows = []
     moveset_rows = []          # one row per moveset (all k)
     examples = {}
+
+    def _flush():
+        """Write CSVs / pkl with whatever is accumulated so far, so a kill mid-run
+        keeps the completed positions."""
+        if args.out_csv and summary_rows:
+            with open(args.out_csv, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+                w.writeheader(); w.writerows(summary_rows)
+        if args.per_moveset_csv and moveset_rows:
+            with open(args.per_moveset_csv, 'w', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=list(moveset_rows[0].keys()))
+                w.writeheader(); w.writerows(moveset_rows)
+        if args.examples_pkl and examples:
+            with open(args.examples_pkl, 'wb') as f:
+                pickle.dump(examples, f)
+
     for k in args.positions:
         eligible = [g for g in games if len(g) > k]
         sample_games = random.sample(eligible,
@@ -275,6 +291,8 @@ def main():
                 'board_counts': counts,     # sample frequency of each board
             })
         examples[k] = ex_list
+        _flush()                          # persist progress after every k
+        print(f"  [saved results through k={k}]", flush=True)
 
     if pool is not None:
         pool.close()
