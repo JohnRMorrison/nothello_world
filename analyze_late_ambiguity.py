@@ -216,7 +216,7 @@ def main():
                 'max_decoder_acc': round(float(mdacc), 6),
             })
             per_k.append((n_distinct, prefix, list(p0), list(p1),
-                          board_counts, mdacc))
+                          board_counts, mdacc, idx))
 
         arr = np.array(distinct_counts)
         valid_arr = np.array(valid_trials)
@@ -260,13 +260,14 @@ def main():
         # Keep the most-diverse example movesets (+ their board arrays) for k.
         per_k.sort(key=lambda t: t[0], reverse=True)
         ex_list = []
-        for n_distinct, prefix, p0, p1, board_counts, mdacc in \
+        for n_distinct, prefix, p0, p1, board_counts, mdacc, ms_idx in \
                 per_k[:args.n_examples]:
             items = board_counts.most_common(args.max_example_boards)
             boards = [to_board(b) for b, _ in items]
             counts = [c for _, c in items]
             ex_list.append({
-                'k': k, 'n_distinct': n_distinct,
+                'k': k, 'moveset_idx': ms_idx,   # row in the per-moveset CSV
+                'n_distinct': n_distinct,
                 'max_decoder_acc': float(mdacc),
                 'moveset_prefix': prefix,   # one valid ordering (the played game)
                 'p0_cells': p0, 'p1_cells': p1,
