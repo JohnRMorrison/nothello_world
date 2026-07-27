@@ -21,6 +21,7 @@ Usage:
 """
 import argparse
 import csv
+import multiprocessing as mp
 import os
 import pickle
 import random
@@ -117,6 +118,14 @@ def max_decoder_accuracy(board_counts, state_dtype):
     return acc / 64.0
 
 
+def _measure_task(task):
+    """Worker: seed deterministically, then measure one moveset.
+    task = (task_seed, p0, p1, n_samples, max_retries)."""
+    task_seed, p0, p1, n_samples, max_retries = task
+    random.seed(task_seed)
+    return measure_multiset((p0, p1), n_samples, max_dead_end_retries=max_retries)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--num-multisets', type=int, default=200,
@@ -138,11 +147,18 @@ def main():
     p.add_argument('--per-moveset-csv', default=None,
                    help='Record EVERY moveset: k, n_valid, n_distinct, and '
                         'max_decoder_acc (the per-moveset decoder ceiling).')
+    p.add_argument('--max-dead-end-retries', type=int, default=5)
+    p.add_argument('--workers', type=int, default=0,
+                   help='Parallel worker processes over movesets. '
+                        '0 = all cores (CPU-only job; no GPU used); 1 = serial.')
     args = p.parse_args()
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     state_dtype = OthelloBoardState().state.dtype
+    n_workers = args.workers if args.workers > 0 else (os.cpu_count() or 1)
+    pool = mp.Pool(n_workers) if n_workers > 1 else None
+    print(f"workers: {n_workers}  (CPU-only; the GPU is not used)")
 
     def to_board(b):
         return np.frombuffer(b, dtype=state_dtype).reshape(8, 8).astype(np.int8)
@@ -166,13 +182,28 @@ def main():
         dead_end_rates = []
         dec_accs = []            # max_decoder_acc per moveset
         per_k = []   # (n_distinct, prefix, p0, p1, board_counts, mdacc)
-        for idx, game in enumerate(tqdm(sample_games, desc=f"k={k}",
-                                        leave=False)):
-            prefix = game[:k]
+
+        # Build one task per moveset, each with a deterministic seed so results
+        # are reproducible regardless of --workers.
+        prefixes, tasks = [], []
+        for idx, game in enumerate(sample_games):
+            prefix = list(game[:k])
             p0 = tuple(prefix[0::2])
             p1 = tuple(prefix[1::2])
-            n_valid, n_dead, board_counts = measure_multiset(
-                (p0, p1), n_samples=args.samples_per_multiset)
+            seed_i = (args.seed * 1_000_003 + k * 10_007 + idx) % (2 ** 32)
+            prefixes.append((prefix, p0, p1))
+            tasks.append((seed_i, p0, p1, args.samples_per_multiset,
+                          args.max_dead_end_retries))
+
+        if pool is not None:
+            results = list(tqdm(pool.imap(_measure_task, tasks, chunksize=1),
+                                total=len(tasks), desc=f"k={k}", leave=False))
+        else:
+            results = [_measure_task(t)
+                       for t in tqdm(tasks, desc=f"k={k}", leave=False)]
+
+        for idx, ((n_valid, n_dead, board_counts), (prefix, p0, p1)) in \
+                enumerate(zip(results, prefixes)):
             n_distinct = len(board_counts)
             mdacc = max_decoder_accuracy(board_counts, state_dtype)
             distinct_counts.append(n_distinct)
@@ -184,7 +215,7 @@ def main():
                 'n_distinct': n_distinct,
                 'max_decoder_acc': round(float(mdacc), 6),
             })
-            per_k.append((n_distinct, list(prefix), list(p0), list(p1),
+            per_k.append((n_distinct, prefix, list(p0), list(p1),
                           board_counts, mdacc))
 
         arr = np.array(distinct_counts)
@@ -243,6 +274,10 @@ def main():
                 'board_counts': counts,     # sample frequency of each board
             })
         examples[k] = ex_list
+
+    if pool is not None:
+        pool.close()
+        pool.join()
 
     # Overall aggregate across ALL sampled movesets (e.g. a 5-54 estimate when
     # --positions spans that range).  Each moveset weighted equally.
