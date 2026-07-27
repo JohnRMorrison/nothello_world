@@ -60,7 +60,10 @@ RULES_PER_SQUARE = 5
 N_ALONG_ROW = 2
 N_INTO_BOARD = RULES_PER_SQUARE - N_ALONG_ROW    # 3
 N_CELLS = 72                       # 64 standard + 8 new; the cell-score space
-CONDITIONS = ['coherent', 'incoherent']
+# Condition-id -> name.  0/1 = original fixed-N_INTO_BOARD design; 2/3 = the
+# "all coherent into-board relationships" variant (per-square rule count varies
+# 9/12/7... but is identical between coherent_all and incoherent_all).
+CONDITIONS = ['coherent', 'incoherent', 'coherent_all', 'incoherent_all']
 
 
 def rule_length(rule):
@@ -152,27 +155,38 @@ def _coherent_into_board_candidates(i):
     return cands
 
 
-def create_coherent_rules(rng=None):
+def _into_board_pool(i, all_into_board):
+    """Coherent into-board rules used for square i.  all_into_board=True uses
+    EVERY reachable coherent flank (count varies per square: 9/12/7...);
+    False keeps the fixed N_INTO_BOARD-rule selection (original design)."""
+    cands = _coherent_into_board_candidates(i)
+    return cands if all_into_board else _pick(cands, N_INTO_BOARD)
+
+
+def create_coherent_rules(rng=None, all_into_board=False):
     """Per new square: N_ALONG_ROW shared along-row flanks (reference other new
-    squares) + N_INTO_BOARD flanks into the existing board via geometrically-
-    adjacent cells.  Deterministic."""
+    squares) + into-board flanks into the existing board via geometrically-
+    adjacent cells.  Deterministic.  all_into_board=True uses the FULL coherent
+    candidate pool (all geometric relationships; per-square count varies)."""
     rules = []
     for i in range(N_NEW):
         rules.extend(_pick(_along_row_candidates(i), N_ALONG_ROW))
-        rules.extend(_pick(_coherent_into_board_candidates(i), N_INTO_BOARD))
+        rules.extend(_into_board_pool(i, all_into_board))
     return rules
 
 
-def create_incoherent_rules(rng):
+def create_incoherent_rules(rng, all_into_board=False):
     """Same shared along-row block as coherent, but the into-board flanks
-    reference RANDOM existing cells (lengths matched to coherent's into-board
-    rules one-for-one).  So the ONLY difference vs coherent is whether the
-    connection to the pre-existing board is spatially coherent or random."""
+    reference RANDOM existing cells, matched to coherent's into-board rules
+    ONE-FOR-ONE (same per-square count AND same chain-length distribution).
+    With all_into_board=True this mirrors the full coherent pool, so the two
+    conditions have the identical (unequal) per-square rule distribution and
+    differ ONLY in coherent-geometry vs random-target."""
     playable = [c for c in range(64) if c not in CENTER_CELLS]
     rules = []
     for i in range(N_NEW):
         rules.extend(_pick(_along_row_candidates(i), N_ALONG_ROW))   # identical
-        for r in _pick(_coherent_into_board_candidates(i), N_INTO_BOARD):
+        for r in _into_board_pool(i, all_into_board):
             n_opp = max(1, rule_length(r) - 1)
             cells = rng.choice(playable, size=n_opp + 1, replace=False)
             rules.append({'target': 64 + i,
@@ -183,9 +197,14 @@ def create_incoherent_rules(rng):
 
 
 def make_rules(condition_name, rng):
-    if condition_name == 'coherent':
-        return create_coherent_rules(rng)
-    return create_incoherent_rules(rng)
+    """Conditions: 'coherent' / 'incoherent' (fixed N_INTO_BOARD per square),
+    and 'coherent_all' / 'incoherent_all' (full coherent pool; per-square count
+    varies but is IDENTICAL across the two conditions)."""
+    all_ib = condition_name.endswith('_all')
+    base = condition_name[:-4] if all_ib else condition_name
+    if base == 'coherent':
+        return create_coherent_rules(rng, all_into_board=all_ib)
+    return create_incoherent_rules(rng, all_into_board=all_ib)
 
 
 # ============================================================================
