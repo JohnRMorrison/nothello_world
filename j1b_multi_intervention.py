@@ -134,9 +134,12 @@ def main():
                 vecs.append(torch.zeros_like(H)); continue
             d_hat = d / nrm
             coeff = float(H @ d_hat)
+            # calibrate on the TARGET cell only: logits_b(s) = base - s*coeff*slope
+            Wb = W[mode, :, b, :]                # (hidden, 3)
+            base = (H @ Wb).detach()             # (3,)
+            slope = (d_hat @ Wb).detach()        # (3,)
             def pred(s):
-                Hm = H - s * coeff * d_hat
-                return int(state_logits(Hm, mode)[b].argmax())
+                return int((base - s * coeff * slope).argmax())
             hi = args.scale_cap
             if pred(0.0) == tc:
                 s = 0.5
