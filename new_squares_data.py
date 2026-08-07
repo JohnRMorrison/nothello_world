@@ -424,7 +424,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
     buckets = {}
     for set_name in ('IL', 'LL'):
         positions = manifest.get(set_name, [])
-        tot_prob = tot_acc = 0.0
+        tot_prob = tot_acc = tot_frac = tot_per_tgt = 0.0
         n = 0
         for pos in positions:
             prefix = pos['game_prefix']
@@ -432,10 +432,24 @@ def score_manifest(score_fn, manifest, per_bucket=True):
             if len(prefix) < 1:
                 continue
             scores = score_fn(prefix)                 # (N_CELLS,)
-            prob = float(sum(scores[c] for c in targets if 0 <= c < N_CELLS))
+            valid_targets = [c for c in targets if 0 <= c < N_CELLS]
+            prob = float(sum(scores[c] for c in valid_targets))
             acc = 1.0 if int(np.argmax(scores)) in set(targets) else 0.0
+            # Normalized variants (scale-free; for cross-model comparison):
+            #   frac     = fraction of the model's positive prob mass on the
+            #              legal-new-square targets (turns J1B's independent
+            #              prob-OR values into a distribution, out of the
+            #              unbounded prob-OR scale; ~softmax-fraction for GPT).
+            #   per_tgt  = mean legality prob per legal new square (removes the
+            #              co-legality artifact: coherent positions have more
+            #              simultaneously-legal new squares).
+            pos_mass = float(np.clip(scores, 0.0, None).sum())
+            frac = (prob / pos_mass) if pos_mass > 0 else 0.0
+            per_tgt = (prob / len(valid_targets)) if valid_targets else 0.0
             tot_prob += prob
             tot_acc += acc
+            tot_frac += frac
+            tot_per_tgt += per_tgt
             n += 1
             if per_bucket and set_name == 'IL' and 'bucket' in pos:
                 key = tuple(pos['bucket'])
@@ -445,6 +459,8 @@ def score_manifest(score_fn, manifest, per_bucket=True):
                 b['n'] += 1
         out[f'{set_name}_prob'] = tot_prob / max(n, 1)
         out[f'{set_name}_acc'] = tot_acc / max(n, 1)
+        out[f'{set_name}_prob_frac'] = tot_frac / max(n, 1)
+        out[f'{set_name}_prob_per_target'] = tot_per_tgt / max(n, 1)
         out[f'{set_name}_n'] = n
     if per_bucket:
         out['IL_buckets'] = {
