@@ -115,7 +115,7 @@ def _probor_and_max(probe, Hf):
 
 @torch.no_grad()
 def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
-                                use_relu, device, batch=1024):
+                                use_relu, device, batch=1024, no_flanking=False):
     """Same as evaluate_probe but also returns per-ply-bucket argmax acc."""
     N = X.shape[0]
     total_argmax_hits = 0
@@ -132,7 +132,7 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         L_batch = L[i:i + batch]
         T_batch = T[i:i + batch]
         H = build_hidden_layer_batch(X_batch, mlp, patterns, recent_Ks,
-                                          use_relu, device)
+                                          use_relu, device, no_flanking=no_flanking)
         Hf = H.float() if not use_relu else H
         probs, probs_max = _probor_and_max(probe, Hf)      # prob-OR + max aggregation
         probs_np = probs.cpu().numpy()
@@ -178,7 +178,9 @@ def load_probe(probe_ckpt_path, device):
     patterns = load_patterns(os.path.join(
         REPO_ROOT, saved_args.get('flanking_patterns',
                                       'hand_crafted_flanking_patterns.pt')))
-    hidden_dim = W.shape[0] + len(patterns)   # tree paths + 960 flanking
+    no_flanking = saved_args.get('no_flanking', False)
+    # tree paths (+ 960 flanking features, unless the probe was trained tree-only)
+    hidden_dim = W.shape[0] + (0 if no_flanking else len(patterns))
     probe_type = saved_args.get('probe_type', 'strupo')
     def _build():
         if probe_type == 'linpo':
@@ -202,6 +204,7 @@ def load_probe(probe_ckpt_path, device):
         'patterns': patterns,
         'saved_args': saved_args,
         'tree_path': tree_path,
+        'no_flanking': no_flanking,
     }
 
 
@@ -263,6 +266,7 @@ def main():
             info['probes'], X, L, T, info['mlp'], info['patterns'],
             recent_Ks, use_relu, device,
             batch=info['saved_args'].get('batch_size', 2048),
+            no_flanking=info['no_flanking'],
         )
         name = os.path.basename(path)
         tree_name = os.path.basename(info['tree_path'])
