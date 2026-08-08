@@ -89,11 +89,37 @@ def evaluate_probe(probe, X, L, mlp, patterns, recent_Ks, use_relu, device,
 
 
 @torch.no_grad()
+def _probor_and_max(probe, Hf):
+    """Per-cell legality scores by prob-OR (1-Prod(1-p)) and by MAX over each
+    cell's patterns, averaged across an ensemble.  MAX is only defined for
+    LinearPatternProbOr heads (which expose cell_pat_indices); returns
+    (probor (B,64), maxagg (B,64) or None)."""
+    probes = probe if isinstance(probe, (list, tuple)) else [probe]
+    po_sum = mx_sum = None
+    mx_ok = True
+    for pr in probes:
+        if hasattr(pr, 'cell_pat_indices'):
+            pat = torch.sigmoid(pr.linear(Hf))            # (B, K)
+            g = pat[:, pr.cell_pat_indices]               # (B, 64, max)
+            m = pr.cell_pat_mask
+            po = 1.0 - torch.where(m, 1.0 - g, torch.ones_like(g)).prod(dim=2)
+            mx = torch.where(m, g, torch.zeros_like(g)).max(dim=2).values
+        else:                                             # non-linpo head: prob-OR only
+            po, mx, mx_ok = pr(Hf), None, False
+        po_sum = po if po_sum is None else po_sum + po
+        if mx is not None:
+            mx_sum = mx if mx_sum is None else mx_sum + mx
+    n = len(probes)
+    return po_sum / n, (mx_sum / n if (mx_ok and mx_sum is not None) else None)
+
+
+@torch.no_grad()
 def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
                                 use_relu, device, batch=1024):
     """Same as evaluate_probe but also returns per-ply-bucket argmax acc."""
     N = X.shape[0]
     total_argmax_hits = 0
+    total_argmax_hits_max = 0
     total_pos_perfect = 0
     total_percell_correct = 0
     total_positions = 0
@@ -108,15 +134,16 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         H = build_hidden_layer_batch(X_batch, mlp, patterns, recent_Ks,
                                           use_relu, device)
         Hf = H.float() if not use_relu else H
-        if isinstance(probe, (list, tuple)):        # ensemble: average heads
-            probs = torch.stack([pr(Hf) for pr in probe]).mean(0)
-        else:
-            probs = probe(Hf)
+        probs, probs_max = _probor_and_max(probe, Hf)      # prob-OR + max aggregation
         probs_np = probs.cpu().numpy()
         argmax_cells = probs_np.argmax(axis=1)
+        argmax_cells_max = (probs_max.cpu().numpy().argmax(axis=1)
+                            if probs_max is not None else None)
         for j in range(X_batch.shape[0]):
             hit = int(L_batch[j, argmax_cells[j]] > 0)
             total_argmax_hits += hit
+            if argmax_cells_max is not None:
+                total_argmax_hits_max += int(L_batch[j, argmax_cells_max[j]] > 0)
             bucket = int(T_batch[j]) // 10 * 10
             per_ply_hits[bucket] = per_ply_hits.get(bucket, 0) + hit
             per_ply_n[bucket] = per_ply_n.get(bucket, 0) + 1
@@ -131,6 +158,8 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         'pos_perfect_acc': total_pos_perfect / total_positions,
         'per_cell_acc': total_percell_correct / total_cells,
         'n_positions': total_positions,
+        'argmax_acc_max': (total_argmax_hits_max / total_positions
+                           if total_positions else 0.0),
         'ply_argmax': {b: per_ply_hits[b] / per_ply_n[b]
                         for b in sorted(per_ply_hits)},
         'ply_n': {b: per_ply_n[b] for b in sorted(per_ply_n)},
@@ -242,6 +271,9 @@ def main():
                f'{100*res["per_cell_acc"]:7.4f}%  '
                f'{res["n_positions"]:>6}')
         print(f'  tree: {tree_name}')
+        if res.get('argmax_acc_max') is not None:
+            print(f'  argmax-legality:  prob-OR={100*res["argmax_acc"]:.2f}%   '
+                  f'max={100*res["argmax_acc_max"]:.2f}%   (N={res["n_positions"]})')
         print(f'  ply argmax:', end=' ')
         for b in sorted(res['ply_argmax']):
             print(f'[{b:2d}-{b+9})={100*res["ply_argmax"][b]:5.1f}% (n={res["ply_n"][b]})',
