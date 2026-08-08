@@ -1,5 +1,8 @@
 from .othello import get as get_othello
-import seaborn as sns
+try:                       # optional: only used by plot_probs/plot_mentals below
+    import seaborn as sns
+except Exception:
+    sns = None
 import numpy as np
 import torch
 
