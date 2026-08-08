@@ -1,20 +1,42 @@
 import os
-import pgn
 import numpy as np
 import random
-from tqdm import tqdm
 import time
 import multiprocessing
 import pickle
-import psutil
-import seaborn as sns
 import itertools
 from copy import copy, deepcopy
-from matplotlib.patches import Rectangle, Circle
-from matplotlib.collections import PatchCollection
-from matplotlib.colors import ListedColormap
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
+
+# Optional deps -- used only for championship-game parsing (pgn), progress bars
+# (tqdm), memory logging (psutil), and heatmap plotting (seaborn/matplotlib).
+# Guarded so the core OthelloBoardState imports on a minimal env (e.g. a fresh
+# eval box) without the plotting/analysis stack.
+try:
+    import pgn
+except Exception:
+    pgn = None
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(iterable=None, *a, **k):
+        return iterable if iterable is not None else []
+try:
+    import psutil
+except Exception:
+    psutil = None
+try:
+    import seaborn as sns
+except Exception:
+    sns = None
+try:
+    from matplotlib.patches import Rectangle, Circle
+    from matplotlib.collections import PatchCollection
+    from matplotlib.colors import ListedColormap
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import LinearSegmentedColormap
+except Exception:
+    Rectangle = Circle = PatchCollection = ListedColormap = mpatches = \
+        LinearSegmentedColormap = None
 
 rows = list("abcdefgh")
 columns = [str(_) for _ in range(1, 9)]
