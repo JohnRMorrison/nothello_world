@@ -38,6 +38,11 @@ HID=${HID#H}             # 512 / 4096
 
 echo "Task $SLURM_ARRAY_TASK_ID -> $SPEC (hidden=$HID)"
 
+# NB: --chunk-prefix chunk_ext_ selects ONLY the 40 180-d chunks (the format the
+# MLPs consume: playedeven slices [0:60]+[120:180], move_grid needs [played,when,
+# even]). The plain chunk_N.npz are an older 120-d dataset -- incompatible, and
+# the default "chunk_" prefix would wrongly glob both families (80 chunks).
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python probe_pattern_models.py \
     --ckpt "$CKDIR/pattern_simple_direct_${SPEC}.pt" \
-    --mode direct --hidden "$HID" --nonlinear --epochs 5
+    --mode direct --hidden "$HID" --nonlinear --epochs 5 \
+    --chunk-prefix chunk_ext_
