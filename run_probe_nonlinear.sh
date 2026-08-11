@@ -42,7 +42,13 @@ echo "Task $SLURM_ARRAY_TASK_ID -> $SPEC (hidden=$HID)"
 # MLPs consume: playedeven slices [0:60]+[120:180], move_grid needs [played,when,
 # even]). The plain chunk_N.npz are an older 120-d dataset -- incompatible, and
 # the default "chunk_" prefix would wrongly glob both families (80 chunks).
+# Probes converge by epoch 1 (old linear logs: acc flat across epochs), so the
+# full 39-chunk x 5-epoch grind is wasteful. --max-chunks 8 (~256M positions) x
+# 2 epochs saturates the probe in a fraction of the time. Override via env:
+#   MAXCHUNKS / EPOCHS. Set NONLINEAR= (empty) to train the LINEAR probe instead.
+NL_FLAG=${NONLINEAR-"--nonlinear"}      # default: nonlinear; `--export=ALL,NONLINEAR=` -> linear
 PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 python probe_pattern_models.py \
     --ckpt "$CKDIR/pattern_simple_direct_${SPEC}.pt" \
-    --mode direct --hidden "$HID" --nonlinear --epochs 5 \
+    --mode direct --hidden "$HID" $NL_FLAG \
+    --epochs "${EPOCHS:-2}" --max-chunks "${MAXCHUNKS:-8}" \
     --chunk-prefix chunk_ext_
