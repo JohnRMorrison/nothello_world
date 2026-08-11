@@ -33,7 +33,6 @@ from probe_multi_seed_hidden import NonLinearProbe
 
 torch.set_num_threads(os.cpu_count() or 1)
 N_CELLS, N_CLASSES, N_MOVES = 64, 3, 60
-CENTER = [27, 28, 35, 36]
 FEAT_PLAYEDEVEN = list(range(0, 60)) + list(range(120, 180))
 
 
@@ -130,9 +129,8 @@ def decode_metrics(hid, Y, pos, probe_even, probe_odd, is_linear, device, batch=
 
 def report(name, cell_c, cell_t, ply_c, ply_t):
     acc = cell_c / np.maximum(cell_t, 1)
-    noncen = [c for c in range(64) if c not in CENTER]
     print(f"\n----- {name} -----")
-    print(f"overall per-cell acc: {acc.mean():.4f}   (excl. center: {acc[noncen].mean():.4f})")
+    print(f"overall per-cell acc (all 64 squares): {acc.mean():.4f}")
     print("8x8 per-square accuracy (rank 1 top):")
     g = acc.reshape(8, 8)
     print("      " + "  ".join('ABCDEFGH'))
