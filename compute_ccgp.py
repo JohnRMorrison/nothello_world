@@ -1,34 +1,41 @@
 """Cross-Condition Generalization Performance (CCGP) for board state decoding.
 
-Two flavors:
-  A (--mode phase):   split positions by turn number into N bins.
-                      For each (cell, class), leave-one-bin-out probing.
-  B (--mode context): for each cell C, condition on the state of a paired
-                      "context" cell D (default: diagonal opposite). Train on
-                      positions where D is empty, test where D is occupied
-                      (and vice versa).
+Tests whether a board variable ("cell C is mine/yours") is encoded ABSTRACTLY
+-- one reusable direction that transfers across contexts -- vs a bag of
+context-specific detectors. Train a probe on one region of a condition, test on
+a held-out region.
 
 For each (cell, class):
   CCGP    = mean held-out-condition probe accuracy
-  Within  = mean within-condition probe accuracy (50/50 train-test on the
-            same bin) — context-blind ceiling
-  Gap     = Within − CCGP  (large gap = context-specific representation)
+  Within  = mean within-condition ceiling (matched train size)
+  Gap     = Within - CCGP   (large Gap = context-bound, NON-abstract code)
 
-Per-parity for the MLP (even-MLP on even positions, odd-MLP on odd positions);
-unified for OGPT (single residual stream at chosen layer).
+Condition modes (--ccgp-mode):
+  phase     game-phase turn bins, leave-one-bin-out (early<->late)
+  context   diagonal-opposite cell occupied vs empty
+  crowd     local neighbor-occupancy high vs low
+  frontier  C adjacent to an empty square vs interior
+  spatial   leave-cells-out SHARED decoder (is there one board direction across
+            all 64 squares, or 64 per-cell codes?)  [strongest abstraction test]
+  null      RANDOM split -- control; CCGP should ~= Within. If not, the estimator
+            is biased and real Gaps are inflated. ALWAYS run this.
+  both      phase+context     all   every mode incl. null
+
+--nonlinear swaps the logistic-regression probe for an MLP (linear vs non-linear
+abstractness). Per-parity for the MLP; unified stream for OGPT.
+
+TODO (next tranche): flip/recency modes (need the raw `when` feature + the
+60-move-cell<->64-board-cell map) and parity mode (needs OGPT extraction, which
+get_ogpt_activations still stubs).
 
 Usage:
-  # MLP, cross-phase, 4 turn bins, ~30K positions
-  python compute_ccgp.py --ckpt <path>.pt --hidden 512 --mode-data mlp \\
-      --features wheneven --ccgp-mode phase --n-bins 4 --n 30000
+  # MLP, all modes incl. null control, linear probe
+  python compute_ccgp.py --ckpt <mlp>.pt --hidden 512 --features playedeven \\
+      --ccgp-mode all --n 30000
 
-  # MLP, cross-context-cell (diagonal pair)
-  python compute_ccgp.py --ckpt <path>.pt --hidden 512 --mode-data mlp \\
-      --features wheneven --ccgp-mode context
-
-  # OGPT layer 5
-  python compute_ccgp.py --mode-data ogpt --ogpt-ckpt ckpts/gpt_nanda_synthetic.ckpt \\
-      --layer 5 --ccgp-mode phase
+  # spatial abstraction test with a non-linear probe
+  python compute_ccgp.py --ckpt <mlp>.pt --hidden 512 --features playedeven \\
+      --ccgp-mode spatial --nonlinear
 """
 import argparse
 import os
@@ -38,7 +45,25 @@ sys.path.insert(0, '.')
 import numpy as np
 import torch
 from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
+
+
+# 8-neighborhood adjacency on the 8x8 board (used by crowd/frontier contexts).
+def _neighbors8(c):
+    r, cc = divmod(c, 8)
+    out = []
+    for dr in (-1, 0, 1):
+        for dc in (-1, 0, 1):
+            if dr == 0 and dc == 0:
+                continue
+            nr, ncc = r + dr, cc + dc
+            if 0 <= nr < 8 and 0 <= ncc < 8:
+                out.append(nr * 8 + ncc)
+    return out
+
+
+_NEI = [_neighbors8(c) for c in range(64)]
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +89,16 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
     Returns dict {even: (h, board, pos), odd: (h, board, pos)} where h is
     the post-ReLU hidden vector from the right parity sub-network.
     """
-    from train_pattern_simple import DirectMLP
+    from train_pattern_simple import DirectMLP, to_move_grid_input
     from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
         _load_features, get_device,
     )
 
     device = get_device()
     ckpt = torch.load(ckpt_path, map_location=device)
-    input_dim = ckpt.get('input_dim', len(_feature_cols(features)))
+    is_movegrid = (features == "move_grid") or (ckpt.get('input_dim') == 3600)
+    input_dim = ckpt.get('input_dim',
+                         3600 if is_movegrid else len(_feature_cols(features)))
     n_patterns = ckpt.get('n_patterns', 960)
 
     me = DirectMLP(input_dim, hidden_dim, n_patterns).to(device)
@@ -79,9 +106,11 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
     me.load_state_dict(ckpt['even']); mo.load_state_dict(ckpt['odd'])
     me.eval(); mo.eval()
 
-    X, Y, pos = _load_features(eval_path)
-    feat_cols = _feature_cols(features)
-    X = X[:, feat_cols]
+    X_raw, Y, pos = _load_features(eval_path)          # X_raw: (N, 180)
+    if not is_movegrid:
+        X = X_raw[:, _feature_cols(features)]           # column-slice reps
+    else:
+        X = X_raw                                       # transform per-batch below
     if n_sample is not None and n_sample < len(X):
         rng = np.random.RandomState(0)
         idx = np.sort(rng.choice(len(X), n_sample, replace=False))
@@ -90,6 +119,9 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
     pos_np = pos.numpy() if hasattr(pos, 'numpy') else np.asarray(pos)
     Y_np = Y.numpy() if hasattr(Y, 'numpy') else np.asarray(Y)
 
+    def to_tensor(a):
+        return a if torch.is_tensor(a) else torch.from_numpy(np.asarray(a))
+
     em = (pos_np % 2 == 0)
     om = ~em
     out = {}
@@ -97,8 +129,10 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
         for parity, mask, model in [("even", em, me), ("odd", om, mo)]:
             if not mask.any():
                 continue
-            x_p = X[torch.from_numpy(mask).bool()].to(device) if hasattr(X, 'numpy') else \
-                  torch.from_numpy(X[mask]).to(device)
+            x_p = to_tensor(X)[torch.from_numpy(mask)].float()
+            if is_movegrid:                             # 180-d -> 3600-d
+                x_p = to_move_grid_input(x_p)
+            x_p = x_p.to(device)
             # net = Linear(input,H) -> ReLU -> Linear(H,960)
             h = model.net[1](model.net[0](x_p))
             out[parity] = (h.cpu().numpy().astype(np.float32),
@@ -158,11 +192,13 @@ def _balance(idx, y, rng):
     return np.concatenate([pos, neg])
 
 
-def _probe_acc(h_train, y_train, h_test, y_test, C=1.0, max_iter=1000):
-    """Train logistic regression, return test accuracy.
+def _probe_acc(h_train, y_train, h_test, y_test, C=1.0, max_iter=1000,
+               nonlinear=False):
+    """Train a probe (logistic regression, or an MLP if nonlinear), return test acc.
 
-    Standardizes features (StandardScaler fit on train) before LR so lbfgs
-    converges in tens of iterations instead of thousands.
+    Standardizes features (StandardScaler fit on train) first. nonlinear=True
+    swaps in a small MLPClassifier so we can compare whether the board variable
+    is LINEARLY abstract (transfers under LR) vs only non-linearly abstract.
     """
     if len(h_train) < 20 or len(h_test) < 10:
         return None
@@ -171,9 +207,22 @@ def _probe_acc(h_train, y_train, h_test, y_test, C=1.0, max_iter=1000):
     scaler = StandardScaler()
     h_train = scaler.fit_transform(h_train)
     h_test = scaler.transform(h_test)
-    clf = LogisticRegression(max_iter=max_iter, C=C, solver='lbfgs')
+    if nonlinear:
+        clf = MLPClassifier(hidden_layer_sizes=(256,), max_iter=200,
+                            early_stopping=True, n_iter_no_change=8,
+                            random_state=0)
+    else:
+        clf = LogisticRegression(max_iter=max_iter, C=C, solver='lbfgs')
     clf.fit(h_train, y_train)
     return float(clf.score(h_test, y_test))
+
+
+def _cap_joint(H, y, n, rng):
+    """Cap a pooled (H, y) sample set to at most n rows (without replacement)."""
+    if len(H) <= n:
+        return H, y
+    sel = rng.choice(len(H), n, replace=False)
+    return H[sel], y[sel]
 
 
 def _subsample(idx, n_target, rng):
@@ -185,7 +234,7 @@ def _subsample(idx, n_target, rng):
 
 def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                cells=range(64), seed=0, min_per_bin=200,
-               train_size=None):
+               train_size=None, nonlinear=False):
     """Option A: leave-one-bin-out CCGP across game-phase bins.
 
     For each fold, both CCGP and Within use the SAME train_size (after
@@ -234,7 +283,8 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                 tr_pool = np.concatenate([per_bin[b] for b in valid_bins if b != held_b])
                 te_idx = per_bin[held_b]
                 tr_idx = _subsample(tr_pool, t, rng)
-                a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx])
+                a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx],
+                               nonlinear=nonlinear)
                 if a is not None:
                     fold_acc.append(a)
             if fold_acc:
@@ -254,7 +304,8 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                     te = idx[f * fold_size:(f + 1) * fold_size]
                     tr = np.concatenate([idx[:f * fold_size], idx[(f + 1) * fold_size:]])
                     tr = _subsample(tr, t, rng)
-                    a = _probe_acc(h[tr], y[tr], h[te], y[te])
+                    a = _probe_acc(h[tr], y[tr], h[te], y[te],
+                                   nonlinear=nonlinear)
                     if a is not None:
                         wf.append(a)
             if wf:
@@ -271,20 +322,36 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
     }
 
 
+def _context_state(board, cell, ctx_mode, rng):
+    """Binary per-position context state for cell C. A good board code should
+    decode C's own class invariant to this context (small Gap)."""
+    if ctx_mode == "context":                       # diagonal-opposite cell occupied
+        return (board[:, 63 - cell] != 0).astype(int)
+    nei = _NEI[cell]
+    if ctx_mode == "crowd":                         # local crowding: occupied-neighbor count
+        occ = (board[:, nei] != 0).sum(1)
+        return (occ >= np.median(occ)).astype(int)
+    if ctx_mode == "frontier":                      # C touches an empty square (frontier vs interior)
+        return (board[:, nei] == 0).any(1).astype(int)
+    if ctx_mode == "null":                          # random split -> control; CCGP should ~= Within
+        return rng.randint(0, 2, size=len(board))
+    raise ValueError(f"unknown ctx_mode {ctx_mode}")
+
+
 def ccgp_context(h, board, pos, classes=(1, 2),
                  cells=range(64), seed=0, min_per_cond=200,
-                 train_size=None):
-    """Option B: cross-context-cell CCGP. Pair each cell C with diagonal cell D
-    (D = 63 - C). Split positions by D's occupancy. Train on D-empty, test on
-    D-occupied (and vice versa). Within = 2-fold CV inside each context
-    state, with the same per-fit training set size as CCGP."""
+                 train_size=None, ctx_mode="context", nonlinear=False):
+    """Cross-context CCGP. For each cell C, split positions by a binary context
+    (see _context_state / ctx_mode), train the C-class probe on one context
+    state, test on the other (both directions), vs a within-state 2-fold ceiling
+    at matched train size. Gap = Within - CCGP; large Gap = context-bound code.
+
+    ctx_mode: 'context' (diagonal cell occupied), 'crowd' (neighbor occupancy),
+    'frontier' (C adjacent to empty), 'null' (random split; sanity control)."""
     rng = np.random.RandomState(seed)
     ccgp_per, within_per = [], []
     for cell in cells:
-        ctx = 63 - cell
-        if cell == ctx:
-            continue
-        ctx_state = (board[:, ctx] != 0).astype(int)
+        ctx_state = _context_state(board, cell, ctx_mode, rng)
         for cls in classes:
             y = (board[:, cell] == cls).astype(np.int32)
             if y.sum() < 100 or (1 - y).sum() < 100:
@@ -313,7 +380,8 @@ def ccgp_context(h, board, pos, classes=(1, 2),
             for held in (0, 1):
                 tr_idx = _subsample(per_state[1 - held], t, rng)
                 te_idx = per_state[held]
-                a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx])
+                a = _probe_acc(h[tr_idx], y[tr_idx], h[te_idx], y[te_idx],
+                               nonlinear=nonlinear)
                 if a is not None:
                     fold_acc.append(a)
             if fold_acc:
@@ -328,11 +396,87 @@ def ccgp_context(h, board, pos, classes=(1, 2),
                 for tr_part, te_part in [(idx[:half], idx[half:]),
                                           (idx[half:], idx[:half])]:
                     tr = _subsample(tr_part, t, rng)
-                    a = _probe_acc(h[tr], y[tr], h[te_part], y[te_part])
+                    a = _probe_acc(h[tr], y[tr], h[te_part], y[te_part],
+                                   nonlinear=nonlinear)
                     if a is not None:
                         wf.append(a)
             if wf:
                 within_per.append(np.mean(wf))
+
+    return {
+        'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
+        'within': float(np.mean(within_per)) if within_per else float('nan'),
+        'gap':    float(np.mean(within_per) - np.mean(ccgp_per))
+                  if (ccgp_per and within_per) else float('nan'),
+        'n_pairs': len(ccgp_per),
+    }
+
+
+def ccgp_spatial(h, board, classes=(1, 2), cells=range(64), seed=0,
+                 n_folds=8, cap_per_cell=1500, cap_train=12000, nonlinear=False):
+    """Cross-SQUARE CCGP: is there ONE reusable 'is-mine'/'is-yours' coding
+    direction shared across board locations, or 64 per-cell codes?
+
+    For each class, pool samples (h_i, board_i[C]==cls) across a set of cells and
+    train a SINGLE decoder; leave-one-fold-of-cells out and test on the held-out
+    cells. High CCGP => a translation-shared board-state direction (abstract).
+    Within = per-cell 2-fold ceiling. Large Gap => cell-specific memorization.
+
+    Note: h_i is shared across the 64 cells of a position, so pooling reuses the
+    same activation with different per-cell labels -- that's the point: it forces
+    a location-agnostic direction."""
+    rng = np.random.RandomState(seed)
+    cells = list(cells)
+    rng.shuffle(cells)
+    folds = [cells[i::n_folds] for i in range(n_folds)]
+    N = len(board)
+    all_idx = np.arange(N)
+
+    def pool(cell_subset, cls, cap_each):
+        Hs, ys = [], []
+        for c in cell_subset:
+            y = (board[:, c] == cls).astype(np.int32)
+            if y.sum() < 30 or (1 - y).sum() < 30:
+                continue
+            idx = _subsample(_balance(all_idx, y, rng), cap_each, rng)
+            Hs.append(h[idx]); ys.append(y[idx])
+        if not Hs:
+            return None, None
+        return np.concatenate(Hs), np.concatenate(ys)
+
+    ccgp_per, within_per = [], []
+    for cls in classes:
+        fold_acc = []
+        for f in range(n_folds):
+            test_cells = folds[f]
+            train_cells = [c for c in cells if c not in set(folds[f])]
+            per_each = max(50, cap_train // max(len(train_cells), 1))
+            Htr, ytr = pool(train_cells, cls, per_each)
+            Hte, yte = pool(test_cells, cls, cap_per_cell)
+            if Htr is None or Hte is None:
+                continue
+            Htr, ytr = _cap_joint(Htr, ytr, cap_train, rng)
+            a = _probe_acc(Htr, ytr, Hte, yte, nonlinear=nonlinear)
+            if a is not None:
+                fold_acc.append(a)
+        if fold_acc:
+            ccgp_per.append(np.mean(fold_acc))
+
+        # Within ceiling: per-cell 2-fold at matched per-cell cap.
+        wf = []
+        for c in cells:
+            y = (board[:, c] == cls).astype(np.int32)
+            if y.sum() < 30 or (1 - y).sum() < 30:
+                continue
+            idx = _balance(all_idx, y, rng); rng.shuffle(idx)
+            half = len(idx) // 2
+            for tr_part, te_part in [(idx[:half], idx[half:]), (idx[half:], idx[:half])]:
+                tr = _subsample(tr_part, cap_per_cell, rng)
+                a = _probe_acc(h[tr], y[tr], h[te_part], y[te_part], nonlinear=nonlinear)
+                if a is not None:
+                    wf.append(a)
+        if wf:
+            within_per.append(np.mean(wf))
 
     return {
         'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
@@ -362,8 +506,17 @@ def main():
     p.add_argument("--layer", type=int, default=4)
     p.add_argument("--n", type=int, default=30000,
                    help="positions to sample from the eval chunk")
-    p.add_argument("--ccgp-mode", choices=["phase", "context", "both"],
-                   default="both")
+    p.add_argument("--ccgp-mode",
+                   choices=["phase", "context", "crowd", "frontier",
+                            "spatial", "null", "both", "all"],
+                   default="both",
+                   help="phase=game-phase bins; context=diagonal cell; "
+                        "crowd/frontier=neighborhood; spatial=leave-cells-out "
+                        "shared decoder; null=random-split control; "
+                        "both=phase+context; all=every mode incl. null.")
+    p.add_argument("--nonlinear", action="store_true",
+                   help="Use an MLP probe instead of logistic regression "
+                        "(tests non-linear vs linear abstractness).")
     p.add_argument("--n-bins", type=int, default=4)
     p.add_argument("--eval-chunk", default=None,
                    help="path to a feature_chunks/*.npz file")
@@ -397,13 +550,33 @@ def main():
         print(f"  Parity: {parity}")
         print(f"========================================")
 
-        if args.ccgp_mode in ("phase", "both"):
-            r = ccgp_phase(h, board, pos, n_bins=args.n_bins)
-            _print_summary(f"Option A: cross-game-phase ({args.n_bins} bins)", r)
+        m = args.ccgp_mode
+        nl = args.nonlinear
+        tag = " [NONLINEAR probe]" if nl else " [linear probe]"
 
-        if args.ccgp_mode in ("context", "both"):
-            r = ccgp_context(h, board, pos)
-            _print_summary("Option B: cross-context-cell (diagonal pair)", r)
+        if m in ("phase", "both", "all"):
+            r = ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl)
+            _print_summary(f"phase: cross-game-phase ({args.n_bins} bins){tag}", r)
+
+        if m in ("context", "both", "all"):
+            r = ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl)
+            _print_summary(f"context: cross-context-cell (diagonal){tag}", r)
+
+        if m in ("crowd", "all"):
+            r = ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl)
+            _print_summary(f"crowd: neighbor-occupancy context{tag}", r)
+
+        if m in ("frontier", "all"):
+            r = ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl)
+            _print_summary(f"frontier: C-adjacent-to-empty context{tag}", r)
+
+        if m in ("spatial", "all"):
+            r = ccgp_spatial(h, board, nonlinear=nl)
+            _print_summary(f"spatial: leave-cells-out shared decoder{tag}", r)
+
+        if m in ("null", "all"):
+            r = ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl)
+            _print_summary(f"null: RANDOM-split control (CCGP~=Within expected){tag}", r)
 
 
 if __name__ == "__main__":
