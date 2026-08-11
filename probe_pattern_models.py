@@ -16,6 +16,22 @@ import argparse
 import numpy as np
 import torch
 import torch.nn as nn
+
+# Some torch 2.13 / py3.13 builds crash on `import torch._dynamo` (an inspect
+# _Dummy bug), which breaks torch.optim construction (Adam -> _disable_dynamo ->
+# import torch._dynamo). We don't use torch.compile, so if that import is broken
+# install a minimal stub whose `disable` is a pass-through. No-op on healthy torch.
+try:
+    import torch._dynamo  # noqa: F401
+except Exception:
+    import sys as _sys, types as _types
+    _stub = _types.ModuleType('torch._dynamo')
+    _stub.disable = lambda fn=None, recursive=True: (fn if callable(fn) else (lambda f: f))
+    _stub.reset = lambda: None
+    _sys.modules['torch._dynamo'] = _stub
+    torch._dynamo = _stub
+    print("[warn] torch._dynamo import broken; installed pass-through stub for torch.optim",
+          flush=True)
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
 )
