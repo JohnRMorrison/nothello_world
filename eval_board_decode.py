@@ -68,13 +68,21 @@ def extract_hidden(Xraw, pos, rep, me, mo, device, batch=4096):
 
 
 def train_nonlinear(hid, Y, pos, hidden_dim, device, epochs=8, lr=1e-3, batch=4096):
-    """Parity-split NonLinearProbe on (hidden, board target)."""
+    """Parity-split NonLinearProbe on (hidden, board target).
+
+    Uses a MANUAL Adam loop rather than torch.optim.* -- constructing a torch
+    optimizer lazily does `import torch._dynamo`, which is broken on this
+    torch 2.13 / py3.13 build (the _register_fake/inspect _Dummy bug)."""
     probes = {}
     ce = nn.CrossEntropyLoss()
+    b1, b2, eps = 0.9, 0.999, 1e-8
     for par, sel in (('even', pos % 2 == 0), ('odd', pos % 2 == 1)):
         h = torch.from_numpy(hid[sel]).float(); y = torch.from_numpy(Y[sel]).long()
         p = NonLinearProbe(hidden_dim).to(device)
-        opt = torch.optim.AdamW(p.parameters(), lr=lr)
+        params = list(p.parameters())
+        m = [torch.zeros_like(q) for q in params]
+        v = [torch.zeros_like(q) for q in params]
+        t = 0
         n = len(h); g = torch.Generator().manual_seed(0)
         for _ in range(epochs):
             perm = torch.randperm(n, generator=g)
@@ -82,7 +90,18 @@ def train_nonlinear(hid, Y, pos, hidden_dim, device, epochs=8, lr=1e-3, batch=40
                 idx = perm[i:i + batch]
                 logits = p(h[idx].to(device))                 # (b,64,3)
                 loss = ce(logits.reshape(-1, N_CLASSES), y[idx].reshape(-1).to(device))
-                opt.zero_grad(); loss.backward(); opt.step()
+                for q in params:
+                    q.grad = None
+                loss.backward()
+                t += 1
+                with torch.no_grad():
+                    for j, q in enumerate(params):
+                        gr = q.grad
+                        m[j].mul_(b1).add_(gr, alpha=1 - b1)
+                        v[j].mul_(b2).addcmul_(gr, gr, value=1 - b2)
+                        mhat = m[j] / (1 - b1 ** t)
+                        vhat = v[j] / (1 - b2 ** t)
+                        q.addcdiv_(mhat, vhat.sqrt().add_(eps), value=-lr)
         p.eval(); probes[par] = p
     return probes['even'], probes['odd']
 
