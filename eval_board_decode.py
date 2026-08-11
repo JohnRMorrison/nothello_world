@@ -146,21 +146,31 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--mlps', nargs='+', required=True)
     ap.add_argument('--eval-chunk', required=True)
-    ap.add_argument('--train-chunk', required=True)
+    ap.add_argument('--train-chunk', default=None,
+                    help="Only needed WITHOUT --load-nonlinear (to train the floor probe).")
     ap.add_argument('--ply-min', type=int, default=5)
     ap.add_argument('--ply-max', type=int, default=54)
     ap.add_argument('--eval-positions', type=int, default=300_000)
     ap.add_argument('--train-positions', type=int, default=200_000)
     ap.add_argument('--epochs', type=int, default=8)
+    ap.add_argument('--load-nonlinear', action='store_true',
+                    help="Load a pretrained non-linear probe (probe_nonlinear_direct_*, "
+                         "trained on the full chunk set by probe_pattern_models.py "
+                         "--nonlinear) instead of training one here. This is the FAIR "
+                         "comparison to the 6M-game linear probe.")
     args = ap.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device={device} threads={torch.get_num_threads()}', flush=True)
 
     print('loading EVAL chunk ...', flush=True)
     Xe, Ye, pose = load_slice(args.eval_chunk, args.ply_min, args.ply_max, args.eval_positions, 0)
-    print('loading TRAIN chunk ...', flush=True)
-    Xt, Yt, post = load_slice(args.train_chunk, args.ply_min, args.ply_max, args.train_positions, 1)
-    print(f'eval N={len(pose):,}  train N={len(post):,}', flush=True)
+    Xt = Yt = post = None
+    if not args.load_nonlinear:
+        if args.train_chunk is None:
+            ap.error("--train-chunk is required unless --load-nonlinear is set")
+        print('loading TRAIN chunk ...', flush=True)
+        Xt, Yt, post = load_slice(args.train_chunk, args.ply_min, args.ply_max, args.train_positions, 1)
+    print(f'eval N={len(pose):,}' + (f'  train N={len(post):,}' if post is not None else ''), flush=True)
 
     for mlp_path in args.mlps:
         ck = torch.load(mlp_path, map_location='cpu', weights_only=False)
@@ -174,15 +184,24 @@ def main():
         lin_o = nn.Linear(H, 192).to(device); lin_o.load_state_dict(pk['odd']); lin_o.eval()
         print(f"\n######### {os.path.basename(mlp_path)}  (rep={rep}, H={H}) #########", flush=True)
 
-        # hidden for train + eval
-        hid_t = extract_hidden(Xt, post, rep, me, mo, device)
-        nlp_e, nlp_o = train_nonlinear(hid_t, Yt, post, H, device, epochs=args.epochs)
+        # non-linear probe: load a full-chunk-trained one (fair) or train here (floor)
+        if args.load_nonlinear:
+            nl_path = mlp_path.replace('pattern_simple_', 'probe_nonlinear_')
+            nk = torch.load(nl_path, map_location='cpu', weights_only=False)
+            nlp_e = NonLinearProbe(H).to(device); nlp_e.load_state_dict(nk['even']); nlp_e.eval()
+            nlp_o = NonLinearProbe(H).to(device); nlp_o.load_state_dict(nk['odd']); nlp_o.eval()
+            nl_tag = f"NON-LINEAR probe (loaded {os.path.basename(nl_path)}, full-chunk)"
+            print(f"  loaded non-linear probe: {nl_path}  (best_acc={nk.get('best_acc')})", flush=True)
+        else:
+            hid_t = extract_hidden(Xt, post, rep, me, mo, device)
+            nlp_e, nlp_o = train_nonlinear(hid_t, Yt, post, H, device, epochs=args.epochs)
+            nl_tag = f"NON-LINEAR probe (trained here, {args.train_positions//1000}k pos -- FLOOR)"
         hid_e = extract_hidden(Xe, pose, rep, me, mo, device)
 
         lc, lt, lpc, lpt = decode_metrics(hid_e, Ye, pose, lin_e, lin_o, True, device)
         report(f"{os.path.basename(mlp_path)}  LINEAR probe (saved probe_direct)", lc, lt, lpc, lpt)
         nc, nt, npc, npt = decode_metrics(hid_e, Ye, pose, nlp_e, nlp_o, False, device)
-        report(f"{os.path.basename(mlp_path)}  NON-LINEAR probe (trained)", nc, nt, npc, npt)
+        report(f"{os.path.basename(mlp_path)}  {nl_tag}", nc, nt, npc, npt)
 
 
 if __name__ == '__main__':

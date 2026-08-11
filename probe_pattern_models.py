@@ -19,6 +19,7 @@ import torch.nn as nn
 from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
     _load_features, get_device, N_MOVES, OPTIONS,
 )
+from probe_multi_seed_hidden import NonLinearProbe
 
 
 def get_hidden(model, x, mode):
@@ -32,8 +33,13 @@ def get_hidden(model, x, mode):
 
 def train_probe(chunk_dir, device, model_even, model_odd, mode,
                 feature_cols, hidden_dim, epochs=10, lr=1e-3, batch_size=1024,
-                feature_fn=None, chunk_prefix="chunk_", max_chunks=None):
-    """Train linear probe streaming through all chunks."""
+                feature_fn=None, chunk_prefix="chunk_", max_chunks=None,
+                nonlinear=False):
+    """Train probe streaming through all chunks.
+
+    nonlinear=False -> Linear(hidden->64x3) (Nanda-style linear board probe).
+    nonlinear=True  -> NonLinearProbe(hidden->512->64x3), trained on the SAME
+    data / streaming / epochs so it is a fair comparison to the linear probe."""
 
     chunk_files = sorted(os.path.join(chunk_dir, f)
                          for f in os.listdir(chunk_dir)
@@ -52,8 +58,11 @@ def train_probe(chunk_dir, device, model_even, model_odd, mode,
     print(f"Probe training: {len(chunk_files)} chunks, H={hidden_dim}, {epochs} epochs")
 
     # Even/odd probes (separate, matching the model split)
-    probe_even = nn.Linear(hidden_dim, 64 * OPTIONS).to(device)
-    probe_odd = nn.Linear(hidden_dim, 64 * OPTIONS).to(device)
+    def make_probe():
+        return (NonLinearProbe(hidden_dim) if nonlinear
+                else nn.Linear(hidden_dim, 64 * OPTIONS)).to(device)
+    probe_even = make_probe()
+    probe_odd = make_probe()
     optimizer = torch.optim.Adam(
         list(probe_even.parameters()) + list(probe_odd.parameters()), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -178,6 +187,10 @@ if __name__ == "__main__":
                         choices=["direct", "emergent", "e2e", "two-stage", "randproj"])
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--nonlinear", action="store_true",
+                        help="Train a NonLinearProbe (hidden->512->64x3) instead "
+                             "of a linear probe, on the same data/epochs. Saves "
+                             "as probe_nonlinear_<stem>.pt.")
     parser.add_argument("--max-chunks", type=int, default=None,
                         help="If set, train the probe on at most this many "
                              "chunks per epoch (each chunk ~600K games).")
@@ -287,7 +300,8 @@ if __name__ == "__main__":
     best_acc, best_probe_state = train_probe(
         chunk_dir, device, model_even, model_odd, args.mode,
         feature_cols, args.hidden, epochs=args.epochs, feature_fn=feature_fn,
-        chunk_prefix=args.chunk_prefix, max_chunks=args.max_chunks)
+        chunk_prefix=args.chunk_prefix, max_chunks=args.max_chunks,
+        nonlinear=args.nonlinear)
 
     # Save probe weights. Derive suffix from source checkpoint filename so
     # probes for variants (_single, _pw50, _lw1, etc.) don't overwrite each other.
@@ -298,7 +312,8 @@ if __name__ == "__main__":
         stem = stem[len("pattern_simple_"):]
     if stem.endswith(".pt"):
         stem = stem[:-3]
-    probe_path = os.path.join(save_dir, f"probe_{stem}.pt")
+    prefix = "probe_nonlinear_" if args.nonlinear else "probe_"
+    probe_path = os.path.join(save_dir, f"{prefix}{stem}.pt")
     torch.save({
         'even': best_probe_state['even'],
         'odd': best_probe_state['odd'],
@@ -306,6 +321,7 @@ if __name__ == "__main__":
         'hidden_dim': args.hidden,
         'best_acc': best_acc,
         'mode': args.mode,
+        'nonlinear': args.nonlinear,
     }, probe_path)
     print(f"Saved probe to {probe_path}")
 
