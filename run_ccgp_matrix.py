@@ -19,8 +19,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compute_ccgp as C
 
-MODES = ["phase", "phase_fwd", "phase_bwd", "context", "crowd", "frontier",
-         "spatial", "flip", "recency", "null"]
+MODES = ["null", "phase_fwd", "phase_bwd", "recency_fixed", "flip_true", "crowd_frac",
+         "phase", "context", "crowd", "frontier", "spatial", "flip", "recency"]
 
 
 def infer_mlp(path):

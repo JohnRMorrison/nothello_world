@@ -168,7 +168,7 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
             h = model.net[1](model.net[0](x_p))
             out[parity] = (h.cpu().numpy().astype(np.float32),
                            Y_np[mask], pos_np[mask])
-            aux[parity] = (place_color[mask], place_step[mask])
+            aux[parity] = (place_color[mask], place_step[mask], None)
     return out, aux
 
 
@@ -248,7 +248,7 @@ def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
     for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
         if mask.any():
             out[parity] = (h[mask], board[mask], pos[mask])
-            aux[parity] = (place_color[mask], place_step[mask])
+            aux[parity] = (place_color[mask], place_step[mask], None)
     return out, aux
 
 
@@ -300,6 +300,7 @@ def sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo=5, ply_hi=54,
     feat = np.zeros((N, 180), np.float32)
     board = np.zeros((N, 64), np.int8)
     pc = np.zeros((N, 64), np.int8); ps = np.full((N, 64), -1, np.int16)
+    ever = np.zeros((N, 64), np.int8)                                 # ever-flipped (>=1 capture)
     pos = np.asarray(nmoves, dtype=np.int64)
     ogpt_h = np.zeros((N, n_embd), np.float32)
 
@@ -319,21 +320,29 @@ def sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo=5, ply_hi=54,
             st = ss[i, t - 1].reshape(64)                            # board after t moves
             board[gi] = np.where(st == 0, 0, np.where(st == -1, 1, 2)).astype(np.int8)
             ogpt_h[gi] = resid[i, t - 1].detach().cpu().numpy()
+            # ever-flipped: a square's color changed at least once after placement
+            hist = ss[i, :t].reshape(t, 64)
+            nzf = hist != 0
+            firstnz = np.argmax(nzf, 0)
+            place_c = hist[firstnz, np.arange(64)]
+            ever[gi] = (nzf.any(0) & ((hist != 0) & (hist != place_c[None, :])).any(0)).astype(np.int8)
         if s0 % (batch * 25) == 0:
             print(f"    ...{min(s0 + batch, N)}/{N} positions", flush=True)
 
     return dict(feat=feat, board=board, pos=pos, place_color=pc, place_step=ps,
-                ogpt_h=ogpt_h, n_embd=n_embd, games=games)
+                ever_flipped=ever, ogpt_h=ogpt_h, n_embd=n_embd, games=games)
 
 
 def _split_parity(h, sample):
-    """Wrap an (N, d) activation array + a sample dict into (per_parity, aux)."""
+    """Wrap an (N, d) activation array + a sample dict into (per_parity, aux).
+    aux[parity] = (place_color, place_step, ever_flipped)."""
     board, pos, pc, ps = sample['board'], sample['pos'], sample['place_color'], sample['place_step']
+    ev = sample.get('ever_flipped')
     out, aux = {}, {}
     for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
         if mask.any():
             out[parity] = (h[mask], board[mask], pos[mask])
-            aux[parity] = (pc[mask], ps[mask])
+            aux[parity] = (pc[mask], ps[mask], ev[mask] if ev is not None else None)
     return out, aux
 
 
@@ -897,6 +906,116 @@ def ccgp_conditioned(h, board, pos, place_color, place_step, cond="flip",
     }
 
 
+# ---------------------------------------------------------------------------
+# "proper" table conditions: two-tail CCGP with optional ply-matching.
+# ---------------------------------------------------------------------------
+
+def _match_ply_pair(a, b, pos, rng):
+    """Subsample index arrays a, b to the same per-ply distribution."""
+    oa, ob = [], []
+    for p in np.unique(np.concatenate([pos[a], pos[b]])):
+        aa = a[pos[a] == p]; bb = b[pos[b] == p]
+        k = min(len(aa), len(bb))
+        if k:
+            oa.append(rng.choice(aa, k, replace=False)); ob.append(rng.choice(bb, k, replace=False))
+    return (np.concatenate(oa), np.concatenate(ob)) if oa else (a[:0], b[:0])
+
+
+def _two_tail(h, y, a_idx, b_idx, pos, rng, match_ply=False, nonlinear=False, min_per_tail=150):
+    """One (cell, class): train tail A -> test B and reverse (CCGP); 2-fold within
+    each tail (Within); matched train size. Returns (ccgp, within) or (None, None)."""
+    if match_ply:
+        a_idx, b_idx = _match_ply_pair(a_idx, b_idx, pos, rng)
+    if len(a_idx) < min_per_tail or len(b_idx) < min_per_tail:
+        return None, None
+    for idx in (a_idx, b_idx):
+        if y[idx].sum() < 30 or (1 - y[idx]).sum() < 30:
+            return None, None
+    a = _balance(a_idx, y, rng); b = _balance(b_idx, y, rng)
+    t = max(50, min(min(len(a), len(b)), min(len(a) // 2, len(b) // 2)))
+    fa = []
+    for tr, te in ((b, a), (a, b)):
+        trs = _subsample(tr, t, rng)
+        acc = _probe_acc(h[trs], y[trs], h[te], y[te], nonlinear=nonlinear)
+        if acc is not None:
+            fa.append(acc)
+    wf = []
+    for tail in (a, b):
+        idx = tail.copy(); rng.shuffle(idx); half = len(idx) // 2
+        for trp, tep in ((idx[:half], idx[half:]), (idx[half:], idx[:half])):
+            trs = _subsample(trp, t, rng)
+            acc = _probe_acc(h[trs], y[trs], h[tep], y[tep], nonlinear=nonlinear)
+            if acc is not None:
+                wf.append(acc)
+    if not fa or not wf:
+        return None, None
+    return float(np.mean(fa)), float(np.mean(wf))
+
+
+def _pack(cg, wi):
+    return {
+        'ccgp':   float(np.mean(cg)) if cg else float('nan'),
+        'within': float(np.mean(wi)) if wi else float('nan'),
+        'gap':    float(np.mean(wi) - np.mean(cg)) if (cg and wi) else float('nan'),
+        'n_pairs': len(cg),
+    }
+
+
+def ccgp_crowd_frac(h, board, pos, sparse_frac=0.25, crowd_frac=0.75, classes=(1, 2),
+                    cells=range(64), seed=0, match_ply=True, nonlinear=False):
+    """Neighbors <sparse_frac full vs >crowd_frac full (fraction of a cell's own
+    neighbor count -> all cells qualify). ply-matched by default."""
+    rng = np.random.RandomState(seed)
+    cg, wi = [], []
+    for cell in cells:
+        nei = _NEI[cell]
+        frac = (board[:, nei] != 0).sum(1) / len(nei)
+        sp = np.where(frac <= sparse_frac)[0]; cr = np.where(frac >= crowd_frac)[0]
+        for cls in classes:
+            y = (board[:, cell] == cls).astype(np.int32)
+            c, w = _two_tail(h, y, sp, cr, pos, rng, match_ply, nonlinear)
+            if c is not None:
+                cg.append(c); wi.append(w)
+    return _pack(cg, wi)
+
+
+def ccgp_recency_fixed(h, board, pos, place_step, recent_max=2, settled_min=15,
+                       cells=None, seed=0, match_ply=True, nonlinear=False):
+    """Occupied C decoded by color; recent (placed <=recent_max moves ago) vs
+    settled (>=settled_min). ply-matched by default."""
+    rng = np.random.RandomState(seed)
+    cells = list(cells) if cells is not None else list(_VALID_MOVES)
+    cg, wi = [], []
+    for cell in cells:
+        placed = place_step[:, cell] >= 0
+        occ = (board[:, cell] != 0) & placed
+        rec = pos - place_step[:, cell]
+        recent = np.where(occ & (rec <= recent_max))[0]
+        settled = np.where(occ & (rec >= settled_min))[0]
+        y = (board[:, cell] == 1).astype(np.int32)         # color (=mine/yours per parity)
+        c, w = _two_tail(h, y, recent, settled, pos, rng, match_ply, nonlinear)
+        if c is not None:
+            cg.append(c); wi.append(w)
+    return _pack(cg, wi)
+
+
+def ccgp_flip_true(h, board, pos, ever, cells=None, seed=0, match_ply=True, nonlinear=False):
+    """Occupied C decoded by color; truly-never-flipped (0 captures) vs
+    ever-flipped (>=1). Needs `ever` (from the game replay). ply-matched by default."""
+    rng = np.random.RandomState(seed)
+    cells = list(cells) if cells is not None else list(_VALID_MOVES)
+    cg, wi = [], []
+    for cell in cells:
+        occ = board[:, cell] != 0
+        never = np.where(occ & (ever[:, cell] == 0))[0]
+        everf = np.where(occ & (ever[:, cell] == 1))[0]
+        y = (board[:, cell] == 1).astype(np.int32)
+        c, w = _two_tail(h, y, never, everf, pos, rng, match_ply, nonlinear)
+        if c is not None:
+            cg.append(c); wi.append(w)
+    return _pack(cg, wi)
+
+
 def _print_summary(label, res):
     print(f"\n--- {label} ---")
     print(f"  CCGP    = {res['ccgp']:.4f}")
@@ -930,9 +1049,12 @@ def run_modes(per_parity, aux, args, model_label=""):
 
     m, nl = args.ccgp_mode, args.nonlinear
     tag = (f"{hdr} " if hdr else " ") + ("[NONLINEAR probe]" if nl else "[linear probe]")
+    # 'proper' = the finalized table conditions (phase-controlled extremes).
+    PROPER = ["null", "phase_fwd", "phase_bwd", "recency_fixed", "flip_true", "crowd_frac"]
     wanted = (["phase", "phase_fwd", "phase_bwd", "context", "crowd", "frontier",
                "spatial", "flip", "recency", "null"]
-              if m == "all" else ["phase", "context"] if m == "both" else [m])
+              if m == "all" else PROPER if m == "proper"
+              else ["phase", "context"] if m == "both" else [m])
 
     # Optional cell subsampling: the Gap is averaged over cells, so decoding a
     # random subset gives ~the same mean at proportionally less compute.
@@ -954,7 +1076,13 @@ def run_modes(per_parity, aux, args, model_label=""):
         if mode == "frontier": return ccgp_context(h, board, pos, ctx_mode="frontier", cells=cells_all, nonlinear=nl)
         if mode == "spatial":  return ccgp_spatial(h, board, cells=cells_all, nonlinear=nl)
         if mode == "null":     return ccgp_context(h, board, pos, ctx_mode="null", cells=cells_all, nonlinear=nl)
-        pc, ps = aux[parity]
+        pc, ps, ev = (aux[parity] + (None,) * 3)[:3]        # tolerate 2- or 3-tuples
+        if mode == "crowd_frac":   return ccgp_crowd_frac(h, board, pos, cells=cells_all, match_ply=True, nonlinear=nl)
+        if mode == "recency_fixed": return ccgp_recency_fixed(h, board, pos, ps, cells=cells_mov, match_ply=True, nonlinear=nl)
+        if mode == "flip_true":
+            if ev is None:
+                print("  [flip_true skipped: no flip history for this model path]"); return _pack([], [])
+            return ccgp_flip_true(h, board, pos, ev, cells=cells_mov, match_ply=True, nonlinear=nl)
         return ccgp_conditioned(h, board, pos, pc, ps, cond=mode, cells=cells_mov, nonlinear=nl)
 
     labels = {"phase": f"phase: leave-one-bin-out ({args.n_bins} bins, interpolation)",
@@ -963,6 +1091,9 @@ def run_modes(per_parity, aux, args, model_label=""):
               "context": "context: diagonal cell", "crowd": "crowd: neighbor-occupancy",
               "frontier": "frontier: C-adjacent-to-empty", "spatial": "spatial: leave-cells-out shared",
               "flip": "flip: net-flipped vs never-flipped", "recency": "recency: long-settled vs recent",
+              "crowd_frac": "crowd_frac: neighbors <25% full -> >75% full (ply-matched)",
+              "recency_fixed": "recency_fixed: placed <=2 -> >=15 moves ago (ply-matched)",
+              "flip_true": "flip_true: 0 captures -> >=1 capture (ply-matched)",
               "null": "null: RANDOM-split control (CCGP~=Within)"}
 
     results = {mode: {} for mode in wanted}
@@ -988,7 +1119,9 @@ def main():
                    help="positions to sample from the eval chunk")
     p.add_argument("--ccgp-mode",
                    choices=["phase", "phase_fwd", "phase_bwd", "context", "crowd",
-                            "frontier", "spatial", "flip", "recency", "null", "both", "all"],
+                            "frontier", "spatial", "flip", "recency",
+                            "crowd_frac", "recency_fixed", "flip_true",
+                            "null", "both", "all", "proper"],
                    default="both",
                    help="phase=game-phase bins; context=diagonal cell; "
                         "crowd/frontier=neighborhood; spatial=leave-cells-out "
