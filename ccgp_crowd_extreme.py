@@ -21,7 +21,7 @@ import compute_ccgp as C
 
 def crowd_extreme(h, board, pos, sparse_max=1, crowd_min=7, classes=(1, 2),
                   cells=range(64), seed=0, min_per_tail=150, nonlinear=False,
-                  match_ply=False):
+                  match_ply=False, sparse_frac=None, crowd_frac=None):
     rng = np.random.RandomState(seed)
     ccgp_per, within_per = [], []
     sp_sizes, cr_sizes = [], []
@@ -43,9 +43,14 @@ def crowd_extreme(h, board, pos, sparse_max=1, crowd_min=7, classes=(1, 2),
 
     for cell in cells:
         nei = C._NEI[cell]
-        occ = (board[:, nei] != 0).sum(1)                      # occupied 8-neighbors
-        sp_idx = np.where(occ <= sparse_max)[0]
-        cr_idx = np.where(occ >= crowd_min)[0]
+        occ = (board[:, nei] != 0).sum(1)                      # occupied neighbors
+        if sparse_frac is not None:                            # FRACTION mode (all cells)
+            frac = occ / len(nei)
+            sp_idx = np.where(frac <= sparse_frac)[0]
+            cr_idx = np.where(frac >= crowd_frac)[0]
+        else:                                                  # absolute-count mode (interior only)
+            sp_idx = np.where(occ <= sparse_max)[0]
+            cr_idx = np.where(occ >= crowd_min)[0]
         if match_ply:
             sp_idx, cr_idx = _match_ply(sp_idx, cr_idx)
         if len(sp_idx) < min_per_tail or len(cr_idx) < min_per_tail:
@@ -102,19 +107,31 @@ def main():
     ap.add_argument("--ogpt-ckpt", default="ckpts/gpt_synthetic.ckpt")
     ap.add_argument("--layer", type=int, default=6)
     ap.add_argument("--n", type=int, default=100000)
-    ap.add_argument("--sparse-max", type=int, default=1, help="<= this many occupied neighbors = sparse")
-    ap.add_argument("--crowd-min", type=int, default=7, help=">= this many occupied neighbors = crowded")
+    ap.add_argument("--sparse-max", type=int, default=1, help="<= this many occupied neighbors = sparse (count mode)")
+    ap.add_argument("--crowd-min", type=int, default=7, help=">= this many occupied neighbors = crowded (count mode)")
+    ap.add_argument("--sparse-frac", type=float, default=None,
+                    help="FRACTION mode: occupied/#neighbors <= this = sparse. "
+                         "Includes corners/edges (by their own neighbor count) -> "
+                         "bigger, cleaner sample. e.g. 0.25")
+    ap.add_argument("--crowd-frac", type=float, default=None,
+                    help="FRACTION mode: occupied/#neighbors >= this = crowded. e.g. 0.75")
     ap.add_argument("--nonlinear", action="store_true")
     ap.add_argument("--match-ply", action="store_true",
                     help="Subsample the two tails to the same ply distribution "
                          "(removes the early/late confound).")
     args = ap.parse_args()
 
-    print(f"OGPT extreme-crowd CCGP: sparse<= {args.sparse_max}  vs  crowd>= {args.crowd_min} "
-          f"occupied 8-neighbors  (match_ply={args.match_ply})", flush=True)
+    if args.sparse_frac is not None:
+        desc = (f"FRACTION: occupied/#nei <= {args.sparse_frac} (sparse) vs "
+                f">= {args.crowd_frac} (crowded); all cells")
+    else:
+        desc = (f"COUNT: <= {args.sparse_max} (sparse) vs >= {args.crowd_min} "
+                f"(crowded) occupied neighbors; interior cells only")
+    print(f"OGPT extreme-crowd CCGP: {desc}  (match_ply={args.match_ply})", flush=True)
     per_parity, _aux = C.get_ogpt_activations(args.ogpt_ckpt, args.layer, None, args.n)
     for parity, (h, board, pos) in per_parity.items():
         r = crowd_extreme(h, board, pos, sparse_max=args.sparse_max, crowd_min=args.crowd_min,
+                          sparse_frac=args.sparse_frac, crowd_frac=args.crowd_frac,
                           nonlinear=args.nonlinear, match_ply=args.match_ply)
         print(f"\n--- parity={parity} ---")
         print(f"  CCGP   = {r['ccgp']:.4f}")
