@@ -169,6 +169,10 @@ def main():
                          "trained on the full chunk set by probe_pattern_models.py "
                          "--nonlinear) instead of training one here. This is the FAIR "
                          "comparison to the 6M-game linear probe.")
+    ap.add_argument('--save-npz', default=None,
+                    help="Save per-cell (64) and per-ply (60) accuracy for each "
+                         "MLP x {linear, nonlinear} to this .npz, for heatmaps "
+                         "(plot_board_decode_heatmap.py).")
     args = ap.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'device={device} threads={torch.get_num_threads()}', flush=True)
@@ -183,6 +187,7 @@ def main():
         Xt, Yt, post = load_slice(args.train_chunk, args.ply_min, args.ply_max, args.train_positions, 1)
     print(f'eval N={len(pose):,}' + (f'  train N={len(post):,}' if post is not None else ''), flush=True)
 
+    saved = {}
     for mlp_path in args.mlps:
         ck = _torch_load(mlp_path)
         input_dim, H = ck['input_dim'], ck['hidden_dim']
@@ -213,6 +218,16 @@ def main():
         report(f"{os.path.basename(mlp_path)}  LINEAR probe (saved probe_direct)", lc, lt, lpc, lpt)
         nc, nt, npc, npt = decode_metrics(hid_e, Ye, pose, nlp_e, nlp_o, False, device)
         report(f"{os.path.basename(mlp_path)}  {nl_tag}", nc, nt, npc, npt)
+
+        stem = os.path.basename(mlp_path).replace('pattern_simple_direct_', '').replace('.pt', '')
+        saved[f'{stem}__linear__cell'] = lc / np.maximum(lt, 1)
+        saved[f'{stem}__nonlinear__cell'] = nc / np.maximum(nt, 1)
+        saved[f'{stem}__linear__ply'] = lpc / np.maximum(lpt, 1)
+        saved[f'{stem}__nonlinear__ply'] = npc / np.maximum(npt, 1)
+
+    if args.save_npz:
+        np.savez(args.save_npz, **saved)
+        print(f"\nsaved per-cell/per-ply accuracy -> {args.save_npz}", flush=True)
 
 
 if __name__ == '__main__':
