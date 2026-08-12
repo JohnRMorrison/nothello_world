@@ -256,6 +256,102 @@ def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
 # CCGP probes
 # ---------------------------------------------------------------------------
 
+def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
+                           n_sample, ply_lo=5, ply_hi=54, seed=0, batch=200):
+    """Option (B): produce MLP hidden AND Othello-GPT residual on the SAME
+    positions. For each sampled (game, ply) we build the MLP's 180-d features
+    (played/when/even, step-parity even -- matches the chunk precompute) AND the
+    OGPT token sequence, and take the board label from the same replay. This
+    makes the MLP-vs-OGPT CCGP comparison position-for-position identical.
+
+    Validate via the printed `Within` (MLP ~90%, OGPT ~95% at layer 6); if MLP
+    Within is ~chance, the feature build/convention is wrong.
+
+    Returns {'mlp': (per_parity, aux), 'ogpt': (per_parity, aux)}.
+    """
+    import pickle
+    from train_pattern_simple import DirectMLP, to_move_grid_input
+    from mingpt.model import GPT, GPTConfig
+    from experiments.mathematical_transformation_experiments.probe_state_pred_for_othello import (
+        extract_activations, tokenize_games, _get_state_stack,
+        GAME_LEN, SYNTHETIC_DIR, get_device,
+    )
+    device = get_device()
+    B64_TO_M60 = {c: i for i, c in enumerate(_VALID_MOVES)}
+
+    ck = torch.load(mlp_ckpt, map_location=device)
+    is_mg = (mlp_features == "move_grid") or (ck.get('input_dim') == 3600)
+    input_dim = ck.get('input_dim', 3600 if is_mg else len(_feature_cols(mlp_features)))
+    me = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
+    mo = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
+    me.load_state_dict(ck['even']); mo.load_state_dict(ck['odd']); me.eval(); mo.eval()
+
+    sd = torch.load(ogpt_ckpt, map_location='cpu')
+    if isinstance(sd, dict) and 'model' in sd and isinstance(sd['model'], dict):
+        sd = sd['model']
+    vocab, n_embd = sd['tok_emb.weight'].shape
+    block = sd['pos_emb'].shape[1]
+    n_layer = 1 + max(int(k.split('.')[1]) for k in sd if k.startswith('blocks.'))
+    gpt = GPT(GPTConfig(vocab, block, n_layer=n_layer, n_head=8, n_embd=n_embd))
+    gpt.load_state_dict(sd); gpt = gpt.to(device).eval()
+    if layer >= n_layer:
+        raise ValueError(f"--layer {layer} but OGPT has {n_layer} layers")
+    print(f"  shared: MLP(H={mlp_hidden},{mlp_features}) + OGPT(L{layer}/{n_layer}) on identical positions")
+
+    files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
+    games = []
+    for fn in files:
+        with open(os.path.join(SYNTHETIC_DIR, fn), "rb") as f:
+            games.extend(g for g in pickle.load(f) if len(g) == GAME_LEN)
+        if len(games) >= n_sample:
+            break
+    rng = np.random.RandomState(seed)
+    rng.shuffle(games); games = games[:n_sample]
+    nmoves = rng.randint(ply_lo, ply_hi, size=len(games))
+    N = len(games)
+    print(f"  shared: {N} games, one ply each in [{ply_lo},{ply_hi})")
+
+    feat = np.zeros((N, 180), np.float32)
+    board = np.zeros((N, 64), np.int8)
+    pc = np.zeros((N, 64), np.int8); ps = np.full((N, 64), -1, np.int16)
+    pos = np.asarray(nmoves, dtype=np.int64)
+    ogpt_h = np.zeros((N, n_embd), np.float32)
+
+    for s0 in range(0, N, batch):
+        gb = games[s0:s0 + batch]
+        toks = tokenize_games(gb, seq_len=block).to(device)
+        resid = extract_activations(gpt, toks, layer)                # (b, block, d)
+        ss = _get_state_stack(gb, 0, block).numpy()                  # (b, block, 8, 8)
+        for i in range(len(gb)):
+            gi = s0 + i; t = int(nmoves[gi])
+            for step in range(t):
+                c = gb[i][step]; j = B64_TO_M60[c]
+                feat[gi, j] = 1.0                                    # played
+                feat[gi, 60 + j] = (step + 1) / 60.0                 # when
+                feat[gi, 120 + j] = 1.0 if step % 2 == 0 else 0.0    # even (step-parity)
+                ps[gi, c] = step; pc[gi, c] = 2 if step % 2 == 0 else 1
+            st = ss[i, t - 1].reshape(64)                            # board after t moves
+            board[gi] = np.where(st == 0, 0, np.where(st == -1, 1, 2)).astype(np.int8)
+            ogpt_h[gi] = resid[i, t - 1].detach().cpu().numpy()
+
+    if is_mg:
+        X = to_move_grid_input(torch.from_numpy(feat))
+    else:
+        X = torch.from_numpy(feat[:, _feature_cols(mlp_features)])
+
+    mlp_out, mlp_aux, og_out, og_aux = {}, {}, {}, {}
+    for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
+        if not mask.any():
+            continue
+        model = me if parity == "even" else mo
+        with torch.no_grad():
+            xp = X[torch.from_numpy(mask)].float().to(device)
+            h = model.net[1](model.net[0](xp)).cpu().numpy().astype(np.float32)
+        mlp_out[parity] = (h, board[mask], pos[mask]); mlp_aux[parity] = (pc[mask], ps[mask])
+        og_out[parity] = (ogpt_h[mask], board[mask], pos[mask]); og_aux[parity] = (pc[mask], ps[mask])
+    return {'mlp': (mlp_out, mlp_aux), 'ogpt': (og_out, og_aux)}
+
+
 def _balance(idx, y, rng):
     """Subsample to balance positive/negative in idx given binary labels y."""
     pos = idx[y[idx] == 1]
@@ -649,13 +745,54 @@ def _print_summary(label, res):
     print(f"  ({res['n_pairs']} (cell, class) pairs averaged)")
 
 
+def run_modes(per_parity, aux, args, model_label=""):
+    """Run the selected CCGP modes for one model's per-parity activations."""
+    hdr = f" [{model_label}]" if model_label else ""
+    print(f"\nLoaded activations{hdr}:")
+    for parity, (h, board, pos) in per_parity.items():
+        print(f"  {parity}: {len(h)} positions, hidden_dim={h.shape[1]}, "
+              f"turn_range=[{int(pos.min())}, {int(pos.max())}]")
+
+    m, nl = args.ccgp_mode, args.nonlinear
+    tag = (f"{hdr} " if hdr else " ") + ("[NONLINEAR probe]" if nl else "[linear probe]")
+    for parity, (h, board, pos) in per_parity.items():
+        print(f"\n======================================== {model_label} parity={parity}")
+
+        if m in ("phase", "both", "all"):
+            _print_summary(f"phase: cross-game-phase ({args.n_bins} bins){tag}",
+                           ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl))
+        if m in ("context", "both", "all"):
+            _print_summary(f"context: cross-context-cell (diagonal){tag}",
+                           ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl))
+        if m in ("crowd", "all"):
+            _print_summary(f"crowd: neighbor-occupancy context{tag}",
+                           ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl))
+        if m in ("frontier", "all"):
+            _print_summary(f"frontier: C-adjacent-to-empty context{tag}",
+                           ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl))
+        if m in ("spatial", "all"):
+            _print_summary(f"spatial: leave-cells-out shared decoder{tag}",
+                           ccgp_spatial(h, board, nonlinear=nl))
+        if m in ("flip", "all"):
+            pc, ps = aux[parity]
+            _print_summary(f"flip: net-flipped vs never-flipped (occupied C){tag}",
+                           ccgp_conditioned(h, board, pos, pc, ps, cond="flip", nonlinear=nl))
+        if m in ("recency", "all"):
+            pc, ps = aux[parity]
+            _print_summary(f"recency: long-settled vs recent (occupied C){tag}",
+                           ccgp_conditioned(h, board, pos, pc, ps, cond="recency", nonlinear=nl))
+        if m in ("null", "all"):
+            _print_summary(f"null: RANDOM-split control (CCGP~=Within expected){tag}",
+                           ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl))
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", default=None,
-                   help="Path to MLP checkpoint (mode-data mlp).")
+                   help="Path to MLP checkpoint (mode-data mlp/shared).")
     p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--features", default="wheneven")
-    p.add_argument("--mode-data", choices=["mlp", "ogpt"], default="mlp")
+    p.add_argument("--mode-data", choices=["mlp", "ogpt", "shared"], default="mlp")
     p.add_argument("--ogpt-ckpt", default="ckpts/gpt_nanda_synthetic.ckpt")
     p.add_argument("--layer", type=int, default=4)
     p.add_argument("--n", type=int, default=30000,
@@ -676,71 +813,32 @@ def main():
                    help="path to a feature_chunks/*.npz file")
     args = p.parse_args()
 
-    if args.eval_chunk is None:
-        chunk_dir = ("experiments/mathematical_transformation_experiments/"
-                     "heuristic_probe_results/feature_chunks")
-        files = sorted(f for f in os.listdir(chunk_dir)
-                       if f.endswith(".npz") and "_patterns" not in f)
-        args.eval_chunk = os.path.join(chunk_dir, files[-1])
-    print(f"Eval chunk: {args.eval_chunk}")
+    if args.mode_data == "shared":
+        if args.ckpt is None:
+            p.error("--ckpt (MLP) is required when --mode-data shared")
+        shared = get_shared_activations(
+            args.ckpt, args.hidden, args.features, args.ogpt_ckpt, args.layer, args.n)
+        run_modes(*shared['mlp'], args, model_label="MLP")
+        run_modes(*shared['ogpt'], args, model_label="OGPT")
+        return
 
     if args.mode_data == "mlp":
         if args.ckpt is None:
             p.error("--ckpt is required when --mode-data mlp")
+        if args.eval_chunk is None:
+            chunk_dir = ("experiments/mathematical_transformation_experiments/"
+                         "heuristic_probe_results/feature_chunks")
+            files = sorted(f for f in os.listdir(chunk_dir)
+                           if f.endswith(".npz") and "_patterns" not in f)
+            args.eval_chunk = os.path.join(chunk_dir, files[-1])
+        print(f"Eval chunk: {args.eval_chunk}")
         per_parity, aux = get_mlp_activations(
-            args.ckpt, args.hidden, args.features,
-            args.eval_chunk, args.n)
+            args.ckpt, args.hidden, args.features, args.eval_chunk, args.n)
+        run_modes(per_parity, aux, args, model_label="MLP")
     else:
         per_parity, aux = get_ogpt_activations(
             args.ogpt_ckpt, args.layer, args.eval_chunk, args.n)
-
-    print(f"\nLoaded activations:")
-    for parity, (h, board, pos) in per_parity.items():
-        print(f"  {parity}: {len(h)} positions, hidden_dim={h.shape[1]}, "
-              f"turn_range=[{int(pos.min())}, {int(pos.max())}]")
-
-    for parity, (h, board, pos) in per_parity.items():
-        print(f"\n========================================")
-        print(f"  Parity: {parity}")
-        print(f"========================================")
-
-        m = args.ccgp_mode
-        nl = args.nonlinear
-        tag = " [NONLINEAR probe]" if nl else " [linear probe]"
-
-        if m in ("phase", "both", "all"):
-            r = ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl)
-            _print_summary(f"phase: cross-game-phase ({args.n_bins} bins){tag}", r)
-
-        if m in ("context", "both", "all"):
-            r = ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl)
-            _print_summary(f"context: cross-context-cell (diagonal){tag}", r)
-
-        if m in ("crowd", "all"):
-            r = ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl)
-            _print_summary(f"crowd: neighbor-occupancy context{tag}", r)
-
-        if m in ("frontier", "all"):
-            r = ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl)
-            _print_summary(f"frontier: C-adjacent-to-empty context{tag}", r)
-
-        if m in ("spatial", "all"):
-            r = ccgp_spatial(h, board, nonlinear=nl)
-            _print_summary(f"spatial: leave-cells-out shared decoder{tag}", r)
-
-        if m in ("flip", "all"):
-            pc, ps = aux[parity]
-            r = ccgp_conditioned(h, board, pos, pc, ps, cond="flip", nonlinear=nl)
-            _print_summary(f"flip: net-flipped vs never-flipped (occupied C){tag}", r)
-
-        if m in ("recency", "all"):
-            pc, ps = aux[parity]
-            r = ccgp_conditioned(h, board, pos, pc, ps, cond="recency", nonlinear=nl)
-            _print_summary(f"recency: long-settled vs recent (occupied C){tag}", r)
-
-        if m in ("null", "all"):
-            r = ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl)
-            _print_summary(f"null: RANDOM-split control (CCGP~=Within expected){tag}", r)
+        run_modes(per_parity, aux, args, model_label="OGPT")
 
 
 if __name__ == "__main__":
