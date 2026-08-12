@@ -19,7 +19,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import compute_ccgp as C
 
-MODES = ["phase", "context", "crowd", "frontier", "spatial", "flip", "recency", "null"]
+MODES = ["phase", "phase_fwd", "phase_bwd", "context", "crowd", "frontier",
+         "spatial", "flip", "recency", "null"]
 
 
 def infer_mlp(path):
@@ -44,6 +45,9 @@ def main():
     ap.add_argument("--ply-min", type=int, default=5)
     ap.add_argument("--ply-max", type=int, default=54)
     ap.add_argument("--n-bins", type=int, default=4)
+    ap.add_argument("--ccgp-mode", default="all",
+                    help="Which CCGP mode(s) to run (default all). Single mode "
+                         "e.g. phase / phase_fwd / phase_bwd / spatial for sweeps.")
     ap.add_argument("--probes", choices=["linear", "nonlinear", "both"], default="both")
     ap.add_argument("--j1b-bank", default=None,
                     help="If set (e.g. banks/J1_perpattern.pt), also run J1B "
@@ -69,7 +73,7 @@ def main():
     passes = (["linear", "nonlinear"] if args.probes == "both" else [args.probes])
     for probe in passes:
         nl = (probe == "nonlinear")
-        run_args = argparse.Namespace(ccgp_mode="all", nonlinear=nl, n_bins=args.n_bins)
+        run_args = argparse.Namespace(ccgp_mode=args.ccgp_mode, nonlinear=nl, n_bins=args.n_bins)
         print(f"\n############################## PROBE = {probe.upper()} ##############################", flush=True)
         table = {}
         for label, (pp, aux) in models:

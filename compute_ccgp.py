@@ -569,6 +569,69 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
     }
 
 
+def ccgp_phase_extrap(h, board, pos, n_bins=4, direction="forward", classes=(1, 2),
+                      cells=range(64), seed=0, min_per_bin=150, train_size=None,
+                      nonlinear=False):
+    """STRICT extrapolation across game phase (no interpolation).
+
+    Bin plies into n_bins quantile bins. Then:
+      direction='forward'  : train on the EARLIEST bins, test on the LATEST bin
+                             (probe must extrapolate forward in time).
+      direction='backward' : train on the LATEST bins, test on the EARLIEST bin.
+    The test bin lies entirely OUTSIDE the training ply range -- unlike
+    leave-one-bin-out (ccgp_phase), which surrounds the held-out bin. Within is
+    a 2-fold ceiling inside the test bin at the SAME train size, so a large Gap
+    means the code genuinely does not transfer to unseen phase."""
+    rng = np.random.RandomState(seed)
+    quantiles = np.quantile(pos, np.linspace(0, 1, n_bins + 1))
+    quantiles[0] -= 0.5; quantiles[-1] += 0.5
+    bins = np.digitize(pos, quantiles[1:-1])
+
+    ccgp_per, within_per = [], []
+    for cell in cells:
+        for cls in classes:
+            y = (board[:, cell] == cls).astype(np.int32)
+            if y.sum() < 100 or (1 - y).sum() < 100:
+                continue
+            per_bin = []
+            for b in range(n_bins):
+                idx = np.where(bins == b)[0]
+                per_bin.append(_balance(idx, y, rng) if len(idx) >= min_per_bin else None)
+            valid = [b for b in range(n_bins) if per_bin[b] is not None]
+            if len(valid) < 2:
+                continue
+            if direction == "forward":
+                test_b, train_bs = valid[-1], valid[:-1]
+            else:
+                test_b, train_bs = valid[0], valid[1:]
+            tr_pool = np.concatenate([per_bin[b] for b in train_bs])
+            te = per_bin[test_b]
+            t = train_size or min(len(tr_pool), max(50, len(te) // 2))
+
+            sub = _subsample(tr_pool, t, rng)
+            a = _probe_acc(h[sub], y[sub], h[te], y[te], nonlinear=nonlinear)
+            if a is not None:
+                ccgp_per.append(a)
+
+            idx = te.copy(); rng.shuffle(idx); half = len(idx) // 2
+            wf = []
+            for tr_part, te_part in [(idx[:half], idx[half:]), (idx[half:], idx[:half])]:
+                trs = _subsample(tr_part, t, rng)
+                a = _probe_acc(h[trs], y[trs], h[te_part], y[te_part], nonlinear=nonlinear)
+                if a is not None:
+                    wf.append(a)
+            if wf:
+                within_per.append(np.mean(wf))
+
+    return {
+        'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
+        'within': float(np.mean(within_per)) if within_per else float('nan'),
+        'gap':    float(np.mean(within_per) - np.mean(ccgp_per))
+                  if (ccgp_per and within_per) else float('nan'),
+        'n_pairs': len(ccgp_per),
+    }
+
+
 def _context_state(board, cell, ctx_mode, rng):
     """Binary per-position context state for cell C. A good board code should
     decode C's own class invariant to this context (small Gap)."""
@@ -833,11 +896,14 @@ def run_modes(per_parity, aux, args, model_label=""):
 
     m, nl = args.ccgp_mode, args.nonlinear
     tag = (f"{hdr} " if hdr else " ") + ("[NONLINEAR probe]" if nl else "[linear probe]")
-    wanted = (["phase", "context", "crowd", "frontier", "spatial", "flip", "recency", "null"]
+    wanted = (["phase", "phase_fwd", "phase_bwd", "context", "crowd", "frontier",
+               "spatial", "flip", "recency", "null"]
               if m == "all" else ["phase", "context"] if m == "both" else [m])
 
     def compute(mode, h, board, pos, parity):
         if mode == "phase":    return ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl)
+        if mode == "phase_fwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="forward", nonlinear=nl)
+        if mode == "phase_bwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="backward", nonlinear=nl)
         if mode == "context":  return ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl)
         if mode == "crowd":    return ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl)
         if mode == "frontier": return ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl)
@@ -846,7 +912,9 @@ def run_modes(per_parity, aux, args, model_label=""):
         pc, ps = aux[parity]
         return ccgp_conditioned(h, board, pos, pc, ps, cond=mode, nonlinear=nl)
 
-    labels = {"phase": f"phase: cross-game-phase ({args.n_bins} bins)",
+    labels = {"phase": f"phase: leave-one-bin-out ({args.n_bins} bins, interpolation)",
+              "phase_fwd": f"phase_fwd: train EARLY -> test LATEST ({args.n_bins} bins, EXTRAPOLATE)",
+              "phase_bwd": f"phase_bwd: train LATE -> test EARLIEST ({args.n_bins} bins, EXTRAPOLATE)",
               "context": "context: diagonal cell", "crowd": "crowd: neighbor-occupancy",
               "frontier": "frontier: C-adjacent-to-empty", "spatial": "spatial: leave-cells-out shared",
               "flip": "flip: net-flipped vs never-flipped", "recency": "recency: long-settled vs recent",
@@ -874,8 +942,8 @@ def main():
     p.add_argument("--n", type=int, default=30000,
                    help="positions to sample from the eval chunk")
     p.add_argument("--ccgp-mode",
-                   choices=["phase", "context", "crowd", "frontier",
-                            "spatial", "flip", "recency", "null", "both", "all"],
+                   choices=["phase", "phase_fwd", "phase_bwd", "context", "crowd",
+                            "frontier", "spatial", "flip", "recency", "null", "both", "all"],
                    default="both",
                    help="phase=game-phase bins; context=diagonal cell; "
                         "crowd/frontier=neighborhood; spatial=leave-cells-out "
