@@ -65,6 +65,34 @@ def _neighbors8(c):
 
 _NEI = [_neighbors8(c) for c in range(64)]
 
+# 60 move-cells (all squares except the 4 center) -> board-cell indices.
+_VALID_MOVES = [c for c in range(64) if c not in (27, 28, 35, 36)]
+
+
+def _placement_from_raw(Xr):
+    """From raw 180-d features [played(60), when(60), even(60)] derive, per BOARD
+    cell (64): placement color and placement step.
+
+    Encoding (train_pattern_simple): move_num = round(when*60 - 1); even==1 means
+    placed by WHITE (step 0 = white). Board-label convention is 0=empty, 1=white,
+    2=black, so place_color uses the same {1=white, 2=black, 0=unplayed}.
+
+    Returns (place_color (N,64) int8, place_step (N,64) int16 with -1 = unplayed).
+    Center cells (27,28,35,36) are always unplayed here (initial discs, no 'when').
+    """
+    played = Xr[:, 0:60] > 0.5
+    when = Xr[:, 60:120]
+    even = Xr[:, 120:180] > 0.5
+    move_num = np.clip(np.round(when * 60.0 - 1.0), 0, 59).astype(np.int16)
+    col60 = np.where(played, np.where(even, 1, 2), 0).astype(np.int8)     # 1 white, 2 black
+    step60 = np.where(played, move_num, -1).astype(np.int16)
+    N = Xr.shape[0]
+    place_color = np.zeros((N, 64), np.int8)
+    place_step = np.full((N, 64), -1, np.int16)
+    place_color[:, _VALID_MOVES] = col60
+    place_step[:, _VALID_MOVES] = step60
+    return place_color, place_step
+
 
 # ---------------------------------------------------------------------------
 # Activation extraction
@@ -107,6 +135,8 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
     me.eval(); mo.eval()
 
     X_raw, Y, pos = _load_features(eval_path)          # X_raw: (N, 180)
+    Xr = X_raw.numpy() if hasattr(X_raw, 'numpy') else np.asarray(X_raw)
+    place_color, place_step = _placement_from_raw(Xr)   # (N,64) each
     if not is_movegrid:
         X = X_raw[:, _feature_cols(features)]           # column-slice reps
     else:
@@ -115,6 +145,7 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
         rng = np.random.RandomState(0)
         idx = np.sort(rng.choice(len(X), n_sample, replace=False))
         X, Y, pos = X[idx], Y[idx], pos[idx]
+        place_color, place_step = place_color[idx], place_step[idx]
 
     pos_np = pos.numpy() if hasattr(pos, 'numpy') else np.asarray(pos)
     Y_np = Y.numpy() if hasattr(Y, 'numpy') else np.asarray(Y)
@@ -124,7 +155,7 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
 
     em = (pos_np % 2 == 0)
     om = ~em
-    out = {}
+    out, aux = {}, {}
     with torch.no_grad():
         for parity, mask, model in [("even", em, me), ("odd", om, mo)]:
             if not mask.any():
@@ -137,7 +168,8 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
             h = model.net[1](model.net[0](x_p))
             out[parity] = (h.cpu().numpy().astype(np.float32),
                            Y_np[mask], pos_np[mask])
-    return out
+            aux[parity] = (place_color[mask], place_step[mask])
+    return out, aux
 
 
 def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
@@ -187,7 +219,7 @@ def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
     games = games[:n_sample]
     print(f"  OGPT: probing {len(games)} games, one ply each in [{ply_lo},{ply_hi})")
 
-    H, B, P = [], [], []
+    H, B, P, PC, PS = [], [], [], [], []
     for s in range(0, len(games), batch):
         gb = games[s:s + batch]
         toks = tokenize_games(gb, seq_len=block_size).to(device)     # (b, block)
@@ -200,15 +232,24 @@ def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
             # absolute color: 0 empty, 1 white(-1), 2 black(+1)
             B.append(np.where(st == 0, 0, np.where(st == -1, 1, 2)).astype(np.int8))
             P.append(t)
+            # placement info from the move sequence (black first: step 0 = black).
+            pc = np.zeros(64, np.int8); ps = np.full(64, -1, np.int16)
+            for j in range(t + 1):
+                c = gb[i][j]
+                pc[c] = 2 if (j % 2 == 0) else 1        # black(2) on even steps, white(1) on odd
+                ps[c] = j
+            PC.append(pc); PS.append(ps)
 
     h = np.stack(H).astype(np.float32)
     board = np.stack(B)
     pos = np.asarray(P, dtype=np.int64)
-    out = {}
+    place_color = np.stack(PC); place_step = np.stack(PS)
+    out, aux = {}, {}
     for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
         if mask.any():
             out[parity] = (h[mask], board[mask], pos[mask])
-    return out
+            aux[parity] = (place_color[mask], place_step[mask])
+    return out, aux
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +563,84 @@ def ccgp_spatial(h, board, classes=(1, 2), cells=range(64), seed=0,
     }
 
 
+def ccgp_conditioned(h, board, pos, place_color, place_step, cond="flip",
+                     cells=None, seed=0, min_per_cond=150, train_size=None,
+                     nonlinear=False):
+    """Flip / recency CCGP, conditioned on cell C being OCCUPIED.
+
+    Target = C's color dichotomy (white vs black; within a parity that IS
+    mine vs yours). Context split:
+      flip     : current color != placement color (net-flipped) vs never-flipped
+                 -> does 'C is mine' transfer across whether C was just captured?
+                 A Markov state code should (small Gap).
+      recency  : moves-since-placement >= median (long-settled) vs recent
+                 -> do long-settled squares decode like fresh ones?
+
+    Only non-center cells (the 60 move-cells have placement info)."""
+    rng = np.random.RandomState(seed)
+    cells = list(cells) if cells is not None else list(_VALID_MOVES)
+    ccgp_per, within_per = [], []
+    for cell in cells:
+        occ = np.where(board[:, cell] != 0)[0]
+        if len(occ) < 2 * min_per_cond:
+            continue
+        y = (board[occ, cell] == 1).astype(np.int32)          # white(1) vs black(0)
+        if y.sum() < 60 or (1 - y).sum() < 60:
+            continue
+        if cond == "flip":
+            ctx = (board[occ, cell] != place_color[occ, cell]).astype(int)   # 1=flipped
+        elif cond == "recency":
+            rec = pos[occ].astype(np.int32) - place_step[occ, cell].astype(np.int32)
+            ctx = (rec >= np.median(rec)).astype(int)          # 1=long-settled
+        else:
+            raise ValueError(f"unknown cond {cond}")
+        hocc = h[occ]
+
+        per_state = []
+        for s in (0, 1):
+            si = np.where(ctx == s)[0]
+            if len(si) < min_per_cond:
+                per_state.append(None); continue
+            per_state.append(_balance(si, y, rng))
+        if any(p is None for p in per_state):
+            continue
+
+        ccgp_pool = min(len(per_state[0]), len(per_state[1]))
+        within_pool = min(len(per_state[0]) // 2, len(per_state[1]) // 2)
+        t = train_size or min(ccgp_pool, within_pool)
+        t = max(t, 50)
+
+        fold_acc = []
+        for held in (0, 1):
+            tr = _subsample(per_state[1 - held], t, rng)
+            te = per_state[held]
+            a = _probe_acc(hocc[tr], y[tr], hocc[te], y[te], nonlinear=nonlinear)
+            if a is not None:
+                fold_acc.append(a)
+        if fold_acc:
+            ccgp_per.append(np.mean(fold_acc))
+
+        wf = []
+        for s in (0, 1):
+            si = per_state[s].copy(); rng.shuffle(si)
+            half = len(si) // 2
+            for tr_part, te_part in [(si[:half], si[half:]), (si[half:], si[:half])]:
+                tr = _subsample(tr_part, t, rng)
+                a = _probe_acc(hocc[tr], y[tr], hocc[te_part], y[te_part], nonlinear=nonlinear)
+                if a is not None:
+                    wf.append(a)
+        if wf:
+            within_per.append(np.mean(wf))
+
+    return {
+        'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
+        'within': float(np.mean(within_per)) if within_per else float('nan'),
+        'gap':    float(np.mean(within_per) - np.mean(ccgp_per))
+                  if (ccgp_per and within_per) else float('nan'),
+        'n_pairs': len(ccgp_per),
+    }
+
+
 def _print_summary(label, res):
     print(f"\n--- {label} ---")
     print(f"  CCGP    = {res['ccgp']:.4f}")
@@ -543,7 +662,7 @@ def main():
                    help="positions to sample from the eval chunk")
     p.add_argument("--ccgp-mode",
                    choices=["phase", "context", "crowd", "frontier",
-                            "spatial", "null", "both", "all"],
+                            "spatial", "flip", "recency", "null", "both", "all"],
                    default="both",
                    help="phase=game-phase bins; context=diagonal cell; "
                         "crowd/frontier=neighborhood; spatial=leave-cells-out "
@@ -568,11 +687,11 @@ def main():
     if args.mode_data == "mlp":
         if args.ckpt is None:
             p.error("--ckpt is required when --mode-data mlp")
-        per_parity = get_mlp_activations(
+        per_parity, aux = get_mlp_activations(
             args.ckpt, args.hidden, args.features,
             args.eval_chunk, args.n)
     else:
-        per_parity = get_ogpt_activations(
+        per_parity, aux = get_ogpt_activations(
             args.ogpt_ckpt, args.layer, args.eval_chunk, args.n)
 
     print(f"\nLoaded activations:")
@@ -608,6 +727,16 @@ def main():
         if m in ("spatial", "all"):
             r = ccgp_spatial(h, board, nonlinear=nl)
             _print_summary(f"spatial: leave-cells-out shared decoder{tag}", r)
+
+        if m in ("flip", "all"):
+            pc, ps = aux[parity]
+            r = ccgp_conditioned(h, board, pos, pc, ps, cond="flip", nonlinear=nl)
+            _print_summary(f"flip: net-flipped vs never-flipped (occupied C){tag}", r)
+
+        if m in ("recency", "all"):
+            pc, ps = aux[parity]
+            r = ccgp_conditioned(h, board, pos, pc, ps, cond="recency", nonlinear=nl)
+            _print_summary(f"recency: long-settled vs recent (occupied C){tag}", r)
 
         if m in ("null", "all"):
             r = ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl)
