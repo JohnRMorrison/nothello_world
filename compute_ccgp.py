@@ -389,7 +389,8 @@ def j1b_from_sample(sample, bank, flanking_patterns, svd_k=2048, batch=1024, see
     W_tree, b_tree, meta = tsp.load_trees(bank)
     mlp = tsp.OpeningTreeMLP(W_tree, b_tree, meta, device)
     leaf_build = tsp.load_leaf_build(bank)                 # None for binary J1 bank
-    patterns = tsp.load_patterns(flanking_patterns)
+    # no_flanking=True -> flanking patterns are unused; load only if present.
+    patterns = tsp.load_patterns(flanking_patterns) if os.path.exists(flanking_patterns) else None
     n_leaves = int(mlp.W.shape[0])
     games, pos = sample['games'], sample['pos']
     N = len(games)
