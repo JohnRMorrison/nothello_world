@@ -15,9 +15,44 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.patches as mpatches
 
 MONO = {"family": "monospace"}
 COLS = "ABCDEFGH"
+
+# presentation_boards.ipynb board aesthetic
+CELL_EDGE = "#aaaaaa"
+BOARD_EDGE = "#666666"
+LABEL_FS = 11
+
+
+def _draw_nb(ax, acc64, title, cmap, vmin, vmax):
+    """Board-style panel matching presentation_boards.ipynb: fixed-scale cells
+    with gray outlines, bold A-H / 1-8 labels, board outline, white background,
+    value in each square. Rank 1 (row 0) on top; A-H along the top."""
+    grid = acc64.reshape(8, 8)
+    norm = mpl.colors.Normalize(vmin, vmax)
+    cm = plt.get_cmap(cmap)
+    for r in range(8):
+        for c in range(8):
+            v = grid[r, c]
+            ax.add_patch(mpatches.Rectangle((c - 0.5, r - 0.5), 1.0, 1.0,
+                         facecolor=cm(norm(v)), edgecolor=CELL_EDGE, linewidth=0.8, zorder=1))
+            frac = (v - vmin) / max(vmax - vmin, 1e-9)
+            ax.text(c, r, f"{100*v:.0f}", ha="center", va="center", fontsize=7,
+                    fontweight="bold", color="white" if frac < 0.5 else "black", zorder=2)
+    ax.add_patch(mpatches.Rectangle((-0.5, -0.5), 8, 8, facecolor="none",
+                 edgecolor=BOARD_EDGE, linewidth=1.5, zorder=7))
+    for c in range(8):                                   # A-H along the top
+        ax.text(c, -1.05, COLS[c], ha="center", va="center", fontsize=LABEL_FS, fontweight="bold")
+    for r in range(8):                                   # ranks 1-8 down the left
+        ax.text(-1.05, r, str(r + 1), ha="center", va="center", fontsize=LABEL_FS, fontweight="bold")
+    ax.text(3.5, -1.85, title, ha="center", va="center", fontsize=12, fontweight="bold")
+    ax.set_xlim(-1.7, 7.7)
+    ax.set_ylim(7.7, -2.3)                               # y inverted (rank 1 top), title gutter
+    ax.set_aspect("equal")
+    ax.axis("off")
 
 
 def _draw(ax, acc64, title, cmap, vmin, vmax):
@@ -49,6 +84,9 @@ def main():
     ap.add_argument("--cmap", default="viridis")
     ap.add_argument("--vmin", type=float, default=None, help="default: data min")
     ap.add_argument("--vmax", type=float, default=1.0)
+    ap.add_argument("--style", choices=["plain", "notebook"], default="notebook",
+                    help="notebook = presentation_boards board aesthetic "
+                         "(drawn cells, gray outlines, bold A-H/1-8 labels).")
     ap.add_argument("--out", default="board_decode_heatmap.png")
     args = ap.parse_args()
 
@@ -63,7 +101,9 @@ def main():
 
     ncol = len(stems)
     nrow = len(probes)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.0 * ncol, 3.1 * nrow),
+    nb = (args.style == "notebook")
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=((2.7 if nb else 3.0) * ncol, (2.9 if nb else 3.1) * nrow),
                              squeeze=False)
     fig.patch.set_facecolor("white")
     im = None
@@ -73,17 +113,20 @@ def main():
             ax = axes[i][j]
             if key not in d.files:
                 ax.axis("off"); continue
-            title = stem if nrow == 1 else f"{stem}\n{probe}"
-            im = _draw(ax, d[key], title, args.cmap, vmin, args.vmax)
+            title = stem if nrow == 1 else f"{stem}  ({probe})"
+            if nb:
+                _draw_nb(ax, d[key], title, args.cmap, vmin, args.vmax)
+            else:
+                im = _draw(ax, d[key], title, args.cmap, vmin, args.vmax)
 
     fig.suptitle(f"Board-decode accuracy per square ({args.probe}, mine/yours frame)",
-                 fontfamily="monospace", fontsize=12)
-    if im is not None:
+                 fontsize=13, fontweight="bold", y=0.99)
+    if im is not None:                                   # colorbar only for the plain (imshow) style
         cb = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
         cb.ax.tick_params(labelsize=8)
         cb.set_label("accuracy", fontfamily="monospace", fontsize=9)
     fig.savefig(args.out, dpi=200, bbox_inches="tight")
-    print(f"saved {args.out}  (stems: {', '.join(stems)}; vmin={vmin:.2f})")
+    print(f"saved {args.out}  (stems: {', '.join(stems)}; style={args.style}; vmin={vmin:.2f})")
 
 
 if __name__ == "__main__":
