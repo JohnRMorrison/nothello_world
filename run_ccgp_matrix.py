@@ -45,6 +45,11 @@ def main():
     ap.add_argument("--ply-max", type=int, default=54)
     ap.add_argument("--n-bins", type=int, default=4)
     ap.add_argument("--probes", choices=["linear", "nonlinear", "both"], default="both")
+    ap.add_argument("--j1b-bank", default=None,
+                    help="If set (e.g. banks/J1_perpattern.pt), also run J1B "
+                         "(tree-leaf one-hot, SVD-reduced) on the same positions.")
+    ap.add_argument("--j1b-flanking", default="hand_crafted_flanking_patterns.pt")
+    ap.add_argument("--j1b-svd-k", type=int, default=2048)
     args = ap.parse_args()
 
     print(f"Sampling {args.n} shared positions (OGPT L{args.layer}) -- computed ONCE ...", flush=True)
@@ -56,6 +61,10 @@ def main():
     for path in args.mlps:
         hidden, feat, tag = infer_mlp(path)
         models.append((f"MLP:{tag}", C.mlp_from_sample(sample, path, hidden, feat)))
+    if args.j1b_bank:
+        models.append((f"J1B:svd{args.j1b_svd_k}",
+                       C.j1b_from_sample(sample, args.j1b_bank, args.j1b_flanking,
+                                         svd_k=args.j1b_svd_k)))
 
     passes = (["linear", "nonlinear"] if args.probes == "both" else [args.probes])
     for probe in passes:

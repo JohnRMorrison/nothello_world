@@ -323,7 +323,7 @@ def sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo=5, ply_hi=54,
             print(f"    ...{min(s0 + batch, N)}/{N} positions", flush=True)
 
     return dict(feat=feat, board=board, pos=pos, place_color=pc, place_step=ps,
-                ogpt_h=ogpt_h, n_embd=n_embd)
+                ogpt_h=ogpt_h, n_embd=n_embd, games=games)
 
 
 def _split_parity(h, sample):
@@ -367,6 +367,54 @@ def mlp_from_sample(sample, mlp_ckpt, mlp_hidden, mlp_features):
             xp = X[torch.from_numpy(mask)].float().to(device)
             h_full[mask] = model.net[1](model.net[0](xp)).cpu().numpy().astype(np.float32)
     return _split_parity(h_full, sample)
+
+
+def j1b_from_sample(sample, bank, flanking_patterns, svd_k=2048, batch=1024, seed=0):
+    """J1B (interpretable tree-bank) representation on the shared positions:
+    the ~47k tree-leaf one-hot (OpeningTreeMLP over 121-d mover-canonicalized
+    playedeven features), built SPARSE then TruncatedSVD-reduced to svd_k dims so
+    CCGP's per-fold fits are tractable. SVD is a linear reprojection, so the
+    linear-probe CCGP is preserved when svd_k captures the board-relevant
+    variance -- validate via Within (~J1B's board-decode ceiling, ~0.90). If
+    Within is low, raise svd_k.
+
+    Returns (per_parity, aux) on the SAME positions as the rest of the sample."""
+    import scipy.sparse as sp
+    from sklearn.decomposition import TruncatedSVD
+    import train_streaming_probe as tsp
+    from opening_tree_mlp import playedeven_features
+    from experiments.mathematical_transformation_experiments.probe_state_pred_for_othello import get_device
+    device = get_device()
+
+    W_tree, b_tree, meta = tsp.load_trees(bank)
+    mlp = tsp.OpeningTreeMLP(W_tree, b_tree, meta, device)
+    leaf_build = tsp.load_leaf_build(bank)                 # None for binary J1 bank
+    patterns = tsp.load_patterns(flanking_patterns)
+    n_leaves = int(mlp.W.shape[0])
+    games, pos = sample['games'], sample['pos']
+    N = len(games)
+    print(f"  J1B: bank leaves={n_leaves}, building leaf one-hots for {N} positions ...", flush=True)
+
+    rows, cols = [], []
+    for s0 in range(0, N, batch):
+        gg = games[s0:s0 + batch]; tt = pos[s0:s0 + batch]
+        X = np.stack([playedeven_features(g[:int(t)], canonicalize_mover=True)
+                      for g, t in zip(gg, tt)]).astype(np.float32)
+        H = tsp.build_hidden_layer_batch(X, mlp, patterns, None, False, device,
+                                         no_flanking=True, leaf_build=leaf_build,
+                                         leaf_index=None)
+        r, c = np.nonzero(H.cpu().numpy())
+        rows.append(r + s0); cols.append(c)
+        if s0 % (batch * 20) == 0:
+            print(f"    ...{min(s0 + batch, N)}/{N}", flush=True)
+    rows = np.concatenate(rows); cols = np.concatenate(cols)
+    Hs = sp.csr_matrix((np.ones(len(rows), np.float32), (rows, cols)), shape=(N, n_leaves))
+    print(f"  J1B: sparse leaf matrix {Hs.shape}, {Hs.nnz} nnz ({Hs.nnz/N:.0f}/row); "
+          f"TruncatedSVD -> {svd_k}", flush=True)
+    svd = TruncatedSVD(n_components=min(svd_k, n_leaves - 1), random_state=seed)
+    h_red = svd.fit_transform(Hs).astype(np.float32)
+    print(f"  J1B: SVD explained variance = {svd.explained_variance_ratio_.sum():.3f}", flush=True)
+    return _split_parity(h_red, sample)
 
 
 def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
