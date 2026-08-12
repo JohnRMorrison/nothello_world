@@ -140,40 +140,75 @@ def get_mlp_activations(ckpt_path, hidden_dim, features, eval_path, n_sample):
     return out
 
 
-def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample):
-    """Load OGPT, run forward, return residual stream at `layer` + board + positions.
+def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
+                         ply_lo=5, ply_hi=54, seed=0, batch=200):
+    """Load Othello-GPT, run games through it, return per-parity residual-stream
+    activations at `layer` + board labels + ply, mirroring get_mlp_activations.
 
-    Returns dict {"all": (h, board, pos)}.
+    Board labels are ABSOLUTE color {0=empty, 1=white, 2=black}; split by ply
+    parity so that, within a parity group, class 1/2 IS the mine/yours variable
+    (same as the per-parity MLP). One position per game (independent test set).
+
+    `eval_path` is ignored for OGPT (we run real game sequences, not the chunk).
+    Returns dict {even: (h, board, pos), odd: (h, board, pos)}.
     """
-    from data import get_othello
-    from mingpt.dataset import CharDataset
+    import pickle
     from mingpt.model import GPT, GPTConfig
-    from experiments.mathematical_transformation_experiments.heuristic_probe_experiments import (
-        _load_features, get_device,
+    from experiments.mathematical_transformation_experiments.probe_state_pred_for_othello import (
+        extract_activations, tokenize_games, _get_state_stack,
+        GAME_LEN, SYNTHETIC_DIR, get_device,
     )
     device = get_device()
 
-    othello = get_othello(ood_num=100)
-    dataset = CharDataset(othello)
-    mconf = GPTConfig(dataset.vocab_size, dataset.block_size,
-                      n_layer=8, n_head=8, n_embd=512)
-    model = GPT(mconf)
-    model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    model = model.to(device).eval()
+    # Rebuild the GPT config from the checkpoint tensor shapes (robust to
+    # block_size / n_embd differences), then load.
+    sd = torch.load(ckpt_path, map_location='cpu')
+    if isinstance(sd, dict) and 'model' in sd and isinstance(sd['model'], dict):
+        sd = sd['model']
+    vocab, n_embd = sd['tok_emb.weight'].shape
+    block_size = sd['pos_emb'].shape[1]
+    n_layer = 1 + max(int(k.split('.')[1]) for k in sd if k.startswith('blocks.'))
+    mconf = GPTConfig(vocab, block_size, n_layer=n_layer, n_head=8, n_embd=n_embd)
+    model = GPT(mconf); model.load_state_dict(sd); model = model.to(device).eval()
+    if layer >= n_layer:
+        raise ValueError(f"--layer {layer} but model has {n_layer} layers (0..{n_layer-1})")
+    print(f"  OGPT: {n_layer} layers, d={n_embd}, block={block_size}, probing resid_post @ layer {layer}")
 
-    X, Y, pos = _load_features(eval_path)
-    pos_np = pos.numpy() if hasattr(pos, 'numpy') else np.asarray(pos)
-    Y_np = Y.numpy() if hasattr(Y, 'numpy') else np.asarray(Y)
+    # Load enough synthetic games (one probed position each -> need n_sample games).
+    files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
+    games = []
+    for fn in files:
+        with open(os.path.join(SYNTHETIC_DIR, fn), "rb") as f:
+            games.extend(g for g in pickle.load(f) if len(g) == GAME_LEN)
+        if len(games) >= n_sample:
+            break
+    rng = np.random.RandomState(seed)
+    rng.shuffle(games)
+    games = games[:n_sample]
+    print(f"  OGPT: probing {len(games)} games, one ply each in [{ply_lo},{ply_hi})")
 
-    # We need the actual game token sequences, not "when" features. The
-    # feature chunks were precomputed from move histories — extracting those
-    # back out is non-trivial here. For MVP, sample positions from a small
-    # set of synthetic games run through OGPT.
-    raise NotImplementedError(
-        "OGPT activation extraction needs the game-token sequences for the "
-        "sampled positions; for now run --mode-data mlp. Wire this up by "
-        "loading the pickled games corresponding to the eval chunk and "
-        "running them through `model.blocks[:layer]`.")
+    H, B, P = [], [], []
+    for s in range(0, len(games), batch):
+        gb = games[s:s + batch]
+        toks = tokenize_games(gb, seq_len=block_size).to(device)     # (b, block)
+        resid = extract_activations(model, toks, layer)               # (b, block, d)
+        ss = _get_state_stack(gb, 0, block_size).numpy()              # (b, block, 8, 8) in {-1,0,1}
+        for i in range(len(gb)):
+            t = int(rng.randint(ply_lo, ply_hi))
+            H.append(resid[i, t].detach().cpu().numpy())
+            st = ss[i, t].reshape(64)
+            # absolute color: 0 empty, 1 white(-1), 2 black(+1)
+            B.append(np.where(st == 0, 0, np.where(st == -1, 1, 2)).astype(np.int8))
+            P.append(t)
+
+    h = np.stack(H).astype(np.float32)
+    board = np.stack(B)
+    pos = np.asarray(P, dtype=np.int64)
+    out = {}
+    for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
+        if mask.any():
+            out[parity] = (h[mask], board[mask], pos[mask])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -537,8 +572,8 @@ def main():
             args.ckpt, args.hidden, args.features,
             args.eval_chunk, args.n)
     else:
-        per_parity = {"all": get_ogpt_activations(
-            args.ogpt_ckpt, args.layer, args.eval_chunk, args.n)}
+        per_parity = get_ogpt_activations(
+            args.ogpt_ckpt, args.layer, args.eval_chunk, args.n)
 
     print(f"\nLoaded activations:")
     for parity, (h, board, pos) in per_parity.items():
