@@ -494,6 +494,12 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
     quantiles = np.quantile(pos, np.linspace(0, 1, n_bins + 1))
     quantiles[0] -= 0.5; quantiles[-1] += 0.5
     bins = np.digitize(pos, quantiles[1:-1])
+    bin_plyrange = [((int(pos[bins == b].min()), int(pos[bins == b].max()))
+                     if (bins == b).any() else None) for b in range(n_bins)]
+    # per-bin accumulators: ccgp_by_bin[b] = leave-bin-b-out transfer accuracy
+    # (decode bin b from the others); within_by_bin[b] = within-bin ceiling.
+    ccgp_by_bin = [[] for _ in range(n_bins)]
+    within_by_bin = [[] for _ in range(n_bins)]
 
     ccgp_per, within_per = [], []
     for cell in cells:
@@ -534,6 +540,7 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                                nonlinear=nonlinear)
                 if a is not None:
                     fold_acc.append(a)
+                    ccgp_by_bin[held_b].append(a)
             if fold_acc:
                 ccgp_per.append(np.mean(fold_acc))
 
@@ -547,6 +554,7 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                 fold_size = len(idx) // n_folds
                 if fold_size < 20:
                     continue
+                bin_folds = []
                 for f in range(n_folds):
                     te = idx[f * fold_size:(f + 1) * fold_size]
                     tr = np.concatenate([idx[:f * fold_size], idx[(f + 1) * fold_size:]])
@@ -554,18 +562,24 @@ def ccgp_phase(h, board, pos, n_bins=4, classes=(1, 2),
                     a = _probe_acc(h[tr], y[tr], h[te], y[te],
                                    nonlinear=nonlinear)
                     if a is not None:
-                        wf.append(a)
+                        bin_folds.append(a)
+                if bin_folds:
+                    within_by_bin[b].append(np.mean(bin_folds))
+                    wf.extend(bin_folds)
             if wf:
                 within_per.append(np.mean(wf))
 
+    def _m(lst):
+        return float(np.mean(lst)) if lst else float('nan')
     return {
         'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
         'within': float(np.mean(within_per)) if within_per else float('nan'),
         'gap':    float(np.mean(within_per) - np.mean(ccgp_per))
                   if (ccgp_per and within_per) else float('nan'),
         'n_pairs': len(ccgp_per),
-        'per_pair_ccgp': ccgp_per,
-        'per_pair_within': within_per,
+        'bin_plyrange': bin_plyrange,
+        'per_bin_within': [_m(within_by_bin[b]) for b in range(n_bins)],
+        'per_bin_ccgp': [_m(ccgp_by_bin[b]) for b in range(n_bins)],
     }
 
 
@@ -586,6 +600,8 @@ def ccgp_phase_extrap(h, board, pos, n_bins=4, direction="forward", classes=(1, 
     quantiles = np.quantile(pos, np.linspace(0, 1, n_bins + 1))
     quantiles[0] -= 0.5; quantiles[-1] += 0.5
     bins = np.digitize(pos, quantiles[1:-1])
+    bin_plyrange = [((int(pos[bins == b].min()), int(pos[bins == b].max()))
+                     if (bins == b).any() else None) for b in range(n_bins)]
 
     ccgp_per, within_per = [], []
     for cell in cells:
@@ -623,12 +639,18 @@ def ccgp_phase_extrap(h, board, pos, n_bins=4, direction="forward", classes=(1, 
             if wf:
                 within_per.append(np.mean(wf))
 
+    test_idx = (n_bins - 1) if direction == "forward" else 0
+    train_idx = [b for b in range(n_bins) if b != test_idx]
+    tr_lo = min((bin_plyrange[b][0] for b in train_idx if bin_plyrange[b]), default=None)
+    tr_hi = max((bin_plyrange[b][1] for b in train_idx if bin_plyrange[b]), default=None)
     return {
         'ccgp':   float(np.mean(ccgp_per))   if ccgp_per else float('nan'),
         'within': float(np.mean(within_per)) if within_per else float('nan'),
         'gap':    float(np.mean(within_per) - np.mean(ccgp_per))
                   if (ccgp_per and within_per) else float('nan'),
         'n_pairs': len(ccgp_per),
+        'test_plyrange': bin_plyrange[test_idx],
+        'train_plyrange': (tr_lo, tr_hi),
     }
 
 
@@ -881,6 +903,18 @@ def _print_summary(label, res):
     print(f"  Within  = {res['within']:.4f}")
     print(f"  Gap     = {res['gap']:.4f}")
     print(f"  ({res['n_pairs']} (cell, class) pairs averaged)")
+    # phase (leave-one-bin-out): per-bin Within (ceiling at that ply) and per-bin
+    # CCGP (decode that bin from the others), so we can compare to the ply-decay.
+    if 'per_bin_within' in res:
+        print("  per-bin (ply-range: Within / CCGP-into-bin):")
+        for b, rng in enumerate(res['bin_plyrange']):
+            w, c = res['per_bin_within'][b], res['per_bin_ccgp'][b]
+            rs = f"ply {rng[0]:>2}-{rng[1]:<2}" if rng else "empty"
+            print(f"    bin{b} {rs}:  within={w:.3f}  ccgp={c:.3f}")
+    # phase_fwd/bwd: which plies were train vs the extrapolated test bin.
+    if 'test_plyrange' in res:
+        tr, te = res['train_plyrange'], res['test_plyrange']
+        print(f"  train plies {tr[0]}-{tr[1]}  ->  test plies {te[0]}-{te[1]} (extrapolated)")
 
 
 def run_modes(per_parity, aux, args, model_label=""):
