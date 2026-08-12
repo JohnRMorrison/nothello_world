@@ -70,9 +70,14 @@ def main():
         hidden, feat, tag = infer_mlp(path)
         models.append((f"MLP:{tag}", C.mlp_from_sample(sample, path, hidden, feat)))
     if args.j1b_bank:
-        models.append((f"J1B:svd{args.j1b_svd_k}",
-                       C.j1b_from_sample(sample, args.j1b_bank, args.j1b_flanking,
-                                         svd_k=args.j1b_svd_k)))
+        try:
+            models.append((f"J1B:svd{args.j1b_svd_k}",
+                           C.j1b_from_sample(sample, args.j1b_bank, args.j1b_flanking,
+                                             svd_k=args.j1b_svd_k)))
+        except Exception as e:                     # never let J1B kill the whole run
+            import traceback
+            print(f"\n[WARN] J1B extraction failed -- continuing without it:\n{e}", flush=True)
+            traceback.print_exc()
 
     passes = (["linear", "nonlinear"] if args.probes == "both" else [args.probes])
     for probe in passes:
