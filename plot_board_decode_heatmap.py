@@ -27,6 +27,15 @@ BOARD_EDGE = "#666666"
 LABEL_FS = 11
 
 
+def _pretty(stem):
+    """'H4096_move_grid' -> 'H=4096 move_grid'; 'H512_playedeven' -> 'H=512 move_set'."""
+    h, _, rep = stem.partition("_")
+    if h.startswith("H") and h[1:].isdigit():
+        h = f"H={h[1:]}"
+    rep = rep.replace("playedeven", "move_set")
+    return f"{h} {rep}"
+
+
 def _draw_nb(ax, acc64, title, cmap, vmin, vmax):
     """Board-style panel matching presentation_boards.ipynb: fixed-scale cells
     with gray outlines, bold A-H / 1-8 labels, board outline, white background,
@@ -115,14 +124,12 @@ def main():
             ax = axes[i][j]
             if key not in d.files:
                 ax.axis("off"); continue
-            title = stem if nrow == 1 else f"{stem}\n{probe}"
+            title = _pretty(stem) if nrow == 1 else f"{_pretty(stem)}\n{probe}"
             if nb:
                 _draw_nb(ax, d[key], title, args.cmap, vmin, args.vmax)
             else:
                 im = _draw(ax, d[key], title, args.cmap, vmin, args.vmax)
 
-    fig.suptitle(f"Board-decode accuracy per square ({args.probe}, mine/yours frame)",
-                 fontsize=13, fontweight="bold", y=0.99)
     if im is not None:                                   # colorbar only for the plain (imshow) style
         cb = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.02)
         cb.ax.tick_params(labelsize=8)
