@@ -256,21 +256,15 @@ def get_ogpt_activations(ckpt_path, layer, eval_path, n_sample,
 # CCGP probes
 # ---------------------------------------------------------------------------
 
-def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
-                           n_sample, ply_lo=5, ply_hi=54, seed=0, batch=200):
-    """Option (B): produce MLP hidden AND Othello-GPT residual on the SAME
-    positions. For each sampled (game, ply) we build the MLP's 180-d features
-    (played/when/even, step-parity even -- matches the chunk precompute) AND the
-    OGPT token sequence, and take the board label from the same replay. This
-    makes the MLP-vs-OGPT CCGP comparison position-for-position identical.
+def sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo=5, ply_hi=54,
+                            seed=0, batch=200):
+    """Sample (game, ply) positions ONCE and compute the shared, expensive parts:
+    the MLP's 180-d features, the board label, placement aux, and the OGPT
+    residual at `layer` -- all on the SAME positions. Reuse the returned dict
+    across many MLPs (each cheap) via mlp_from_sample() and ogpt_from_sample().
 
-    Validate via the printed `Within` (MLP ~90%, OGPT ~95% at layer 6); if MLP
-    Within is ~chance, the feature build/convention is wrong.
-
-    Returns {'mlp': (per_parity, aux), 'ogpt': (per_parity, aux)}.
-    """
+    One probed ply per game (independent). Returns a dict of numpy arrays."""
     import pickle
-    from train_pattern_simple import DirectMLP, to_move_grid_input
     from mingpt.model import GPT, GPTConfig
     from experiments.mathematical_transformation_experiments.probe_state_pred_for_othello import (
         extract_activations, tokenize_games, _get_state_stack,
@@ -278,13 +272,6 @@ def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
     )
     device = get_device()
     B64_TO_M60 = {c: i for i, c in enumerate(_VALID_MOVES)}
-
-    ck = torch.load(mlp_ckpt, map_location=device)
-    is_mg = (mlp_features == "move_grid") or (ck.get('input_dim') == 3600)
-    input_dim = ck.get('input_dim', 3600 if is_mg else len(_feature_cols(mlp_features)))
-    me = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
-    mo = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
-    me.load_state_dict(ck['even']); mo.load_state_dict(ck['odd']); me.eval(); mo.eval()
 
     sd = torch.load(ogpt_ckpt, map_location='cpu')
     if isinstance(sd, dict) and 'model' in sd and isinstance(sd['model'], dict):
@@ -296,7 +283,6 @@ def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
     gpt.load_state_dict(sd); gpt = gpt.to(device).eval()
     if layer >= n_layer:
         raise ValueError(f"--layer {layer} but OGPT has {n_layer} layers")
-    print(f"  shared: MLP(H={mlp_hidden},{mlp_features}) + OGPT(L{layer}/{n_layer}) on identical positions")
 
     files = sorted(f for f in os.listdir(SYNTHETIC_DIR) if f.endswith(".pickle"))
     games = []
@@ -309,7 +295,7 @@ def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
     rng.shuffle(games); games = games[:n_sample]
     nmoves = rng.randint(ply_lo, ply_hi, size=len(games))
     N = len(games)
-    print(f"  shared: {N} games, one ply each in [{ply_lo},{ply_hi})")
+    print(f"  shared sample: {N} games from {len(files)} pickle(s), one ply each in [{ply_lo},{ply_hi}); OGPT L{layer}/{n_layer}", flush=True)
 
     feat = np.zeros((N, 180), np.float32)
     board = np.zeros((N, 64), np.int8)
@@ -333,23 +319,63 @@ def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
             st = ss[i, t - 1].reshape(64)                            # board after t moves
             board[gi] = np.where(st == 0, 0, np.where(st == -1, 1, 2)).astype(np.int8)
             ogpt_h[gi] = resid[i, t - 1].detach().cpu().numpy()
+        if s0 % (batch * 25) == 0:
+            print(f"    ...{min(s0 + batch, N)}/{N} positions", flush=True)
 
-    if is_mg:
-        X = to_move_grid_input(torch.from_numpy(feat))
-    else:
-        X = torch.from_numpy(feat[:, _feature_cols(mlp_features)])
+    return dict(feat=feat, board=board, pos=pos, place_color=pc, place_step=ps,
+                ogpt_h=ogpt_h, n_embd=n_embd)
 
-    mlp_out, mlp_aux, og_out, og_aux = {}, {}, {}, {}
+
+def _split_parity(h, sample):
+    """Wrap an (N, d) activation array + a sample dict into (per_parity, aux)."""
+    board, pos, pc, ps = sample['board'], sample['pos'], sample['place_color'], sample['place_step']
+    out, aux = {}, {}
     for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
-        if not mask.any():
-            continue
-        model = me if parity == "even" else mo
-        with torch.no_grad():
+        if mask.any():
+            out[parity] = (h[mask], board[mask], pos[mask])
+            aux[parity] = (pc[mask], ps[mask])
+    return out, aux
+
+
+def ogpt_from_sample(sample):
+    """(per_parity, aux) for the OGPT residual already in the sample."""
+    return _split_parity(sample['ogpt_h'], sample)
+
+
+def mlp_from_sample(sample, mlp_ckpt, mlp_hidden, mlp_features):
+    """Run one MLP on the sampled positions -> (per_parity, aux). Cheap; reuse
+    the same `sample` across many MLPs."""
+    from train_pattern_simple import DirectMLP, to_move_grid_input
+    from experiments.mathematical_transformation_experiments.probe_state_pred_for_othello import get_device
+    device = get_device()
+    ck = torch.load(mlp_ckpt, map_location=device)
+    is_mg = (mlp_features == "move_grid") or (ck.get('input_dim') == 3600)
+    input_dim = ck.get('input_dim', 3600 if is_mg else len(_feature_cols(mlp_features)))
+    me = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
+    mo = DirectMLP(input_dim, mlp_hidden, ck.get('n_patterns', 960)).to(device)
+    me.load_state_dict(ck['even']); mo.load_state_dict(ck['odd']); me.eval(); mo.eval()
+
+    feat = sample['feat']
+    X = to_move_grid_input(torch.from_numpy(feat)) if is_mg else torch.from_numpy(feat[:, _feature_cols(mlp_features)])
+    pos = sample['pos']
+    h_full = np.zeros((len(pos), mlp_hidden), np.float32)
+    with torch.no_grad():
+        for parity, mask in (("even", pos % 2 == 0), ("odd", pos % 2 == 1)):
+            if not mask.any():
+                continue
+            model = me if parity == "even" else mo
             xp = X[torch.from_numpy(mask)].float().to(device)
-            h = model.net[1](model.net[0](xp)).cpu().numpy().astype(np.float32)
-        mlp_out[parity] = (h, board[mask], pos[mask]); mlp_aux[parity] = (pc[mask], ps[mask])
-        og_out[parity] = (ogpt_h[mask], board[mask], pos[mask]); og_aux[parity] = (pc[mask], ps[mask])
-    return {'mlp': (mlp_out, mlp_aux), 'ogpt': (og_out, og_aux)}
+            h_full[mask] = model.net[1](model.net[0](xp)).cpu().numpy().astype(np.float32)
+    return _split_parity(h_full, sample)
+
+
+def get_shared_activations(mlp_ckpt, mlp_hidden, mlp_features, ogpt_ckpt, layer,
+                           n_sample, ply_lo=5, ply_hi=54, seed=0, batch=200):
+    """Single MLP-vs-OGPT pair on identical positions (composes the pieces).
+    Returns {'mlp': (per_parity, aux), 'ogpt': (per_parity, aux)}."""
+    sample = sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo, ply_hi, seed, batch)
+    return {'mlp': mlp_from_sample(sample, mlp_ckpt, mlp_hidden, mlp_features),
+            'ogpt': ogpt_from_sample(sample)}
 
 
 def _balance(idx, y, rng):
@@ -746,7 +772,10 @@ def _print_summary(label, res):
 
 
 def run_modes(per_parity, aux, args, model_label=""):
-    """Run the selected CCGP modes for one model's per-parity activations."""
+    """Run the selected CCGP modes for one model's per-parity activations.
+
+    Prints a summary per (mode, parity) and RETURNS {mode: {parity: res}} so a
+    driver can tabulate Gaps across models."""
     hdr = f" [{model_label}]" if model_label else ""
     print(f"\nLoaded activations{hdr}:")
     for parity, (h, board, pos) in per_parity.items():
@@ -755,35 +784,33 @@ def run_modes(per_parity, aux, args, model_label=""):
 
     m, nl = args.ccgp_mode, args.nonlinear
     tag = (f"{hdr} " if hdr else " ") + ("[NONLINEAR probe]" if nl else "[linear probe]")
+    wanted = (["phase", "context", "crowd", "frontier", "spatial", "flip", "recency", "null"]
+              if m == "all" else ["phase", "context"] if m == "both" else [m])
+
+    def compute(mode, h, board, pos, parity):
+        if mode == "phase":    return ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl)
+        if mode == "context":  return ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl)
+        if mode == "crowd":    return ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl)
+        if mode == "frontier": return ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl)
+        if mode == "spatial":  return ccgp_spatial(h, board, nonlinear=nl)
+        if mode == "null":     return ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl)
+        pc, ps = aux[parity]
+        return ccgp_conditioned(h, board, pos, pc, ps, cond=mode, nonlinear=nl)
+
+    labels = {"phase": f"phase: cross-game-phase ({args.n_bins} bins)",
+              "context": "context: diagonal cell", "crowd": "crowd: neighbor-occupancy",
+              "frontier": "frontier: C-adjacent-to-empty", "spatial": "spatial: leave-cells-out shared",
+              "flip": "flip: net-flipped vs never-flipped", "recency": "recency: long-settled vs recent",
+              "null": "null: RANDOM-split control (CCGP~=Within)"}
+
+    results = {mode: {} for mode in wanted}
     for parity, (h, board, pos) in per_parity.items():
         print(f"\n======================================== {model_label} parity={parity}")
-
-        if m in ("phase", "both", "all"):
-            _print_summary(f"phase: cross-game-phase ({args.n_bins} bins){tag}",
-                           ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl))
-        if m in ("context", "both", "all"):
-            _print_summary(f"context: cross-context-cell (diagonal){tag}",
-                           ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl))
-        if m in ("crowd", "all"):
-            _print_summary(f"crowd: neighbor-occupancy context{tag}",
-                           ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl))
-        if m in ("frontier", "all"):
-            _print_summary(f"frontier: C-adjacent-to-empty context{tag}",
-                           ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl))
-        if m in ("spatial", "all"):
-            _print_summary(f"spatial: leave-cells-out shared decoder{tag}",
-                           ccgp_spatial(h, board, nonlinear=nl))
-        if m in ("flip", "all"):
-            pc, ps = aux[parity]
-            _print_summary(f"flip: net-flipped vs never-flipped (occupied C){tag}",
-                           ccgp_conditioned(h, board, pos, pc, ps, cond="flip", nonlinear=nl))
-        if m in ("recency", "all"):
-            pc, ps = aux[parity]
-            _print_summary(f"recency: long-settled vs recent (occupied C){tag}",
-                           ccgp_conditioned(h, board, pos, pc, ps, cond="recency", nonlinear=nl))
-        if m in ("null", "all"):
-            _print_summary(f"null: RANDOM-split control (CCGP~=Within expected){tag}",
-                           ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl))
+        for mode in wanted:
+            res = compute(mode, h, board, pos, parity)
+            results[mode][parity] = res
+            _print_summary(f"{labels[mode]}{tag}", res)
+    return results
 
 
 def main():
