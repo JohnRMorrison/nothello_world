@@ -934,17 +934,28 @@ def run_modes(per_parity, aux, args, model_label=""):
                "spatial", "flip", "recency", "null"]
               if m == "all" else ["phase", "context"] if m == "both" else [m])
 
+    # Optional cell subsampling: the Gap is averaged over cells, so decoding a
+    # random subset gives ~the same mean at proportionally less compute.
+    max_cells = getattr(args, "max_cells", None)
+    if max_cells:
+        _r = np.random.RandomState(0)
+        cells_all = sorted(_r.choice(64, min(max_cells, 64), replace=False).tolist())
+        cells_mov = sorted(_r.choice(_VALID_MOVES, min(max_cells, len(_VALID_MOVES)), replace=False).tolist())
+        print(f"  (max_cells={max_cells}: {len(cells_all)} cells / {len(cells_mov)} movable per mode)")
+    else:
+        cells_all, cells_mov = list(range(64)), list(_VALID_MOVES)
+
     def compute(mode, h, board, pos, parity):
-        if mode == "phase":    return ccgp_phase(h, board, pos, n_bins=args.n_bins, nonlinear=nl)
-        if mode == "phase_fwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="forward", nonlinear=nl)
-        if mode == "phase_bwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="backward", nonlinear=nl)
-        if mode == "context":  return ccgp_context(h, board, pos, ctx_mode="context", nonlinear=nl)
-        if mode == "crowd":    return ccgp_context(h, board, pos, ctx_mode="crowd", nonlinear=nl)
-        if mode == "frontier": return ccgp_context(h, board, pos, ctx_mode="frontier", nonlinear=nl)
-        if mode == "spatial":  return ccgp_spatial(h, board, nonlinear=nl)
-        if mode == "null":     return ccgp_context(h, board, pos, ctx_mode="null", nonlinear=nl)
+        if mode == "phase":    return ccgp_phase(h, board, pos, n_bins=args.n_bins, cells=cells_all, nonlinear=nl)
+        if mode == "phase_fwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="forward", cells=cells_all, nonlinear=nl)
+        if mode == "phase_bwd": return ccgp_phase_extrap(h, board, pos, n_bins=args.n_bins, direction="backward", cells=cells_all, nonlinear=nl)
+        if mode == "context":  return ccgp_context(h, board, pos, ctx_mode="context", cells=cells_all, nonlinear=nl)
+        if mode == "crowd":    return ccgp_context(h, board, pos, ctx_mode="crowd", cells=cells_all, nonlinear=nl)
+        if mode == "frontier": return ccgp_context(h, board, pos, ctx_mode="frontier", cells=cells_all, nonlinear=nl)
+        if mode == "spatial":  return ccgp_spatial(h, board, cells=cells_all, nonlinear=nl)
+        if mode == "null":     return ccgp_context(h, board, pos, ctx_mode="null", cells=cells_all, nonlinear=nl)
         pc, ps = aux[parity]
-        return ccgp_conditioned(h, board, pos, pc, ps, cond=mode, nonlinear=nl)
+        return ccgp_conditioned(h, board, pos, pc, ps, cond=mode, cells=cells_mov, nonlinear=nl)
 
     labels = {"phase": f"phase: leave-one-bin-out ({args.n_bins} bins, interpolation)",
               "phase_fwd": f"phase_fwd: train EARLY -> test LATEST ({args.n_bins} bins, EXTRAPOLATE)",

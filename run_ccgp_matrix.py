@@ -49,6 +49,10 @@ def main():
                     help="Which CCGP mode(s) to run (default all). Single mode "
                          "e.g. phase / phase_fwd / phase_bwd / spatial for sweeps.")
     ap.add_argument("--probes", choices=["linear", "nonlinear", "both"], default="both")
+    ap.add_argument("--max-cells", type=int, default=None,
+                    help="Decode only this many (random) cells per mode instead of "
+                         "all 64. Gap is cell-averaged, so ~3x fewer cells barely "
+                         "moves the mean but is ~3x faster. e.g. 24.")
     ap.add_argument("--j1b-bank", default=None,
                     help="If set (e.g. banks/J1_perpattern.pt), also run J1B "
                          "(tree-leaf one-hot, SVD-reduced) on the same positions.")
@@ -73,7 +77,8 @@ def main():
     passes = (["linear", "nonlinear"] if args.probes == "both" else [args.probes])
     for probe in passes:
         nl = (probe == "nonlinear")
-        run_args = argparse.Namespace(ccgp_mode=args.ccgp_mode, nonlinear=nl, n_bins=args.n_bins)
+        run_args = argparse.Namespace(ccgp_mode=args.ccgp_mode, nonlinear=nl,
+                                      n_bins=args.n_bins, max_cells=args.max_cells)
         print(f"\n############################## PROBE = {probe.upper()} ##############################", flush=True)
         table = {}
         for label, (pp, aux) in models:
