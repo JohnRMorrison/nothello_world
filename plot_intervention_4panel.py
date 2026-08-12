@@ -11,8 +11,9 @@ Then for each intervention sample, compute four margins per relevant cell:
                   [HIGH = surgical: newly-legal cell ranks above all always-illegal]
   Panel (0,1):  min P(always legal) - P(newly legal)
                   [HIGH = surgical: weakest legal cell still beats newly-legal]
-  Panel (1,0):  max P(always legal) - P(newly illegal)
-                  [HIGH = surgical: top legal cell still beats newly-illegal]
+  Panel (1,0):  min P(always legal) - P(newly illegal)
+                  [HIGH = surgical: newly-illegal falls below the WEAKEST legal cell
+                   -> out of the legal band (symmetric with panel (0,1))]
   Panel (1,1):  P(newly illegal) - max P(always illegal)
                   [LOW (negative) = surgical: newly-illegal joins the illegal range]
 
@@ -94,7 +95,7 @@ def compute_four_metrics(samples):
         for c in newly_illegal:
             if ip[c] < 0:
                 continue
-            m3.append(max_al - ip[c])      # max P(AL) - P(NI)
+            m3.append(min_al - ip[c])      # min P(AL) - P(NI): below the legal FLOOR?
             m4.append(ip[c] - max_ai)      # P(NI) - max P(AI)
     return np.array(m1), np.array(m2), np.array(m3), np.array(m4)
 
@@ -148,7 +149,7 @@ def main():
                 "min P(always legal) − P(newly legal)",
                 color='#ff7f0e')
     plot_panel(ax10, m3, thresholds,
-                "max P(always legal) − P(newly illegal)",
+                "min P(always legal) − P(newly illegal)",
                 color='#2ca02c')
     plot_panel(ax11, m4, thresholds,
                 "P(newly illegal) − max P(always illegal)",
@@ -174,7 +175,7 @@ def main():
     for name, vals in [
         ("P(NL) - max P(AI)", m1),
         ("min P(AL) - P(NL)", m2),
-        ("max P(AL) - P(NI)", m3),
+        ("min P(AL) - P(NI)", m3),
         ("P(NI) - max P(AI)", m4),
     ]:
         if len(vals) == 0:
