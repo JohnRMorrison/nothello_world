@@ -33,6 +33,17 @@ from probe_multi_seed_hidden import NonLinearProbe
 
 torch.set_num_threads(os.cpu_count() or 1)
 N_CELLS, N_CLASSES, N_MOVES = 64, 3, 60
+
+
+def _torch_load(path):
+    """Load a checkpoint, compatible with old torch (no weights_only kwarg) and
+    new torch (weights_only defaults to True and would reject these pickles)."""
+    try:
+        return torch.load(path, map_location='cpu', weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location='cpu')
+
+
 FEAT_PLAYEDEVEN = list(range(0, 60)) + list(range(120, 180))
 
 
@@ -173,13 +184,13 @@ def main():
     print(f'eval N={len(pose):,}' + (f'  train N={len(post):,}' if post is not None else ''), flush=True)
 
     for mlp_path in args.mlps:
-        ck = torch.load(mlp_path, map_location='cpu', weights_only=False)
+        ck = _torch_load(mlp_path)
         input_dim, H = ck['input_dim'], ck['hidden_dim']
         rep = {120: 'playedeven', 3600: 'move_grid'}[input_dim]
         me = DirectMLP(input_dim, H).to(device); me.load_state_dict(ck['even']); me.eval()
         mo = DirectMLP(input_dim, H).to(device); mo.load_state_dict(ck['odd']); mo.eval()
         probe_path = mlp_path.replace('pattern_simple_direct_', 'probe_direct_')
-        pk = torch.load(probe_path, map_location='cpu', weights_only=False)
+        pk = _torch_load(probe_path)
         lin_e = nn.Linear(H, 192).to(device); lin_e.load_state_dict(pk['even']); lin_e.eval()
         lin_o = nn.Linear(H, 192).to(device); lin_o.load_state_dict(pk['odd']); lin_o.eval()
         print(f"\n######### {os.path.basename(mlp_path)}  (rep={rep}, H={H}) #########", flush=True)
@@ -187,7 +198,7 @@ def main():
         # non-linear probe: load a full-chunk-trained one (fair) or train here (floor)
         if args.load_nonlinear:
             nl_path = mlp_path.replace('pattern_simple_', 'probe_nonlinear_')
-            nk = torch.load(nl_path, map_location='cpu', weights_only=False)
+            nk = _torch_load(nl_path)
             nlp_e = NonLinearProbe(H).to(device); nlp_e.load_state_dict(nk['even']); nlp_e.eval()
             nlp_o = NonLinearProbe(H).to(device); nlp_o.load_state_dict(nk['odd']); nlp_o.eval()
             nl_tag = f"NON-LINEAR probe (loaded {os.path.basename(nl_path)}, full-chunk)"
