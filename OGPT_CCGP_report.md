@@ -47,7 +47,7 @@ test on the other.
 | **phase_bwd** | train latest bins → test **earliest** bin (**extrapolate backward**) | does the code learned late cover early boards it never saw? |
 | **spatial** | leave-cells-out: train a single decoder pooled over some squares → decode held-out squares | is there **one shared** "is-mine" direction reused across all 64 squares (translation-invariance)? |
 
-## Results (Othell-GPT, layer 6, N=100k)
+## Results (Othello-GPT, layer 6, N=100k)
 
 Gap ordered small → large:
 
