@@ -48,9 +48,9 @@ def _draw_nb(ax, acc64, title, cmap, vmin, vmax):
         ax.text(c, -1.05, COLS[c], ha="center", va="center", fontsize=LABEL_FS, fontweight="bold")
     for r in range(8):                                   # ranks 1-8 down the left
         ax.text(-1.05, r, str(r + 1), ha="center", va="center", fontsize=LABEL_FS, fontweight="bold")
-    ax.text(3.5, -1.85, title, ha="center", va="center", fontsize=12, fontweight="bold")
+    ax.text(3.5, -2.35, title, ha="center", va="center", fontsize=9, fontweight="bold")
     ax.set_xlim(-1.7, 7.7)
-    ax.set_ylim(7.7, -2.3)                               # y inverted (rank 1 top), title gutter
+    ax.set_ylim(7.7, -3.1)                               # y inverted (rank 1 top), title gutter
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -81,7 +81,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
     ap.add_argument("--probe", choices=["linear", "nonlinear", "both"], default="linear")
-    ap.add_argument("--cmap", default="viridis")
+    ap.add_argument("--cmap", default="Greys_r",
+                    help="default Greys_r = B&W (light=high acc), matching the "
+                         "deck; use viridis etc. for color.")
     ap.add_argument("--vmin", type=float, default=None, help="default: data min")
     ap.add_argument("--vmax", type=float, default=1.0)
     ap.add_argument("--style", choices=["plain", "notebook"], default="notebook",
@@ -113,7 +115,7 @@ def main():
             ax = axes[i][j]
             if key not in d.files:
                 ax.axis("off"); continue
-            title = stem if nrow == 1 else f"{stem}  ({probe})"
+            title = stem if nrow == 1 else f"{stem}\n{probe}"
             if nb:
                 _draw_nb(ax, d[key], title, args.cmap, vmin, args.vmax)
             else:
