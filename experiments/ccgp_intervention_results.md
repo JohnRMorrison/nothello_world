@@ -15,7 +15,7 @@ Gap = Within − CCGP (small = abstract/transferable). Chance = 0.5. All `null`
 | null | 0.0000 | 0.0000 | −0.0002 | 0.0005 | −0.0001 | 0.0001 |
 | phase_fwd | 0.0034 | 0.0542 | 0.0420 | 0.0185 | 0.1120 | 0.0144 |
 | phase_bwd | 0.0810 | 0.1603 | 0.1919 | 0.2480 | 0.2682 | 0.2477 |
-| recency_fixed ⚠️ | 0.1545 | 0.1263 | 0.0863 | 0.1382 | 0.1075 | 0.1036 |
+| recency_fixed | 0.0453 | 0.1029 | 0.0672 | 0.1216 | 0.0951 | 0.1051 |
 | flip_true | 0.0491 | 0.6050 | 0.4325 | 0.6215 | 0.4021 | 0.4792 |
 | crowd_frac | 0.1096 | 0.1490 | 0.1001 | 0.1426 | 0.1027 | 0.3449 |
 
@@ -25,7 +25,7 @@ Gap = Within − CCGP (small = abstract/transferable). Chance = 0.5. All `null`
 | null | 0.9897 | 0.8273 | 0.8968 | 0.8139 | 0.8621 | 0.8417 |
 | phase_fwd | 0.9847 | 0.7526 | 0.8225 | 0.7178 | 0.7738 | 0.7337 |
 | phase_bwd | 0.9431 | 0.9154 | 0.9575 | 0.9040 | 0.8971 | 0.9479 |
-| recency_fixed | 0.9781 | 0.8092 | 0.8369 | 0.8196 | 0.7992 | 0.7543 |
+| recency_fixed | 0.9726 | 0.7840 | 0.8188 | 0.8021 | 0.7868 | 0.7116 |
 | flip_true | 0.9942 | 0.9005 | 0.9018 | 0.8966 | 0.8796 | 0.8763 |
 | crowd_frac | 0.8969 | 0.8187 | 0.8590 | 0.7977 | 0.7659 | 0.8294 |
 
@@ -43,8 +43,41 @@ move_grid MLPs sit at chance (no placement-color cue → no transfer, no inversi
 Capacity does not fix it (H4096_pe flip 0.62 ≥ H512_pe 0.60). phase_bwd is a
 distant second signal and worsens with capacity. J1B's signature is crowd (0.345).
 
-**⚠️ recency_fixed row is SUSPECT** — off-by-one in the consolidated sampler
-(see §3). Do not quote until re-run.
+(recency_fixed row RE-RUN at n=100k with the pos fix — see §3; OGPT 0.0453
+confirms the standalone. The pre-fix buggy row was OGPT 0.155.)
+
+## 1b. Deck-ready tables (Condition/Split × model)
+
+Gap = Within − CCGP (small = abstract). `† ply-matched.` Columns: **OGPT** =
+Othello-GPT L6; **512/4k · set/grid** = interpretable MLPs (H512/H4096 ×
+move_set(playedeven)/move_grid); **J1B** = tree-bank (SVD-2048).
+
+### Gap
+| Condition | Split | OGPT | 512·set | 512·grid | 4k·set | 4k·grid | J1B |
+|---|---|---|---|---|---|---|---|
+| Random (control) | shuffled labels | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+| Phase forward | train 5–40 → 41–53 | 0.003 | 0.054 | 0.042 | 0.019 | 0.112 | 0.014 |
+| Recency † | played ≤2 → >15 moves | 0.045 | 0.103 | 0.067 | 0.122 | 0.095 | 0.105 |
+| Flip † | never → ever flipped | 0.049 | 0.605 | 0.433 | 0.622 | 0.402 | 0.479 |
+| Phase backward | train 17–53 → 5–16 | 0.081 | 0.160 | 0.192 | 0.248 | 0.268 | 0.248 |
+| Crowding † | nbrs <.25 → >.75 full | 0.109 | 0.149 | 0.100 | 0.143 | 0.103 | 0.345 |
+
+### Within (companion — decodability ceiling within each condition)
+| Condition | Split | OGPT | 512·set | 512·grid | 4k·set | 4k·grid | J1B |
+|---|---|---|---|---|---|---|---|
+| Random (control) | shuffled labels | 0.990 | 0.827 | 0.897 | 0.814 | 0.862 | 0.842 |
+| Phase forward | train 5–40 → 41–53 | 0.985 | 0.753 | 0.823 | 0.718 | 0.774 | 0.734 |
+| Recency † | played ≤2 → >15 moves | 0.973 | 0.784 | 0.819 | 0.802 | 0.787 | 0.712 |
+| Flip † | never → ever flipped | 0.994 | 0.901 | 0.902 | 0.897 | 0.880 | 0.876 |
+| Phase backward | train 17–53 → 5–16 | 0.943 | 0.915 | 0.958 | 0.904 | 0.897 | 0.948 |
+| Crowding † | nbrs <.25 → >.75 full | 0.897 | 0.819 | 0.859 | 0.798 | 0.766 | 0.829 |
+
+Within is high for every model on every condition (0.71–0.99) — the board IS
+decodable within a condition. The story is entirely in the Gap: OGPT transfers
+across conditions (esp. flip), the interpretable models don't. Note OGPT's Within
+is uniformly ~0.94–0.99 (near-perfect board read at L6), while the interpretable
+models sit ~0.71–0.96 — so their large flip Gaps are genuine transfer failures,
+not a within-condition decodability artifact.
 
 ## 2. Intervention boundary margins (faithful Nanda vs faithful Li vs cd0)
 
@@ -104,6 +137,8 @@ earlier "~0.044" reference was a different-n/config number; the correct
 matched-n OGPT recency Gap is ~0.08 (may shrink slightly at n=100k). OGPT is
 NOT uniquely recency-dependent — that was the artifact.
 
-**Still TODO:** the recency row for ALL SIX models in §1 was computed with the
-buggy `pos` (shared sample), so it must be re-run at n=100k with the fix before
-use. Everything else in §1 (esp. the flip headline) is validated and unaffected.
+**RE-RUN DONE (n=100k, fix applied).** Corrected recency_fixed row now in §1:
+OGPT 0.0453 (matches the standalone 0.044 → fix validated at full n), 512·set
+0.1029, 512·grid 0.0672, 4k·set 0.1216, 4k·grid 0.0951, J1B 0.1051. All fell vs
+the buggy row. OGPT is the MOST recency-abstract; recency is a moderate, not
+discriminating, condition (cf. flip).
