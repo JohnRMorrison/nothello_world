@@ -112,7 +112,7 @@ def main():
           f">= {args.settled_min} moves ago  (match_ply={args.match_ply})", flush=True)
     per_parity, aux = C.get_ogpt_activations(args.ogpt_ckpt, args.layer, None, args.n)
     for parity, (h, board, pos) in per_parity.items():
-        place_color, place_step = aux[parity]
+        place_color, place_step = aux[parity][:2]
         r = recency_extreme(h, board, pos, place_step, recent_max=args.recent_max,
                             settled_min=args.settled_min, nonlinear=args.nonlinear,
                             match_ply=args.match_ply)

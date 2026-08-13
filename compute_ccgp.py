@@ -301,7 +301,12 @@ def sample_shared_positions(ogpt_ckpt, layer, n_sample, ply_lo=5, ply_hi=54,
     board = np.zeros((N, 64), np.int8)
     pc = np.zeros((N, 64), np.int8); ps = np.full((N, 64), -1, np.int16)
     ever = np.zeros((N, 64), np.int8)                                 # ever-flipped (>=1 capture)
-    pos = np.asarray(nmoves, dtype=np.int64)
+    # pos = index of the LAST move on the board. board/residual sit at token
+    # t-1 (state after t moves, steps 0..t-1) and place_step is 0-indexed over
+    # 0..t-1, so the current-ply index is t-1, not t. Using nmoves here left
+    # rec = pos - place_step one too large (no rec=0 bucket), which inflated the
+    # recency-CCGP Gap vs get_ogpt_activations. -1 aligns the two conventions.
+    pos = np.asarray(nmoves - 1, dtype=np.int64)
     ogpt_h = np.zeros((N, n_embd), np.float32)
 
     for s0 in range(0, N, batch):
