@@ -1,0 +1,49 @@
+{
+  "n_positions": 5000,
+  "n_interventions": 81079,
+  "n_shared": 81078,
+  "K": 1.0,
+  "cal_depth": 0,
+  "models": {
+    "j1b": {
+      "flip|newly_legal": {
+        "n": 41147,
+        "topn_before": 0.8198850063723409,
+        "topn_after": 0.8230602465388667,
+        "topn_shift": 0.0031752401665257877
+      },
+      "flip|newly_illegal": {
+        "n": 26420,
+        "topn_before": 0.7854248174624282,
+        "topn_after": 0.8039144685267443,
+        "topn_shift": 0.01848965106431607
+      },
+      "flip|both": {
+        "n": 13511,
+        "topn_before": 0.7747154820517617,
+        "topn_after": 0.7947675918879266,
+        "topn_shift": 0.020052109836164882
+      }
+    },
+    "ogpt": {
+      "flip|newly_legal": {
+        "n": 41147,
+        "topn_before": 0.8883087753665018,
+        "topn_after": 0.8914209245826289,
+        "topn_shift": 0.0031121492161271342
+      },
+      "flip|newly_illegal": {
+        "n": 26420,
+        "topn_before": 0.8793073857239481,
+        "topn_after": 0.8792559064870428,
+        "topn_shift": -5.14792369052785e-05
+      },
+      "flip|both": {
+        "n": 13511,
+        "topn_before": 0.8706960927004374,
+        "topn_after": 0.8713242196172186,
+        "topn_shift": 0.0006281269167811896
+      }
+    }
+  }
+}

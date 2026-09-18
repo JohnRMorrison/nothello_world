@@ -1,0 +1,77 @@
+{
+  "n_positions": 5000,
+  "n_interventions": 81079,
+  "n_shared": 81055,
+  "K": 4.0,
+  "cal_depth": 2,
+  "models": {
+    "j1b": {
+      "ALL|pooled": {
+        "n": 81055,
+        "topn_before": 0.8011193200650795,
+        "topn_after": 0.8199909347880828,
+        "topn_shift": 0.01887161472300336,
+        "err_before": 4.024723952871507,
+        "err_after": 3.6397014372956633
+      },
+      "flip|newly_legal": {
+        "n": 41145,
+        "topn_before": 0.8198740812125029,
+        "topn_after": 0.8313499306478224,
+        "topn_shift": 0.011475849435319386,
+        "err_before": 3.7448535666545144,
+        "err_after": 3.5138655972779196
+      },
+      "flip|newly_illegal": {
+        "n": 26404,
+        "topn_before": 0.7854208565354107,
+        "topn_after": 0.806671061245525,
+        "topn_shift": 0.021250204710114306,
+        "err_before": 4.0519618239660655,
+        "err_after": 3.629374337221633
+      },
+      "flip|both": {
+        "n": 13506,
+        "topn_before": 0.7746745979879754,
+        "topn_after": 0.8114267452699958,
+        "topn_shift": 0.03675214728202035,
+        "err_before": 4.824078187472234,
+        "err_after": 4.043240041463053
+      }
+    },
+    "ogpt": {
+      "ALL|pooled": {
+        "n": 81055,
+        "topn_before": 0.8824410772008454,
+        "topn_after": 0.982524406135098,
+        "topn_shift": 0.10008332893425258,
+        "err_before": 2.3658256739251127,
+        "err_after": 0.3211893158966134
+      },
+      "flip|newly_legal": {
+        "n": 41145,
+        "topn_before": 0.8882979211500722,
+        "topn_after": 0.981998396614598,
+        "topn_shift": 0.09370047546452573,
+        "err_before": 2.340794750273423,
+        "err_after": 0.33758658403208164
+      },
+      "flip|newly_illegal": {
+        "n": 26404,
+        "topn_before": 0.8793246030956439,
+        "topn_after": 0.9802330140266735,
+        "topn_shift": 0.10090841093102963,
+        "err_before": 2.214437206483866,
+        "err_after": 0.3363884259960612
+      },
+      "flip|both": {
+        "n": 13506,
+        "topn_before": 0.8706913021366376,
+        "topn_after": 0.9886064866142791,
+        "topn_shift": 0.11791518447764145,
+        "err_before": 2.7380423515474606,
+        "err_after": 0.24152228639123352
+      }
+    }
+  }
+}
