@@ -46,27 +46,37 @@ Usage
 
 PROTOCOL STATUS - READ BEFORE USING (2026-09-18)
 ------------------------------------------------
-The OGPT side inherits ogpt_legal_mass_shift.py's parameterisation, which ties
-the edit layer to the single layer-6 probe:  intervene_layer = 6 - cal_depth.
-That means:
+Calibration here is LOCAL: the probe is applied directly to the edited
+activation at the edit layer (no forward pass between edit and probe).  So the
+"probe layer" is simply whichever probe you pass via --probe-path, and it must
+match the layer you edit.
 
-  --cal-depth 0  -> edit at resid_post block 6, calibrated with the layer-6
-                    probe (native, but NOT the layer Nanda edits)
-  --cal-depth 2  -> edit at resid_post block 4, but calibrated at layer 6
-                    (right layer, NON-native: alpha must be large enough to
-                    survive two blocks, hence the K~4 multiplier needed)
+  edit layer = --intervene-layer, else 6 - --cal-depth
 
-NEITHER is Nanda's protocol, which edits at layer 4 and calibrates against the
-LAYER-4 (native) probe -- cf. multi_intervention.py, whose --layer-probe default
-is "layer-intervene - 1, i.e. native" and --cal-depth 0 = "local (native probe)".
-Doing that needs a layer-4 probe, which is not in the repo (only the layer-6
-main_linear_probe.pth); train one with
-    train_nanda_probe_extended.py --layer 4
-which emits the same (3, 512, 8, 8, 3) format this script consumes.
+With the default probe (main_linear_probe.pth, trained at layer 6):
+  --intervene-layer 6   native/matched  (probe layer == edit layer)
+  --intervene-layer 4   MISMATCHED: the layer-6 probe applied to layer-4
+                        activations.  This is why the committed numbers needed
+                        K~4 to show an effect -- not because alpha had to
+                        survive propagation.
 
-Consequently, any comparison here between cal_depth settings confounds the edit
-layer with the calibration target, and the cross-model (OGPT vs MLP) rows
-inherit that confound.  Treat the committed numbers as provisional.
+NANDA'S PROTOCOL = edit at layer 4 against the LAYER-4 (native) probe, cf.
+multi_intervention.py (--layer-probe default "layer-intervene - 1, i.e. native";
+--cal-depth 0 = "local (native probe)").  The repo ships only the layer-6 probe,
+so train one:
+
+    python train_nanda_probe_extended.py --layer 4 \
+        --output mechanistic_interpretability/main_linear_probe_L4.pth
+
+then run:
+
+    python topn_intervention_compare.py --n-positions 5000 \
+        --models ogpt --categories flip --K 1 \
+        --intervene-layer 4 \
+        --probe-path mechanistic_interpretability/main_linear_probe_L4.pth
+
+The committed numbers used the MISMATCHED layer-6-probe-at-layer-4 setting and
+are therefore provisional; cross-model rows inherit the same caveat.
 """
 import argparse
 import json
@@ -388,7 +398,10 @@ def run_mlp(args, positions, entries, seqs_string, device, which):
 def run_ogpt(args, positions, entries, seqs_int, device):
     model = oms.load_model(args.ckpt, device)
     probe = oms.load_probe(args.probe_path, device)
-    INTERVENE_LAYER = oms.intervene_layer_for(args.cal_depth, oms.PROBE_LAYER)
+    INTERVENE_LAYER = (args.intervene_layer if args.intervene_layer is not None
+                       else oms.intervene_layer_for(args.cal_depth, oms.PROBE_LAYER))
+    print(f"  OGPT: editing resid_post block {INTERVENE_LAYER}; calibration is LOCAL "
+          f"at that layer using {os.path.basename(args.probe_path)}")
     probe_mode = oms.PROBE_KIND_TO_MODE[args.probe_kind]
 
     by_pid = defaultdict(list)
@@ -507,7 +520,12 @@ def main():
     ap.add_argument('--ckpt', default='ckpts/gpt_nanda_synthetic.ckpt')
     ap.add_argument('--probe-path', default='mechanistic_interpretability/main_linear_probe.pth')
     ap.add_argument('--probe-kind', default='mode0_mineyours')
-    ap.add_argument('--cal-depth', type=int, default=0)
+    ap.add_argument('--cal-depth', type=int, default=0,
+                    help='legacy: intervene_layer = 6 - cal_depth. Prefer --intervene-layer.')
+    ap.add_argument('--intervene-layer', type=int, default=None,
+                    help='resid_post block to edit. Calibration is LOCAL at this layer '
+                         'using --probe-path, so pass the probe trained at THIS layer '
+                         '(Nanda: --intervene-layer 4 with a layer-4 probe).')
     ap.add_argument('--int-path', default='mechanistic_interpretability/board_seqs_int_small.npy')
     ap.add_argument('--string-path', default='mechanistic_interpretability/board_seqs_string_small.npy')
     ap.add_argument('--device', default=None)
