@@ -325,6 +325,7 @@ def generate_balanced_games(new_rules, legal_budget, rng, min_len=5,
     their per-decision turn_records.
     """
     new_set = set(NEW_SQUARE_IDS)
+    n_pos_seen = 0                    # unique id per scored position, for SDT
     games, records = [], []
     n_new_legal = 0
     i = 0
@@ -364,6 +365,7 @@ def build_test_manifest(games, records, n_positions=5000, min_turn=4):
     LL: standard moves legal -> retention check.
     """
     new_set = set(NEW_SQUARE_IDS)
+    n_pos_seen = 0                    # unique id per scored position, for SDT
     test_IL, test_LL = [], []
     used_IL, used_LL = set(), set()
 
@@ -424,7 +426,28 @@ def _auc(strength, label):
     return float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
-def _sdt(strength, label, calib, cell=None):
+def _rank_within_position(strength, posid):
+    """Replace each score by its tie-averaged rank among the new squares of its
+    OWN position.  Removes anything that scales a whole position at once --
+    above all the softmax denominator, which is shared by all 8 new squares and
+    is systematically different in positions where new squares tend to be legal
+    (later game, more discs, more legal moves)."""
+    out = np.empty(len(strength), float)
+    order = np.argsort(posid, kind='mergesort')
+    s = 0
+    while s < len(order):
+        e = s
+        while e < len(order) and posid[order[e]] == posid[order[s]]:
+            e += 1
+        idx = order[s:e]
+        u, inv, cnt = np.unique(strength[idx], return_inverse=True,
+                               return_counts=True)
+        out[idx] = (np.cumsum(cnt) - (cnt - 1) / 2.0)[inv]
+        s = e
+    return out
+
+
+def _sdt(strength, label, calib, cell=None, posid=None):
     """Signal-detection summary for the 'is this new square legal?' decision.
 
     Each of the 8 new squares in each test position is one trial: a SIGNAL
@@ -439,16 +462,14 @@ def _sdt(strength, label, calib, cell=None):
     score.  Lower criterion = more willing to call a new square legal.
 
     Two readings:
-      AUC_within / dprime_within  THE ONE TO REPORT.  AUC computed separately
-        for each new square -- its legal trials against its own illegal trials
-        -- then averaged.  A new token starts with a random embedding, so each
-        new square carries a roughly constant score across positions; pooling
-        the 8 squares lets that constant correlate with how often each square
-        happens to be legal, which put the untrained model at AUC 0.64 rather
-        than 0.50.  Comparing a square only against itself cancels the offset,
-        so chance is 0.5 for real and the two conditions share a floor.
-      AUC / dprime_auc  the same thing pooled over all 8 squares; kept for
-        continuity, but carries the per-square base-rate artifact above.
+      AUC_within / dprime_within  THE ONE TO REPORT.  Scores are first ranked
+        against the other new squares of the SAME position, then each square is
+        judged against ITSELF across positions, and the per-square AUCs are
+        averaged.  Both steps are needed: see _rank_within_position and the
+        comment in the body.  Chance is 0.5 for real, so the coherent and
+        incoherent runs share a floor.
+      AUC / dprime_auc  raw scores pooled over all 8 squares; kept for
+        continuity, but carries both artifacts and is NOT a clean floor.
       hit / FA / dprime / criterion  at the calibrated criterion: a square is
         "called legal" when it carries at least half of 1/n_legal, the share a
         perfectly calibrated model puts on each legal move.  Rates get the
@@ -472,13 +493,21 @@ def _sdt(strength, label, calib, cell=None):
 
     auc = _auc(strength, label)
 
-    # per-square AUC: each new square judged only against itself, so its
-    # constant random offset cannot masquerade as sensitivity
+    # Two nuisances have to go, and they need different controls:
+    #   position level -- the shared softmax denominator; killed by ranking the
+    #     8 new squares against each other WITHIN a position
+    #   square level   -- a new token's random embedding gives each square a
+    #     near-constant offset; killed by judging each square against ITSELF
+    # Neither alone suffices: on the real manifest an untrained model sat at
+    # AUC 0.64 pooled and still 0.64 within-square.  Ranking first, then
+    # comparing each square to itself, gives exactly 0.5 under either nuisance.
+    ranked = (_rank_within_position(strength, np.asarray(posid))
+              if posid is not None else strength)
     per_sq = {}
     if cell is not None:
         for c in np.unique(cell):
             m = cell == c
-            a = _auc(strength[m], label[m])
+            a = _auc(ranked[m], label[m])
             if a is not None:
                 per_sq[int(c)] = a
     auc_within = float(np.mean(list(per_sq.values()))) if per_sq else float('nan')
@@ -514,9 +543,10 @@ def score_manifest(score_fn, manifest, per_bucket=True):
     out = {}
     buckets = {}
     new_set = set(NEW_SQUARE_IDS)
+    n_pos_seen = 0                    # unique id per scored position, for SDT
     # signal-detection trials, pooled over BOTH sets: every new square in every
     # position, labelled by whether it is actually legal there
-    sdt_strength, sdt_label, sdt_calib, sdt_cell = [], [], [], []
+    sdt_strength, sdt_label, sdt_calib, sdt_cell, sdt_pos = [], [], [], [], []
     for set_name in ('IL', 'LL'):
         positions = manifest.get(set_name, [])
         tot_prob = tot_acc = tot_frac = tot_per_tgt = 0.0
@@ -527,6 +557,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
             if len(prefix) < 1:
                 continue
             scores = score_fn(prefix)                 # (N_CELLS,)
+            n_pos_seen += 1
             valid_targets = [c for c in targets if 0 <= c < N_CELLS]
             prob = float(sum(scores[c] for c in valid_targets))
             acc = 1.0 if int(np.argmax(scores)) in set(targets) else 0.0
@@ -555,6 +586,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
                     sdt_label.append(1 if c in legal_here else 0)
                     sdt_calib.append(float(scores[c]) * n_legal)
                     sdt_cell.append(c)
+                    sdt_pos.append(n_pos_seen)
             if per_bucket and set_name == 'IL' and 'bucket' in pos:
                 key = tuple(pos['bucket'])
                 b = buckets.setdefault(key, {'prob': 0.0, 'acc': 0.0, 'n': 0})
@@ -566,7 +598,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
         out[f'{set_name}_prob_frac'] = tot_frac / max(n, 1)
         out[f'{set_name}_prob_per_target'] = tot_per_tgt / max(n, 1)
         out[f'{set_name}_n'] = n
-    out.update(_sdt(sdt_strength, sdt_label, sdt_calib, sdt_cell))
+    out.update(_sdt(sdt_strength, sdt_label, sdt_calib, sdt_cell, sdt_pos))
     if per_bucket:
         out['IL_buckets'] = {
             f'{L}_{nl}': {'prob': b['prob'] / b['n'],
