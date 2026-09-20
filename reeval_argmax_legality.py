@@ -113,6 +113,11 @@ def _probor_and_max(probe, Hf):
     return po_sum / n, (mx_sum / n if (mx_ok and mx_sum is not None) else None)
 
 
+_CENTER = np.array([27, 28, 35, 36], dtype=int)
+_CENTER_MASK = np.zeros(64, dtype=bool)
+_CENTER_MASK[_CENTER] = True
+
+
 @torch.no_grad()
 def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
                                 use_relu, device, batch=1024, no_flanking=False):
@@ -124,6 +129,10 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
     total_percell_correct = 0
     total_positions = 0
     total_cells = 0
+    total_top3_hits = 0
+    total_top5_hits = 0
+    total_pct5_hits = 0
+    total_pct10_hits = 0
     per_ply_hits = {}
     per_ply_n = {}
 
@@ -153,6 +162,33 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         total_percell_correct += int((preds_binary == L_batch).sum())
         total_positions += X_batch.shape[0]
         total_cells += X_batch.shape[0] * BOARD_CELLS
+
+        # ── top-3 / top-5 legal-move rates ───────────────────────────────────
+        p_sort = probs_np.copy()
+        p_sort[:, _CENTER] = -1.0          # exclude center from ranking
+        sorted_idx = p_sort.argsort(axis=1)[:, ::-1]   # descending
+        legal_np = (L_batch > 0)
+        for k, counter_attr in ((3, 'top3'), (5, 'top5')):
+            topk = sorted_idx[:, :k]       # (B, k)
+            # position is "hit" if ALL top-k cells are legal
+            all_legal = np.array([legal_np[j, topk[j]].all()
+                                  for j in range(len(X_batch))])
+            if k == 3:
+                total_top3_hits += int(all_legal.sum())
+            else:
+                total_top5_hits += int(all_legal.sum())
+
+        # ── >5% / >10% on any illegal cell ───────────────────────────────────
+        p_norm = probs_np.copy()
+        p_norm[:, _CENTER] = 0.0
+        row_sums = p_norm.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        p_norm /= row_sums
+        illegal_valid = (~_CENTER_MASK) & (~legal_np)   # (B, 64)
+        max_illegal = np.where(illegal_valid, p_norm, 0.0).max(axis=1)   # (B,)
+        total_pct5_hits  += int((max_illegal > 0.05).sum())
+        total_pct10_hits += int((max_illegal > 0.10).sum())
+
     return {
         'argmax_acc': total_argmax_hits / total_positions,
         'pos_perfect_acc': total_pos_perfect / total_positions,
@@ -160,6 +196,10 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         'n_positions': total_positions,
         'argmax_acc_max': (total_argmax_hits_max / total_positions
                            if total_positions else 0.0),
+        'top3_acc':     total_top3_hits  / total_positions,
+        'top5_acc':     total_top5_hits  / total_positions,
+        'pct5_illegal': total_pct5_hits  / total_positions,
+        'pct10_illegal':total_pct10_hits / total_positions,
         'ply_argmax': {b: per_ply_hits[b] / per_ply_n[b]
                         for b in sorted(per_ply_hits)},
         'ply_n': {b: per_ply_n[b] for b in sorted(per_ply_n)},
@@ -216,8 +256,8 @@ def main():
                     default=('experiments/mathematical_transformation_experiments/'
                              'heuristic_probe_results/feature_chunks/chunk_ext_0039.npz'))
     ap.add_argument('--max-positions', type=int, default=500_000)
-    ap.add_argument('--ply-min', type=int, default=10)
-    ap.add_argument('--ply-max', type=int, default=50)
+    ap.add_argument('--ply-min', type=int, default=5)
+    ap.add_argument('--ply-max', type=int, default=53)
     ap.add_argument('--canonicalize-mover', action='store_true',
                     help='Override -- otherwise detected from probe saved_args.')
     args = ap.parse_args()
@@ -278,6 +318,10 @@ def main():
         if res.get('argmax_acc_max') is not None:
             print(f'  argmax-legality:  prob-OR={100*res["argmax_acc"]:.2f}%   '
                   f'max={100*res["argmax_acc_max"]:.2f}%   (N={res["n_positions"]})')
+        print(f'  top-3 legal-move rate:  {100*res["top3_acc"]:.2f}%')
+        print(f'  top-5 legal-move rate:  {100*res["top5_acc"]:.2f}%')
+        print(f'  >5%  on illegal move:   {100*res["pct5_illegal"]:.2f}%')
+        print(f'  >10% on illegal move:   {100*res["pct10_illegal"]:.2f}%')
         print(f'  ply argmax:', end=' ')
         for b in sorted(res['ply_argmax']):
             print(f'[{b:2d}-{b+9})={100*res["ply_argmax"][b]:5.1f}% (n={res["ply_n"][b]})',
