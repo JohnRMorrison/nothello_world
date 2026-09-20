@@ -408,7 +408,23 @@ def build_test_manifest(games, records, n_positions=5000, min_turn=4):
 # Model-agnostic evaluation of a test manifest
 # ============================================================================
 
-def _sdt(strength, label, calib):
+def _auc(strength, label):
+    """Rank AUC with ties shared; None if either class is empty."""
+    n1, n0 = int(label.sum()), int((1 - label).sum())
+    if n1 == 0 or n0 == 0:
+        return None
+    order = np.argsort(strength, kind='mergesort')
+    ranks = np.empty(len(strength), float)
+    ranks[order] = np.arange(1, len(strength) + 1)
+    uniq, inv, counts = np.unique(strength, return_inverse=True,
+                                  return_counts=True)
+    if (counts > 1).any():
+        sums = np.bincount(inv, weights=ranks, minlength=len(uniq))
+        ranks = (sums / counts)[inv]
+    return float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def _sdt(strength, label, calib, cell=None):
     """Signal-detection summary for the 'is this new square legal?' decision.
 
     Each of the 8 new squares in each test position is one trial: a SIGNAL
@@ -423,7 +439,16 @@ def _sdt(strength, label, calib):
     score.  Lower criterion = more willing to call a new square legal.
 
     Two readings:
-      AUC / dprime_auc  threshold-free, from the ranking alone.
+      AUC_within / dprime_within  THE ONE TO REPORT.  AUC computed separately
+        for each new square -- its legal trials against its own illegal trials
+        -- then averaged.  A new token starts with a random embedding, so each
+        new square carries a roughly constant score across positions; pooling
+        the 8 squares lets that constant correlate with how often each square
+        happens to be legal, which put the untrained model at AUC 0.64 rather
+        than 0.50.  Comparing a square only against itself cancels the offset,
+        so chance is 0.5 for real and the two conditions share a floor.
+      AUC / dprime_auc  the same thing pooled over all 8 squares; kept for
+        continuity, but carries the per-square base-rate artifact above.
       hit / FA / dprime / criterion  at the calibrated criterion: a square is
         "called legal" when it carries at least half of 1/n_legal, the share a
         perfectly calibrated model puts on each legal move.  Rates get the
@@ -435,30 +460,40 @@ def _sdt(strength, label, calib):
     strength = np.asarray(strength, float)
     label = np.asarray(label, int)
     calib = np.asarray(calib, float)
+    cell = None if cell is None else np.asarray(cell, int)
     n1, n0 = int(label.sum()), int((1 - label).sum())
     if n1 == 0 or n0 == 0:
         return {'AUC': float('nan'), 'dprime_auc': float('nan'),
+                'AUC_within': float('nan'), 'dprime_within': float('nan'),
+                'AUC_per_square': {},
                 'hit': float('nan'), 'FA': float('nan'),
                 'dprime': float('nan'), 'criterion': float('nan'),
                 'sdt_n_signal': n1, 'sdt_n_noise': n0}
 
-    # rank-based AUC, ties shared (= P(signal scores above noise))
-    order = np.argsort(strength, kind='mergesort')
-    ranks = np.empty(len(strength), float)
-    ranks[order] = np.arange(1, len(strength) + 1)
-    uniq, inv, counts = np.unique(strength, return_inverse=True,
-                                  return_counts=True)
-    if (counts > 1).any():
-        sums = np.bincount(inv, weights=ranks, minlength=len(uniq))
-        ranks = (sums / counts)[inv]
-    auc = float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+    auc = _auc(strength, label)
+
+    # per-square AUC: each new square judged only against itself, so its
+    # constant random offset cannot masquerade as sensitivity
+    per_sq = {}
+    if cell is not None:
+        for c in np.unique(cell):
+            m = cell == c
+            a = _auc(strength[m], label[m])
+            if a is not None:
+                per_sq[int(c)] = a
+    auc_within = float(np.mean(list(per_sq.values()))) if per_sq else float('nan')
 
     said = calib >= 0.5
     hit = (float(said[label == 1].sum()) + 0.5) / (n1 + 1)
     fa = (float(said[label == 0].sum()) + 0.5) / (n0 + 1)
     zh, zf = z(hit), z(fa)
-    return {'AUC': auc,
-            'dprime_auc': float(np.sqrt(2) * z(min(max(auc, 1e-6), 1 - 1e-6))),
+    def _d(a):
+        return float(np.sqrt(2) * z(min(max(a, 1e-6), 1 - 1e-6)))
+
+    return {'AUC': auc, 'dprime_auc': _d(auc),
+            'AUC_within': auc_within,
+            'dprime_within': _d(auc_within) if per_sq else float('nan'),
+            'AUC_per_square': per_sq,
             'hit': hit, 'FA': fa, 'dprime': float(zh - zf),
             'criterion': float(-0.5 * (zh + zf)),
             'sdt_n_signal': n1, 'sdt_n_noise': n0}
@@ -481,7 +516,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
     new_set = set(NEW_SQUARE_IDS)
     # signal-detection trials, pooled over BOTH sets: every new square in every
     # position, labelled by whether it is actually legal there
-    sdt_strength, sdt_label, sdt_calib = [], [], []
+    sdt_strength, sdt_label, sdt_calib, sdt_cell = [], [], [], []
     for set_name in ('IL', 'LL'):
         positions = manifest.get(set_name, [])
         tot_prob = tot_acc = tot_frac = tot_per_tgt = 0.0
@@ -519,6 +554,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
                     sdt_strength.append(float(scores[c]))
                     sdt_label.append(1 if c in legal_here else 0)
                     sdt_calib.append(float(scores[c]) * n_legal)
+                    sdt_cell.append(c)
             if per_bucket and set_name == 'IL' and 'bucket' in pos:
                 key = tuple(pos['bucket'])
                 b = buckets.setdefault(key, {'prob': 0.0, 'acc': 0.0, 'n': 0})
@@ -530,7 +566,7 @@ def score_manifest(score_fn, manifest, per_bucket=True):
         out[f'{set_name}_prob_frac'] = tot_frac / max(n, 1)
         out[f'{set_name}_prob_per_target'] = tot_per_tgt / max(n, 1)
         out[f'{set_name}_n'] = n
-    out.update(_sdt(sdt_strength, sdt_label, sdt_calib))
+    out.update(_sdt(sdt_strength, sdt_label, sdt_calib, sdt_cell))
     if per_bucket:
         out['IL_buckets'] = {
             f'{L}_{nl}': {'prob': b['prob'] / b['n'],

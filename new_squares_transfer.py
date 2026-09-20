@@ -267,10 +267,12 @@ def main():
         'LL_acc': [], 'std_lpm': [], 'std_top': [], 'IL_buckets': [],
         # signal detection on the new squares: sensitivity, and the bias that
         # IL_prob silently rewards
-        'AUC': [], 'dprime_auc': [], 'dprime': [], 'criterion': [],
-        'hit': [], 'FA': [],
+        'AUC': [], 'dprime_auc': [], 'AUC_within': [], 'dprime_within': [],
+        'dprime': [], 'criterion': [], 'hit': [], 'FA': [],
+        'AUC_per_square': [],
     }
-    SDT_KEYS = ('AUC', 'dprime_auc', 'dprime', 'criterion', 'hit', 'FA')
+    SDT_KEYS = ('AUC', 'dprime_auc', 'AUC_within', 'dprime_within',
+                'dprime', 'criterion', 'hit', 'FA', 'AUC_per_square')
     t0 = time.time()
 
     def do_eval(step):
@@ -294,7 +296,8 @@ def main():
             results[k].append(m[k])
         print(f"  Step {step}: IL_prob={m['IL_prob']:.4f} IL_acc={m['IL_acc']:.4f} "
               f"LL_prob={m['LL_prob']:.4f} std_lpm={std_lpm:.4f} "
-              f"AUC={m['AUC']:.4f} d'={m['dprime_auc']:.3f} c={m['criterion']:+.3f} "
+              f"AUCw={m['AUC_within']:.4f} d'w={m['dprime_within']:.3f} "
+              f"AUC={m['AUC']:.4f} c={m['criterion']:+.3f} "
               f"elapsed={time.time()-t0:.0f}s", flush=True)
         model.train()
 
