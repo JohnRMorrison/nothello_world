@@ -385,7 +385,9 @@ def fit_and_score(D, rules, games, manifest, args, device):
     print(f'    D={D}: IL_prob={m["IL_prob"]:.4f} '
           f'IL_frac={m["IL_prob_frac"]:.4f} '
           f'IL_per_tgt={m["IL_prob_per_target"]:.4f} '
-          f'IL_acc={m["IL_acc"]:.4f}  ({time.time()-t0:.0f}s)', flush=True)
+          f'IL_acc={m["IL_acc"]:.4f} '
+          f'AUC={m["AUC"]:.4f} d\'={m["dprime_auc"]:.3f} c={m["criterion"]:+.3f}'
+          f'  ({time.time()-t0:.0f}s)', flush=True)
     return m
 
 
@@ -447,10 +449,15 @@ def main():
         'IL_prob': [], 'IL_prob_frac': [], 'IL_prob_per_target': [],
         'IL_acc': [], 'LL_prob': [], 'LL_acc': [],
         'IL_n': [], 'IL_buckets': [],
+        # signal detection on the new squares (see _sdt in new_squares_data)
+        'AUC': [], 'dprime_auc': [], 'dprime': [], 'criterion': [],
+        'hit': [], 'FA': [],
     }
     t0 = time.time()
     for D in schedule:
         m = fit_and_score(D, rules, games, manifest, args, device)
+        for k in ('AUC', 'dprime_auc', 'dprime', 'criterion', 'hit', 'FA'):
+            results[k].append(m[k])
         results['IL_prob'].append(m['IL_prob'])
         results['IL_prob_frac'].append(m['IL_prob_frac'])
         results['IL_prob_per_target'].append(m['IL_prob_per_target'])

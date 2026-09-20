@@ -200,6 +200,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--regenerate-data", action="store_true",
                     help="Force re-generation of the shared data files.")
+    ap.add_argument("--no-save-ckpt", action="store_true",
+                    help="Skip saving the fine-tuned model (smoke tests).")
     args = ap.parse_args()
 
     cond_name = CONDITIONS[args.condition_id]
@@ -263,7 +265,12 @@ def main():
         'lr': args.lr, 'bs': args.bs, 'seed': args.seed,
         'eval_steps': [], 'IL_prob': [], 'IL_acc': [], 'LL_prob': [],
         'LL_acc': [], 'std_lpm': [], 'std_top': [], 'IL_buckets': [],
+        # signal detection on the new squares: sensitivity, and the bias that
+        # IL_prob silently rewards
+        'AUC': [], 'dprime_auc': [], 'dprime': [], 'criterion': [],
+        'hit': [], 'FA': [],
     }
+    SDT_KEYS = ('AUC', 'dprime_auc', 'dprime', 'criterion', 'hit', 'FA')
     t0 = time.time()
 
     def do_eval(step):
@@ -283,8 +290,11 @@ def main():
         results['std_lpm'].append(std_lpm)
         results['std_top'].append(std_top)
         results['IL_buckets'].append(m.get('IL_buckets', {}))
+        for k in SDT_KEYS:
+            results[k].append(m[k])
         print(f"  Step {step}: IL_prob={m['IL_prob']:.4f} IL_acc={m['IL_acc']:.4f} "
               f"LL_prob={m['LL_prob']:.4f} std_lpm={std_lpm:.4f} "
+              f"AUC={m['AUC']:.4f} d'={m['dprime_auc']:.3f} c={m['criterion']:+.3f} "
               f"elapsed={time.time()-t0:.0f}s", flush=True)
         model.train()
 
@@ -308,6 +318,21 @@ def main():
     with open(out_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"Saved {out_path}", flush=True)
+
+    # Keep the fine-tuned model.  The eval metrics have changed once already and
+    # re-deriving them cost a full retrain; with this, a new metric is a rescore.
+    if not args.no_save_ckpt:
+        ck_path = os.path.join(args.output_dir,
+                               f'gpt_cond_{args.condition_id:03d}.ckpt')
+        torch.save({'state_dict': model.state_dict(),
+                    'stoi': train_ds.stoi, 'itos': train_ds.itos,
+                    'block_size': train_ds.block_size,
+                    'vocab_size': train_ds.vocab_size,
+                    'condition_id': args.condition_id,
+                    'condition_name': cond_name,
+                    'total_steps': total_steps, 'seed': args.seed},
+                   ck_path)
+        print(f"Saved {ck_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -185,7 +185,9 @@ def fit_and_score(D, rules, games, manifest, mlp, feat_dim, H_dim, args, device)
     m = score_manifest(score_fn, manifest, per_bucket=True)
     print(f'    D={D}: IL_frac={m["IL_prob_frac"]:.4f} '
           f'IL_per_tgt={m["IL_prob_per_target"]:.4f} '
-          f'IL_acc={m["IL_acc"]:.4f}  ({time.time()-t0:.0f}s)', flush=True)
+          f'IL_acc={m["IL_acc"]:.4f} '
+          f'AUC={m["AUC"]:.4f} d\'={m["dprime_auc"]:.3f} c={m["criterion"]:+.3f}'
+          f'  ({time.time()-t0:.0f}s)', flush=True)
     return m
 
 
@@ -243,13 +245,17 @@ def main():
         'seed': args.seed,
         'IL_prob': [], 'IL_prob_frac': [], 'IL_prob_per_target': [],
         'IL_acc': [], 'LL_prob': [], 'LL_acc': [], 'IL_n': [],
+        # signal detection on the new squares (see _sdt in new_squares_data)
+        'AUC': [], 'dprime_auc': [], 'dprime': [], 'criterion': [],
+        'hit': [], 'FA': [],
     }
     t0 = time.time()
     for D in schedule:
         m = fit_and_score(D, rules, games, manifest, mlp, feat_dim, H_dim,
                           args, device)
         for k in ('IL_prob', 'IL_prob_frac', 'IL_prob_per_target',
-                  'IL_acc', 'LL_prob', 'LL_acc', 'IL_n'):
+                  'IL_acc', 'LL_prob', 'LL_acc', 'IL_n',
+                  'AUC', 'dprime_auc', 'dprime', 'criterion', 'hit', 'FA'):
             results[k].append(m[k])
     results['elapsed_seconds'] = time.time() - t0
 
