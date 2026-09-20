@@ -57,11 +57,11 @@ def load_j1b(bank, readout, flanking_patterns, state_decoder, device):
     mlp = tsp.OpeningTreeMLP(W_tree, b_tree, meta, device)
     leaf_build = tsp.load_leaf_build(bank)
     patterns = tsp.load_patterns(flanking_patterns)
-    ck = torch.load(readout, map_location=device, weights_only=False)
+    ck = torch.load(readout, map_location=device)
     st = ck['probe_state'] if 'probe_state' in ck else ck['probe_states'][0]
     hidden = st['linear.weight'].shape[1]
     probe = LinearPatternProbOr(hidden, patterns).to(device); probe.load_state_dict(st); probe.eval()
-    sd = torch.load(state_decoder, map_location=device, weights_only=False)
+    sd = torch.load(state_decoder, map_location=device)
     W = torch.as_tensor(sd['state_probe'], dtype=torch.float32, device=device)   # (2,H,64,3)
     assert W.shape[1] == hidden, f"state-decoder H {W.shape[1]} != readout H {hidden}"
     print(f"J1B: hidden={hidden}, state-decoder acc={sd.get('final_acc')}")
