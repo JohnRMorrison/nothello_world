@@ -80,6 +80,8 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=3)
     ap.add_argument('--batch-size', type=int, default=512)
+    ap.add_argument('--normalize', action='store_true',
+                    help='renormalise the 60 cell scores to sum to 1 before\n                          thresholding, so the numbers mean the same thing\n                          as OGPT softmax probabilities')
     args = ap.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -146,6 +148,13 @@ def main():
             gathered = gathered.masked_fill(~mask[None], 0.0)
             cell_scores = -gathered.sum(dim=-1)                        # (B, 60)
             cell_probs = 1.0 - torch.exp(-cell_scores.clamp(min=0))    # (B, 60)
+            if args.normalize:
+                # The 60 prob-OR scores are independent sigmoids: they do not
+                # sum to anything, and accumulating ~16 patterns per cell puts
+                # some illegal cell over 0.5 in essentially every game.  OGPT's
+                # numbers come from a softmax over 60 moves, so to compare
+                # like with like, renormalise to a distribution first.
+                cell_probs = cell_probs / cell_probs.sum(dim=1, keepdim=True).clamp(min=1e-12)
             probs_np = cell_probs.cpu().numpy()
 
             # Zero out probabilities on legal cells; take max over illegal cells
