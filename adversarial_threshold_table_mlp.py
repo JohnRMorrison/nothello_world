@@ -80,6 +80,8 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=3)
     ap.add_argument('--batch-size', type=int, default=512)
+    ap.add_argument('--agg', choices=['prob_or', 'max'], default='prob_or',
+                    help='how the ~16 patterns targeting a cell combine')
     ap.add_argument('--normalize', action='store_true',
                     help='renormalise the 60 cell scores to sum to 1 before\n                          thresholding, so the numbers mean the same thing\n                          as OGPT softmax probabilities')
     args = ap.parse_args()
@@ -143,11 +145,20 @@ def main():
                 logits[use_me] = me(x[use_me])
             if use_mo.any():
                 logits[use_mo] = mo(x[use_mo])
-            log1m = -F.softplus(logits)                                # (B, 960)
-            gathered = log1m[:, idx]                                    # (B, 60, K)
-            gathered = gathered.masked_fill(~mask[None], 0.0)
-            cell_scores = -gathered.sum(dim=-1)                        # (B, 60)
-            cell_probs = 1.0 - torch.exp(-cell_scores.clamp(min=0))    # (B, 60)
+            if args.agg == 'max':
+                # the single strongest pattern for a cell.  prob-OR instead
+                # accumulates ~16 patterns per cell, which inflates illegal
+                # cells before any normalising.
+                p_all = torch.sigmoid(logits)                          # (B, 960)
+                g = p_all[:, idx]                                      # (B, 60, K)
+                cell_probs = torch.where(mask[None], g,
+                                         torch.zeros_like(g)).max(dim=-1).values
+            else:
+                log1m = -F.softplus(logits)                            # (B, 960)
+                gathered = log1m[:, idx]                               # (B, 60, K)
+                gathered = gathered.masked_fill(~mask[None], 0.0)
+                cell_scores = -gathered.sum(dim=-1)                    # (B, 60)
+                cell_probs = 1.0 - torch.exp(-cell_scores.clamp(min=0))
             if args.normalize:
                 # The 60 prob-OR scores are independent sigmoids: they do not
                 # sum to anything, and accumulating ~16 patterns per cell puts
