@@ -15,6 +15,10 @@ ways, then the top-1 cell is checked against the true legal set:
   * prob-OR : 1 - Prod(1 - p_j)   (higher; accumulates patterns)
   * max     : max_j p_j           (simpler; reads the single strongest pattern)
 
+--ks gives top-K legality: all of the top min(K, n_legal) cells must be legal.
+The cap matters -- ~5% of positions have fewer than 5 legal moves, so uncapped
+top-5 is unachievable there and understates the model by several points.
+
 Input rep is auto-detected from each checkpoint's input_dim
 (120 = played+even = MOVESET; 3600 = MOVEGRID).
 
@@ -58,8 +62,14 @@ def cell_group_index():
 
 
 @torch.no_grad()
-def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device, batch, rep_override):
-    ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device, batch, rep_override, ks=(1,)):
+    try:
+        # torch on the cluster (py3.8) predates weights_only; newer torch
+        # defaults it to True, which refuses these checkpoints.  Try the
+        # explicit form, fall back to the old signature.
+        ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    except TypeError:
+        ck = torch.load(ckpt_path, map_location='cpu')
     input_dim, hidden = ck['input_dim'], ck['hidden_dim']
     rep = rep_override or {120: 'playedeven', 3600: 'move_grid'}.get(input_dim)
     if rep is None:
@@ -70,7 +80,9 @@ def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device,
     even = head(ck['even'])
     odd = head(ck['odd']) if ck.get('odd') is not None else even
 
-    po_hit = mx_hit = n = 0
+    po_hit = {k: 0 for k in ks}
+    mx_hit = {k: 0 for k in ks}
+    n = 0
     for i in range(0, len(kidx), batch):
         b = kidx[i:i + batch]
         x = build_input(torch.from_numpy(feats180[b].astype(np.float32)).to(device), rep)
@@ -84,10 +96,20 @@ def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device,
         probor = 1.0 - torch.where(msk, 1.0 - g, torch.ones_like(g)).prod(dim=2)
         maxagg = torch.where(msk, g, torch.zeros_like(g)).max(dim=2).values
         legal = torch.from_numpy(cell_legal[b]).to(device)
-        po_hit += int(legal.gather(1, probor.argmax(1, keepdim=True)).sum())
-        mx_hit += int(legal.gather(1, maxagg.argmax(1, keepdim=True)).sum())
+        nlegal = legal.sum(1)                       # legal moves at each position
+        for agg, acc in ((probor, po_hit), (maxagg, mx_hit)):
+            order = agg.argsort(dim=1, descending=True)
+            for k in ks:
+                # cap at n_legal: with fewer than k legal moves, "all of the
+                # top k are legal" is unachievable and would understate the
+                # model rather than measure it
+                ke = torch.clamp(nlegal, max=k)
+                picked = legal.gather(1, order[:, :k])          # (B, k) 0/1
+                rank = torch.arange(k, device=device).unsqueeze(0)
+                ok = ((picked == 1) | (rank >= ke.unsqueeze(1))).all(dim=1)
+                acc[k] += int(ok.sum())
         n += len(b)
-    return rep, hidden, 100 * po_hit / n, 100 * mx_hit / n, n
+    return rep, hidden, po_hit, mx_hit, n
 
 
 def main():
@@ -100,6 +122,8 @@ def main():
     ap.add_argument('--ply-max', type=int, default=54)     # half-open [5,54) = moves 5-53
     ap.add_argument('--max-positions', type=int, default=500_000)
     ap.add_argument('--batch-size', type=int, default=4096)
+    ap.add_argument('--ks', type=int, nargs='+', default=[1, 3, 5],
+                    help='top-K legality, capped at the number of legal moves')
     ap.add_argument('--seed', type=int, default=0)
     args = ap.parse_args()
 
@@ -122,14 +146,22 @@ def main():
     rows = []
     for ck in args.ckpts:
         rep, H, po, mx, n = eval_one(ck, feats180, cell_legal, positions, kidx, idx, msk,
-                                     device, args.batch_size, args.rep)
-        rows.append((os.path.basename(ck), rep, H, po, mx))
-        print(f'  {os.path.basename(ck):45s} rep={rep:10s} H={H:<5d}  prob-OR={po:.2f}%  max={mx:.2f}%', flush=True)
+                                     device, args.batch_size, args.rep, tuple(args.ks))
+        rows.append((os.path.basename(ck), rep, H, po, mx, n))
+        po_s = '  '.join(f'top{k}={100*po[k]/n:.2f}%' for k in args.ks)
+        mx_s = '  '.join(f'top{k}={100*mx[k]/n:.2f}%' for k in args.ks)
+        print(f'  {os.path.basename(ck):45s} rep={rep:10s} H={H:<5d}', flush=True)
+        print(f'      prob-OR  {po_s}', flush=True)
+        print(f'      max      {mx_s}', flush=True)
 
     print(f'\n=== top-1 argmax-legality, ply [{args.ply_min},{args.ply_max}), N={len(kidx):,} ===')
-    print(f'{"model":45s} {"rep":10s} {"H":>5} {"prob-OR":>8} {"max":>7}')
-    for name, rep, H, po, mx in rows:
-        print(f'{name:45s} {rep:10s} {H:>5} {po:>7.2f}% {mx:>6.2f}%')
+    hdr = ' '.join(f'{"pOR-top"+str(k):>11}' for k in args.ks) + \
+          ' ' + ' '.join(f'{"max-top"+str(k):>11}' for k in args.ks)
+    print(f'{"model":45s} {"rep":10s} {"H":>5}' + hdr)
+    for name, rep, H, po, mx, n in rows:
+        vals = ' '.join(f'{100*po[k]/n:>10.2f}%' for k in args.ks) + \
+               ' ' + ' '.join(f'{100*mx[k]/n:>10.2f}%' for k in args.ks)
+        print(f'{name:45s} {rep:10s} {H:>5}' + vals)
 
 
 if __name__ == '__main__':

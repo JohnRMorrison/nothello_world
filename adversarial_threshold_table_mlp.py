@@ -26,6 +26,31 @@ sys.path.insert(0, '.')
 from train_pattern_simple import DirectMLP, _get_cell_pat_index
 from hand_crafted_flanking import enumerate_flanking_patterns, MOVE_TO_IDX
 from compare_v4_vs_mlp import played_even_features, C64_TO_C60, load_val_games
+
+
+def move_grid_features(game_prefix):
+    """3600-d move_grid input straight from a game prefix.
+
+    Matches train_pattern_simple.to_move_grid_input exactly (verified against
+    it on 200 prefixes): grid[cell, move_num] flattened as cell*60 + move_num,
+    with +1 for an odd move index and -1 for an even one -- the convention the
+    180-d precompute uses, where 'even step' means white.
+    """
+    grid = torch.zeros(60, 60)
+    for i, c in enumerate(game_prefix):
+        if c not in C64_TO_C60:
+            continue
+        grid[C64_TO_C60[c], i] = -1.0 if (i % 2 == 0) else 1.0
+    return grid.reshape(-1)
+
+
+def features_for(game_prefix, input_dim):
+    """Pick the representation the checkpoint was trained on."""
+    if input_dim == 120:
+        return played_even_features(game_prefix)
+    if input_dim == 3600:
+        return move_grid_features(game_prefix)
+    raise ValueError(f'no feature builder for input_dim={input_dim}')
 from data.othello import OthelloBoardState
 
 
@@ -83,7 +108,7 @@ def main():
             legal = legal_cells_60(game, k)
             if legal is None or not legal:
                 continue
-            feats_list.append(played_even_features(game[:k]))
+            feats_list.append(features_for(game[:k], input_dim))
             ks_list.append(k)
             legal_list.append(legal)
             game_id_list.append(g_id)
