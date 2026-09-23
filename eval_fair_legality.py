@@ -82,6 +82,8 @@ def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device,
 
     po_hit = {k: 0 for k in ks}
     mx_hit = {k: 0 for k in ks}
+    po_frac = {k: 0.0 for k in ks}
+    mx_frac = {k: 0.0 for k in ks}
     n = 0
     for i in range(0, len(kidx), batch):
         b = kidx[i:i + batch]
@@ -97,19 +99,24 @@ def eval_one(ckpt_path, feats180, cell_legal, positions, kidx, idx, msk, device,
         maxagg = torch.where(msk, g, torch.zeros_like(g)).max(dim=2).values
         legal = torch.from_numpy(cell_legal[b]).to(device)
         nlegal = legal.sum(1)                       # legal moves at each position
-        for agg, acc in ((probor, po_hit), (maxagg, mx_hit)):
+        for agg, acc_all, acc_frac in ((probor, po_hit, po_frac),
+                                       (maxagg, mx_hit, mx_frac)):
             order = agg.argsort(dim=1, descending=True)
             for k in ks:
-                # cap at n_legal: with fewer than k legal moves, "all of the
-                # top k are legal" is unachievable and would understate the
-                # model rather than measure it
+                # cap at n_legal: with fewer than k legal moves neither metric
+                # is achievable at full k, and the number would measure the
+                # board rather than the model
                 ke = torch.clamp(nlegal, max=k)
                 picked = legal.gather(1, order[:, :k])          # (B, k) 0/1
                 rank = torch.arange(k, device=device).unsqueeze(0)
-                ok = ((picked == 1) | (rank >= ke.unsqueeze(1))).all(dim=1)
-                acc[k] += int(ok.sum())
+                within = rank < ke.unsqueeze(1)
+                # ALL: every one of the top ke is legal (strict, falls steeply)
+                acc_all[k] += int(((picked == 1) | ~within).all(dim=1).sum())
+                # FRAC: mean proportion of the top ke that are legal (gentle)
+                hits = (picked * within).sum(dim=1).float()
+                acc_frac[k] += float((hits / ke.float()).sum())
         n += len(b)
-    return rep, hidden, po_hit, mx_hit, n
+    return rep, hidden, po_hit, mx_hit, po_frac, mx_frac, n
 
 
 def main():
@@ -145,23 +152,32 @@ def main():
 
     rows = []
     for ck in args.ckpts:
-        rep, H, po, mx, n = eval_one(ck, feats180, cell_legal, positions, kidx, idx, msk,
-                                     device, args.batch_size, args.rep, tuple(args.ks))
-        rows.append((os.path.basename(ck), rep, H, po, mx, n))
-        po_s = '  '.join(f'top{k}={100*po[k]/n:.2f}%' for k in args.ks)
-        mx_s = '  '.join(f'top{k}={100*mx[k]/n:.2f}%' for k in args.ks)
+        rep, H, po, mx, pof, mxf, n = eval_one(ck, feats180, cell_legal, positions,
+                                               kidx, idx, msk, device,
+                                               args.batch_size, args.rep, tuple(args.ks))
+        rows.append((os.path.basename(ck), rep, H, po, mx, pof, mxf, n))
+        fmt = lambda d, sc: '  '.join(f'top{k}={100*d[k]/sc:.2f}%' for k in args.ks)
         print(f'  {os.path.basename(ck):45s} rep={rep:10s} H={H:<5d}', flush=True)
-        print(f'      prob-OR  {po_s}', flush=True)
-        print(f'      max      {mx_s}', flush=True)
+        print(f'      prob-OR  ALL  {fmt(po, n)}', flush=True)
+        print(f'      prob-OR  FRAC {fmt(pof, n)}', flush=True)
+        print(f'      max      ALL  {fmt(mx, n)}', flush=True)
+        print(f'      max      FRAC {fmt(mxf, n)}', flush=True)
 
     print(f'\n=== top-1 argmax-legality, ply [{args.ply_min},{args.ply_max}), N={len(kidx):,} ===')
-    hdr = ' '.join(f'{"pOR-top"+str(k):>11}' for k in args.ks) + \
-          ' ' + ' '.join(f'{"max-top"+str(k):>11}' for k in args.ks)
-    print(f'{"model":45s} {"rep":10s} {"H":>5}' + hdr)
-    for name, rep, H, po, mx, n in rows:
-        vals = ' '.join(f'{100*po[k]/n:>10.2f}%' for k in args.ks) + \
-               ' ' + ' '.join(f'{100*mx[k]/n:>10.2f}%' for k in args.ks)
-        print(f'{name:45s} {rep:10s} {H:>5}' + vals)
+    print('ALL  = every one of the top min(K, n_legal) is legal')
+    print('FRAC = mean proportion of the top min(K, n_legal) that are legal\n')
+    for metric, i_po, i_mx in (('ALL', 3, 4), ('FRAC', 5, 6)):
+        print(f'--- {metric} ---')
+        hdr = ' '.join(f'{"pOR-top"+str(k):>11}' for k in args.ks) + \
+              ' ' + ' '.join(f'{"max-top"+str(k):>11}' for k in args.ks)
+        print(f'{"model":45s} {"rep":10s} {"H":>5}' + hdr)
+        for row in rows:
+            name, rep, H, n = row[0], row[1], row[2], row[7]
+            po_d, mx_d = row[i_po], row[i_mx]
+            vals = ' '.join(f'{100*po_d[k]/n:>10.2f}%' for k in args.ks) + \
+                   ' ' + ' '.join(f'{100*mx_d[k]/n:>10.2f}%' for k in args.ks)
+            print(f'{name:45s} {rep:10s} {H:>5}' + vals)
+        print()
 
 
 if __name__ == '__main__':
