@@ -129,8 +129,8 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
     total_percell_correct = 0
     total_positions = 0
     total_cells = 0
-    total_top3_hits = 0
-    total_top5_hits = 0
+    total_top3_hits = 0.0
+    total_top5_hits = 0.0
     total_pct5_hits = 0
     total_pct10_hits = 0
     per_ply_hits = {}
@@ -170,13 +170,13 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         legal_np = (L_batch > 0)
         for k, counter_attr in ((3, 'top3'), (5, 'top5')):
             topk = sorted_idx[:, :k]       # (B, k)
-            # position is "hit" if ALL top-k cells are legal
-            all_legal = np.array([legal_np[j, topk[j]].all()
-                                  for j in range(len(X_batch))])
+            # partial credit: fraction of top-k cells that are legal
+            legal_frac = np.array([legal_np[j, topk[j]].sum() / k
+                                   for j in range(len(X_batch))])
             if k == 3:
-                total_top3_hits += int(all_legal.sum())
+                total_top3_hits += legal_frac.sum()
             else:
-                total_top5_hits += int(all_legal.sum())
+                total_top5_hits += legal_frac.sum()
 
         # ── >5% / >10% on any illegal cell ───────────────────────────────────
         p_norm = probs_np.copy()

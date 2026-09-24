@@ -152,6 +152,10 @@ for sq_label, cat, sub, rec in tqdm(records, desc='alpha sweep'):
     r_tgt, c_tgt = rec.square
     clean_resid = rec.extras['clean_resid_at_probe']
 
+    # P(legal_orig) on clean output — used for P_illegal_before (fixed reference)
+    clean_p60 = metrics.cell_probs(rec.extras['clean_logits_last'])
+    p_legal_orig_clean = metrics.mass_on(clean_p60, rec.legal_orig)
+
     for mult in ALPHA_MULTS:
         alpha_val = base_alpha * mult
         intv_logits, intv_resid = intervention.run_with_intervention(
@@ -182,6 +186,7 @@ for sq_label, cat, sub, rec in tqdm(records, desc='alpha sweep'):
             'n_corrupted_total': n_total,
             'n_corrupted_collateral': n_collateral,
             'target_flipped': target_flipped,
+            'P_before_legal_orig': p_legal_orig_clean,
             **m,
         })
 
@@ -264,6 +269,39 @@ iox.save_table(
         'Alpha sweep — probability shift to newly-legal / newly-illegal moves\n'
         'P_before / P_after = total probability mass on those moves before/after intervention\n'
         'dP = P_after - P_before  (positive = model gives more mass to those moves)'
+    ),
+)
+
+# Table 4: total probability on ALL illegal moves at each alpha
+# P_illegal_before = 1 - P(legal_orig)  — baseline measured against original legal set
+# P_illegal_after  = 1 - P(legal_cf)    — post-intervention measured against counterfactual legal set
+rows4 = []
+for mult in ALPHA_MULTS:
+    for sq_key, entries in sorted(buckets[mult].items()):
+        sq_label, cat, sub = sq_key
+        p_ill_before = [1.0 - e['P_before_legal_orig'] for e in entries]
+        p_ill_after  = [1.0 - e['P_after_legal_cf']    for e in entries]
+        dp_ill       = [a - b for a, b in zip(p_ill_after, p_ill_before)]
+        n = len(entries)
+        rows4.append([
+            sq_label, cat, sub, f'{mult}x', n,
+            sum(p_ill_before) / n,
+            sum(p_ill_after)  / n,
+            sum(dp_ill)       / n,
+        ])
+
+iox.save_table(
+    rows4,
+    filename=f'alpha_sweep_illegal_prob{args.out_suffix}.txt',
+    headers=[
+        'square', 'category', 'sub_condition', 'alpha_mult', 'n',
+        'P_illegal_before', 'P_illegal_after', 'dP_illegal',
+    ],
+    title=(
+        'Alpha sweep — total probability mass on illegal moves at each alpha\n'
+        'P_illegal_before = 1 - P(legal_orig cells) on clean output\n'
+        'P_illegal_after  = 1 - P(legal_cf cells) on intervened output\n'
+        'dP_illegal = P_illegal_after - P_illegal_before  (positive = more mass leaks to illegal moves)'
     ),
 )
 
