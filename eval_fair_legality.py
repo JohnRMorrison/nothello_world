@@ -25,7 +25,7 @@ Input rep is auto-detected from each checkpoint's input_dim
 Usage (on the pod):
   /usr/bin/python3.13 eval_fair_legality.py \
     --ckpts <CKDIR>/pattern_simple_direct_H{512,4096}_{playedeven,move_grid}.pt \
-    --chunk /workspace/feature_chunks/chunk_ext_0004.npz --ply-min 5 --ply-max 54
+    --chunk /workspace/feature_chunks/chunk_ext_0004.npz --ply-min 5 --ply-max 53
 """
 import argparse, os, sys
 from collections import defaultdict
@@ -125,8 +125,14 @@ def main():
     ap.add_argument('--chunk', default=('experiments/mathematical_transformation_experiments/'
                                         'heuristic_probe_results/feature_chunks/chunk_ext_0004.npz'))
     ap.add_argument('--rep', choices=['playedeven', 'move_grid'], default=None)
+    # INCLUSIVE move counts, matching adversarial_threshold_table_mlp.py's
+    # --k-min/--k-max and ogpt_topk_legality.py's ply window: "move n" is the
+    # board after n moves have been played.  A chunk row stores positions == p
+    # for the board after p+1 moves (precompute_chunks_extended.py: the feature
+    # builder uses step_of_move <= t, i.e. game[:t+1]), so the filter below
+    # shifts by one.  Filtering the raw positions instead scores moves 6-54.
     ap.add_argument('--ply-min', type=int, default=5)
-    ap.add_argument('--ply-max', type=int, default=54)     # half-open [5,54) = moves 5-53
+    ap.add_argument('--ply-max', type=int, default=53)
     ap.add_argument('--max-positions', type=int, default=500_000)
     ap.add_argument('--batch-size', type=int, default=4096)
     ap.add_argument('--ks', type=int, nargs='+', default=[1, 3, 5],
@@ -140,13 +146,15 @@ def main():
     print(f'loading chunk ONCE: {args.chunk} ...', flush=True)
     feats180, cell_legal, positions = load_chunk_with_legal_cells(args.chunk)
     positions = positions.astype(np.int64)
-    keep = ((positions >= args.ply_min) & (positions < args.ply_max)
+    moves_played = positions + 1
+    keep = ((moves_played >= args.ply_min) & (moves_played <= args.ply_max)
             & (cell_legal.sum(1) > 0))
     kidx = np.where(keep)[0]
     if len(kidx) > args.max_positions:
         rng = np.random.RandomState(args.seed)
         kidx = np.sort(rng.choice(kidx, args.max_positions, replace=False))
-    print(f'{len(kidx):,} eval positions (ply [{args.ply_min},{args.ply_max}), capped {args.max_positions:,})', flush=True)
+    print(f'{len(kidx):,} eval positions (moves {args.ply_min}-{args.ply_max} '
+          f'inclusive, capped {args.max_positions:,})', flush=True)
 
     idx, msk = cell_group_index(); idx = idx.to(device); msk = msk.to(device)
 
@@ -163,7 +171,7 @@ def main():
         print(f'      max      ALL  {fmt(mx, n)}', flush=True)
         print(f'      max      FRAC {fmt(mxf, n)}', flush=True)
 
-    print(f'\n=== top-1 argmax-legality, ply [{args.ply_min},{args.ply_max}), N={len(kidx):,} ===')
+    print(f'\n=== top-K legality, moves {args.ply_min}-{args.ply_max} inclusive, N={len(kidx):,} ===')
     print('ALL  = every one of the top min(K, n_legal) is legal')
     print('FRAC = mean proportion of the top min(K, n_legal) that are legal\n')
     for metric, i_po, i_mx in (('ALL', 3, 4), ('FRAC', 5, 6)):

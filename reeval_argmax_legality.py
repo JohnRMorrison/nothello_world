@@ -20,7 +20,7 @@ Usage:
   python reeval_argmax_legality.py \\
       --probe-ckpts ckpts_midgame/stream_strupo_g6000000_*.pt \\
       [--chunk-path experiments/.../feature_chunks/chunk_ext_0039.npz] \\
-      [--max-positions 500000] [--ply-min 10] [--ply-max 50]
+      [--max-positions 500000] [--ply-min 5] [--ply-max 53]   (inclusive)
 """
 import argparse
 import glob
@@ -168,26 +168,45 @@ def evaluate_probe_with_ply(probe, X, L, T, mlp, patterns, recent_Ks,
         p_sort[:, _CENTER] = -1.0          # exclude center from ranking
         sorted_idx = p_sort.argsort(axis=1)[:, ::-1]   # descending
         legal_np = (L_batch > 0)
-        for k, counter_attr in ((3, 'top3'), (5, 'top5')):
-            topk = sorted_idx[:, :k]       # (B, k)
-            # partial credit: fraction of top-k cells that are legal
-            legal_frac = np.array([legal_np[j, topk[j]].sum() / k
-                                   for j in range(len(X_batch))])
+        n_legal = legal_np[:, ~_CENTER_MASK].sum(axis=1)
+        for k in (3, 5):
+            # FRAC, capped at n_legal: the mean proportion of the top
+            # min(k, n_legal) cells that are legal.
+            #
+            # Two earlier versions of this were both wrong in the same
+            # direction.  Uncapped ALL (every one of the top k legal) and
+            # uncapped partial credit (hits / k) each punish a position for
+            # having fewer than k legal moves, which no model can do anything
+            # about -- ~5% of positions have fewer than 5 -- so they measure
+            # the board rather than the model.  Dividing by min(k, n_legal)
+            # is what eval_fair_legality.py reports and what the paper's
+            # top-K columns use; keep the two in step.
+            ke = np.minimum(n_legal, k)
+            topk = sorted_idx[:, :k]                       # (B, k)
+            picked = np.take_along_axis(legal_np, topk, axis=1)   # (B, k) bool
+            within = np.arange(k)[None, :] < ke[:, None]
+            hits = (picked & within).sum(axis=1)
+            frac = np.where(ke > 0, hits / np.maximum(ke, 1), 0.0).sum()
             if k == 3:
-                total_top3_hits += legal_frac.sum()
+                total_top3_hits += float(frac)
             else:
-                total_top5_hits += legal_frac.sum()
+                total_top5_hits += float(frac)
 
-        # ── >5% / >10% on any illegal cell ───────────────────────────────────
+        # ── >5% / >10% of the probability mass on illegal moves ──────────────
+        # TOTAL mass, not the single worst cell: total is what reproduces the
+        # published Othello-GPT column (24.6/16.8 vs its 25/17 over moves 5-58;
+        # max-cell gives 23.2/14.9).  NOTE this is per POSITION, whereas the
+        # Othello-GPT number is the per-GAME max over positions -- chunk rows
+        # carry no game id, so the two are not directly comparable.
         p_norm = probs_np.copy()
         p_norm[:, _CENTER] = 0.0
         row_sums = p_norm.sum(axis=1, keepdims=True)
         row_sums[row_sums == 0] = 1.0
         p_norm /= row_sums
         illegal_valid = (~_CENTER_MASK) & (~legal_np)   # (B, 64)
-        max_illegal = np.where(illegal_valid, p_norm, 0.0).max(axis=1)   # (B,)
-        total_pct5_hits  += int((max_illegal > 0.05).sum())
-        total_pct10_hits += int((max_illegal > 0.10).sum())
+        illegal_mass = np.where(illegal_valid, p_norm, 0.0).sum(axis=1)   # (B,)
+        total_pct5_hits  += int((illegal_mass > 0.05).sum())
+        total_pct10_hits += int((illegal_mass > 0.10).sum())
 
     return {
         'argmax_acc': total_argmax_hits / total_positions,
@@ -293,7 +312,10 @@ def main():
                     or info['saved_args'].get('canonicalize_mover', False))
         if loaded_can != can_flag:
             X, _, T, L = process_chunk_ext_file(
-                args.chunk_path, args.ply_min, args.ply_max,
+                # process_chunk_ext_file takes a HALF-OPEN moves-played window;
+                # --ply-max here is inclusive, matching eval_fair_legality.py
+                # and adversarial_threshold_table_mlp.py's --k-max.
+                args.chunk_path, args.ply_min, args.ply_max + 1,
                 canonicalize_mover=can_flag,
                 max_positions=args.max_positions,
             )
@@ -318,10 +340,10 @@ def main():
         if res.get('argmax_acc_max') is not None:
             print(f'  argmax-legality:  prob-OR={100*res["argmax_acc"]:.2f}%   '
                   f'max={100*res["argmax_acc_max"]:.2f}%   (N={res["n_positions"]})')
-        print(f'  top-3 legal-move rate:  {100*res["top3_acc"]:.2f}%')
-        print(f'  top-5 legal-move rate:  {100*res["top5_acc"]:.2f}%')
-        print(f'  >5%  on illegal move:   {100*res["pct5_illegal"]:.2f}%')
-        print(f'  >10% on illegal move:   {100*res["pct10_illegal"]:.2f}%')
+        print(f'  top-3 legal FRAC (capped):  {100*res["top3_acc"]:.2f}%')
+        print(f'  top-5 legal FRAC (capped):  {100*res["top5_acc"]:.2f}%')
+        print(f'  positions >5%%  illegal mass: {100*res["pct5_illegal"]:.2f}%%')
+        print(f'  positions >10%% illegal mass: {100*res["pct10_illegal"]:.2f}%%')
         print(f'  ply argmax:', end=' ')
         for b in sorted(res['ply_argmax']):
             print(f'[{b:2d}-{b+9})={100*res["ply_argmax"][b]:5.1f}% (n={res["ply_n"][b]})',
