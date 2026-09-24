@@ -67,7 +67,8 @@ def main():
     print(f'{label}: {len(games)} games, plies [{a.ply_min},{a.ply_max})',
           flush=True)
 
-    hit = {k: 0 for k in a.ks}
+    hit = {k: 0 for k in a.ks}     # ALL:  every one of the top min(k,n) legal
+    frac = {k: 0.0 for k in a.ks}  # FRAC: mean proportion of them legal
     n = 0
     t0 = time.time()
     for b0 in range(0, len(games), a.batch):
@@ -89,7 +90,9 @@ def main():
                             ke = min(k, len(legal))     # cannot need more
                             top = [TOK_TO_CELL[int(order[j]) + 1]
                                    for j in range(ke)]
-                            hit[k] += int(all(c in legal for c in top))
+                            h = sum(c in legal for c in top)
+                            hit[k] += int(h == ke)
+                            frac[k] += h / ke
                         n += 1
                 board.update([g[ply]])
         if (b0 // a.batch) % 5 == 0:
@@ -98,10 +101,12 @@ def main():
 
     print(f'\n=== {label}, plies [{a.ply_min},{a.ply_max}), N={n:,} ===')
     for k in a.ks:
-        print(f'  top-{k} legal rate: {100 * hit[k] / max(n, 1):.2f}%')
+        print(f'  top-{k}:  ALL {100 * hit[k] / max(n, 1):6.2f}%   '
+              f'FRAC {100 * frac[k] / max(n, 1):6.2f}%')
     if a.out_npz:
         np.savez(a.out_npz, model=label, ks=np.array(a.ks),
                  rates=np.array([hit[k] / max(n, 1) for k in a.ks]),
+                 rates_frac=np.array([frac[k] / max(n, 1) for k in a.ks]),
                  n=n, ply_min=a.ply_min, ply_max=a.ply_max)
         print(f'saved {a.out_npz}')
 

@@ -80,6 +80,9 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--num-data-files', type=int, default=3)
     ap.add_argument('--batch-size', type=int, default=512)
+    ap.add_argument('--metric', choices=['maxcell', 'total'], default='maxcell',
+                    help="'total' = probability mass on ALL illegal cells at a "
+                         "position; 'maxcell' = the single worst illegal cell")
     ap.add_argument('--agg', choices=['prob_or', 'max'], default='prob_or',
                     help='how the ~16 patterns targeting a cell combine')
     ap.add_argument('--normalize', action='store_true',
@@ -170,7 +173,13 @@ def main():
 
             # Zero out probabilities on legal cells; take max over illegal cells
             probs_np = probs_np * illegal_mask_np[bstart:bend]
-            max_illegal = probs_np.max(axis=1)                         # (B,)
+            # 'total' matches how the Othello-GPT column was measured: the
+            # probability mass sitting on illegal moves at a position, not the
+            # single worst cell.  Verified on OGPT -- total reproduces the
+            # published 25%/17% (24.6/16.8 on 8k games), max-cell does not
+            # (23.2/14.9).
+            max_illegal = (probs_np.sum(axis=1) if args.metric == 'total'
+                           else probs_np.max(axis=1))                  # (B,)
 
             # Update per-game max
             for i in range(B):
