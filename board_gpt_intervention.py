@@ -124,7 +124,13 @@ def main():
     W = class_weights(trunk, kind).to(dev).float()
     rck = torch.load(a.readout, map_location='cpu')
     readout = build_head(a.readout_kind, cfg.n_embd)
-    readout.load_state_dict(rck['head']); readout.eval().to(dev)
+    sd = rck['head']
+    # legal_readout_L6_20M.ckpt predates the LinearHead refactor: it stored the
+    # bare nn.Linear as 'weight', where LinearHead expects 'lin.weight'.
+    want = set(readout.state_dict())
+    if set(sd) != want and want == {'lin.weight'} and set(sd) == {'weight'}:
+        sd = {'lin.weight': sd['weight']}
+    readout.load_state_dict(sd); readout.eval().to(dev)
     print(f'{a.ckpt}: {cfg.n_layer}L d{cfg.n_embd} head={kind}', flush=True)
     print(f'readout: {a.readout} ({a.readout_kind})  device {dev}', flush=True)
 
