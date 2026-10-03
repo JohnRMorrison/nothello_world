@@ -215,6 +215,7 @@ def evaluate(model, X, Y, dev, batch=256, amp=True, perm=None):
     """Per-square accuracy over all moves, and over moves 5-53 (the range the
     Othello-GPT probe is scored on, so the two are comparable)."""
     model.eval(); tot = np.zeros(2); hit = np.zeros(2); per_move = np.zeros((BLOCK, 2))
+    ex_tot = np.zeros(2); ex_hit = np.zeros(2)       # whole-position exact match
     for i in range(0, len(X), batch):
         x = torch.from_numpy(np.asarray(X[i:i+batch])).long().to(dev)
         y = unpack_labels(Y[i:i+batch], dev)
@@ -226,10 +227,19 @@ def evaluate(model, X, Y, dev, batch=256, amp=True, perm=None):
         ok = (pr == y) & m
         hit[0] += int(ok.sum()); tot[0] += int(m.sum())
         hit[1] += int(ok[:, 4:53].sum()); tot[1] += int(m[:, 4:53].sum())
+        # Per-square accuracy is flattering: at 99.63%/square, a position with
+        # 64 squares is fully correct only ~79% of the time, and ONE wrong
+        # square can flip legality.  So also score the whole position.
+        corr = (pr == y) | ~m                        # masked squares count as correct
+        exact = corr.all(-1); valid = m.any(-1)
+        ex_hit[0] += int((exact & valid).sum()); ex_tot[0] += int(valid.sum())
+        ex_hit[1] += int((exact & valid)[:, 4:53].sum())
+        ex_tot[1] += int(valid[:, 4:53].sum())
         per_move[:, 0] += ok.sum(-1).sum(0).cpu().numpy()
         per_move[:, 1] += m.sum(-1).sum(0).cpu().numpy()
     model.train()
-    return hit[0]/max(tot[0],1), hit[1]/max(tot[1],1), per_move
+    return (hit[0]/max(tot[0],1), hit[1]/max(tot[1],1), per_move,
+            ex_hit[0]/max(ex_tot[0],1), ex_hit[1]/max(ex_tot[1],1))
 
 
 def main():
@@ -256,6 +266,8 @@ def main():
     ap.add_argument('--fp32', action='store_true',
                     help='disable bf16 autocast (default is bf16 on CUDA)')
     ap.add_argument('--out', default='ckpts/board_gpt.ckpt')
+    ap.add_argument('--eval-ckpt', default=None,
+                    help='load this checkpoint, evaluate, and exit (no training)')
     a = ap.parse_args()
 
     dev = ('cuda' if torch.cuda.is_available()
@@ -287,15 +299,26 @@ def main():
              else GPTBoardState(cfg)).to(dev)
     print(f'{sum(p.numel() for p in model.parameters()):,} parameters', flush=True)
 
+    if a.eval_ckpt:
+        ck = torch.load(a.eval_ckpt, map_location='cpu')
+        model.load_state_dict(ck['model'])
+        acc_all, acc_rng, pm, ex_all, ex_rng = evaluate(model, Xev, Yev, dev,
+                                                        amp=amp, perm=perm)
+        print(f'\n=== {a.eval_ckpt} ===')
+        print(f'  per-square     {100*acc_all:.2f}%  / moves 5-53 {100*acc_rng:.2f}%')
+        print(f'  EXACT-position {100*ex_all:.2f}%  / moves 5-53 {100*ex_rng:.2f}%'
+              '   <- all 64 squares right')
+        return
+
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
     spe = (len(Xtr) + a.batch_size - 1) // a.batch_size
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr,
                                                 total_steps=a.epochs * spe, pct_start=0.05)
     step = 0
     for ep in range(a.epochs):
-        perm = np.random.permutation(len(Xtr))
+        order = np.random.permutation(len(Xtr))   # NOT `perm`: that is the label permutation
         for i in range(0, len(Xtr), a.batch_size):
-            idx = np.sort(perm[i:i+a.batch_size])            # sorted = faster memmap reads
+            idx = np.sort(order[i:i+a.batch_size])           # sorted = faster memmap reads
             x = torch.from_numpy(np.asarray(Xtr[idx])).long().to(dev)
             y = unpack_labels(Ytr[idx], dev)
             if perm is not None:
@@ -308,15 +331,19 @@ def main():
             if step % 500 == 0:
                 print(f'  ep{ep} step {step}/{a.epochs*spe}  loss {loss.item():.4f}  '
                       f'({time.time()-t0:.0f}s)', flush=True)
-        acc_all, acc_rng, _ = evaluate(model, Xev, Yev, dev, amp=amp, perm=perm)
-        print(f'epoch {ep}: all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%',
-              flush=True)
+        acc_all, acc_rng, _, ex_all, ex_rng = evaluate(model, Xev, Yev, dev,
+                                                       amp=amp, perm=perm)
+        print(f'epoch {ep}: per-square {100*acc_all:.2f}% / 5-53 {100*acc_rng:.2f}%   '
+              f'EXACT-position {100*ex_all:.2f}% / 5-53 {100*ex_rng:.2f}%', flush=True)
         os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
         torch.save({'model': model.state_dict(), 'cfg': vars(cfg), 'args': vars(a),
                     'epoch': ep}, a.out)
 
-    acc_all, acc_rng, pm = evaluate(model, Xev, Yev, dev, amp=amp, perm=perm)
-    print(f'\nFINAL  all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%')
+    acc_all, acc_rng, pm, ex_all, ex_rng = evaluate(model, Xev, Yev, dev,
+                                                    amp=amp, perm=perm)
+    print(f'\nFINAL  per-square     {100*acc_all:.2f}%  / moves 5-53 {100*acc_rng:.2f}%')
+    print(f'       EXACT-position {100*ex_all:.2f}%  / moves 5-53 {100*ex_rng:.2f}%'
+          '   <- all 64 squares right')
     print('  (Othello-GPT probe, same data: 95.84% at depth 4, 99.19% peak)')
     print('by move:', '  '.join(f'{t+1}:{100*pm[t,0]/max(pm[t,1],1):.1f}%'
                                 for t in range(4, 59, 6)))
