@@ -104,7 +104,8 @@ def main():
     ap.add_argument('--readout-kind', default='linear')
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--n-games', type=int, default=2000)
-    ap.add_argument('--ply', type=int, default=25)
+    ap.add_argument('--ply-min', type=int, default=5)
+    ap.add_argument('--ply-max', type=int, default=53)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--fp32', action='store_true')
     ap.add_argument('--out-csv', default=None)
@@ -129,7 +130,8 @@ def main():
 
     games = held_out_games(a.data_dir, a.n_games)
     rng = np.random.default_rng(a.seed)
-    print(f'{len(games)} held-out games, ply {a.ply}', flush=True)
+    print(f'{len(games)} held-out games, ply sampled uniformly in '
+          f'[{a.ply_min},{a.ply_max}]', flush=True)
 
     # one position per game; one target square per category within that position
     acc = collections.defaultdict(lambda: dict(n=0, dl=0.0, di=0.0))
@@ -137,15 +139,19 @@ def main():
     t0 = time.time(); B = 128
     for b0 in range(0, len(games), B):
         bt = games[b0:b0 + B]
-        toks = torch.tensor([[CELL_TO_TOK[c] for c in g[:a.ply]] for g in bt],
+        T = a.ply_max
+        plies = rng.integers(a.ply_min, a.ply_max + 1, size=len(bt))
+        toks = torch.tensor([[CELL_TO_TOK[c] for c in g[:T]] for g in bt],
                             dtype=torch.long, device=dev)
         with torch.no_grad(), _autocast(dev, amp):
-            x = trunk.drop(trunk.tok_emb(toks) + trunk.pos_emb[:, :a.ply, :])
-            H = trunk.ln_f(trunk.blocks(x))[:, -1, :].float()     # layer 6, cd=0
+            x = trunk.drop(trunk.tok_emb(toks) + trunk.pos_emb[:, :T, :])
+            Hall = trunk.ln_f(trunk.blocks(x)).float()            # (B, T, d)
+        pidx = torch.tensor(plies - 1, device=dev)
+        H = Hall[torch.arange(len(bt), device=dev), pidx]          # layer 6, cd=0
 
         boards, movers = [], []
-        for g in bt:
-            bd = OthelloBoardState(); bd.update(list(g[:a.ply]))
+        for g, p in zip(bt, plies):
+            bd = OthelloBoardState(); bd.update(list(g[:int(p)]))
             boards.append(bd); movers.append(bd.next_hand_color)
 
         for cat, pairs in CATEGORIES.items():
@@ -201,14 +207,14 @@ def main():
                     r = acc[key]; r['n'] += 1; r['dl'] += dl; r['di'] += di
                     if a.out_csv:
                         rowsout.append((sqs[j]//8, sqs[j]%8, cat, sub, am,
-                                        float(s0[j]), dl, di))
+                                        int(plies[sel[j]]), float(s0[j]), dl, di))
         if (b0 // B) % 4 == 0:
             print(f'  {b0+len(bt)}/{len(games)} games ({time.time()-t0:.0f}s)',
                   flush=True)
 
     # aggregate exactly as the Othello-GPT table is aggregated
     print(f'\n=== layer-6 (cd=0) calibrated interventions, head={kind}, '
-          f'readout={a.readout_kind} ===')
+          f'readout={a.readout_kind}, ply {a.ply_min}-{a.ply_max} ===')
     print('  alpha   dP(newly legal)   dP(newly illegal)      n_legal   n_illegal')
     for am in ALPHAS:
         wl = [(r['dl'], r['n']) for k, r in acc.items()
@@ -235,10 +241,10 @@ def main():
         with open(a.out_csv, 'w', newline='') as fh:
             w = csv.writer(fh)
             w.writerow(['row','col','category','sub_condition','alpha_mult',
-                        'calibrated_s','dP_newly_legal','dP_newly_illegal'])
+                        'ply','calibrated_s','dP_newly_legal','dP_newly_illegal'])
             for r in rowsout:
-                w.writerow([r[0], r[1], r[2], r[3], r[4],
-                            f'{r[5]:.6f}', f'{r[6]:.6f}', f'{r[7]:.6f}'])
+                w.writerow([r[0], r[1], r[2], r[3], r[4], r[5],
+                            f'{r[6]:.6f}', f'{r[7]:.6f}', f'{r[8]:.6f}'])
         print(f'\nwrote {a.out_csv} ({len(rowsout)} rows, 6dp)')
 
 
