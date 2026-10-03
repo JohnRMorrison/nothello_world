@@ -34,14 +34,95 @@ from train_board_state_gpt import (GPTBoardState, GPTBoardGrid, BLOCK,
 TOK_TO_CELL = {t: c for c, t in CELL_TO_TOK.items()}
 
 
+CENTER = {27, 28, 35, 36}
+VALID60 = [c for c in range(64) if c not in CENTER]
+
+
+def _pad61(logits60):
+    """-> (..., 61) with a hard-negative pad logit at index 0, so score_legality
+    and the training loss (ignore_index=0) work on every readout alike."""
+    pad = torch.full_like(logits60[..., :1], -1e4)
+    return torch.cat([pad, logits60], -1)
+
+
+class LinearHead(nn.Module):
+    """Othello-GPT's head: one 512x61 matrix, nothing else."""
+
+    def __init__(self, d, **kw):
+        super().__init__()
+        self.lin = nn.Linear(d, 61, bias=False)
+        nn.init.normal_(self.lin.weight, 0.0, 0.02)
+
+    def forward(self, h, trunk=None):
+        return self.lin(h)
+
+
+class MLPHead(nn.Module):
+    def __init__(self, d, hidden=2048, layers=1, **kw):
+        super().__init__()
+        mods, i = [], d
+        for _ in range(layers):
+            mods += [nn.Linear(i, hidden), nn.ReLU()]; i = hidden
+        mods += [nn.Linear(i, 60)]
+        self.net = nn.Sequential(*mods)
+
+    def forward(self, h, trunk=None):
+        return _pad61(self.net(h))
+
+
+class AttnHead(nn.Module):
+    """Square-attention over 64 tokens projected out of h.
+
+    The ladder's winner on the true board: 0.048% illegal mass at 399k params,
+    beating a 4.7M MLP.  Here the 64 tokens come from a learned projection of
+    the trunk's 512-d state rather than from the board itself.
+    """
+
+    def __init__(self, d, dm=128, layers=2, heads=4, from_board=False, **kw):
+        super().__init__()
+        self.dm = dm; self.from_board = from_board
+        if from_board:
+            self.inp = nn.Linear(3, dm)          # the frozen head's 3 class logits
+        else:
+            self.inp = nn.Linear(d, 64 * dm)
+        self.row = nn.Embedding(8, dm); self.col = nn.Embedding(8, dm)
+        enc = nn.TransformerEncoderLayer(dm, heads, 4 * dm, dropout=0.0,
+                                         batch_first=True, norm_first=True)
+        self.tr = nn.TransformerEncoder(enc, layers)
+        self.out = nn.Linear(dm, 1)
+        self.register_buffer('rid', torch.arange(64) // 8)
+        self.register_buffer('cid', torch.arange(64) % 8)
+        self.register_buffer('valid', torch.tensor(VALID60))
+
+    def forward(self, h, trunk=None):
+        lead = h.shape[:-1]
+        if self.from_board:
+            with torch.no_grad():                # frozen board head
+                b3 = trunk.head(h).view(*lead, 64, 3).float()
+            tok = self.inp(b3)
+        else:
+            tok = self.inp(h).view(*lead, 64, self.dm)
+        tok = tok + self.row(self.rid) + self.col(self.cid)
+        tok = self.tr(tok.reshape(-1, 64, self.dm)).view(*lead, 64, self.dm)
+        return _pad61(self.out(tok).squeeze(-1)[..., self.valid])
+
+
+def build_head(kind, d):
+    if kind == 'linear':    return LinearHead(d)
+    if kind == 'mlp':       return MLPHead(d, 2048, 1)
+    if kind == 'mlp2':      return MLPHead(d, 2048, 2)
+    if kind == 'attn':      return AttnHead(d, 128, 2, 4, from_board=False)
+    if kind == 'attnboard': return AttnHead(d, 128, 2, 4, from_board=True)
+    raise ValueError(kind)
+
+
 class LegalReadout(nn.Module):
     """Frozen trunk + Othello-GPT's head.  Only `head` has gradients."""
 
-    def __init__(self, trunk, n_embd, vocab=61):
+    def __init__(self, trunk, n_embd, kind='linear'):
         super().__init__()
         self.trunk = trunk
-        self.head = nn.Linear(n_embd, vocab, bias=False)
-        nn.init.normal_(self.head.weight, 0.0, 0.02)
+        self.readout = build_head(kind, n_embd)
         for p in self.trunk.parameters():
             p.requires_grad = False
         self.trunk.eval()
@@ -51,12 +132,17 @@ class LegalReadout(nn.Module):
         self.trunk.eval()          # never let the frozen trunk re-enable dropout
         return self
 
-    def forward(self, idx):
+    def features(self, idx):
         tr = self.trunk
         with torch.no_grad():
             x = tr.drop(tr.tok_emb(idx) + tr.pos_emb[:, :idx.size(1), :])
-            x = tr.ln_f(tr.blocks(x))
-        return self.head(x)
+            return tr.ln_f(tr.blocks(x))
+
+    def forward(self, idx, pos=None):
+        h = self.features(idx)
+        if pos is not None:                      # train on a subset of positions
+            h = torch.gather(h, 1, pos.unsqueeze(-1).expand(-1, -1, h.size(-1)))
+        return self.readout(h, self.trunk)
 
 
 def load_trunk(ckpt_path, dev):
@@ -136,6 +222,9 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--cache', default='./cache/board')
     ap.add_argument('--n-games', type=int, default=2_000_000)
+    ap.add_argument('--cache-games', type=int, default=0,
+                    help="the cache's game count, if using a slice of a bigger "
+                         "cache (0 = same as --n-games)")
     ap.add_argument('--epochs', type=int, default=3)
     ap.add_argument('--batch-size', type=int, default=1024)
     ap.add_argument('--lr', type=float, default=1e-3)
@@ -143,6 +232,12 @@ def main():
     ap.add_argument('--ply-min', type=int, default=5)
     ap.add_argument('--ply-max', type=int, default=54)   # half-open: moves 5-53
     ap.add_argument('--ks', type=int, nargs='+', default=[1, 3, 5])
+    ap.add_argument('--readout', default='linear',
+                    choices=['linear', 'mlp', 'mlp2', 'attn', 'attnboard'])
+    ap.add_argument('--pos-sample', type=int, default=0,
+                    help='train on this many random positions per game (0 = all). '
+                         'The trunk runs over the full prefix either way; this '
+                         'only bounds the head, which matters for attn.')
     ap.add_argument('--fp32', action='store_true')
     ap.add_argument('--out', default='ckpts/legal_readout.ckpt')
     a = ap.parse_args()
@@ -156,7 +251,7 @@ def main():
           flush=True)
 
     trunk, cfg = load_trunk(a.ckpt, dev)
-    model = LegalReadout(trunk, cfg.n_embd).to(dev)
+    model = LegalReadout(trunk, cfg.n_embd, a.readout).to(dev)
     tp = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'{tp:,} trainable (head only) of '
           f'{sum(p.numel() for p in model.parameters()):,}', flush=True)
@@ -164,11 +259,12 @@ def main():
     # Reuse the board-state cache: only X (move tokens) is needed, since the
     # next-move target is X shifted by one.  Token 0 is pad, so ignore_index=0
     # drops both padded targets and the positions past a game's end.
-    xp = f'{a.cache}_tr{a.n_games}_X.npy'
+    xp = f'{a.cache}_tr{a.cache_games or a.n_games}_X.npy'
     if not os.path.exists(xp):
         sys.exit(f'no token cache at {xp} -- run train_board_state_gpt.py '
-                 f'with --n-games {a.n_games} --cache {a.cache} first')
-    X = np.load(xp, mmap_mode='r')
+                 f'with --n-games {a.cache_games or a.n_games} '
+                 f'--cache {a.cache} first')
+    X = np.load(xp, mmap_mode='r')[:a.n_games]
     print(f'{len(X):,} training games from {xp}', flush=True)
 
     opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
@@ -184,9 +280,18 @@ def main():
             idx = np.sort(perm[i:i + a.batch_size])
             x = torch.from_numpy(np.asarray(X[idx])).long().to(dev)
             with _autocast(dev, amp):
-                lg = model(x)
-                loss = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
-                                       x[:, 1:].reshape(-1), ignore_index=0)
+                if a.pos_sample:
+                    # positions 0..BLOCK-2 only: the target is the NEXT token
+                    pos = torch.randint(0, x.size(1) - 1, (x.size(0), a.pos_sample),
+                                        device=dev)
+                    lg = model(x, pos)
+                    tgt = torch.gather(x, 1, pos + 1)
+                    loss = F.cross_entropy(lg.reshape(-1, lg.size(-1)),
+                                           tgt.reshape(-1), ignore_index=0)
+                else:
+                    lg = model(x)
+                    loss = F.cross_entropy(lg[:, :-1].reshape(-1, lg.size(-1)),
+                                           x[:, 1:].reshape(-1), ignore_index=0)
             opt.zero_grad(set_to_none=True); loss.backward()
             opt.step(); sched.step(); step += 1
             if step % 250 == 0:
@@ -195,22 +300,23 @@ def main():
         print(f'epoch {ep} done ({time.time()-t0:.0f}s)', flush=True)
 
     os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
-    torch.save({'head': model.head.state_dict(), 'args': vars(a)}, a.out)
+    torch.save({'head': model.readout.state_dict(), 'args': vars(a)}, a.out)
     print(f'saved {a.out}', flush=True)
 
     games = held_out_games(a.data_dir, a.eval_games)
     print(f'\nscoring {len(games)} HELD-OUT games, plies '
           f'[{a.ply_min},{a.ply_max}) = moves {a.ply_min}-{a.ply_max-1}', flush=True)
     r = score_legality(model, games, dev, a.ply_min, a.ply_max, a.ks, amp)
-    print(f'\n=== legal-move readout on frozen board-state trunk, N={r["n"]:,} ===')
+    print(f'\n=== readout "{a.readout}" on frozen board-state trunk, N={r["n"]:,} ===')
     for k in a.ks:
         print(f'  top-{k}:  FRAC {100*r["frac"][k]:6.2f}%   ALL {100*r["hit"][k]:6.2f}%')
     print(f'  illegal mass: median {100*r["med_mass"]:.3f}%  '
           f'mean {100*r["mean_mass"]:.3f}%')
     print(f'  per-game max illegal mass: median {100*r["gmax_med"]:.2f}%  '
           f'>5% {100*r["gt5"]:.1f}%  >10% {100*r["gt10"]:.1f}%')
-    print('\n  reference (moves 5-53, held-out): Othello-GPT top-1 99.95 '
-          'FRAC, median illegal mass 0.25%, >5% 16.7, >10% 10.5')
+    print('\n  references (moves 5-53): Othello-GPT linear head 99.95 / 0.25%; '
+          'TRUE board -- linear 98.98 / 26.00%, mlp2 99.81 / 0.199%, '
+          'attn 99.85 / 0.048%')
 
 
 if __name__ == '__main__':
