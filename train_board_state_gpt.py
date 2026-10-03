@@ -22,7 +22,7 @@ million, and memmapped it need not be resident at all.
     python train_board_state_gpt.py --n-games 5000000 --epochs 3 --n-layer 6 \
         --cache /workspace/board_cache --out ckpts/board_gpt_L6_5M.ckpt
 """
-import argparse, os, pickle, sys, time
+import argparse, contextlib, os, pickle, sys, time
 from multiprocessing import Pool
 import numpy as np
 import torch
@@ -145,15 +145,25 @@ def load_games(data_dir, n_games, held_out=False, n_held=3):
     return out[:n_games]
 
 
+def _autocast(dev, amp):
+    """bf16 on CUDA.  The matmuls run on Tensor Cores while weights and the
+    optimizer stay fp32, which measured 0.264 s/step in fp32 against a 58,596
+    step run -- 4.3 h.  bf16 needs no loss scaling, unlike fp16."""
+    if dev == 'cuda' and amp:
+        return torch.autocast('cuda', dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 @torch.no_grad()
-def evaluate(model, X, Y, dev, batch=256):
+def evaluate(model, X, Y, dev, batch=256, amp=True):
     """Per-square accuracy over all moves, and over moves 5-53 (the range the
     Othello-GPT probe is scored on, so the two are comparable)."""
     model.eval(); tot = np.zeros(2); hit = np.zeros(2); per_move = np.zeros((BLOCK, 2))
     for i in range(0, len(X), batch):
         x = torch.from_numpy(np.asarray(X[i:i+batch])).long().to(dev)
         y = unpack_labels(Y[i:i+batch], dev)
-        pr = model(x)[0].argmax(-1)
+        with _autocast(dev, amp):
+            pr = model(x)[0].argmax(-1)
         m = y != -100
         ok = (pr == y) & m
         hit[0] += int(ok.sum()); tot[0] += int(m.sum())
@@ -178,12 +188,19 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--absolute', action='store_true')
+    ap.add_argument('--fp32', action='store_true',
+                    help='disable bf16 autocast (default is bf16 on CUDA)')
     ap.add_argument('--out', default='ckpts/board_gpt.ckpt')
     a = ap.parse_args()
 
     dev = ('cuda' if torch.cuda.is_available()
            else 'mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f'device {dev}  nproc {a.nproc}', flush=True)
+    amp = not a.fp32
+    if dev == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    print(f'device {dev}  nproc {a.nproc}  '
+          f'precision {"bf16" if (dev == "cuda" and amp) else "fp32"}', flush=True)
 
     t0 = time.time()
     print('loading games...', flush=True)
@@ -209,21 +226,22 @@ def main():
             idx = np.sort(perm[i:i+a.batch_size])            # sorted = faster memmap reads
             x = torch.from_numpy(np.asarray(Xtr[idx])).long().to(dev)
             y = unpack_labels(Ytr[idx], dev)
-            _, loss = model(x, y)
+            with _autocast(dev, amp):
+                _, loss = model(x, y)
             opt.zero_grad(set_to_none=True); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); sched.step(); step += 1
             if step % 500 == 0:
                 print(f'  ep{ep} step {step}/{a.epochs*spe}  loss {loss.item():.4f}  '
                       f'({time.time()-t0:.0f}s)', flush=True)
-        acc_all, acc_rng, _ = evaluate(model, Xev, Yev, dev)
+        acc_all, acc_rng, _ = evaluate(model, Xev, Yev, dev, amp=amp)
         print(f'epoch {ep}: all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%',
               flush=True)
         os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
         torch.save({'model': model.state_dict(), 'cfg': vars(cfg), 'args': vars(a),
                     'epoch': ep}, a.out)
 
-    acc_all, acc_rng, pm = evaluate(model, Xev, Yev, dev)
+    acc_all, acc_rng, pm = evaluate(model, Xev, Yev, dev, amp=amp)
     print(f'\nFINAL  all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%')
     print('  (Othello-GPT probe, same data: 95.84% at depth 4, 99.19% peak)')
     print('by move:', '  '.join(f'{t+1}:{100*pm[t,0]/max(pm[t,1],1):.1f}%'
