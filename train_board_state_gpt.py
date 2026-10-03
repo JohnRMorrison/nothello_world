@@ -87,22 +87,45 @@ def _init(absolute):
     _ABS = absolute
 
 
+# ---- label packing ------------------------------------------------------
+# Labels take exactly four values (-100 ignore, 0 empty, 1 theirs, 2 mine), so
+# two bits hold one square and one byte holds four.  That shrinks the label
+# cache 4x -- 3,776 bytes/game down to 944 -- which is what lets a 20M-game
+# cache fit on disk at all.  -100 is stored as code 3.
+
+
+def pack_labels(y):
+    """int8 (..., 64) in {-100,0,1,2}  ->  uint8 (..., 16)."""
+    c = np.where(y == -100, 3, y).astype(np.uint8).reshape(*y.shape[:-1], 16, 4)
+    return c[..., 0] | (c[..., 1] << 2) | (c[..., 2] << 4) | (c[..., 3] << 6)
+
+
+def unpack_labels(p, dev):
+    """uint8 (..., 16) -> long tensor (..., 64) on dev, code 3 back to -100.
+    Unpacked on the GPU, so a quarter as much data crosses the bus."""
+    t = torch.from_numpy(np.ascontiguousarray(p)).to(dev)
+    sh = torch.tensor([0, 2, 4, 6], device=dev, dtype=torch.uint8)
+    c = ((t.unsqueeze(-1) >> sh) & 3).reshape(*t.shape[:-1], 64).long()
+    return torch.where(c == 3, torch.full_like(c, -100), c)
+
+
 def build_cache(games, prefix, absolute, nproc):
-    """Write X/Y memmaps, reusing them if already present and the right size."""
-    xp, yp = prefix + '_X.npy', prefix + '_Y.npy'
+    """Write X/Y memmaps, reusing them if already present and the right size.
+    Y is 2-bit packed (see pack_labels), so its last axis is 16, not 64."""
+    xp, yp = prefix + '_X.npy', prefix + '_Yp.npy'
     n = len(games)
     if os.path.exists(xp) and os.path.exists(yp):
         X = np.load(xp, mmap_mode='r'); Y = np.load(yp, mmap_mode='r')
-        if len(X) == n:
+        if len(X) == n and Y.shape[-1] == 16:
             print(f'  reusing cache {xp} ({n:,} games)', flush=True)
             return X, Y
     os.makedirs(os.path.dirname(xp) or '.', exist_ok=True)
     X = np.lib.format.open_memmap(xp, mode='w+', dtype=np.int16, shape=(n, BLOCK))
-    Y = np.lib.format.open_memmap(yp, mode='w+', dtype=np.int8, shape=(n, BLOCK, 64))
+    Y = np.lib.format.open_memmap(yp, mode='w+', dtype=np.uint8, shape=(n, BLOCK, 16))
     t0 = time.time()
     with Pool(nproc, initializer=_init, initargs=(absolute,)) as pool:
         for i, (x, y) in enumerate(pool.imap(_one, games, chunksize=512)):
-            X[i] = x; Y[i] = y
+            X[i] = x; Y[i] = pack_labels(y)
             if (i + 1) % 250_000 == 0:
                 print(f'  built {i+1:,}/{n:,}  ({time.time()-t0:.0f}s)', flush=True)
     X.flush(); Y.flush()
@@ -129,7 +152,7 @@ def evaluate(model, X, Y, dev, batch=256):
     model.eval(); tot = np.zeros(2); hit = np.zeros(2); per_move = np.zeros((BLOCK, 2))
     for i in range(0, len(X), batch):
         x = torch.from_numpy(np.asarray(X[i:i+batch])).long().to(dev)
-        y = torch.from_numpy(np.asarray(Y[i:i+batch])).long().to(dev)
+        y = unpack_labels(Y[i:i+batch], dev)
         pr = model(x)[0].argmax(-1)
         m = y != -100
         ok = (pr == y) & m
@@ -185,7 +208,7 @@ def main():
         for i in range(0, len(Xtr), a.batch_size):
             idx = np.sort(perm[i:i+a.batch_size])            # sorted = faster memmap reads
             x = torch.from_numpy(np.asarray(Xtr[idx])).long().to(dev)
-            y = torch.from_numpy(np.asarray(Ytr[idx])).long().to(dev)
+            y = unpack_labels(Ytr[idx], dev)
             _, loss = model(x, y)
             opt.zero_grad(set_to_none=True); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
