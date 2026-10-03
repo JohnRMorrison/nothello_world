@@ -145,6 +145,62 @@ def load_games(data_dir, n_games, held_out=False, n_held=3):
     return out[:n_games]
 
 
+class GPTBoardGrid(GPT):
+    """Design B: a head whose only notion of square identity is (row, col).
+
+    Eight row vectors and eight column vectors address all 64 squares, and ONE
+    bilinear readout is shared by every square:
+
+        q[r,c]        = row[r] * col[c]            (elementwise, rank-m address)
+        logits[r,c,k] = (x @ W[k]) . q[r,c]
+
+    The flat head gives each square its own 512-dim weight block, so it is
+    exactly invariant to any relabelling of the 64 squares -- permute the label
+    axis and nothing changes.  This head is not: a square is reachable only by
+    combining its row with its column, so squares sharing a row share
+    parameters.
+
+    `rank` (m) is the knob.  Each class's 8x8 logit map is confined to
+    span{row[:,j] (x) col[:,j]}, an m-dimensional subspace of the 64-dimensional
+    space of 8x8 maps, so m=64 is expressive while smaller m is a genuine
+    structural restriction.  Note this is a strong inductive bias, not a hard
+    constraint at m=64 -- which is what the permutation control measures.
+
+    Parameters land at 99,331 against the flat head's 98,304, so the comparison
+    is capacity-matched.
+    """
+
+    def __init__(self, config, rank=64):
+        super().__init__(config)
+        self.head = nn.Identity()                      # flat head unused
+        self.rank = rank
+        self.row = nn.Parameter(torch.empty(8, rank))
+        self.col = nn.Parameter(torch.empty(8, rank))
+        self.Wk = nn.Parameter(torch.empty(3, config.n_embd, rank))
+        self.bk = nn.Parameter(torch.zeros(3))
+        self.apply(self._init_weights)
+        with torch.no_grad():                          # _init_weights skips raw Parameters
+            self.row.normal_(0, 1.0)
+            self.col.normal_(0, 1.0)
+            self.Wk.normal_(0, 0.02)
+
+    def forward(self, idx, targets=None):
+        b, t = idx.size()
+        x = self.drop(self.tok_emb(idx) + self.pos_emb[:, :t, :])
+        x = self.ln_f(self.blocks(x))
+        q = (self.row[:, None, :] * self.col[None, :, :]).reshape(64, self.rank)
+        z = torch.einsum('bti,kij->btkj', x, self.Wk)          # (b, t, 3, m)
+        # 1/sqrt(m), as in attention: q is a product of two unit-variance
+        # factors, so without it the 64-term sum gives logits of std ~3.6 and a
+        # softmax saturated at init (initial loss 3.37 against ln(3) = 1.10).
+        logits = (torch.einsum('btkj,sj->btsk', z, q) / self.rank ** 0.5) + self.bk
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.reshape(-1, 3), targets.reshape(-1).long(),
+                                   ignore_index=-100)
+        return logits, loss
+
+
 def _autocast(dev, amp):
     """bf16 on CUDA.  The matmuls run on Tensor Cores while weights and the
     optimizer stay fp32, which measured 0.264 s/step in fp32 against a 58,596
@@ -155,13 +211,15 @@ def _autocast(dev, amp):
 
 
 @torch.no_grad()
-def evaluate(model, X, Y, dev, batch=256, amp=True):
+def evaluate(model, X, Y, dev, batch=256, amp=True, perm=None):
     """Per-square accuracy over all moves, and over moves 5-53 (the range the
     Othello-GPT probe is scored on, so the two are comparable)."""
     model.eval(); tot = np.zeros(2); hit = np.zeros(2); per_move = np.zeros((BLOCK, 2))
     for i in range(0, len(X), batch):
         x = torch.from_numpy(np.asarray(X[i:i+batch])).long().to(dev)
         y = unpack_labels(Y[i:i+batch], dev)
+        if perm is not None:
+            y = y[..., perm]
         with _autocast(dev, amp):
             pr = model(x)[0].argmax(-1)
         m = y != -100
@@ -188,6 +246,13 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--nproc', type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument('--absolute', action='store_true')
+    ap.add_argument('--head', choices=['flat', 'grid'], default='flat',
+                    help='flat: Linear(512, 64*3).  grid: Design B, row/col addressing')
+    ap.add_argument('--head-rank', type=int, default=64,
+                    help='grid head only: address rank m (64 = expressive, lower = tighter)')
+    ap.add_argument('--permute-labels', type=int, default=-1, metavar='SEED',
+                    help='control: fixed random permutation of the 64 square labels. '
+                         'The flat head is invariant to this; a spatial head should not be.')
     ap.add_argument('--fp32', action='store_true',
                     help='disable bf16 autocast (default is bf16 on CUDA)')
     ap.add_argument('--out', default='ckpts/board_gpt.ckpt')
@@ -202,6 +267,12 @@ def main():
     print(f'device {dev}  nproc {a.nproc}  '
           f'precision {"bf16" if (dev == "cuda" and amp) else "fp32"}', flush=True)
 
+    perm = None
+    if a.permute_labels >= 0:
+        rng = np.random.default_rng(a.permute_labels)
+        perm = torch.from_numpy(rng.permutation(64)).to(dev)
+        print(f'PERMUTING label axis with seed {a.permute_labels}', flush=True)
+
     t0 = time.time()
     print('loading games...', flush=True)
     tr = load_games(a.data_dir, a.n_games)
@@ -212,7 +283,8 @@ def main():
     del tr, ev
 
     cfg = GPTConfig(61, BLOCK, n_layer=a.n_layer, n_head=a.n_head, n_embd=a.n_embd)
-    model = GPTBoardState(cfg).to(dev)
+    model = (GPTBoardGrid(cfg, rank=a.head_rank) if a.head == 'grid'
+             else GPTBoardState(cfg)).to(dev)
     print(f'{sum(p.numel() for p in model.parameters()):,} parameters', flush=True)
 
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=0.01)
@@ -226,6 +298,8 @@ def main():
             idx = np.sort(perm[i:i+a.batch_size])            # sorted = faster memmap reads
             x = torch.from_numpy(np.asarray(Xtr[idx])).long().to(dev)
             y = unpack_labels(Ytr[idx], dev)
+            if perm is not None:
+                y = y[..., perm]
             with _autocast(dev, amp):
                 _, loss = model(x, y)
             opt.zero_grad(set_to_none=True); loss.backward()
@@ -234,14 +308,14 @@ def main():
             if step % 500 == 0:
                 print(f'  ep{ep} step {step}/{a.epochs*spe}  loss {loss.item():.4f}  '
                       f'({time.time()-t0:.0f}s)', flush=True)
-        acc_all, acc_rng, _ = evaluate(model, Xev, Yev, dev, amp=amp)
+        acc_all, acc_rng, _ = evaluate(model, Xev, Yev, dev, amp=amp, perm=perm)
         print(f'epoch {ep}: all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%',
               flush=True)
         os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
         torch.save({'model': model.state_dict(), 'cfg': vars(cfg), 'args': vars(a),
                     'epoch': ep}, a.out)
 
-    acc_all, acc_rng, pm = evaluate(model, Xev, Yev, dev, amp=amp)
+    acc_all, acc_rng, pm = evaluate(model, Xev, Yev, dev, amp=amp, perm=perm)
     print(f'\nFINAL  all moves {100*acc_all:.2f}%   moves 5-53 {100*acc_rng:.2f}%')
     print('  (Othello-GPT probe, same data: 95.84% at depth 4, 99.19% peak)')
     print('by move:', '  '.join(f'{t+1}:{100*pm[t,0]/max(pm[t,1],1):.1f}%'
