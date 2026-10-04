@@ -74,6 +74,11 @@ def load_trunk(kind, ckpt, layer, dev):
         nl = 1 + max(int(k.split('.')[1]) for k in sdw if k.startswith('blocks.'))
         cfg = GPTConfig(v, sdw['pos_emb'].shape[1], n_layer=nl, n_head=8, n_embd=d)
     g = GPT(cfg)
+    # Drop head.* : GPTBoardState's head is Linear(d, 64*3) where GPT's is
+    # Linear(d, vocab), and strict=False forgives missing/unexpected keys but
+    # NOT shape mismatches.  Trunk only runs tok_emb + pos_emb + blocks, so the
+    # head is never needed.
+    sdw = {k: v for k, v in sdw.items() if not k.startswith('head.')}
     g.load_state_dict(sdw, strict=False)
     # expand the token embedding 61 -> 69 so the new-square moves can be INPUT.
     old = g.tok_emb.weight.shape[0]
