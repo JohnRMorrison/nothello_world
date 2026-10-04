@@ -45,20 +45,48 @@ class Trunk(nn.Module):
     how a linear probe reads the residual stream.
     """
 
-    def __init__(self, gpt, layer):
+    def __init__(self, gpt, layer, n_new=0, n_old=0):
         super().__init__()
         self.g = gpt; self.layer = layer
         for p in self.g.parameters():
             p.requires_grad = False
         self.g.eval()
+        # The NEW move tokens are new symbols: nothing else can teach the model
+        # what they mean, so leaving them at random init makes the trunk receive
+        # noise whenever a new square is played -- which is what made both
+        # trunks look identical (0.788 vs 0.786).  They get their OWN trainable
+        # embedding rather than trainable rows of the pretrained table: a
+        # gradient mask does not protect the frozen rows, because AdamW applies
+        # weight decay to any requires_grad parameter regardless of gradient
+        # (measured: rows 0..60 drifted 2.6e-02 under a masked hook).
+        self.n_new = n_new; self.n_old = n_old
+        if n_new:
+            self.new_emb = nn.Embedding(n_new, gpt.pos_emb.shape[-1])
+            self.new_emb.weight.data.normal_(0.0, 0.02)
+            print(f'  {n_new} new move tokens get a SEPARATE trainable '
+                  f'embedding; the pretrained {n_old} rows and all blocks are '
+                  f'frozen', flush=True)
 
     def train(self, mode=True):
         super().train(mode); self.g.eval(); return self
 
     def forward(self, idx):
         g = self.g
-        with torch.no_grad():
-            x = g.drop(g.tok_emb(idx) + g.pos_emb[:, :idx.size(1), :])
+        # NOT under no_grad when the new embedding trains: gradients must flow
+        # THROUGH the frozen blocks to reach it.  requires_grad=False on the
+        # block params stops gradient being accumulated for them, not
+        # propagation through them.
+        train_new = bool(self.n_new) and self.training
+        ctx = torch.enable_grad() if train_new else torch.no_grad()
+        with ctx:
+            if self.n_new:
+                e = g.tok_emb(idx.clamp(max=self.n_old - 1))
+                is_new = (idx >= self.n_old).unsqueeze(-1)
+                e = torch.where(is_new,
+                                self.new_emb((idx - self.n_old).clamp(min=0)), e)
+            else:
+                e = g.tok_emb(idx)
+            x = g.drop(e + g.pos_emb[:, :idx.size(1), :])
             for blk in g.blocks[:self.layer]:
                 x = blk(x)
             return x
@@ -80,17 +108,11 @@ def load_trunk(kind, ckpt, layer, dev):
     # head is never needed.
     sdw = {k: v for k, v in sdw.items() if not k.startswith('head.')}
     g.load_state_dict(sdw, strict=False)
-    # expand the token embedding 61 -> 69 so the new-square moves can be INPUT.
     old = g.tok_emb.weight.shape[0]
-    if old < VOCAB:
-        emb = nn.Embedding(VOCAB, cfg.n_embd)
-        emb.weight.data[:old] = g.tok_emb.weight.data
-        emb.weight.data[old:].normal_(0.0, 0.02)
-        g.tok_emb = emb
-        print(f'  expanded token embedding {old} -> {VOCAB}', flush=True)
     print(f'  {kind}: {cfg.n_layer} layers, d{cfg.n_embd}, reading block {layer}',
           flush=True)
-    return Trunk(g, layer).to(dev), cfg.n_embd, cfg.block_size
+    return (Trunk(g, layer, max(0, VOCAB - old), old).to(dev),
+            cfg.n_embd, cfg.block_size)
 
 
 # ---------------------------------------------------------------- readout
@@ -210,6 +232,8 @@ def batches(X, L, bs, block, dev, shuffle=True):
 
 def step(trunk, head, x, last, y, opt=None):
     h = trunk(x)[torch.arange(len(x), device=x.device), last]
+    if not h.requires_grad:
+        h = h.detach()
     lg = head(h)
     loss = soft_ce(lg, y)
     if opt is not None:
@@ -332,7 +356,11 @@ def main():
     print(f'\nphase 2: condition {a.condition_id}, {len(Xc):,} positions '
           f'({time.time()-t0:.0f}s)', flush=True)
     sched = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000]
-    opt = torch.optim.AdamW(head.parameters(), lr=a.lr)
+    tp = [p for p in trunk.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(list(head.parameters()) + tp, lr=a.lr)
+    if tp:
+        print(f'  optimising {sum(p.numel() for p in tp):,} trunk params '
+              f'(new token rows only)', flush=True)
     res = {'trunk': a.trunk, 'ckpt': a.ckpt, 'layer': a.layer, 'seed': a.seed,
            'condition_id': a.condition_id, 'readout': 'generic_attention',
            'n_positions': len(Xc), 'newsq_pos': a.newsq_pos,
