@@ -192,8 +192,51 @@ def step(trunk, head, x, last, y, opt=None):
     return loss.item()
 
 
-def make_score_fn(trunk, head, block, dev):
+def _scores_batched(trunk, head, block, dev, prefixes, bs=256):
+    """Score many prefixes at once.  score_manifest calls score_fn ONE position
+    at a time, and the manifest holds 10,000 of them -- 100,000 batch-1 forwards
+    per run at 10 eval points, which is most of the runtime and leaves the GPU
+    idle.  Precomputing in batches keeps score_manifest untouched (so the
+    metrics stay identical to the GPT and MLP arms) while doing the work 256 at
+    a time.
+
+    Right-padding is equivalent to the unbatched path: the trunk is causal, so
+    position len(toks)-1 depends only on tokens 0..len(toks)-1, and each token
+    receives the same pos_emb index either way.
+    """
+    out = {}
+    for i in range(0, len(prefixes), bs):
+        chunk = prefixes[i:i + bs]
+        toks = [[CELL_TO_TOK[m] for m in pre if m in CELL_TO_TOK][-block:]
+                for pre in chunk]
+        ln = max(1, max(len(t) for t in toks))
+        x = np.zeros((len(toks), ln), np.int64)
+        last = np.zeros(len(toks), np.int64)
+        for a, t in enumerate(toks):
+            if t:
+                x[a, :len(t)] = t; last[a] = len(t) - 1
+        xt = torch.from_numpy(x).to(dev)
+        lt = torch.from_numpy(last).to(dev)
+        with torch.no_grad():
+            h = trunk(xt)[torch.arange(len(toks), device=dev), lt]
+            p = torch.softmax(head(h).float(), -1).cpu().numpy()
+        for a, pre in enumerate(chunk):
+            out[pre] = p[a] if toks[a] else np.zeros(N_CELLS, np.float32)
+    return out
+
+
+def make_score_fn(trunk, head, block, dev, manifest=None):
+    cache = {}
+    if manifest is not None:
+        pres = [tuple(pos['game_prefix']) for st in ('IL', 'LL')
+                for pos in manifest.get(st, [])]
+        cache = _scores_batched(trunk, head, block, dev,
+                                list(dict.fromkeys(pres)))
+
     def score_fn(prefix):
+        k = tuple(prefix)
+        if k in cache:
+            return cache[k]
         toks = [CELL_TO_TOK[m] for m in prefix if m in CELL_TO_TOK][-block:]
         out = np.zeros(N_CELLS, np.float32)
         if not toks:
@@ -201,8 +244,7 @@ def make_score_fn(trunk, head, block, dev):
         x = torch.tensor([toks], dtype=torch.long, device=dev)
         with torch.no_grad():
             h = trunk(x)[:, -1]
-            p = torch.softmax(head(h)[0].float(), -1).cpu().numpy()
-        return p
+            return torch.softmax(head(h)[0].float(), -1).cpu().numpy()
     return score_fn
 
 
@@ -277,7 +319,7 @@ def main():
 
     def ev(st):
         head.eval()
-        r = score_manifest(make_score_fn(trunk, head, block, dev), man,
+        r = score_manifest(make_score_fn(trunk, head, block, dev, man), man,
                            per_bucket=False)
         head.train()
         res['eval_steps'].append(st)
