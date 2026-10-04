@@ -23,7 +23,9 @@ shortcut "these cells all hold value v".
 
   arm    trunk               frozen board decoder        board acc
   board  board_gpt_L6_20M    its own 64x3 head           99.63%
-  ogpt   gpt_synthetic       Nanda's probe, mode 2       99.19%
+(both checkpoints give identical probe accuracy, so the TL->mingpt conversion
+is faithful and the pairing is free.)
+  ogpt   gpt_nanda_synthetic Nanda's probe, MODE 0       98.47%
 
 Next-move prediction IS legality here: the games are random.choice(all_legal),
 so the Bayes-optimal next-move distribution is uniform over the legal set.
@@ -129,7 +131,13 @@ def load_arm(kind, ckpt, probe_path, layer, dev):
         v, d = sdw['tok_emb.weight'].shape
         nlayer = 1 + max(int(k.split('.')[1]) for k in sdw if k.startswith('blocks.'))
         cfg = GPTConfig(v, sdw['pos_emb'].shape[1], n_layer=nlayer, n_head=8, n_embd=d)
-        P = torch.load(probe_path, map_location='cpu')[2].detach()   # (d,8,8,3)
+        # MODE 0, not mode 2.  Measured per-square board accuracy at block 6
+        # over plies 4-53: mode 0 = 98.47%, mode 1 = 46.86%, mode 2 = 75.68%,
+        # parity-selected = 71.68%.  Mode 0 works at ALL plies.  Note
+        # ogpt_intervention.py and ogpt_legal_mass_shift.py both use mode 2,
+        # so the published alpha sweep used a 75.68% decoder when a 98.47% one
+        # was available -- worth revisiting there.
+        P = torch.load(probe_path, map_location='cpu')[0].detach()   # (d,8,8,3)
         W = P.permute(1, 2, 3, 0).reshape(64, 3, d).clone()          # (64,3,d)
     g = GPT(cfg)
     g.load_state_dict({k: v for k, v in sdw.items() if not k.startswith('head.')},
