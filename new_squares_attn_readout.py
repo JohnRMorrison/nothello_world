@@ -154,11 +154,22 @@ def positions_from_real_games(data_dir, n_games, ply_max=54):
     return X, L
 
 
-def positions_from_condition(cdir, max_pos):
-    """(prefix_tokens, legal_mask) from a condition's train_records -- phase 2."""
+def positions_from_condition(cdir, n_newsq, n_other):
+    """(prefix_tokens, legal_mask) from a condition's train_records -- phase 2.
+
+    EXPOSURE-MATCHED: takes exactly n_newsq positions where at least one new
+    square is legal and n_other where none is.  A flat cap does not work --
+    incoherent rules fire far more often, so the same slice gives it 60.0% new
+    -square-legal positions against coherent's 44.1% (239,882 vs 176,402 of
+    400,000).  That is 36% more new-square training signal, which alone can
+    produce a coherent/incoherent difference with no geometry involved.
+    Matching the count is not enough either: the per-step RATE has to match, so
+    both classes are fixed separately.
+    """
     games = pickle.load(open(os.path.join(cdir, 'train_games.pickle'), 'rb'))
     recs = pickle.load(open(os.path.join(cdir, 'train_records.pickle'), 'rb'))
-    X, L = [], []
+    new = set(NEW_SQUARE_IDS)
+    Xa, La, Xb, Lb = [], [], [], []
     for g, rs in zip(games, recs):
         for r in rs:
             m = np.zeros(N_CELLS, bool)
@@ -167,11 +178,20 @@ def positions_from_condition(cdir, max_pos):
                     m[c] = True
             if not m.any():
                 continue
-            X.append([CELL_TO_TOK[c] for c in g[:r['prefix_len']] if c in CELL_TO_TOK])
-            L.append(m)
-            if len(X) >= max_pos:
-                return X, L
-    return X, L
+            hit = bool(new & set(r['all_legal']))
+            if hit and len(Xa) < n_newsq:
+                Xa.append([CELL_TO_TOK[c] for c in g[:r['prefix_len']]
+                           if c in CELL_TO_TOK]); La.append(m)
+            elif not hit and len(Xb) < n_other:
+                Xb.append([CELL_TO_TOK[c] for c in g[:r['prefix_len']]
+                           if c in CELL_TO_TOK]); Lb.append(m)
+            if len(Xa) >= n_newsq and len(Xb) >= n_other:
+                break
+        if len(Xa) >= n_newsq and len(Xb) >= n_other:
+            break
+    print(f'  exposure-matched pool: {len(Xa):,} new-square-legal + '
+          f'{len(Xb):,} other', flush=True)
+    return Xa + Xb, La + Lb
 
 
 def batches(X, L, bs, block, dev, shuffle=True):
@@ -263,7 +283,8 @@ def main():
     ap.add_argument('--data-dir', default='./data/othello_synthetic')
     ap.add_argument('--pre-games', type=int, default=4000)
     ap.add_argument('--pre-epochs', type=int, default=3)
-    ap.add_argument('--max-pos', type=int, default=400000)
+    ap.add_argument('--newsq-pos', type=int, default=140000)
+    ap.add_argument('--other-pos', type=int, default=140000)
     ap.add_argument('--bs', type=int, default=256)
     ap.add_argument('--lr', type=float, default=3e-4)
     ap.add_argument('--seed', type=int, default=0,
@@ -307,14 +328,15 @@ def main():
     # ---- phase 2: fine-tune on the condition, scoring the shared manifest ----
     cdir = condition_dir(a.exp_dir, a.condition_id)
     man = json.load(open(os.path.join(cdir, 'test_manifest.json')))
-    Xc, Lc = positions_from_condition(cdir, a.max_pos)
+    Xc, Lc = positions_from_condition(cdir, a.newsq_pos, a.other_pos)
     print(f'\nphase 2: condition {a.condition_id}, {len(Xc):,} positions '
           f'({time.time()-t0:.0f}s)', flush=True)
     sched = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000]
     opt = torch.optim.AdamW(head.parameters(), lr=a.lr)
     res = {'trunk': a.trunk, 'ckpt': a.ckpt, 'layer': a.layer, 'seed': a.seed,
            'condition_id': a.condition_id, 'readout': 'generic_attention',
-           'n_positions': len(Xc), 'lr': a.lr, 'bs': a.bs,
+           'n_positions': len(Xc), 'newsq_pos': a.newsq_pos,
+           'other_pos': a.other_pos, 'lr': a.lr, 'bs': a.bs,
            'eval_steps': [], 'IL_prob': [], 'IL_acc': [], 'LL_prob': [], 'LL_acc': [],
            # the two NORMALISED variants score_manifest provides: prob_frac is
            # scale-free (for cross-model comparison) and prob_per_target removes
