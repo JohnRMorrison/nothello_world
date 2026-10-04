@@ -272,18 +272,42 @@ def main():
     data = collect(cdir, a.new_tgt, a.old_tgt, block)
     print(f'  {len(data):,} positions ({time.time()-t0:.0f}s)', flush=True)
 
-    def score_fn(prefix):
-        toks = [CELL_TO_TOK[m] for m in prefix if m in CELL_TO_TOK][:block]
-        out = np.zeros(N_CELLS, np.float32)
-        if not toks:
-            return out
-        x = torch.tensor([toks], dtype=torch.long, device=dev)
-        with torch.no_grad():
-            lg, _ = feats(feat, model, x, torch.tensor([len(toks)-1], device=dev))
-            p = torch.softmax(lg[0, 1:].float(), -1).cpu().numpy()
-        for t, c in TOK_TO_CELL.items():
-            out[c] = p[t - 1]
+    def _score_many(prefixes, bs=256):
+        """score_manifest calls score_fn ONE position at a time and the manifest
+        holds 10,000 of them -- 100,000 batch-1 forwards per run across 10 eval
+        points, which dominates the runtime.  Precomputing in batches leaves
+        score_manifest untouched, so the metrics stay identical to the GPT and
+        MLP arms."""
+        out = {}
+        for i in range(0, len(prefixes), bs):
+            chunk = prefixes[i:i + bs]
+            toks = [[CELL_TO_TOK[m] for m in pre if m in CELL_TO_TOK][:block]
+                    for pre in chunk]
+            ln = max(1, max(len(t) for t in toks))
+            xa = np.zeros((len(toks), ln), np.int64)
+            la = np.zeros(len(toks), np.int64)
+            for a_, t in enumerate(toks):
+                if t:
+                    xa[a_, :len(t)] = t; la[a_] = len(t) - 1
+            with torch.no_grad():
+                lg, _ = feats(feat, model, torch.from_numpy(xa).to(dev),
+                              torch.from_numpy(la).to(dev))
+                pr = torch.softmax(lg[:, 1:].float(), -1).cpu().numpy()
+            for a_, pre in enumerate(chunk):
+                v = np.zeros(N_CELLS, np.float32)
+                if toks[a_]:
+                    for t, c in TOK_TO_CELL.items():
+                        v[c] = pr[a_, t - 1]
+                out[pre] = v
         return out
+
+    _cache = {}
+
+    def score_fn(prefix):
+        k = tuple(prefix)
+        if k in _cache:
+            return _cache[k]
+        return _score_many([k])[k]
 
     @torch.no_grad()
     def newsq_board_acc():
@@ -310,6 +334,10 @@ def main():
 
     def ev(st):
         feat.eval(); model.eval()
+        _cache.clear()
+        pres = [tuple(q['game_prefix']) for st_ in ('IL', 'LL')
+                for q in man.get(st_, [])]
+        _cache.update(_score_many(list(dict.fromkeys(pres))))
         r = score_manifest(score_fn, man, per_bucket=False)
         feat.train(); model.train()
         ba = newsq_board_acc()
