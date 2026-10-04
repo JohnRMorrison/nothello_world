@@ -219,6 +219,12 @@ def main():
     ap.add_argument('--max-pos', type=int, default=400000)
     ap.add_argument('--bs', type=int, default=256)
     ap.add_argument('--lr', type=float, default=3e-4)
+    ap.add_argument('--seed', type=int, default=0,
+                    help='seeds readout init and batch order.  Within a seed the '
+                         'two conditions share one phase-1 readout, so they '
+                         'differ ONLY in fine-tuning data; across seeds both '
+                         'init and data order vary, which is what the error bars '
+                         'need to capture.')
     ap.add_argument('--readout-cache', default=None)
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
@@ -226,7 +232,8 @@ def main():
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     if dev == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
-    print(f'device {dev}', flush=True)
+    torch.manual_seed(a.seed); np.random.seed(a.seed)
+    print(f'device {dev}  seed {a.seed}', flush=True)
     trunk, d_in, block = load_trunk(a.trunk, a.ckpt, a.layer, dev)
     head = AttnReadout(d_in).to(dev)
     print(f'  readout: {sum(p.numel() for p in head.parameters()):,} params',
@@ -258,7 +265,7 @@ def main():
           f'({time.time()-t0:.0f}s)', flush=True)
     sched = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000]
     opt = torch.optim.AdamW(head.parameters(), lr=a.lr)
-    res = {'trunk': a.trunk, 'ckpt': a.ckpt, 'layer': a.layer,
+    res = {'trunk': a.trunk, 'ckpt': a.ckpt, 'layer': a.layer, 'seed': a.seed,
            'condition_id': a.condition_id, 'readout': 'generic_attention',
            'n_positions': len(Xc), 'lr': a.lr, 'bs': a.bs,
            'eval_steps': [], 'IL_prob': [], 'IL_acc': [], 'LL_prob': [], 'LL_acc': [],
