@@ -40,7 +40,7 @@ def load_model(ckpt_path: str = None, device: str = "cpu",
     cfg = GPTConfig(vocab_size=61, block_size=59,
                     n_layer=n_layer, n_head=n_head, n_embd=n_embd)
     model = GPT(cfg)
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(state)
     model.to(device).eval()
     return model
@@ -261,6 +261,149 @@ def run_with_intervention(
         return forward_from_prefix_capturing(
             model, x, intervene_layer + 1, capture_layer,
         )
+
+
+# ---------------------------------------------------------------------------
+# Cascade intervention (Li et al. 2023, Sec. 4.1): push at the starting layer,
+# then after every later block, each time along that layer's own probe.
+# ---------------------------------------------------------------------------
+LATER_LAYER_MODES = ("skip_if_target", "always", "none")
+PUSH_TYPES = ("reflect", "add")
+
+
+def calibrate_alpha_add(
+    h: torch.Tensor,
+    probe_cell_W: torch.Tensor,
+    target_class: int,
+    *,
+    alpha_cap: float = 100.0,
+    n_iters: int = 20,
+    safety_margin: float = 1.1,
+) -> float:
+    """Smallest alpha such that the probe reads `target_class` after the
+    additive push h + alpha * unit(W[:, target]) (Nanda et al. 2023), at the
+    same layer (no propagation). Same rules as calibrate_alpha: 0.5 if the
+    probe already reads the target, alpha_cap if it cannot be flipped,
+    otherwise the bound times `safety_margin`, clamped to alpha_cap."""
+    W = probe_cell_W.to(h.device)
+    d = W[:, target_class]
+    d_hat = d / d.norm()
+
+    def reads_target(a: float) -> bool:
+        return int((W.T @ (h + a * d_hat)).argmax()) == target_class
+
+    if reads_target(0.0):
+        return 0.5
+    if not reads_target(alpha_cap):
+        return alpha_cap
+    lo, hi = 0.0, alpha_cap
+    for _ in range(n_iters):
+        mid = (lo + hi) / 2.0
+        if reads_target(mid):
+            hi = mid
+        else:
+            lo = mid
+    return min(hi * safety_margin, alpha_cap)
+
+
+def layer_probe_path(block: int) -> str:
+    """Linear probe trained on resid_post of `block` (TransformerLens index)."""
+    if block == config.PROBE_LAYER_NANDA:
+        return config.PROBE_PATH
+    return os.path.join(_REPO_ROOT, "mechanistic_interpretability",
+                        f"main_linear_probe_L{block}.pth")
+
+
+def load_layer_probes(blocks, device: str = "cpu") -> dict:
+    """{block: (3, d_model, 8, 8, 3) probe tensor} for each block in `blocks`."""
+    return {b: probes.load_probe(layer_probe_path(b), device=device)
+            for b in blocks}
+
+
+def li_layer_to_block(li_layer: int) -> int:
+    """Li et al. count a layer as 'after k blocks'; our blocks are 0-indexed,
+    so Li layer k is resid_post of block k-1 (Li Ls=4 -> blocks 3..7)."""
+    return li_layer - 1
+
+
+def run_cascade(
+    model,
+    prefix_acts: torch.Tensor,
+    pos: int,
+    cell: tuple,
+    current_class: int,
+    target_class: int,
+    start_block: int,
+    alpha: float,
+    layer_probes: dict,
+    *,
+    probe_mode: int = 0,
+    later_layers: str = "skip_if_target",
+    push: str = "reflect",
+):
+    """Cascade intervention with one fixed `alpha` at every layer.
+
+    push="reflect" (ours): h <- h - alpha * (h . d_k) * d_k with
+    d_k = unit(W_k[:, target] - W_k[:, current]); the push depends on h.
+    push="add" (Nanda et al. 2023): h <- h + alpha * unit(W_k[:, target]);
+    the push does not depend on h.
+
+    `prefix_acts` is resid_post of `start_block`
+    (= compute_prefix(model, tokens, start_block + 1)). At start_block and then
+    after each later block k, the activation at `pos` is pushed with the same
+    rule as apply_intervention, using layer k's probe and k's current
+    activation:  h <- h - alpha * (h . d_k) * d_k,
+    d_k = unit(W_k[:, target] - W_k[:, current]).
+
+    later_layers (layers after start_block only):
+      "skip_if_target": no push if layer k's probe already reads the target
+      "always":         push regardless
+      "none":           no later pushes (= single-layer intervention)
+
+    Returns (logits, info). info["read_target"][k] is whether layer k's probe
+    reads the target after that layer's step, info["pushed"]/["skipped"] list
+    the blocks where a push was / was not applied, info["h_start"] is the
+    post-push activation at start_block.
+    """
+    if later_layers not in LATER_LAYER_MODES:
+        raise ValueError(f"later_layers must be one of {LATER_LAYER_MODES}")
+    if push not in PUSH_TYPES:
+        raise ValueError(f"push must be one of {PUSH_TYPES}")
+    r, c = cell
+    device = next(model.parameters()).device
+    x = prefix_acts.to(device).clone()
+    info = {"read_target": {}, "pushed": [], "skipped": [], "h_start": None,
+            "h_layers": {}}
+    with torch.no_grad():
+        for k in range(start_block, len(model.blocks)):
+            if k > start_block:
+                x = model.blocks[k](x)
+            W = layer_probes[k][probe_mode, :, r, c, :].to(device)
+            h = x[0, pos]
+            later = k > start_block
+            do_push = True
+            if later and later_layers == "none":
+                do_push = False
+            elif later and later_layers == "skip_if_target":
+                do_push = int((W.T @ h).argmax()) != target_class
+            if do_push:
+                if push == "add":
+                    d = W[:, target_class]
+                    h = h + alpha * (d / d.norm())
+                else:
+                    d = W[:, target_class] - W[:, current_class]
+                    d_hat = d / d.norm()
+                    h = h - alpha * (h @ d_hat) * d_hat
+                x[0, pos] = h
+                info["pushed"].append(k)
+            else:
+                info["skipped"].append(k)
+            info["read_target"][k] = int((W.T @ h).argmax()) == target_class
+            info["h_layers"][k] = h.detach().clone()
+            if k == start_block:
+                info["h_start"] = h.detach().clone()
+        logits = model.head(model.ln_f(x))
+    return logits, info
 
 
 # ---------------------------------------------------------------------------

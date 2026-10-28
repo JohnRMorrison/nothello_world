@@ -12,8 +12,10 @@ import os
 DEFAULT_INTERVENTION_LAYER = 4
 # cal_depth = number of transformer blocks between intervention and probe.
 # probe_layer = intervention_layer + cal_depth.
-# cal_depth = 0: intervene + decode at the same layer (no propagation).
-# cal_depth = 2: Nanda's published setup (intervene L4, probe L6).
+# cal_depth = 0: intervene + decode at the same layer (paper's setup).
+# cal_depth = 2: read the edit back at L6, where Nanda's probe was trained.
+#   Nanda himself used fixed alpha=2.0 at L4/L3 with no read-back, i.e.
+#   intervention_layer=4, calibration_mode="fixed", alpha=2.0.
 DEFAULT_CAL_DEPTH = 0
 # How alpha is chosen per intervention:
 #   "fixed"        — same alpha for every position/square (Nanda's protocol)
