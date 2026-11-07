@@ -262,6 +262,13 @@ def main():
         hit = tot = 0
         for x, last, y, nl in batches(data[:4096], 256, dev, shuffle=False):
             _, b3 = feats(feat, model, x, last)
+            if b3.shape[1] <= 64:
+                # No new-square decoder rows exist in the board-only
+                # architecture -- that is the point: nothing about row 8 comes
+                # from the residual stream.  This diagnostic measured Wnew,
+                # which has been removed, so it no longer applies.
+                feat.train(); model.train()
+                return float('nan')
             hit += int((b3[:, 64:, :].argmax(-1) == nl).sum()); tot += nl.numel()
         feat.train(); model.train()
         return hit / max(tot, 1)
