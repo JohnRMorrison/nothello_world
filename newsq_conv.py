@@ -96,9 +96,20 @@ class ConvReadout(nn.Module):
     NCH = 6
 
     def __init__(self, Wfrozen, d, ch=16, ksize=8, mlp_hidden=0,
-                 newsq_occ='none'):
+                 newsq_occ='none', newsq_rows=False):
         super().__init__()
-        self.register_buffer('W64', Wfrozen)        # (64,3,d) FROZEN, no Wnew
+        self.register_buffer('W64', Wfrozen)        # (64,3,d) always FROZEN
+        self.newsq_rows = newsq_rows
+        if newsq_rows:
+            # 8 trainable decoder rows extending the board to 9x8.  ONLY safe
+            # when supervised on new-square occupancy (--board-loss > 0):
+            # unsupervised, these 24 numbers are a leak -- the next-move loss
+            # makes them encode "this square is legal", which a length-1 kernel
+            # reads locally, so the convolution never consults the scattered
+            # cells.  Supervised, they are an honest board extension and the
+            # rule work has nowhere to go but the shared kernels.
+            self.Wnew = nn.Parameter(torch.zeros(N_NEW, 3, d))
+            self.Wnew.data.normal_(0.0, 0.02)
         self.ch, self.k, self.newsq_occ = ch, ksize, newsq_occ
         self.fams = []
         for i, (name, idx) in enumerate(line_index()):
@@ -115,15 +126,18 @@ class ConvReadout(nn.Module):
                              torch.tensor([CELL_TO_TOK[64 + i] for i in range(N_NEW)]))
 
     def board(self, h):
-        """64x3 only -- the trunk's own frozen output."""
-        return torch.einsum('bd,ckd->bck', h, self.W64)       # (B,64,3)
+        """64x3 from the frozen decoder, optionally extended to 72x3."""
+        W = torch.cat([self.W64, self.Wnew], 0) if self.newsq_rows else self.W64
+        return torch.einsum('bd,ckd->bck', h, W)
 
     def grid(self, h, idx):
         b3 = self.board(h)
         B = b3.shape[0]
         g = torch.zeros(B, N_CELLS, self.NCH, device=b3.device, dtype=b3.dtype)
-        g[:, :64, :3] = torch.softmax(b3, -1)
+        g[:, :64, :3] = torch.softmax(b3[:, :64], -1)
         g[:, 64:, 4] = 1.0                                    # new-square marker
+        if self.newsq_rows:
+            g[:, 64:, :3] = torch.softmax(b3[:, 64:], -1)     # decoded new row
         if self.newsq_occ == 'occupied' and idx is not None:
             # occupancy is a deterministic function of the INPUT tokens -- square
             # 64+i is occupied iff its token appears in the prefix.  Not residual
@@ -191,6 +205,17 @@ def main():
                          "64x3 board plus a new-square marker.  'occupied' also "
                          "supplies new-square occupancy from the input tokens "
                          "(deterministic, not residual access).")
+    ap.add_argument('--newsq-decoder', choices=['none', 'learned'], default='none',
+                    help="'none': row 8 is a marker only, nothing about it comes "
+                         "from h (strictest).  'learned': 8 trainable decoder "
+                         "rows extend the board to 9x8 -- use WITH --board-loss, "
+                         "or they leak.")
+    ap.add_argument('--board-loss', type=float, default=0.0,
+                    help='weight on an auxiliary cross-entropy supervising the 8 '
+                         'new decoder rows on new-square OCCUPANCY (never on '
+                         'legality -- the flanking rule is not taught).  Pins '
+                         'those rows to being a real board so the rule work must '
+                         'happen in the shared kernels.')
     ap.add_argument('--mlp-hidden', type=int, default=0,
                     help='0 = pure conv (incoherent into-board rules are '
                          'inexpressible); >0 adds a per-cell nonlinear escape '
@@ -210,8 +235,12 @@ def main():
     print(f'device {dev}  seed {a.seed}  arm {a.arm}  mlp_hidden {a.mlp_hidden}',
           flush=True)
     feat, W, d, block = load_arm(a.arm, a.ckpt, a.probe, a.layer, dev)
-    model = ConvReadout(W, d, a.ch, a.ksize, a.mlp_hidden,
-                        a.newsq_occ if hasattr(a,'newsq_occ') else a.newsq_occupancy).to(dev)
+    model = ConvReadout(W, d, a.ch, a.ksize, a.mlp_hidden, a.newsq_occupancy,
+                        a.newsq_decoder == 'learned').to(dev)
+    if a.newsq_decoder == 'learned' and a.board_loss <= 0:
+        print('  WARNING: learned new-square rows with NO board loss -- these '
+              '24 numbers can encode legality directly and bypass the kernels',
+              flush=True)
     tp = [p for p in feat.parameters() if p.requires_grad]
     print('  trainable: readout %d (conv kernels %d) + new-token emb %d'
           % (sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -278,7 +307,9 @@ def main():
     res = {'arm': a.arm, 'ckpt': a.ckpt, 'condition_id': a.condition_id,
            'seed': a.seed, 'architecture': 'conv_readout',
            'ch': a.ch, 'ksize': a.ksize, 'mlp_hidden': a.mlp_hidden,
-           'newsq_occupancy': a.newsq_occupancy, 'board_channels': '64x3_only',
+           'newsq_occupancy': a.newsq_occupancy,
+           'newsq_decoder': a.newsq_decoder, 'board_loss': a.board_loss,
+           'board_channels': '72x3' if a.newsq_decoder=='learned' else '64x3_only',
            'objective': 'next_move_only', 'n_positions': len(data),
            'lr': a.lr, 'bs': a.bs, 'eval_steps': [], 'IL_prob': [],
            'IL_acc': [], 'LL_prob': [], 'IL_prob_per_target': [],
@@ -319,8 +350,12 @@ def main():
     feat.train(); model.train()
     while not done:
         for x, last, y, nl in batches(data, a.bs, dev):
-            lg, _ = feats(feat, model, x, last)
-            loss = F.cross_entropy(lg, y)          # NEXT-MOVE ONLY
+            lg, b3 = feats(feat, model, x, last)
+            loss = F.cross_entropy(lg, y)                     # next-move
+            if a.board_loss > 0 and b3.shape[1] > 64:
+                # supervises OCCUPANCY of the 8 new squares, not legality
+                loss = loss + a.board_loss * F.cross_entropy(
+                    b3[:, 64:, :].reshape(-1, 3), nl.reshape(-1))
             opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
             st += 1
             if st in sched:
