@@ -69,71 +69,105 @@ def line_index():
 
 
 class ConvReadout(nn.Module):
-    def __init__(self, Wfrozen, d, ch=16, ksize=8, mlp_hidden=0):
+    """Convolutions over the trunk's 64x3 board output.  NO residual stream.
+
+    The ONLY path from the trunk to the convolution is the frozen,
+    board-supervised 64x3 decoder.  There is no trainable decoder row: an
+    earlier version had Wnew (8x3x512 params reading h) for the new squares,
+    and that was a LEAK -- 24 free numbers optimised by the next-move loss can
+    encode "this square is legal right now", which a length-1 kernel then
+    reads locally.  The convolution never had to look at the scattered cells,
+    which is how a readout that cannot express 80 of 122 incoherent rules still
+    scored better on them.  Evidence it was happening: those channels decoded
+    occupancy at only 0.50-0.54 where the frozen 64 decode at ~99%.
+
+    The grid is 9x8.  Rows 0-7 carry the decoded board; row 8 is the 8 new
+    squares, which have NO board channels -- they get a marker channel only, so
+    nothing about them comes from h.  Rays from (8,i) run UP into the real
+    board, which is exactly where coherent rules live: [., theirs, theirs, mine]
+    up column i is detectable from the frozen board alone, while incoherent
+    rules reference scattered cells no ray reaches.
+
+    Channels: 0 empty, 1 theirs, 2 mine, 3 off-board, 4 new-square,
+              5 new-square-occupied (only with --newsq-occupancy occupied).
+    Off-board must be distinct from empty or every edge case breaks.
+    """
+
+    NCH = 6
+
+    def __init__(self, Wfrozen, d, ch=16, ksize=8, mlp_hidden=0,
+                 newsq_occ='none'):
         super().__init__()
-        self.register_buffer('W64', Wfrozen)                 # (64,3,d) frozen
-        self.Wnew = nn.Parameter(torch.zeros(N_NEW, 3, d))
-        self.Wnew.data.normal_(0.0, 0.02)
-        self.ch, self.k = ch, ksize
+        self.register_buffer('W64', Wfrozen)        # (64,3,d) FROZEN, no Wnew
+        self.ch, self.k, self.newsq_occ = ch, ksize, newsq_occ
         self.fams = []
         for i, (name, idx) in enumerate(line_index()):
             self.register_buffer(f'idx{i}', idx)
             self.fams.append((name, i, idx.shape))
-        # one kernel set per family per DIRECTION (8 total).  kernel_size 8
-        # spans the longest possible flank: empty + 6 theirs + 1 mine.
-        self.conv = nn.ModuleList([nn.Conv1d(4, ch, ksize)
+        self.conv = nn.ModuleList([nn.Conv1d(self.NCH, ch, ksize)
                                    for _ in range(len(self.fams) * 2)])
         self.comb = nn.Linear(len(self.fams) * 2 * ch, 1)
-        self.mlp = (nn.Sequential(nn.Linear(N_CELLS * 4, mlp_hidden), nn.ReLU(),
-                                  nn.Linear(mlp_hidden, N_CELLS))
+        self.mlp = (nn.Sequential(nn.Linear(N_CELLS * self.NCH, mlp_hidden),
+                                  nn.ReLU(), nn.Linear(mlp_hidden, N_CELLS))
                     if mlp_hidden else None)
         self.register_buffer('valid', torch.tensor(PLAYABLE))
+        self.register_buffer('newtok',
+                             torch.tensor([CELL_TO_TOK[64 + i] for i in range(N_NEW)]))
 
     def board(self, h):
-        W = torch.cat([self.W64, self.Wnew], 0)
-        return torch.einsum('bd,ckd->bck', h, W)             # (B,72,3)
+        """64x3 only -- the trunk's own frozen output."""
+        return torch.einsum('bd,ckd->bck', h, self.W64)       # (B,64,3)
 
-    def forward(self, h):
+    def grid(self, h, idx):
         b3 = self.board(h)
         B = b3.shape[0]
-        # 4-channel one-hot: argmax class + off-board.  Straight-through on the
-        # softmax so the decoder still receives gradient.
-        p = torch.softmax(b3, -1)
-        oh = torch.cat([p, torch.zeros(B, N_CELLS, 1, device=p.device)], -1)
-        feats = []
+        g = torch.zeros(B, N_CELLS, self.NCH, device=b3.device, dtype=b3.dtype)
+        g[:, :64, :3] = torch.softmax(b3, -1)
+        g[:, 64:, 4] = 1.0                                    # new-square marker
+        if self.newsq_occ == 'occupied' and idx is not None:
+            # occupancy is a deterministic function of the INPUT tokens -- square
+            # 64+i is occupied iff its token appears in the prefix.  Not residual
+            # access.  Colour is not recoverable this way (forfeits break parity),
+            # so the along-row rules are only partly served.
+            occ = (idx.unsqueeze(-1) == self.newtok).any(1).to(g.dtype)
+            g[:, 64:, 5] = occ
+        return g, b3
+
+    def forward(self, h, idx=None):
+        g, b3 = self.grid(h, idx)
+        B = g.shape[0]
+        feats_ = []
         for name, i, shape in self.fams:
-            idx = getattr(self, f'idx{i}')                   # (L, M)
-            L, M = idx.shape
-            flat = idx.clamp(min=0).reshape(-1)
-            g = oh[:, flat, :].view(B, L, M, 4).clone()
-            off = (idx < 0).unsqueeze(0).unsqueeze(-1).expand(B, L, M, 1)
-            g = torch.where(off.expand(B, L, M, 4),
-                            F.one_hot(torch.tensor(OFFB, device=p.device), 4)
-                             .float().expand(B, L, M, 4), g)
+            lidx = getattr(self, f'idx{i}')
+            L, M = lidx.shape
+            gl = g[:, lidx.clamp(min=0).reshape(-1), :].view(B, L, M, self.NCH)
+            offmask = (lidx < 0)
+            if offmask.any():
+                gl = gl.clone()
+                gl[:, offmask] = 0.0
+                gl[:, offmask, 3] = 1.0                       # off-board channel
             for d in (0, 1):
-                seq = g if d == 0 else torch.flip(g, dims=[2])
-                x = seq.permute(0, 1, 3, 2).reshape(B * L, 4, M)
-                x = F.pad(x, (0, self.k - 1))                # output j = run start
-                y = self.conv[i * 2 + d](x)                  # (B*L, ch, M)
-                y = y.view(B, L, self.ch, M).permute(0, 1, 3, 2)   # (B,L,M,ch)
+                seq = gl if d == 0 else torch.flip(gl, dims=[2])
+                x = seq.permute(0, 1, 3, 2).reshape(B * L, self.NCH, M)
+                x = F.pad(x, (0, self.k - 1))
+                y = self.conv[i * 2 + d](x)
+                y = y.view(B, L, self.ch, M).permute(0, 1, 3, 2)
                 if d == 1:
                     y = torch.flip(y, dims=[2])
-                acc = torch.zeros(B, N_CELLS, self.ch, device=p.device)
-                m = (idx >= 0)
-                src = y[:, m]                                # (B, n_valid, ch)
-                tgt = idx[m]                                 # (B? no: n_valid)
-                acc.index_add_(1, tgt, src)
-                feats.append(acc)
-        lg = self.comb(torch.cat(feats, -1)).squeeze(-1)      # (B,72)
+                acc = torch.zeros(B, N_CELLS, self.ch, device=g.device, dtype=y.dtype)
+                m = (lidx >= 0)
+                acc.index_add_(1, lidx[m], y[:, m])
+                feats_.append(acc)
+        lg = self.comb(torch.cat(feats_, -1)).squeeze(-1)
         if self.mlp is not None:
-            lg = lg + self.mlp(oh.reshape(B, -1))
+            lg = lg + self.mlp(g.reshape(B, -1))
         pad = torch.full_like(lg[:, :1], -1e4)
         return torch.cat([pad, lg[:, self.valid]], 1), b3
 
 
 def feats(feat, model, x, last):
     h = feat(x)[torch.arange(len(x), device=x.device), last]
-    return model(h)
+    return model(h, x)
 
 
 def main():
@@ -146,6 +180,12 @@ def main():
     ap.add_argument('--exp-dir', default='experiments/new_squares')
     ap.add_argument('--ch', type=int, default=16)
     ap.add_argument('--ksize', type=int, default=8)
+    ap.add_argument('--newsq-occupancy', choices=['none','occupied'],
+                    default='none',
+                    help="'none' is the strict spec: the readout sees ONLY the "
+                         "64x3 board plus a new-square marker.  'occupied' also "
+                         "supplies new-square occupancy from the input tokens "
+                         "(deterministic, not residual access).")
     ap.add_argument('--mlp-hidden', type=int, default=0,
                     help='0 = pure conv (incoherent into-board rules are '
                          'inexpressible); >0 adds a per-cell nonlinear escape '
@@ -165,7 +205,8 @@ def main():
     print(f'device {dev}  seed {a.seed}  arm {a.arm}  mlp_hidden {a.mlp_hidden}',
           flush=True)
     feat, W, d, block = load_arm(a.arm, a.ckpt, a.probe, a.layer, dev)
-    model = ConvReadout(W, d, a.ch, a.ksize, a.mlp_hidden).to(dev)
+    model = ConvReadout(W, d, a.ch, a.ksize, a.mlp_hidden,
+                        a.newsq_occ if hasattr(a,'newsq_occ') else a.newsq_occupancy).to(dev)
     tp = [p for p in feat.parameters() if p.requires_grad]
     print('  trainable: readout %d (conv kernels %d) + new-token emb %d'
           % (sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -225,6 +266,7 @@ def main():
     res = {'arm': a.arm, 'ckpt': a.ckpt, 'condition_id': a.condition_id,
            'seed': a.seed, 'architecture': 'conv_readout',
            'ch': a.ch, 'ksize': a.ksize, 'mlp_hidden': a.mlp_hidden,
+           'newsq_occupancy': a.newsq_occupancy, 'board_channels': '64x3_only',
            'objective': 'next_move_only', 'n_positions': len(data),
            'lr': a.lr, 'bs': a.bs, 'eval_steps': [], 'IL_prob': [],
            'IL_acc': [], 'LL_prob': [], 'IL_prob_per_target': [],
