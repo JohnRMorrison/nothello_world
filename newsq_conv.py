@@ -228,7 +228,16 @@ def main():
            'objective': 'next_move_only', 'n_positions': len(data),
            'lr': a.lr, 'bs': a.bs, 'eval_steps': [], 'IL_prob': [],
            'IL_acc': [], 'LL_prob': [], 'IL_prob_per_target': [],
-           'newsq_board_acc': []}
+           'newsq_board_acc': [],
+           # DISCRIMINATION metrics.  IL_prob_per_target is NOT one:
+           # per_tgt = prob / n_legal_targets, so a model putting mass p on
+           # EVERY new square scores p regardless of which are legal.  It
+           # measures how much mass goes to new squares, and incoherent
+           # rules fire more often (60% vs 44% of positions), so it rewards
+           # prior matching.  AUC_within ranks new squares WITHIN a
+           # position, so it is immune to that base rate.
+           'AUC': [], 'AUC_within': [], 'dprime': [],
+           'dprime_within': [], 'hit': [], 'FA': []}
 
     def ev(st):
         feat.eval(); model.eval()
@@ -240,7 +249,9 @@ def main():
         feat.train(); model.train()
         ba = newsq_board_acc()
         res['eval_steps'].append(st)
-        for k in ('IL_prob', 'IL_acc', 'LL_prob', 'IL_prob_per_target'):
+        for k in ('IL_prob', 'IL_acc', 'LL_prob', 'IL_prob_per_target',
+                  'AUC', 'AUC_within', 'dprime', 'dprime_within',
+                  'hit', 'FA'):
             res[k].append(float(r.get(k, float('nan'))))
         res['newsq_board_acc'].append(float(ba))
         print('  step %6d  IL_prob %.4f  per_tgt %.4f  IL_acc %.4f  '
@@ -266,6 +277,8 @@ def main():
         ev(st)
     res['elapsed_seconds'] = time.time() - t0
     os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
+    torch.save({'readout': model.state_dict()},
+               a.out.replace('.json', '_readout.pt'))
     json.dump(res, open(a.out, 'w'), indent=2)
     print(f'\nwrote {a.out}', flush=True)
 
