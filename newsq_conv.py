@@ -143,9 +143,14 @@ class ConvReadout(nn.Module):
             gl = g[:, lidx.clamp(min=0).reshape(-1), :].view(B, L, M, self.NCH)
             offmask = (lidx < 0)
             if offmask.any():
+                # One unambiguous assignment.  `gl[:, offmask, 3] = 1.0` mixes a
+                # 2-D boolean mask with an integer index, and torch disagrees
+                # across versions about which dim the 3 consumes -- it worked
+                # locally and raised on the pod's 2.8.0.
+                ob = torch.zeros(self.NCH, device=gl.device, dtype=gl.dtype)
+                ob[3] = 1.0                                   # off-board channel
                 gl = gl.clone()
-                gl[:, offmask] = 0.0
-                gl[:, offmask, 3] = 1.0                       # off-board channel
+                gl[:, offmask] = ob
             for d in (0, 1):
                 seq = gl if d == 0 else torch.flip(gl, dims=[2])
                 x = seq.permute(0, 1, 3, 2).reshape(B * L, self.NCH, M)
