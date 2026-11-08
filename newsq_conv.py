@@ -30,7 +30,7 @@ Everything else -- trunk, frozen board decoder, exposure matching, next-move
 objective, manifest scoring, the read-only newsq_board diagnostic -- is reused
 unchanged from newsq_bottleneck.py so the two readouts are comparable.
 """
-import argparse, json, os, sys, time
+import argparse, json, os, pickle, sys, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from new_squares_data import N_CELLS, N_NEW, condition_dir, score_manifest
@@ -184,6 +184,36 @@ class ConvReadout(nn.Module):
         return torch.cat([pad, lg[:, self.valid]], 1), b3
 
 
+def collect_real(data_dir, n_games, block):
+    """(prefix, next-move token, new-square labels) from REAL games -- phase 1.
+
+    Standard legality on the original board.  New squares never occur, so their
+    labels are all 0 (empty) -- true, and with --board-loss it teaches the new
+    decoder rows that new squares start empty.
+
+    Pretraining is ESSENTIAL for a cross-architecture axis.  Without it the
+    readout never gains base-game competence and reserves only ~22% of its
+    probability for old-board legal moves where Othello-GPT reserves 99.9%, so
+    IL_prob then compares allocation policies rather than rule learning.
+    Measured: pretrained runs reach LL_prob 0.995-1.000 and IL_prob 0.104-0.109,
+    matching Othello-GPT's own 0.999 / 0.102-0.123.  Exposure matching does NOT
+    break this -- pretraining alone was the whole fix, so 60/60 matching stays
+    and the two conditions remain directly comparable.
+    """
+    import glob
+    out = []
+    for f in sorted(glob.glob(os.path.join(data_dir, '*.pickle'))):
+        for g in pickle.load(open(f, 'rb')):
+            if len(g) < 60:
+                continue
+            toks = [CELL_TO_TOK[c] for c in g if c in CELL_TO_TOK]
+            for pp in range(1, min(len(toks), block + 1)):
+                out.append((toks[:pp], toks[pp], np.zeros(N_NEW, np.int64)))
+            if len(out) >= n_games * 50:
+                return out
+    return out
+
+
 def feats(feat, model, x, last):
     h = feat(x)[torch.arange(len(x), device=x.device), last]
     return model(h, x)
@@ -220,6 +250,13 @@ def main():
                     help='0 = pure conv (incoherent into-board rules are '
                          'inexpressible); >0 adds a per-cell nonlinear escape '
                          'hatch so they become learnable but must be memorised')
+    ap.add_argument('--data-dir', default='./data/othello_synthetic')
+    ap.add_argument('--pre-games', type=int, default=4000,
+                    help='phase 1: real games for standard-legality pretraining')
+    ap.add_argument('--pre-epochs', type=int, default=3)
+    ap.add_argument('--readout-cache', default=None,
+                    help='share ONE phase-1 readout across both conditions of a '
+                         'seed, so they differ only in fine-tuning data')
     ap.add_argument('--new-tgt', type=int, default=60000)
     ap.add_argument('--old-tgt', type=int, default=60000)
     ap.add_argument('--bs', type=int, default=256)
@@ -302,6 +339,32 @@ def main():
         feat.train(); model.train()
         return hit / max(tot, 1)
 
+    # ---- phase 1: standard legality on real games ----
+    if a.readout_cache and os.path.exists(a.readout_cache):
+        model.load_state_dict(torch.load(a.readout_cache, map_location=dev))
+        print('  loaded pretrained readout %s' % a.readout_cache, flush=True)
+    elif a.pre_games:
+        pre = collect_real(a.data_dir, a.pre_games, block)
+        print('  phase 1: %d real-game positions' % len(pre), flush=True)
+        popt = torch.optim.AdamW(list(model.parameters()) + tp, lr=1e-3)
+        feat.train(); model.train()
+        for ep in range(a.pre_epochs):
+            ls = []
+            for x, last, y, nl in batches(pre, a.bs, dev):
+                lg, b3 = feats(feat, model, x, last)
+                loss = F.cross_entropy(lg, y)
+                if a.board_loss > 0 and b3.shape[1] > 64:
+                    loss = loss + a.board_loss * F.cross_entropy(
+                        b3[:, 64:, :].reshape(-1, 3), nl.reshape(-1))
+                popt.zero_grad(set_to_none=True); loss.backward(); popt.step()
+                ls.append(loss.item())
+            print('    pre ep%d loss %.4f (%.0fs)'
+                  % (ep, float(np.mean(ls[-20:])), time.time() - t0), flush=True)
+        if a.readout_cache:
+            os.makedirs(os.path.dirname(a.readout_cache) or '.', exist_ok=True)
+            torch.save(model.state_dict(), a.readout_cache)
+        del pre
+
     opt = torch.optim.AdamW(list(model.parameters()) + tp, lr=a.lr)
     sched = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000]
     res = {'arm': a.arm, 'ckpt': a.ckpt, 'condition_id': a.condition_id,
@@ -311,7 +374,7 @@ def main():
            'newsq_decoder': a.newsq_decoder, 'board_loss': a.board_loss,
            'board_channels': '72x3' if a.newsq_decoder=='learned' else '64x3_only',
            'objective': 'next_move_only', 'n_positions': len(data),
-           'lr': a.lr, 'bs': a.bs, 'eval_steps': [], 'IL_prob': [],
+           'lr': a.lr, 'bs': a.bs, 'pre_games': a.pre_games, 'eval_steps': [], 'IL_prob': [],
            'IL_acc': [], 'LL_prob': [], 'IL_prob_per_target': [],
            'newsq_board_acc': [],
            # DISCRIMINATION metrics.  IL_prob_per_target is NOT one:
