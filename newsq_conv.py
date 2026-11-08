@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from new_squares_data import N_CELLS, N_NEW, condition_dir, score_manifest
 from newsq_bottleneck import (PLAYABLE, CELL_TO_TOK, TOK_TO_CELL, VOCAB,
                               load_arm, collect, batches)
+from new_squares_data import NEW_SQUARE_IDS
 
 ROWS, COLS = 9, 8                      # the 9th row is the new squares
 OFFB = 3                               # 4th channel: off-board, distinct from empty
@@ -96,7 +97,7 @@ class ConvReadout(nn.Module):
     NCH = 6
 
     def __init__(self, Wfrozen, d, ch=16, ksize=8, mlp_hidden=0,
-                 newsq_occ='none', newsq_rows=False):
+                 newsq_occ='none', newsq_rows=False, comb_hidden=256):
         super().__init__()
         self.register_buffer('W64', Wfrozen)        # (64,3,d) always FROZEN
         self.newsq_rows = newsq_rows
@@ -117,7 +118,19 @@ class ConvReadout(nn.Module):
             self.fams.append((name, i, idx.shape))
         self.conv = nn.ModuleList([nn.Conv1d(self.NCH, ch, ksize)
                                    for _ in range(len(self.fams) * 2)])
-        self.comb = nn.Linear(len(self.fams) * 2 * ch, 1)
+        # SHARED nonlinear combiner -- the same weights at every cell, so
+        # weight sharing and the line structure are untouched.  Legality is
+        # "ANY of the ~16 patterns targeting this cell fires", a disjunction; a
+        # linear map gives a weighted COUNT instead, which is why Linear(128,1)
+        # stalled at LL_prob 0.287 with the loss stuck at 2.77 against a 2.20
+        # floor -- the same failure as feeding the 960 patterns to a linear map.
+        # Both attention readouts already had this: TransformerEncoderLayer's
+        # FFN (dm -> 4dm -> dm) is exactly a position-wise shared MLP, and they
+        # reached LL_prob 1.000.  The conv was the only readout without one.
+        nf = len(self.fams) * 2 * ch
+        self.comb = (nn.Sequential(nn.Linear(nf, comb_hidden), nn.ReLU(),
+                                   nn.Linear(comb_hidden, 1))
+                     if comb_hidden else nn.Linear(nf, 1))
         self.mlp = (nn.Sequential(nn.Linear(N_CELLS * self.NCH, mlp_hidden),
                                   nn.ReLU(), nn.Linear(mlp_hidden, N_CELLS))
                     if mlp_hidden else None)
@@ -214,6 +227,82 @@ def collect_real(data_dir, n_games, block):
     return out
 
 
+def newsq_legal_here(lab, rules):
+    """Is >=1 new square legal at this position?  Computed from the replayed
+    mover-relative 72-labels (0 empty, 1 theirs, 2 mine) plus the condition's
+    rules.  This exact predicate was verified against the generator's own
+    all_legal on 8,016 positions with zero mismatches, and it avoids loading the
+    526 MB train_records file.
+    """
+    for r in rules:
+        t = r['target']
+        if t < 64 or lab[t] != 0:
+            continue
+        if any(lab[o] != 1 for o in r['opponents']):
+            continue
+        if lab[r['terminal']] != 2:
+            continue
+        return True
+    return False
+
+
+def collect_cond(cdir, n_new_tgt, n_old_tgt, block):
+    """As newsq_bottleneck.collect, plus a per-position flag for whether a new
+    square is LEGAL there -- the quantity the figure's x-axis counts.
+
+    The appendix measures learning speed in new-square-LEGAL positions, not
+    games, because coherent rules sit in a new bottom row whose neighbours fill
+    late while incoherent rules draw uniformly and fire earlier.  Our pool is
+    matched on new-square TARGETS, which is a different quantity, so the x-axis
+    is MEASURED per condition rather than assumed -- which makes it valid
+    whatever the pool composition.
+    """
+    games = pickle.load(open(os.path.join(cdir, 'train_games.pickle'), 'rb'))
+    rules = json.load(open(os.path.join(cdir, 'rules.json')))
+    from newsq_bottleneck import replay_72
+    A, B = [], []
+    for g in games:
+        labs = replay_72(g, rules)
+        for pp in range(1, min(len(g), block + 1)):
+            tgt = g[pp]
+            if tgt not in CELL_TO_TOK:
+                continue
+            lab = labs[pp - 1]
+            item = ([CELL_TO_TOK[c] for c in g[:pp]], CELL_TO_TOK[tgt],
+                    lab[64:].copy(),
+                    np.int64(newsq_legal_here(lab, rules)))
+            (A if tgt >= 64 else B).append(item)
+        if len(A) >= n_new_tgt and len(B) >= n_old_tgt:
+            break
+    A, B = A[:n_new_tgt], B[:n_old_tgt]
+    tot = A + B
+    frac = float(np.mean([x[3] for x in tot])) if tot else 0.0
+    print('  exposure-matched: %d new-square targets + %d other; %.1f%% of '
+          'positions have a new square LEGAL' % (len(A), len(B), 100 * frac),
+          flush=True)
+    return tot
+
+
+def batches4(data, bs, dev, shuffle=True):
+    """As newsq_bottleneck.batches, carrying the new-square-legal flag."""
+    idx = np.random.permutation(len(data)) if shuffle else np.arange(len(data))
+    for i in range(0, len(idx), bs):
+        j = idx[i:i + bs]
+        ln = max(1, max(len(data[k][0]) for k in j))
+        x = np.zeros((len(j), ln), np.int64); last = np.zeros(len(j), np.int64)
+        y = np.zeros(len(j), np.int64); nl = np.zeros((len(j), N_NEW), np.int64)
+        f = np.zeros(len(j), np.int64)
+        for a_, k in enumerate(j):
+            it = data[k]
+            x[a_, :len(it[0])] = it[0]; last[a_] = len(it[0]) - 1; y[a_] = it[1]
+            nl[a_] = it[2]
+            if len(it) > 3:
+                f[a_] = it[3]
+        yield (torch.from_numpy(x).to(dev), torch.from_numpy(last).to(dev),
+               torch.from_numpy(y).to(dev), torch.from_numpy(nl).to(dev),
+               int(f.sum()))
+
+
 def feats(feat, model, x, last):
     h = feat(x)[torch.arange(len(x), device=x.device), last]
     return model(h, x)
@@ -229,6 +318,10 @@ def main():
     ap.add_argument('--exp-dir', default='experiments/new_squares')
     ap.add_argument('--ch', type=int, default=16)
     ap.add_argument('--ksize', type=int, default=8)
+    ap.add_argument('--comb-hidden', type=int, default=256,
+                    help='shared position-wise MLP between the conv '
+                         'features and each cell logit.  0 = linear '
+                         '(stalls: legality is a disjunction).')
     ap.add_argument('--newsq-occupancy', choices=['none','occupied'],
                     default='none',
                     help="'none' is the strict spec: the readout sees ONLY the "
@@ -273,7 +366,7 @@ def main():
           flush=True)
     feat, W, d, block = load_arm(a.arm, a.ckpt, a.probe, a.layer, dev)
     model = ConvReadout(W, d, a.ch, a.ksize, a.mlp_hidden, a.newsq_occupancy,
-                        a.newsq_decoder == 'learned').to(dev)
+                        a.newsq_decoder == 'learned', a.comb_hidden).to(dev)
     if a.newsq_decoder == 'learned' and a.board_loss <= 0:
         print('  WARNING: learned new-square rows with NO board loss -- these '
               '24 numbers can encode legality directly and bypass the kernels',
@@ -287,7 +380,7 @@ def main():
     cdir = condition_dir(a.exp_dir, a.condition_id)
     man = json.load(open(os.path.join(cdir, 'test_manifest.json')))
     t0 = time.time()
-    data = collect(cdir, a.new_tgt, a.old_tgt, block)
+    data = collect_cond(cdir, a.new_tgt, a.old_tgt, block)
     print(f'  {len(data):,} positions ({time.time()-t0:.0f}s)', flush=True)
 
     def _score_many(prefixes, bs=256):
@@ -326,7 +419,7 @@ def main():
         would break the match with Othello-GPT's next-move-only objective."""
         feat.eval(); model.eval()
         hit = tot = 0
-        for x, last, y, nl in batches(data[:4096], 256, dev, shuffle=False):
+        for x, last, y, nl, _ in batches4(data[:4096], 256, dev, shuffle=False):
             _, b3 = feats(feat, model, x, last)
             if b3.shape[1] <= 64:
                 # No new-square decoder rows exist in the board-only
@@ -350,7 +443,7 @@ def main():
         feat.train(); model.train()
         for ep in range(a.pre_epochs):
             ls = []
-            for x, last, y, nl in batches(pre, a.bs, dev):
+            for x, last, y, nl, _ in batches4(pre, a.bs, dev):
                 lg, b3 = feats(feat, model, x, last)
                 loss = F.cross_entropy(lg, y)
                 if a.board_loss > 0 and b3.shape[1] > 64:
@@ -369,7 +462,7 @@ def main():
     sched = [0, 5, 25, 50, 100, 200, 500, 1000, 2000, 5000]
     res = {'arm': a.arm, 'ckpt': a.ckpt, 'condition_id': a.condition_id,
            'seed': a.seed, 'architecture': 'conv_readout',
-           'ch': a.ch, 'ksize': a.ksize, 'mlp_hidden': a.mlp_hidden,
+           'ch': a.ch, 'ksize': a.ksize, 'comb_hidden': a.comb_hidden, 'mlp_hidden': a.mlp_hidden,
            'newsq_occupancy': a.newsq_occupancy,
            'newsq_decoder': a.newsq_decoder, 'board_loss': a.board_loss,
            'board_channels': '72x3' if a.newsq_decoder=='learned' else '64x3_only',
@@ -377,6 +470,10 @@ def main():
            'lr': a.lr, 'bs': a.bs, 'pre_games': a.pre_games, 'eval_steps': [], 'IL_prob': [],
            'IL_acc': [], 'LL_prob': [], 'IL_prob_per_target': [],
            'newsq_board_acc': [],
+           # the figure's x-axis: cumulative training positions in which
+           # >=1 new square was LEGAL (the appendix's unit), measured
+           # per condition rather than assumed from the pool.
+           'newsq_legal_seen': [], 'positions_seen': [],
            # DISCRIMINATION metrics.  IL_prob_per_target is NOT one:
            # per_tgt = prob / n_legal_targets, so a model putting mass p on
            # EVERY new square scores p regardless of which are legal.  It
@@ -386,6 +483,8 @@ def main():
            # position, so it is immune to that base rate.
            'AUC': [], 'AUC_within': [], 'dprime': [],
            'dprime_within': [], 'hit': [], 'FA': []}
+
+    seen = {'nsl': 0, 'pos': 0}
 
     def ev(st):
         feat.eval(); model.eval()
@@ -402,6 +501,8 @@ def main():
                   'hit', 'FA'):
             res[k].append(float(r.get(k, float('nan'))))
         res['newsq_board_acc'].append(float(ba))
+        res['newsq_legal_seen'].append(int(seen['nsl']))
+        res['positions_seen'].append(int(seen['pos']))
         print('  step %6d  IL_prob %.4f  per_tgt %.4f  IL_acc %.4f  '
               'LL_prob %.4f  newsq_board %.4f  (%.0fs)'
               % (st, res['IL_prob'][-1], res['IL_prob_per_target'][-1],
@@ -412,7 +513,8 @@ def main():
     st = 0; done = False
     feat.train(); model.train()
     while not done:
-        for x, last, y, nl in batches(data, a.bs, dev):
+        for x, last, y, nl, n_nsl in batches4(data, a.bs, dev):
+            seen['nsl'] += n_nsl; seen['pos'] += len(x)
             lg, b3 = feats(feat, model, x, last)
             loss = F.cross_entropy(lg, y)                     # next-move
             if a.board_loss > 0 and b3.shape[1] > 64:
